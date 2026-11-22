@@ -63,7 +63,12 @@ impl Scenario for ScratchIsolation {
             let observer = controller.clients()[1].clone();
             let b = observer.mount_point.clone();
 
-            let rules = b"*.tmp\n/scratch-dir/\n";
+            // Windows volumes fold names; the lower-case probe must match this upper-case rule.
+            let rules: &[u8] = if cfg!(windows) {
+                b"*.TMP\n/scratch-dir/\n/$RECYCLE.BIN/\n"
+            } else {
+                b"*.tmp\n/scratch-dir/\n"
+            };
             write_mounted_file_with_readback(
                 a.join(".studiofsignore"),
                 rules,
@@ -71,6 +76,12 @@ impl Scenario for ScratchIsolation {
                 true,
             )?;
             expect_bytes(&b.join(".studiofsignore"), rules)?;
+            #[cfg(windows)]
+            {
+                // Use mount-time loading for the native scratch operations below.
+                controller.unmount_all()?;
+                controller.mount_all()?;
+            }
             let probe_attempts = wait_for_rules_active(&a, &b, "client-a")?;
 
             // Wait for baseline publication (.studiofsignore + probe markers) to settle completely.
@@ -165,6 +176,84 @@ impl Scenario for ScratchIsolation {
                 &autosave_payload,
             )?;
 
+            let creator_names =
+                bounded_mounted_read_dir_names(a.clone(), "creator scratch enumeration", WAIT)?;
+            let peer_names =
+                bounded_mounted_read_dir_names(b.clone(), "peer scratch enumeration", WAIT)?;
+            if !creator_names.iter().any(|name| name == "work.tmp")
+                || !creator_names.iter().any(|name| name == "scratch-dir")
+                || peer_names
+                    .iter()
+                    .any(|name| name == "work.tmp" || name == "scratch-dir")
+            {
+                return Err(
+                    io::Error::other("scratch directory enumeration violated isolation").into(),
+                );
+            }
+            #[cfg(windows)]
+            windows_scratch_shell_names(context, &a, &b)?;
+
+            #[cfg(windows)]
+            {
+                write_summary(
+                    context,
+                    "scratch-native-step.json",
+                    &json!({"step": "reject-nonempty-scratch-rmdir"}),
+                )?;
+                let nonempty = a.join("scratch-dir");
+                let rejected =
+                    run_bounded_mounted_io("reject nonempty scratch rmdir", WAIT, move || {
+                        match fs::remove_dir(nonempty) {
+                            Ok(()) => Ok(false),
+                            Err(error) if error.kind() == io::ErrorKind::DirectoryNotEmpty => {
+                                Ok(true)
+                            }
+                            Err(error) => Err(error),
+                        }
+                    })?;
+                if !rejected {
+                    return Err(io::Error::other("nonempty scratch rmdir succeeded").into());
+                }
+                write_summary(
+                    context,
+                    "scratch-native-step.json",
+                    &json!({"step": "read-children-after-rejected-rmdir"}),
+                )?;
+                expect_bytes(&a.join("scratch-dir/nested/render.exr"), &nested_payload)?;
+                expect_bytes(&a.join("scratch-dir/autosave.blend1"), &autosave_payload)?;
+                write_summary(
+                    context,
+                    "scratch-native-step.json",
+                    &json!({"step": "remove-children-and-empty-scratch-directories"}),
+                )?;
+                let scratch_root = a.join("scratch-dir");
+                run_bounded_mounted_io(
+                    "remove scratch children then empty directories",
+                    WAIT,
+                    move || {
+                        fs::remove_file(scratch_root.join("nested/render.exr"))?;
+                        fs::remove_file(scratch_root.join("autosave.blend1"))?;
+                        fs::remove_dir(scratch_root.join("nested"))?;
+                        fs::remove_dir(scratch_root)
+                    },
+                )?;
+            }
+
+            #[cfg(windows)]
+            {
+                write_summary(
+                    context,
+                    "scratch-native-step.json",
+                    &json!({"step": "recycle-discard"}),
+                )?;
+                windows_recycle_discard(context, controller, &a)?;
+                write_summary(
+                    context,
+                    "scratch-native-step.json",
+                    &json!({"step": "complete"}),
+                )?;
+            }
+
             write_summary(
                 context,
                 SUMMARY,
@@ -175,6 +264,13 @@ impl Scenario for ScratchIsolation {
                     "encrypted_objects_delta": encrypted_after - encrypted_before,
                     "peer_absent": true,
                     "rule_probe_attempts": probe_attempts,
+                    "creator_readdir_visible": true,
+                    "nonempty_scratch_rmdir_rejected": cfg!(windows),
+                    "empty_scratch_rmdir_succeeded": cfg!(windows),
+                    "case_folded_rule": cfg!(windows),
+                    "native_rules_activation": if cfg!(windows) { Some("clean-remount-bootstrap") } else { None },
+                    "recycle_discard_verified": cfg!(windows),
+                    "shell_enumeration_artifact": if cfg!(windows) { Some("scratch-shell.json") } else { None },
                 }),
             )
         })
@@ -187,12 +283,33 @@ impl Scenario for ScratchIsolation {
             || summary["completed_uploads_delta"] != 0
             || summary["encrypted_objects_delta"] != 0
             || summary["peer_absent"] != true
+            || summary["creator_readdir_visible"] != true
         {
             return Err(io::Error::other("scratch isolation acceptance incomplete").into());
         }
-        Ok(vec![format!(
+        #[cfg(windows)]
+        if summary["case_folded_rule"] != true
+            || summary["recycle_discard_verified"] != true
+            || summary["nonempty_scratch_rmdir_rejected"] != true
+            || summary["empty_scratch_rmdir_succeeded"] != true
+            || read_summary(context, "scratch-shell.json")?["verified"] != true
+        {
+            return Err(io::Error::other("native scratch isolation acceptance incomplete").into());
+        }
+        let mut artifacts = vec![format!(
             "artifacts/scenarios/{SCRATCH_ISOLATION}/scratch-isolation.json"
-        )])
+        )];
+        if cfg!(windows) {
+            artifacts.extend(
+                [
+                    "scratch-shell.json",
+                    "scratch-recycle.json",
+                    "scratch-native-step.json",
+                ]
+                .map(|name| format!("artifacts/scenarios/{SCRATCH_ISOLATION}/{name}")),
+            );
+        }
+        Ok(artifacts)
     }
 
     fn cleanup(&self, _context: &ScenarioContext) -> Result<(), ScenarioError> {
@@ -235,8 +352,26 @@ impl Scenario for ScratchAtomicSave {
                 true,
             )?;
             expect_bytes(&b.join(".studiofsignore"), rules)?;
+            #[cfg(windows)]
+            {
+                // Use mount-time loading for the native scratch operations below.
+                controller.unmount_all()?;
+                controller.mount_all()?;
+            }
             let probe_attempts = wait_for_rules_active(&a, &b, "client-a")?;
             let _ = wait_until_sync_safe(controller, "client-a")?;
+
+            #[cfg(windows)]
+            {
+                // A DCC save replaces a published file, rather than only filling an absent name.
+                write_synced_mounted_file(
+                    &a.join("shot.exr"),
+                    b"old tracked shot\n",
+                    "seed tracked shot",
+                )?;
+                expect_bytes(&b.join("shot.exr"), b"old tracked shot\n")?;
+                let _ = wait_until_sync_safe(controller, "client-a")?;
+            }
 
             let objects_before_write = list_cache_object_files(&client_a)?;
 
@@ -265,7 +400,11 @@ impl Scenario for ScratchAtomicSave {
             expect_bytes(&b.join("pre-rename.marker"), b"ok\n")?;
             wait_for_mounted_paths_absent_until(
                 std::slice::from_ref(&observer),
-                &["shot.exr.tmp", "shot.exr"],
+                if cfg!(windows) {
+                    &["shot.exr.tmp"]
+                } else {
+                    &["shot.exr.tmp", "shot.exr"]
+                },
                 Instant::now() + WAIT,
                 POLL,
                 "shot.exr.tmp stays scratch before rename",
@@ -281,7 +420,7 @@ impl Scenario for ScratchAtomicSave {
             let src = tmp_path.clone();
             let dst = final_path.clone();
             run_bounded_mounted_io("atomic rename shot.exr.tmp -> shot.exr", WAIT, move || {
-                fs::rename(&src, &dst)
+                replace_mounted_file(&src, &dst)
             })?;
 
             // Peer observes the promoted file with exact bytes.
@@ -330,13 +469,16 @@ impl Scenario for ScratchAtomicSave {
                 SUMMARY,
                 &json!({
                     "peer_payload_verified": true,
-                    "inode_preserved": ino_before == ino_after,
+                    "inode_preserved": if cfg!(unix) { Some(ino_before == ino_after) } else { None },
+                    "inode_identity_checked": cfg!(unix),
                     "ino": ino_after,
                     "objects_before_write": objects_before_write.len(),
                     "objects_before_rename": objects_before_rename.len(),
                     "objects_added_by_rename": added_after_rename.len(),
                     "scratch_objects_reused": scratch_objects.len(),
                     "rule_probe_attempts": probe_attempts,
+                    "replaced_published_destination": cfg!(windows),
+                    "rename_api": if cfg!(windows) { "MoveFileExW(MOVEFILE_REPLACE_EXISTING)" } else { "rename" },
                 }),
             )
         })
@@ -345,11 +487,19 @@ impl Scenario for ScratchAtomicSave {
     fn validate(&self, context: &ScenarioContext) -> Result<Vec<String>, ScenarioError> {
         let summary = read_summary(context, "scratch-atomic-save.json")?;
         if summary["peer_payload_verified"] != true
-            || summary["inode_preserved"] != true
+            || (cfg!(unix) && summary["inode_preserved"] != true)
             || summary["objects_added_by_rename"] != 0
             || summary["scratch_objects_reused"].as_u64().unwrap_or(0) == 0
         {
             return Err(io::Error::other("scratch atomic-save acceptance incomplete").into());
+        }
+        #[cfg(windows)]
+        if summary["replaced_published_destination"] != true
+            || summary["rename_api"] != "MoveFileExW(MOVEFILE_REPLACE_EXISTING)"
+        {
+            return Err(
+                io::Error::other("native scratch atomic-save acceptance incomplete").into(),
+            );
         }
         Ok(vec![format!(
             "artifacts/scenarios/{SCRATCH_ATOMIC_SAVE}/scratch-atomic-save.json"
@@ -643,6 +793,12 @@ impl Scenario for ScratchOrphanRestore {
                 true,
             )?;
             expect_bytes(&b.join(".studiofsignore"), rules)?;
+            #[cfg(windows)]
+            {
+                // Use mount-time loading for the native scratch operations below.
+                controller.unmount_all()?;
+                controller.mount_all()?;
+            }
             let probe_attempts = wait_for_rules_active(&a, &b, "client-a")?;
 
             // Create a tracked directory `shots/` visible to both clients.
@@ -1263,6 +1419,143 @@ fn write_summary(
         serde_json::to_vec_pretty(value)?,
     )?;
     Ok(())
+}
+
+#[cfg(windows)]
+fn replace_mounted_file(source: &Path, destination: &Path) -> io::Result<()> {
+    use std::os::windows::ffi::OsStrExt as _;
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn MoveFileExW(source: *const u16, destination: *const u16, flags: u32) -> i32;
+    }
+    let source: Vec<u16> = source.as_os_str().encode_wide().chain(Some(0)).collect();
+    let destination: Vec<u16> = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
+    const MOVEFILE_REPLACE_EXISTING: u32 = 1;
+    // SAFETY: Both pointers reference live, NUL-terminated UTF-16 buffers for this call.
+    if unsafe {
+        MoveFileExW(
+            source.as_ptr(),
+            destination.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING,
+        )
+    } == 0
+    {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(windows))]
+fn replace_mounted_file(source: &Path, destination: &Path) -> io::Result<()> {
+    fs::rename(source, destination)
+}
+
+#[cfg(windows)]
+fn windows_scratch_shell_names(
+    context: &ScenarioContext,
+    creator: &Path,
+    peer: &Path,
+) -> Result<(), ScenarioError> {
+    let creator = creator.to_path_buf();
+    let peer = peer.to_path_buf();
+    let mut command = std::process::Command::new("powershell.exe");
+    command
+            .args(["-NoProfile", "-NonInteractive", "-Command", r#"
+$ErrorActionPreference = 'Stop'
+$shell = New-Object -ComObject Shell.Application
+$creator = $shell.NameSpace($env:SFS_SHELL_CREATOR)
+$peer = $shell.NameSpace($env:SFS_SHELL_PEER)
+if ($null -eq $creator -or $null -eq $peer) { throw 'Mounted Shell namespace unavailable' }
+$a = @($creator.Items() | ForEach-Object { Split-Path -Leaf $_.Path })
+$b = @($peer.Items() | ForEach-Object { Split-Path -Leaf $_.Path })
+if ($b -notcontains 'sync-fence.txt') { throw 'Peer Shell view missing replicated fence' }
+if ($a -notcontains 'work.tmp' -or $a -notcontains 'scratch-dir') { throw 'Creator Shell view missing scratch entries' }
+if ($b -contains 'work.tmp' -or $b -contains 'scratch-dir') { throw 'Peer Shell view exposes scratch entries' }
+@{ creator = $a; peer = $b; api = 'Shell.Application.NameSpace.Items'; verified = $true } | ConvertTo-Json
+"#])
+            .env("SFS_SHELL_CREATOR", creator)
+            .env("SFS_SHELL_PEER", peer)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+    crate::process_job::ChildJob::prepare_command(&mut command)?;
+    let mut child = command.spawn()?;
+    let job = crate::process_job::ChildJob::assign_to_child(&child)?;
+    if !crate::process_job::wait_for_child_exit(&mut child, WAIT)? {
+        job.force_kill()?;
+        let _ = child.wait();
+        return Err(io::Error::other("Explorer Shell namespace enumeration timed out").into());
+    }
+    let output = child.wait_with_output()?;
+    if !output.status.success() {
+        return Err(io::Error::other(format!(
+            "Explorer Shell enumeration failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ))
+        .into());
+    }
+    let summary: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    write_summary(context, "scratch-shell.json", &summary)
+}
+
+#[cfg(windows)]
+fn windows_recycle_discard(
+    context: &ScenarioContext,
+    controller: &MultiClientController<SystemClientProcessExecutor>,
+    root: &Path,
+) -> Result<(), ScenarioError> {
+    let recycle = root.join("$RECYCLE.BIN");
+    run_bounded_mounted_io(
+        "Recycle Bin directory remains ephemeral discard",
+        WAIT,
+        move || {
+            fs::create_dir(&recycle)?;
+            if recycle.try_exists()? {
+                return Err(io::Error::other(
+                    "Recycle Bin discard directory persisted after close",
+                ));
+            }
+            Ok(())
+        },
+    )?;
+    // The native directory cache can retain this synthetic name even after lookup disappears.
+    let names = bounded_mounted_read_dir_names(
+        root.to_path_buf(),
+        "enumerate after recycle discard",
+        WAIT,
+    )?;
+    let readdir_contains_trash = names.iter().any(|name| name == "$RECYCLE.BIN");
+    let output = controller.run_cli(
+        "client-a",
+        "scratch-list-after-discard",
+        vec![
+            "scratch".into(),
+            "list".into(),
+            "--volume".into(),
+            controller.clients()[0].volume_name.clone(),
+        ],
+    )?;
+    if !output.stdout.contains("work.tmp") || output.stdout.contains("$RECYCLE.BIN") {
+        return Err(io::Error::other("Recycle Bin discard entered scratch metadata").into());
+    }
+    write_summary(
+        context,
+        "scratch-recycle.json",
+        &json!({
+            "trash_days": 0,
+            "explicit_scratch_rule": "/$RECYCLE.BIN/",
+            "mkdir_succeeded": true,
+            "absent_after_close": true,
+            "readdir_contains_synthetic_trash_name": readdir_contains_trash,
+            "positive_scratch_list_control": "work.tmp",
+            "absent_in_scratch_list": true,
+        }),
+    )
 }
 
 fn read_summary(

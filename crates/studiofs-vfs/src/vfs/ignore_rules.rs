@@ -536,6 +536,10 @@ impl StudioVfs {
         name: &[u8],
         is_dir: bool,
     ) -> VfsResult<ScratchClass> {
+        // Reserved trash roots keep the existing discard/retained namespace routing.
+        if parent == ROOT_INO && super::is_probable_trash_component(name) {
+            return Ok(ScratchClass::Tracked);
+        }
         if self.is_scratch_inode(parent)? {
             return Ok(ScratchClass::Scratch);
         }
@@ -947,6 +951,56 @@ mod tests {
     use std::future::Future;
     use std::task::{Context, Waker};
     use studiofs_meta::{MetaEngineCore, MetaNamespace, MetaPayloadObjects};
+
+    #[test]
+    fn ignore_rules_preserve_reserved_trash_root_routing() {
+        use studiofs_meta::MetaFsOps as _;
+        use studiofs_meta::trash::MetaVolumeSettings as _;
+
+        for trash_days in [0, 7] {
+            let tmp = studiofs_test_support::workspace_target_tempdir("ignore-rules-trash-root-");
+            let (_runtime, vfs, meta) =
+                super::super::tests::make_unstarted_test_vfs(&tmp, "ignore-rules-trash-root");
+            if trash_days != 0 {
+                meta.compare_and_set_trash_days(0, trash_days)
+                    .unwrap()
+                    .unwrap();
+            }
+            let mut rules = ScratchRules::new(true);
+            rules.update(b"", b"**/\n").unwrap();
+            *vfs.ignore_rules.snapshot.write() = Arc::new(rules);
+
+            let parent = meta.create_dir(ROOT_INO, b"work", 0, 0, 0o755).unwrap();
+            for name in [
+                b"$RECYCLE.BIN".as_slice(),
+                b"$recycle.bin",
+                b".Trash",
+                b".Trashes",
+                b".Trash-1000",
+            ] {
+                assert_eq!(
+                    vfs.classify_new_entry(ROOT_INO, name, true).unwrap(),
+                    ScratchClass::Tracked,
+                    "reserved root {name:?}, retention {trash_days}"
+                );
+                assert_eq!(
+                    vfs.classify_new_entry(parent.ino, name, true).unwrap(),
+                    ScratchClass::Scratch,
+                    "ordinary nested name {name:?}"
+                );
+            }
+            let trash = vfs.mkdir(ROOT_INO, b"$RECYCLE.BIN", 0, 0, 0o755).unwrap();
+            assert_eq!(
+                meta.lookup(ROOT_INO, b"$RECYCLE.BIN").unwrap().ino,
+                trash.ino
+            );
+            assert!(
+                meta.lookup_scratch_entry(ROOT_INO, b"$RECYCLE.BIN")
+                    .unwrap()
+                    .is_none()
+            );
+        }
+    }
 
     fn take_refresh_permit(rules: &IgnoreRules) -> bool {
         let mut notified = std::pin::pin!(rules.refresh.notified());
