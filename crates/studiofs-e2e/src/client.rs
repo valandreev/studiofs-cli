@@ -1096,6 +1096,20 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
         Ok(output)
     }
 
+    /// Runs an arbitrary `studiofs` CLI command in a named client's isolated environment.
+    pub fn run_cli(
+        &self,
+        client: &str,
+        action: &str,
+        args: Vec<String>,
+    ) -> Result<ClientCommandOutput, ClientControllerError> {
+        let index = self.client_index(client)?;
+        let command = self.command(index, action, args)?;
+        let output = self.executor.run(&command)?;
+        ensure_success(&command, &output)?;
+        Ok(output)
+    }
+
     /// Reads the mounted runtime diagnostics snapshot for a named client.
     pub fn runtime_snapshot(
         &self,

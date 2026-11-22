@@ -651,10 +651,18 @@ impl StudioVfs {
                 return true;
             }
         };
+        let conflict_inos: std::collections::HashSet<Ino> = match meta.list_scratch_conflicts() {
+            Ok(conflicts) => conflicts.into_iter().map(|record| record.ino).collect(),
+            Err(error) => {
+                warn!(%error, "failed to list scratch conflicts during auto-promote pass");
+                return true;
+            }
+        };
 
         let mut parent_paths: BTreeMap<Ino, Option<Vec<u8>>> = BTreeMap::new();
         let mut candidates: Vec<(bool, Ino, Vec<u8>)> = entries
             .into_iter()
+            .filter(|(_, _, attr)| !conflict_inos.contains(&attr.ino))
             .filter_map(|(parent, name, attr)| {
                 self.auto_promote_candidate(&mut parent_paths, parent, name, &attr)
             })
@@ -814,6 +822,13 @@ impl StudioVfs {
             Err(MetaError::InodeNotFound(_)) => return Ok(CandidateOutcome::Skipped),
             Err(error) => return Err(error.into()),
         };
+        if meta
+            .list_scratch_conflicts()?
+            .iter()
+            .any(|record| record.ino == current_attr.ino)
+        {
+            return Ok(CandidateOutcome::Skipped);
+        }
 
         let Some(parent_path) = self.resolve_tracked_directory_path(parent)? else {
             return Ok(CandidateOutcome::Skipped);
@@ -2645,6 +2660,67 @@ mod tests {
             // Direct check of `CandidateOutcome::Skipped` for missing entry.
             let outcome = vfs
                 .promote_one_auto_candidate(ROOT_INO, b"big")
+                .await
+                .unwrap();
+            assert!(matches!(outcome, CandidateOutcome::Skipped));
+        });
+    }
+
+    #[test]
+    fn replay_conflict_entry_is_not_auto_promoted() {
+        use studiofs_meta::MetaReplication as _;
+
+        let temp = studiofs_test_support::workspace_target_tempdir("scratch-replay-conflict-");
+        let (runtime, vfs, meta) =
+            make_started_vfs_with_limit(&temp, "scratch-replay-conflict", None, None, None);
+        let _guard = runtime.enter();
+        runtime.block_on(async {
+            install_ignore_rules(&vfs, ROOT_INO, b"*.tmp\n").await;
+            let scratch_file =
+                write_and_close_file(&vfs, ROOT_INO, b"clash.tmp", b"local scratch").await;
+            assert!(vfs.is_scratch_inode(scratch_file.ino).unwrap());
+
+            // Simulate foreign replay inserting a tracked `clash.tmp`, which renames the
+            // local scratch file to `clash.tmp.scratch-conflict-1` and records a conflict.
+            let mut peer_attr = InodeAttr::new_file(900_001, ROOT_INO, 0, 0, 0o644);
+            peer_attr.upload_state = UploadState::Updating;
+            meta.apply_replica_serving_state(&[
+                studiofs_meta::MetaEvent::SetAttr { attr: peer_attr },
+                studiofs_meta::MetaEvent::AddEntry {
+                    parent: ROOT_INO,
+                    name: b"clash.tmp".to_vec(),
+                    entry: studiofs_meta::types::DirEntryValue {
+                        ino: 900_001,
+                        kind: FileType::RegularFile,
+                    },
+                },
+            ])
+            .unwrap();
+            for batch in meta.take_invalidation_batches() {
+                vfs.apply_semantic_invalidation_batch(batch);
+            }
+            vfs.dentry_cache_invalidate(ROOT_INO, b"clash.tmp");
+
+            let conflict_attr = vfs
+                .lookup(ROOT_INO, b"clash.tmp.scratch-conflict-1")
+                .unwrap();
+            assert_eq!(conflict_attr.ino, scratch_file.ino);
+            assert!(vfs.is_scratch_inode(conflict_attr.ino).unwrap());
+
+            // Running an auto-promote pass must NOT promote the displaced conflict copy
+            // even though `.scratch-conflict-1` no longer matches `*.tmp`.
+            let cancel = CancellationToken::new();
+            let mut limiter = AutoPromoteRateLimiter::new(100, 100);
+            let needs_follow_up = vfs
+                .run_scratch_auto_promote_pass(&mut limiter, &cancel)
+                .await;
+            assert!(!needs_follow_up);
+            assert!(
+                vfs.is_scratch_inode(conflict_attr.ino).unwrap(),
+                "replay conflict entry must remain local scratch"
+            );
+            let outcome = vfs
+                .promote_one_auto_candidate(ROOT_INO, b"clash.tmp.scratch-conflict-1")
                 .await
                 .unwrap();
             assert!(matches!(outcome, CandidateOutcome::Skipped));

@@ -231,6 +231,44 @@ mandatory workload and must improve at least one warm/reopen-read workload by
 `direct` is the tested operational rollback and requires a remount. Raw
 `/dev/fuse` is no longer a separate runtime profile.
 
+## Scratch layer gate (ADR 0014)
+
+[ADR 0014](adr/0014-local-only-scratch-layer.md) keeps `.studiofsignore`-matched
+paths and built-in `._*` AppleDouble sidecars in a local-only scratch layer.
+The mounted gate exercises the eight SFS-1083 scenarios on Linux FUSE and
+macFUSE. The focused checks cover additional ADR contracts below.
+
+| Invariant | Mounted E2E scenario (`studiofs-e2e`) | Focused unit/CLI checks |
+|---|---|---|
+| Scratch writes add zero `event_log` rows and zero S3 PUTs; peers never see them | `mounted-scratch-isolation-two-client` | `cargo test -p studiofs-vfs --lib scratch_storage` |
+| Atomic save (`shot.exr.tmp` -> `shot.exr`) promotes in place with the same inode and zero writer payload copy; peers read final bytes | `mounted-scratch-atomic-save-two-client` | `cargo test -p studiofs-vfs --lib scratch_promote` |
+| Scratch metadata and payloads survive clean unmount/remount and forced mount-process kill on the creating client | `mounted-scratch-durability` | `cargo test -p studiofs-vfs --lib scratch_storage` |
+| Removing a `.studiofsignore` rule auto-promotes eligible scratch entries on all clients, merges shared directories per ADR 0012, and leaves still-matching children scratch | `mounted-scratch-auto-promote-two-client` | `cargo test -p studiofs-vfs --lib scratch_auto_promote` |
+| A peer's tracked entry wins over a local scratch name; the displaced scratch entry appears locally as `<name>.scratch-conflict-<n>` and stays hidden from peers | `mounted-scratch-conflict-two-client` | `cargo test -p studiofs-meta --lib scratch_conflict` |
+| Peer removal of a tracked parent relocates local scratch children to orphans; `studiofs scratch list --orphaned` surfaces them and `studiofs scratch restore` restores them cleanly | `mounted-scratch-orphan-restore-two-client` | `cargo test -p studiofs --bin studiofs cli::scratch` |
+| Demoting a cached tracked file into a scratch directory removes it on peers and keeps bytes locally offline; demoting an uncached tracked file fails with `EXDEV` | `mounted-scratch-demote-two-client` | `cargo test -p studiofs-vfs --lib scratch_demote` |
+| Built-in `._*` AppleDouble sidecars keep real data on the creating client across remount with zero `event_log` rows and zero S3 PUTs | `mounted-scratch-appledouble-two-client` | `cargo test -p studiofs-vfs --lib scratch_storage` |
+
+| Additional ADR 0014 contract | Focused evidence |
+|---|---|
+| Git ignore syntax, precedence, volume case folding, protected rule files, AppleDouble override | `cargo test -p studiofs-vfs --test scratch_rules` |
+| Rule refresh on local writes and foreign updates, last compiled rules during edits, pin lifetime and persistence | `cargo test -p studiofs-vfs --lib ignore_rules` |
+| Sticky tracked classification, scratch subtree and local namespace operations, reserved xattr, last-close reclamation, `ENOTEMPTY`, rename and hardlink class boundaries | `cargo test -p studiofs-vfs --lib scratch_storage` |
+| Physical reserve rejection and scratch payload retention under cache pressure | `scratch_storage_rejects_writes_below_cached_reserve`, `scratch_payload_survives_budget_and_physical_pressure` |
+| Scratch payloads do not count as dirty or pending upload; scratch status reports conflicts, orphans and limit state | `scratch_payloads_never_count_as_dirty_or_pending_upload_in_status`, `format_scratch_status_section_renders_all_required_fields` |
+| Promotion journal order, retained replace identity, pending-upload demotion, subtree limits, quiet period, rate limiting and shutdown join | `scratch_explicit_promote_keeps_rename_journal_order`, `cargo test -p studiofs-vfs --lib scratch_storage`, `cargo test -p studiofs-vfs --lib scratch_auto_promote` |
+| Peer rename carries scratch children; replay merges directories and snapshot restore relocates orphans | `replay_parent_rename_and_adr_0012_directory_merge_carry_and_reparent_scratch_children`, `snapshot_restore_relocates_orphaned_scratch_entries_and_resolves_conflicts` |
+| Snapshot export excludes scratch, GC keeps scratch payload roots live, and fsck checks scratch metadata | `export_snapshot_excludes_all_scratch_entries`, `scratch_overlay_roots_are_cache_live_and_displaced_on_overwrite`, `fsck_detects_and_repairs_scratch_inconsistencies` |
+| Mounted and offline scratch tooling, including cleanup and explicit promotion | `mounted_scratch_commands_work_over_control_api`, `offline_scratch_commands_work_end_to_end`, `scratch_explicit_promote_path_promotes_over_limit_directory_and_clears_status` |
+| Bounded rule prefetch timeout on first mount, scratch exclusion from logical quota, and unchanged remote janitor behavior | Dedicated evidence pending |
+
+Linux FUSE acceptance (WSL2 + Docker Compose) passed all eight scenarios with
+rebuilt `studiofs` and `studiofs-e2e` binaries (SFS-1083). The review rerun's
+report is `target/e2e-runs/sfs1083-review-linux-fuse/report.json`, with
+per-scenario summaries in the same run directory.
+Native macFUSE acceptance requires running the same eight scenarios on a macOS
+host with macFUSE.
+
 ## Planned: payload compression gate (ADR 0015)
 
 [ADR 0015](adr/0015-adaptive-zstd-payload-compression.md) is implemented in the
