@@ -24,9 +24,10 @@ const DEFAULT_AUTO_PROMOTE_BURST: u64 = 16;
 const MAX_CANDIDATE_RETRIES: usize = 3;
 const FOLLOW_UP_PASS_MIN_DELAY: Duration = Duration::from_secs(1);
 const FOLLOW_UP_PASS_MAX_DELAY: Duration = Duration::from_secs(60);
-/// Quiet period after a rule change before a pass. An in-place rewrite of
-/// `.studiofsignore` (truncate, then write) briefly loads an empty rule set,
-/// which would otherwise promote every scratch entry.
+/// Quiet period after a rule change before a pass. Local in-place rewrites of
+/// `.studiofsignore` are already deferred until the last write handle closes,
+/// but a peer's truncate and subsequent write can still land in separate
+/// foreign-apply replay batches on clients with no local write handle.
 const RULES_SETTLE_DELAY: Duration = Duration::from_secs(1);
 
 #[cfg(test)]
@@ -1557,6 +1558,96 @@ mod tests {
                     .await;
             assert_eq!(snap.promoted_entries, 0);
             assert!(vfs.is_scratch_inode(kept.ino).unwrap());
+
+            vfs.shutdown(Duration::from_secs(5)).await.unwrap();
+        });
+    }
+
+    /// Opening `.studiofsignore` for writing, truncating, flushing, and waiting
+    /// longer than `RULES_SETTLE_DELAY` must keep the previous rules active and
+    /// leave scratch entries unpromoted. Once new rules are written and the
+    /// handle closes, the new rules take effect and trigger auto-promotion.
+    #[test]
+    fn scratch_auto_promote_does_not_run_on_open_for_writing_rule_file_past_settle_delay() {
+        let temp = studiofs_test_support::workspace_target_tempdir("scratch-auto-open-write-");
+        let (rt, vfs, meta) =
+            make_started_vfs_with_limit(&temp, "scratch-auto-open-write", None, None, None);
+        let _guard = rt.enter();
+        rt.block_on(async {
+            let mut rules_changed = vfs.subscribe_ignore_rules_changes();
+            let mut refresh_passes = vfs.subscribe_ignore_rules_refresh_passes_for_test();
+            let mut status_rx = vfs.subscribe_scratch_auto_promote_status();
+
+            install_ignore_rules(&vfs, ROOT_INO, b"*.tmp\n").await;
+            while rules_changed.try_recv().is_ok() {}
+            let initial_gen = vfs.ignore_rule_generation();
+            let initial_snap = wait_for_auto_promote_generation(&mut status_rx, initial_gen).await;
+            assert_eq!(initial_snap.promoted_entries, 0);
+
+            let kept = write_and_close_file(&vfs, ROOT_INO, b"keep.tmp", b"k").await;
+            assert!(vfs.is_scratch_inode(kept.ino).unwrap());
+
+            // Open root `.studiofsignore` for writing, truncate it, and flush.
+            let rule_ino = meta.lookup(ROOT_INO, RULE_FILE).unwrap().ino;
+            let fh = vfs.open_file(rule_ino, OpenFlags::RDWR, false).unwrap();
+            let pass_before = *refresh_passes.borrow();
+            vfs.setattr_with_handle(Some(fh), rule_ino, crate::SetattrArgs::size_only(0))
+                .unwrap();
+            vfs.flush_fh(fh).await.unwrap();
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                refresh_passes.wait_for(|count| *count > pass_before),
+            )
+            .await
+            .expect("rule refresh pass after truncate+flush")
+            .unwrap();
+            assert_eq!(vfs.ignore_rule_generation(), initial_gen);
+
+            // Install an unrelated subdirectory rule file so `background_scratch_auto_promote`
+            // waits out the full `RULES_SETTLE_DELAY` and runs a real pass while root
+            // `.studiofsignore` is still open for writing (no fixed sleep needed).
+            let other_dir = vfs.mkdir(ROOT_INO, b"other", 0, 0, 0o755).unwrap();
+            install_ignore_rules(&vfs, other_dir.ino, b"*.other\n").await;
+            let gen_after_other = vfs.ignore_rule_generation();
+            assert!(gen_after_other > initial_gen);
+            let snap_while_open =
+                wait_for_auto_promote_generation(&mut status_rx, gen_after_other).await;
+            assert_eq!(
+                vfs.classify_scratch_path(b"keep.tmp", false),
+                ScratchClass::Scratch,
+                "previous root rules must remain active while root .studiofsignore is open for writing"
+            );
+            assert!(
+                vfs.is_scratch_inode(kept.ino).unwrap(),
+                "scratch entry must not be promoted while .studiofsignore is open for writing"
+            );
+            assert_eq!(snap_while_open.promoted_entries, 0);
+
+            // Write replacement rules and close the write handle: new rules apply
+            // and `keep.tmp` is promoted.
+            while rules_changed.try_recv().is_ok() {}
+            vfs.write_fh(fh, rule_ino, 0, b"*.bak\n").await.unwrap();
+            vfs.flush_fh(fh).await.unwrap();
+            vfs.release_fh(fh).await.unwrap();
+
+            tokio::time::timeout(Duration::from_secs(5), rules_changed.recv())
+                .await
+                .expect("rules changed after close")
+                .expect("rules channel open");
+            assert_eq!(
+                vfs.classify_scratch_path(b"keep.tmp", false),
+                ScratchClass::Tracked
+            );
+            assert_eq!(
+                vfs.classify_scratch_path(b"other.bak", false),
+                ScratchClass::Scratch
+            );
+
+            let new_gen = vfs.ignore_rule_generation();
+            assert!(new_gen > gen_after_other);
+            let snap = wait_for_auto_promote_generation(&mut status_rx, new_gen).await;
+            assert_eq!(snap.promoted_entries, 1);
+            assert!(!vfs.is_scratch_inode(kept.ino).unwrap());
 
             vfs.shutdown(Duration::from_secs(5)).await.unwrap();
         });

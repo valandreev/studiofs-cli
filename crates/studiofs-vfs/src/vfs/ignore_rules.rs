@@ -77,6 +77,8 @@ pub(super) struct IgnoreRules {
     snapshot: parking_lot::RwLock<Arc<ScratchRules>>,
     rule_generation: AtomicU64,
     dir_rename_epoch: AtomicU64,
+    write_activity_epoch: AtomicU64,
+    opening_trunc_writers: parking_lot::Mutex<HashMap<Ino, u32>>,
     dir_rule_cache: parking_lot::Mutex<LruCache<Ino, CachedDirRules>>,
     sources: RuleSources,
     refresh: Notify,
@@ -84,6 +86,46 @@ pub(super) struct IgnoreRules {
     changed: broadcast::Sender<Vec<Vec<u8>>>,
     bootstrap: watch::Sender<bool>,
     rules_loaded: watch::Sender<bool>,
+    #[cfg(test)]
+    refresh_passes: watch::Sender<u64>,
+}
+
+/// Keeps a watched `.studiofsignore` inode marked as open for writing across
+/// `open_file(..., trunc=true)` between its `setattr(size=0)` and handle
+/// registration in `HandleTable`.
+pub(super) struct OpenTruncRuleGuard<'a> {
+    rules: Option<&'a IgnoreRules>,
+    ino: Ino,
+    notify_on_drop: bool,
+}
+
+impl OpenTruncRuleGuard<'_> {
+    /// Disarms the drop refresh notification once the write-capable handle is
+    /// registered in `HandleTable` (its eventual close will notify instead).
+    pub(super) fn disarm_notify(&mut self) {
+        self.notify_on_drop = false;
+    }
+}
+
+impl Drop for OpenTruncRuleGuard<'_> {
+    fn drop(&mut self) {
+        let Some(rules) = self.rules.take() else {
+            return;
+        };
+        {
+            let mut active = rules.opening_trunc_writers.lock();
+            if let Some(count) = active.get_mut(&self.ino) {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    active.remove(&self.ino);
+                }
+            }
+        }
+        rules.write_activity_epoch.fetch_add(1, Ordering::AcqRel);
+        if self.notify_on_drop {
+            rules.note_local_barrier(self.ino);
+        }
+    }
 }
 
 impl IgnoreRules {
@@ -120,6 +162,8 @@ impl IgnoreRules {
             snapshot: parking_lot::RwLock::new(Arc::new(rules)),
             rule_generation: AtomicU64::new(0),
             dir_rename_epoch: AtomicU64::new(0),
+            write_activity_epoch: AtomicU64::new(0),
+            opening_trunc_writers: parking_lot::Mutex::default(),
             dir_rule_cache: parking_lot::Mutex::new(LruCache::new(
                 NonZeroUsize::new(DIR_RULE_CACHE_CAPACITY).expect("non-zero dir rule cache cap"),
             )),
@@ -129,6 +173,8 @@ impl IgnoreRules {
             changed: broadcast::channel(32).0,
             bootstrap: watch::channel(restored).0,
             rules_loaded: watch::channel(false).0,
+            #[cfg(test)]
+            refresh_passes: watch::channel(0).0,
         };
         'sources: for directory in state.sources.keys() {
             let mut parent = ROOT_INO;
@@ -190,6 +236,45 @@ impl IgnoreRules {
         }
     }
 
+    /// Record that a write-capable handle was opened on `ino`.
+    pub(super) fn note_write_open(&self, ino: Ino) {
+        if self.watched.lock().files.contains(&ino) {
+            self.write_activity_epoch.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    /// Record that the last write-capable handle on `ino` closed, requesting a
+    /// refresh if `ino` is a watched rule file.
+    pub(super) fn note_last_write_close(&self, ino: Ino) {
+        if self.watched.lock().files.contains(&ino) {
+            self.write_activity_epoch.fetch_add(1, Ordering::AcqRel);
+            self.refresh.notify_one();
+        }
+    }
+
+    /// Mark a watched rule file as open for writing while `open_file(..., trunc=true)`
+    /// truncates it before inserting the handle into `HandleTable`.
+    pub(super) fn begin_open_trunc(&self, ino: Ino) -> OpenTruncRuleGuard<'_> {
+        if !self.watched.lock().files.contains(&ino) {
+            return OpenTruncRuleGuard {
+                rules: None,
+                ino,
+                notify_on_drop: false,
+            };
+        }
+        self.write_activity_epoch.fetch_add(1, Ordering::AcqRel);
+        *self.opening_trunc_writers.lock().entry(ino).or_default() += 1;
+        OpenTruncRuleGuard {
+            rules: Some(self),
+            ino,
+            notify_on_drop: true,
+        }
+    }
+
+    fn has_opening_trunc_writer(&self, ino: Ino) -> bool {
+        self.opening_trunc_writers.lock().contains_key(&ino)
+    }
+
     /// Request a refresh after a local namespace change binds `name` to `ino`
     /// (`bound`) or removes `name`. `ino` is the inode moved or created, when
     /// known. Only a binding as a rule file watches and pins the inode.
@@ -202,6 +287,7 @@ impl IgnoreRules {
     ) {
         let relevant = self.watched.lock().note_entry(name, ino, bound);
         if relevant {
+            self.write_activity_epoch.fetch_add(1, Ordering::AcqRel);
             if bound
                 && let Some(ino) = ino
                 && studiofs_meta::fold_dentry_name(name).as_ref() == RULE_FILE
@@ -500,6 +586,20 @@ impl StudioVfs {
         self.ignore_rules.refresh.notify_one();
     }
 
+    #[cfg(test)]
+    pub(super) fn subscribe_ignore_rules_refresh_passes_for_test(&self) -> watch::Receiver<u64> {
+        self.ignore_rules.refresh_passes.subscribe()
+    }
+
+    /// Returns whether a rule file currently has a local write-capable open
+    /// handle, an in-flight `open(..., trunc=true)`, or unflushed local dirty
+    /// state from a handle that is still closing.
+    fn is_ignore_rule_inode_open_for_writing(&self, ino: Ino) -> bool {
+        self.handle_table.write_open_count(ino) > 0
+            || self.ignore_rules.has_opening_trunc_writer(ino)
+            || self.inode_has_pending_local_state(ino)
+    }
+
     /// Wait for the initial prefetch pass before exposing the mount.
     pub async fn wait_for_ignore_rules_bootstrap(&self) {
         if !self.read_only_mount {
@@ -527,6 +627,10 @@ impl StudioVfs {
                 });
             }
             self.ignore_rules.bootstrap.send_replace(true);
+            #[cfg(test)]
+            self.ignore_rules
+                .refresh_passes
+                .send_modify(|passes| *passes = passes.saturating_add(1));
             let retry = outcome == RefreshOutcome::Retry;
             tokio::select! {
                 _ = cancellation.cancelled() => break,
@@ -561,6 +665,10 @@ impl StudioVfs {
         let cancellation = self.state.shutdown.background_shutdown_token.clone();
         let watched = Arc::clone(&self.ignore_rules.watched);
         watched.lock().bound_during_scan.clear();
+        let write_epoch_before = self
+            .ignore_rules
+            .write_activity_epoch
+            .load(Ordering::Acquire);
         let pin_revision = self.ignore_rules.pins.lock().revision;
         let scan = self
             .meta
@@ -686,8 +794,24 @@ impl StudioVfs {
 
         let deadline = tokio::time::Instant::now() + PAYLOAD_READ_BUDGET;
         let mut missing = Vec::new();
+        let mut rescan_after_write_activity = false;
         for (directory, version @ RuleVersion { ino, size, .. }) in files {
             if versions.get(&directory) == Some(&version) {
+                continue;
+            }
+            // Keep the last compiled rule set while a local write-capable handle
+            // is open (or still draining its close barrier) so in-place rewrites
+            // (truncate, then write) never publish an empty or partial rule set.
+            if self.is_ignore_rule_inode_open_for_writing(ino) {
+                continue;
+            }
+            if self
+                .ignore_rules
+                .write_activity_epoch
+                .load(Ordering::Acquire)
+                != write_epoch_before
+            {
+                rescan_after_write_activity = true;
                 continue;
             }
             if size > MAX_RULE_BYTES as u64 {
@@ -706,6 +830,18 @@ impl StudioVfs {
                     continue;
                 }
             };
+            if self.is_ignore_rule_inode_open_for_writing(ino) {
+                continue;
+            }
+            if self
+                .ignore_rules
+                .write_activity_epoch
+                .load(Ordering::Acquire)
+                != write_epoch_before
+            {
+                rescan_after_write_activity = true;
+                continue;
+            }
             match next_rules.update(&directory, &payload) {
                 Ok(_) => {
                     if sources.get(&directory).is_none_or(|old| old != &payload) {
@@ -716,6 +852,9 @@ impl StudioVfs {
                 Err(error) => warn!(%error, ?directory, "ignore rule update rejected"),
             }
             next_versions.insert(directory, version);
+        }
+        if rescan_after_write_activity {
+            self.ignore_rules.refresh.notify_one();
         }
         if !missing.is_empty() {
             warn!(?missing, "ignore rule payloads unavailable during refresh");
@@ -941,7 +1080,8 @@ mod tests {
         });
     }
 
-    /// A WinFSP write-through handle commits the rule file inside the write callback.
+    /// A WinFSP write-through handle commits the rule file inside the write callback,
+    /// but the rule loader keeps the previous rules until the write handle closes.
     #[test]
     fn ignore_rules_refresh_after_write_through_write() {
         let tmp = studiofs_test_support::workspace_target_tempdir("ignore-rules-wt-");
@@ -954,6 +1094,7 @@ mod tests {
         let _guard = runtime.enter();
         vfs.start().unwrap();
         let mut changes = vfs.subscribe_ignore_rules_changes();
+        let mut passes = vfs.subscribe_ignore_rules_refresh_passes_for_test();
         runtime.block_on(async {
             tokio::time::timeout(
                 Duration::from_secs(5),
@@ -972,6 +1113,7 @@ mod tests {
                 )
                 .unwrap();
             let fh = vfs.open_file(attr.ino, OpenFlags::RDWR, false).unwrap();
+            let pass_before = *passes.borrow();
             vfs.write_fh_with_deferred_materialize(
                 fh,
                 attr.ino,
@@ -981,8 +1123,20 @@ mod tests {
             )
             .await
             .unwrap();
-            wait_for_class(&vfs, &mut changes, b"file.tmp", ScratchClass::Scratch).await;
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                passes.wait_for(|count| *count > pass_before),
+            )
+            .await
+            .expect("refresh pass while write-through handle is open")
+            .unwrap();
+            assert_eq!(
+                vfs.classify_scratch_path(b"file.tmp", false),
+                ScratchClass::Tracked,
+                "rules must not load while write-through handle is still open"
+            );
             vfs.release_fh(fh).await.unwrap();
+            wait_for_class(&vfs, &mut changes, b"file.tmp", ScratchClass::Scratch).await;
             vfs.shutdown(Duration::from_secs(5)).await.unwrap();
         });
     }
@@ -1452,6 +1606,155 @@ mod tests {
 
             vfs.state.shutdown.background_shutdown_token.cancel();
             worker.await.unwrap();
+        });
+    }
+
+    /// While `.studiofsignore` has any write-capable open handle, the rule loader
+    /// keeps the last compiled rule set across truncate, write, and flush, and
+    /// loads the new content only after the last write handle closes (even if a
+    /// read-only handle remains open).
+    #[test]
+    fn ignore_rules_keep_last_compiled_rules_while_open_for_writing() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("ignore-rules-open-write-");
+        let (runtime, vfs, _) =
+            super::super::tests::make_unstarted_test_vfs(&tmp, "ignore-rules-open-write");
+        let mut changes = vfs.subscribe_ignore_rules_changes();
+        let mut passes = vfs.subscribe_ignore_rules_refresh_passes_for_test();
+        runtime.block_on(async {
+            let worker = tokio::spawn(Arc::clone(&vfs).background_ignore_rules());
+            vfs.wait_for_ignore_rules_bootstrap().await;
+            let ino = write_rule_file(&vfs, ROOT_INO, b"*.tmp\n").await;
+            wait_for_class(&vfs, &mut changes, b"keep.tmp", ScratchClass::Scratch).await;
+            while changes.try_recv().is_ok() {}
+            let gen_initial = vfs.ignore_rule_generation();
+
+            // Open for writing, truncate, and flush: previous rules must stay active.
+            let fh1 = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
+            let pass_before = *passes.borrow();
+            vfs.setattr_with_handle(Some(fh1), ino, SetattrArgs::size_only(0))
+                .unwrap();
+            vfs.flush_fh(fh1).await.unwrap();
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                passes.wait_for(|count| *count > pass_before),
+            )
+            .await
+            .expect("refresh pass after truncate+flush")
+            .unwrap();
+            assert_eq!(vfs.ignore_rule_generation(), gen_initial);
+            assert_eq!(
+                vfs.classify_scratch_path(b"keep.tmp", false),
+                ScratchClass::Scratch
+            );
+            assert!(matches!(
+                changes.try_recv(),
+                Err(broadcast::error::TryRecvError::Empty)
+            ));
+
+            // A second write handle keeps rules deferred even after fh1 writes, flushes, and closes.
+            let fh2 = vfs.open_file(ino, OpenFlags::WRONLY, false).unwrap();
+            vfs.write_fh(fh1, ino, 0, b"*.bak\n").await.unwrap();
+            vfs.flush_fh(fh1).await.unwrap();
+            let pass_before = *passes.borrow();
+            vfs.release_fh(fh1).await.unwrap();
+            vfs.trigger_ignore_rules_refresh_for_test();
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                passes.wait_for(|count| *count > pass_before),
+            )
+            .await
+            .expect("refresh pass while second write handle is open")
+            .unwrap();
+            assert_eq!(vfs.ignore_rule_generation(), gen_initial);
+            assert_eq!(
+                vfs.classify_scratch_path(b"keep.tmp", false),
+                ScratchClass::Scratch
+            );
+            assert_eq!(
+                vfs.classify_scratch_path(b"keep.bak", false),
+                ScratchClass::Tracked
+            );
+
+            // Closing the last write handle loads the new rules even while a read-only handle is open.
+            let ro_fh = vfs.open_file(ino, OpenFlags::RDONLY, false).unwrap();
+            vfs.release_fh(fh2).await.unwrap();
+            wait_for_class(&vfs, &mut changes, b"keep.bak", ScratchClass::Scratch).await;
+            assert_eq!(
+                vfs.classify_scratch_path(b"keep.tmp", false),
+                ScratchClass::Tracked
+            );
+            vfs.release_fh(ro_fh).await.unwrap();
+            while changes.try_recv().is_ok() {}
+            let gen_bak = vfs.ignore_rule_generation();
+
+            // Opening with O_TRUNC must also keep previous rules active until close.
+            let pass_before = *passes.borrow();
+            let trunc_fh = vfs.open_file(ino, OpenFlags::RDWR, true).unwrap();
+            vfs.trigger_ignore_rules_refresh_for_test();
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                passes.wait_for(|count| *count > pass_before),
+            )
+            .await
+            .expect("refresh pass while O_TRUNC handle is open")
+            .unwrap();
+            assert_eq!(vfs.ignore_rule_generation(), gen_bak);
+            assert_eq!(
+                vfs.classify_scratch_path(b"keep.bak", false),
+                ScratchClass::Scratch
+            );
+            vfs.write_fh(trunc_fh, ino, 0, b"*.log\n").await.unwrap();
+            vfs.release_fh(trunc_fh).await.unwrap();
+            wait_for_class(&vfs, &mut changes, b"keep.log", ScratchClass::Scratch).await;
+            assert_eq!(
+                vfs.classify_scratch_path(b"keep.bak", false),
+                ScratchClass::Tracked
+            );
+
+            vfs.state.shutdown.background_shutdown_token.cancel();
+            worker.await.unwrap();
+        });
+    }
+
+    /// A regular (non-`.studiofsignore`) file undergoing open -> truncate -> flush ->
+    /// write -> flush -> close keeps its immediate visibility and durability behaviour.
+    #[test]
+    fn regular_file_truncate_and_flush_while_open_keeps_current_behaviour() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("regular-file-trunc-");
+        let (runtime, vfs, _) =
+            super::super::tests::make_unstarted_test_vfs(&tmp, "regular-file-trunc");
+        runtime.block_on(async {
+            let attr = vfs.create(ROOT_INO, b"notes.txt", 0, 0, 0o644).unwrap();
+            let fh = vfs.open_file(attr.ino, OpenFlags::RDWR, false).unwrap();
+            vfs.write_fh(fh, attr.ino, 0, b"before\n").await.unwrap();
+            vfs.flush_fh(fh).await.unwrap();
+            vfs.release_fh(fh).await.unwrap();
+
+            let fh = vfs.open_file(attr.ino, OpenFlags::RDWR, false).unwrap();
+            vfs.setattr_with_handle(Some(fh), attr.ino, SetattrArgs::size_only(0))
+                .unwrap();
+            vfs.flush_fh(fh).await.unwrap();
+            assert_eq!(vfs.getattr(attr.ino).unwrap().size, 0);
+            assert!(
+                vfs.read(attr.ino, 0, 64).await.unwrap().is_empty(),
+                "truncated regular file must read empty immediately while still open"
+            );
+
+            vfs.write_fh(fh, attr.ino, 0, b"after\n").await.unwrap();
+            vfs.flush_fh(fh).await.unwrap();
+            assert_eq!(vfs.getattr(attr.ino).unwrap().size, 6);
+            assert_eq!(
+                vfs.read(attr.ino, 0, 64).await.unwrap().as_ref(),
+                b"after\n",
+                "flushed regular file writes must be visible immediately while still open"
+            );
+
+            vfs.release_fh(fh).await.unwrap();
+            assert_eq!(vfs.getattr(attr.ino).unwrap().size, 6);
+            assert_eq!(
+                vfs.read(attr.ino, 0, 64).await.unwrap().as_ref(),
+                b"after\n"
+            );
         });
     }
 }
