@@ -598,6 +598,78 @@ impl LocalDiagnosticsClient {
         }
     }
 
+    pub(crate) async fn list_scratch_entries(
+        &self,
+        path: Option<&str>,
+    ) -> Result<Vec<studiofs_vfs::ScratchListEntry>> {
+        match self
+            .send(DiagnosticsRequest::ScratchList {
+                auth_token: self.discovery.auth_token.clone(),
+                path: path.map(str::to_string),
+            })
+            .await?
+        {
+            DiagnosticsResponse::ScratchList { entries } => Ok(entries),
+            DiagnosticsResponse::Error { message, .. } => Err(anyhow!(message)),
+            other => Err(anyhow!("unexpected diagnostics response: {other:?}")),
+        }
+    }
+
+    pub(crate) async fn list_scratch_orphans(
+        &self,
+        path: Option<&str>,
+    ) -> Result<Vec<studiofs_vfs::ScratchOrphanSummary>> {
+        match self
+            .send(DiagnosticsRequest::ScratchListOrphans {
+                auth_token: self.discovery.auth_token.clone(),
+                path: path.map(str::to_string),
+            })
+            .await?
+        {
+            DiagnosticsResponse::ScratchListOrphans { orphans } => Ok(orphans),
+            DiagnosticsResponse::Error { message, .. } => Err(anyhow!(message)),
+            other => Err(anyhow!("unexpected diagnostics response: {other:?}")),
+        }
+    }
+
+    pub(crate) async fn clean_scratch_entries(
+        &self,
+        path: Option<&str>,
+        older_than_secs: Option<u64>,
+    ) -> Result<studiofs_vfs::ScratchCleanOutcome> {
+        match self
+            .send(DiagnosticsRequest::ScratchClean {
+                auth_token: self.discovery.auth_token.clone(),
+                path: path.map(str::to_string),
+                older_than_secs,
+            })
+            .await?
+        {
+            DiagnosticsResponse::ScratchClean { outcome } => Ok(outcome),
+            DiagnosticsResponse::Error { message, .. } => Err(anyhow!(message)),
+            other => Err(anyhow!("unexpected diagnostics response: {other:?}")),
+        }
+    }
+
+    pub(crate) async fn restore_scratch_orphan(
+        &self,
+        orphan: &str,
+        target_path: Option<&str>,
+    ) -> Result<studiofs_vfs::ScratchRestoreOutcome> {
+        match self
+            .send(DiagnosticsRequest::ScratchRestore {
+                auth_token: self.discovery.auth_token.clone(),
+                orphan: orphan.to_string(),
+                target_path: target_path.map(str::to_string),
+            })
+            .await?
+        {
+            DiagnosticsResponse::ScratchRestore { outcome } => Ok(outcome),
+            DiagnosticsResponse::Error { message, .. } => Err(anyhow!(message)),
+            other => Err(anyhow!("unexpected diagnostics response: {other:?}")),
+        }
+    }
+
     pub(super) async fn send(&self, request: DiagnosticsRequest) -> Result<DiagnosticsResponse> {
         #[cfg(unix)]
         {

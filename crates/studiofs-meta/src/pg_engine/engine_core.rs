@@ -216,6 +216,16 @@ impl MetaEngineCore for PgMetaEngine {
         self.local.scratch_orphans_dir()
     }
 
+    fn inspect_scratch_consistency(&self) -> MetaResult<crate::engine::ScratchConsistencyReport> {
+        self.local.inspect_scratch_consistency()
+    }
+
+    fn repair_scratch_consistency(
+        &self,
+    ) -> MetaResult<crate::engine::ScratchConsistencyRepairSummary> {
+        self.local.repair_scratch_consistency()
+    }
+
     fn load_ignore_rules_cache(&self) -> MetaResult<Option<Vec<u8>>> {
         self.local.load_ignore_rules_cache()
     }

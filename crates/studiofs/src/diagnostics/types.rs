@@ -91,6 +91,8 @@ pub(crate) struct DiagnosticsRuntimeSnapshot {
     pub cache_scrub: Option<studiofs_vfs::VfsCacheScrubSnapshot>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scratch_auto_promote: Option<studiofs_vfs::VfsScratchAutoPromoteSnapshot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scratch_status: Option<studiofs_vfs::VfsScratchStatusSnapshot>,
     #[serde(default)]
     pub logical_quota: Option<studiofs_vfs::LogicalQuotaStatus>,
     pub schema_version: u32,
@@ -121,6 +123,7 @@ impl DiagnosticsRuntimeSnapshot {
         Self {
             cache_scrub: None,
             scratch_auto_promote: None,
+            scratch_status: None,
             logical_quota: None,
             schema_version: DIAGNOSTICS_RUNTIME_SNAPSHOT_SCHEMA_VERSION,
             generated_unix_ms: health.generated_unix_ms,
@@ -193,6 +196,44 @@ pub(crate) trait DiagnosticsDataSource: Send + Sync + 'static {
     fn promote_scratch_path(&self, _path: &str) -> Result<studiofs_vfs::ScratchPromotePathOutcome> {
         Err(anyhow!(
             "scratch promote control is unavailable for this diagnostics session"
+        ))
+    }
+
+    fn list_scratch_entries(
+        &self,
+        _path: Option<&str>,
+    ) -> Result<Vec<studiofs_vfs::ScratchListEntry>> {
+        Err(anyhow!(
+            "scratch list control is unavailable for this diagnostics session"
+        ))
+    }
+
+    fn list_scratch_orphans(
+        &self,
+        _path: Option<&str>,
+    ) -> Result<Vec<studiofs_vfs::ScratchOrphanSummary>> {
+        Err(anyhow!(
+            "scratch orphan list control is unavailable for this diagnostics session"
+        ))
+    }
+
+    fn clean_scratch_entries(
+        &self,
+        _path: Option<&str>,
+        _older_than_secs: Option<u64>,
+    ) -> Result<studiofs_vfs::ScratchCleanOutcome> {
+        Err(anyhow!(
+            "scratch clean control is unavailable for this diagnostics session"
+        ))
+    }
+
+    fn restore_scratch_orphan(
+        &self,
+        _orphan: &str,
+        _target_path: Option<&str>,
+    ) -> Result<studiofs_vfs::ScratchRestoreOutcome> {
+        Err(anyhow!(
+            "scratch restore control is unavailable for this diagnostics session"
         ))
     }
 }

@@ -1692,6 +1692,14 @@ impl MetaEngineCore for RedbMetaEngine {
         Ok(self.resolved_scratch_orphans_dir())
     }
 
+    fn inspect_scratch_consistency(&self) -> MetaResult<ScratchConsistencyReport> {
+        self.inspect_scratch_consistency_inner()
+    }
+
+    fn repair_scratch_consistency(&self) -> MetaResult<ScratchConsistencyRepairSummary> {
+        self.repair_scratch_consistency_inner()
+    }
+
     fn load_ignore_rules_cache(&self) -> MetaResult<Option<Vec<u8>>> {
         let txn = self.begin_read_txn()?;
         let table = match txn.open_table(IGNORE_RULES_CACHE) {

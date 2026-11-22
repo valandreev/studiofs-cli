@@ -1417,6 +1417,89 @@ pub struct ScratchOrphanRecord {
     pub materialized: bool,
 }
 
+/// One dangling row in `scratch_dentries` whose target inode is missing from
+/// `scratch_inodes` or whose parent is not reachable from the tracked/scratch tree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScratchDanglingDentry {
+    /// Parent directory inode of the dangling dentry.
+    pub parent: Ino,
+    /// Raw entry name bytes.
+    pub name: Vec<u8>,
+    /// Target inode referenced by the dangling dentry.
+    pub ino: Ino,
+}
+
+/// One row in `scratch_inodes` that is not reachable from any tracked parent
+/// via `scratch_dentries`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScratchOrphanInode {
+    /// Unreachable scratch inode number.
+    pub ino: Ino,
+    /// Inode file type.
+    pub kind: FileType,
+    /// Stored link count.
+    pub nlink: u32,
+}
+
+/// Auxiliary scratch table that contains an orphaned row whose inode is absent
+/// from `scratch_inodes`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ScratchAuxTable {
+    /// `scratch_overlay` regular-file chunk rows.
+    Overlay,
+    /// `scratch_xattrs` extended attribute rows.
+    Xattrs,
+    /// `scratch_symlinks` symlink target rows.
+    Symlinks,
+    /// `scratch_conflicts` name-conflict records.
+    Conflicts,
+}
+
+/// One orphaned row in an auxiliary scratch table (`scratch_overlay`,
+/// `scratch_xattrs`, `scratch_symlinks`, or `scratch_conflicts`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScratchOrphanAuxRow {
+    /// Auxiliary table containing the orphaned row.
+    pub table: ScratchAuxTable,
+    /// Missing scratch inode number referenced by the row.
+    pub ino: Ino,
+}
+
+/// Scratch payload reference from a live scratch inode or orphan record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScratchPayloadObjectRef {
+    /// Owning scratch inode (for active scratch overlays) or `0` for orphan records.
+    pub ino: Ino,
+    /// Local payload object identifier.
+    pub object_id: u64,
+}
+
+/// Consistency report across all mount-local scratch metadata tables.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ScratchConsistencyReport {
+    /// Dangling `scratch_dentries` rows.
+    pub dangling_dentries: Vec<ScratchDanglingDentry>,
+    /// Unreachable `scratch_inodes` rows.
+    pub orphan_inodes: Vec<ScratchOrphanInode>,
+    /// Orphaned auxiliary rows whose inode is absent from `scratch_inodes`.
+    pub orphan_aux_rows: Vec<ScratchOrphanAuxRow>,
+    /// Payload object IDs referenced by `scratch_overlay` and `scratch_orphans`.
+    pub referenced_payload_objects: Vec<ScratchPayloadObjectRef>,
+}
+
+/// Summary of repairs applied to mount-local scratch metadata tables.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ScratchConsistencyRepairSummary {
+    /// Number of dangling `scratch_dentries` rows removed.
+    pub removed_dangling_dentries: usize,
+    /// Number of unreachable `scratch_inodes` rows removed.
+    pub removed_orphan_inodes: usize,
+    /// Number of orphaned auxiliary rows removed.
+    pub removed_orphan_aux_rows: usize,
+    /// Local payload object IDs freed by removing orphan inodes or overlays.
+    pub freed_payload_object_ids: Vec<u64>,
+}
+
 /// Outcome of automatic scratch promotion triggered by a `.studiofsignore` rule change.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScratchAutoPromoteResult {
@@ -1711,6 +1794,18 @@ pub trait MetaEngineCore: Send + Sync + MetaInodes {
     /// (`<cache>/scratch-orphans`).
     fn scratch_orphans_dir(&self) -> MetaResult<std::path::PathBuf> {
         Err(MetaError::Storage("scratch storage is unsupported".into()))
+    }
+
+    /// Inspect mount-local scratch tables for dangling dentries, unreachable
+    /// scratch inodes, orphaned auxiliary rows, and referenced payload object IDs.
+    fn inspect_scratch_consistency(&self) -> MetaResult<ScratchConsistencyReport> {
+        Ok(ScratchConsistencyReport::default())
+    }
+
+    /// Repair orphaned rows in mount-local scratch metadata tables and return
+    /// any local payload object IDs freed by removed orphan inodes or overlays.
+    fn repair_scratch_consistency(&self) -> MetaResult<ScratchConsistencyRepairSummary> {
+        Ok(ScratchConsistencyRepairSummary::default())
     }
 
     /// Mount-local last-good ignore rule sources, encoded by the VFS.

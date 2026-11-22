@@ -59,7 +59,9 @@ pub use engine::{
     MetadataWriteStageTiming, NamespaceMutation, OrphanInodeFinalization, PgSyncDiagnostics,
     PgSyncFailure, PgSyncLifecycle, PgSyncPageDiagnostics, PgSyncStatus,
     PgSyncWriteAuthorityReason, RegularFileOverlayMutation, ScratchAutoPromoteResult,
-    ScratchConflictRecord, ScratchOrphanEntry, ScratchOrphanRecord, ScratchRenameResult,
+    ScratchAuxTable, ScratchConflictRecord, ScratchConsistencyRepairSummary,
+    ScratchConsistencyReport, ScratchDanglingDentry, ScratchOrphanAuxRow, ScratchOrphanEntry,
+    ScratchOrphanInode, ScratchOrphanRecord, ScratchPayloadObjectRef, ScratchRenameResult,
 };
 pub use events::MetaEvent;
 pub use janitor::{

@@ -51,6 +51,7 @@ mod retained_views;
 mod runtime_stats_surface;
 mod scratch_auto_promote;
 mod scratch_storage;
+mod scratch_tooling;
 mod startup;
 mod startup_replay;
 mod statfs;
@@ -74,24 +75,25 @@ pub use locking::LockKind;
 pub use metrics::{
     LogicalQuotaStatus, RUNTIME_STATS_SCHEMA_VERSION, RUNTIME_STATS_SECTIONS, RuntimeLatencyBucket,
     RuntimeLatencyHistogram, RuntimeScalarMetric, RuntimeStatsParseError, RuntimeStatsSection,
-    RuntimeStatsSnapshot, ScratchPromoteOverLimitEntry, ScratchPromotePathOutcome, StatFs,
-    VfsAttrReadCacheSnapshot, VfsCachePipelineMaterializeStats, VfsCachePipelineStats,
-    VfsCacheScrubCorruption, VfsCacheScrubProgress, VfsCacheScrubSnapshot, VfsCacheStateSnapshot,
-    VfsFetchStats, VfsForegroundReadProtectionStats, VfsFuseAsyncReadSnapshot,
-    VfsFuseAsyncWriteSnapshot, VfsFuseCallbackStats, VfsFuseConnectionSnapshot,
-    VfsFuseInvalidationSnapshot, VfsFuseIoStats, VfsIngressLane, VfsIngressPressure,
-    VfsIngressStats, VfsLatencyHistogramSnapshot, VfsLinuxFuseOpenCacheStats,
-    VfsMacFuseOpenCacheDecision, VfsMacFuseOpenCacheStats, VfsMacFuseOpenMemoryDirectIo,
-    VfsNamespaceCacheSnapshot, VfsNamespaceCreateObservabilityStats, VfsPortableAllocatorStats,
-    VfsReadPathStats, VfsRuntimeEvent, VfsScratchAutoPromoteSnapshot, VfsSyncSafetyReason,
-    VfsSyncSafetySnapshot, VfsSyncSafetyState, VfsSynchronizationStateSnapshot,
-    VfsTransitMemorySnapshot, VfsUploadStats, VfsWritePathBackpressureStats,
-    VfsWritePathBurstStats, VfsWritePathCadenceStats, VfsWritePathDirtyPressureStats,
-    VfsWritePathDrainLagStats, VfsWritePathEagerFlushStats, VfsWritePathLandingZoneStats,
-    VfsWritePathLatencyQuantilesMs, VfsWritePathLatencyQuantilesSaturated,
-    VfsWritePathLocalCacheIoStats, VfsWritePathObservabilitySnapshot,
-    VfsWritePathStageLatencyStats, VfsWritePathSyncDataStats, VfsWritePathTuningStats,
-    VfsWritePathVfsWriteStats, VfsWritePathWinfspCallbackStats,
+    RuntimeStatsSnapshot, ScratchCleanOutcome, ScratchConflictSummary, ScratchListEntry,
+    ScratchOrphanSummary, ScratchPromoteOverLimitEntry, ScratchPromotePathOutcome,
+    ScratchRestoreOutcome, ScratchRuleFileWarning, StatFs, VfsAttrReadCacheSnapshot,
+    VfsCachePipelineMaterializeStats, VfsCachePipelineStats, VfsCacheScrubCorruption,
+    VfsCacheScrubProgress, VfsCacheScrubSnapshot, VfsCacheStateSnapshot, VfsFetchStats,
+    VfsForegroundReadProtectionStats, VfsFuseAsyncReadSnapshot, VfsFuseAsyncWriteSnapshot,
+    VfsFuseCallbackStats, VfsFuseConnectionSnapshot, VfsFuseInvalidationSnapshot, VfsFuseIoStats,
+    VfsIngressLane, VfsIngressPressure, VfsIngressStats, VfsLatencyHistogramSnapshot,
+    VfsLinuxFuseOpenCacheStats, VfsMacFuseOpenCacheDecision, VfsMacFuseOpenCacheStats,
+    VfsMacFuseOpenMemoryDirectIo, VfsNamespaceCacheSnapshot, VfsNamespaceCreateObservabilityStats,
+    VfsPortableAllocatorStats, VfsReadPathStats, VfsRuntimeEvent, VfsScratchAutoPromoteSnapshot,
+    VfsScratchStatusSnapshot, VfsSyncSafetyReason, VfsSyncSafetySnapshot, VfsSyncSafetyState,
+    VfsSynchronizationStateSnapshot, VfsTransitMemorySnapshot, VfsUploadStats,
+    VfsWritePathBackpressureStats, VfsWritePathBurstStats, VfsWritePathCadenceStats,
+    VfsWritePathDirtyPressureStats, VfsWritePathDrainLagStats, VfsWritePathEagerFlushStats,
+    VfsWritePathLandingZoneStats, VfsWritePathLatencyQuantilesMs,
+    VfsWritePathLatencyQuantilesSaturated, VfsWritePathLocalCacheIoStats,
+    VfsWritePathObservabilitySnapshot, VfsWritePathStageLatencyStats, VfsWritePathSyncDataStats,
+    VfsWritePathTuningStats, VfsWritePathVfsWriteStats, VfsWritePathWinfspCallbackStats,
     VfsWritePathWinfspForegroundFlushStats, VfsWritePathWinfspWritePathStats,
     VfsZeroIoCacheBytesSnapshot, VfsZeroIoDrilldownEntry, VfsZeroIoHealthSignal,
     VfsZeroIoRuntimeSnapshot, VfsZeroIoShutdownSnapshot, VfsZeroIoStartupReplaySnapshot,
@@ -109,6 +111,10 @@ pub use runtime_stats_surface::{
     RUNTIME_STATS_FILE_REPORTED_SIZE, read_runtime_stats_buffer,
 };
 pub use scratch_auto_promote::find_over_limit_scratch_directories;
+pub use scratch_tooling::{
+    clean_scratch_offline, inspect_scratch_status, list_scratch_entries_offline,
+    list_scratch_orphans_offline, promote_scratch_path_offline, restore_scratch_orphan_offline,
+};
 
 use crate::coherence::{CoherenceHealthBudget, CoherenceHealthSnapshot, CoherenceHealthTracker};
 use acl::AclState;

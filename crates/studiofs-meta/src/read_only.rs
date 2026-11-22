@@ -168,6 +168,14 @@ where
         self.inner.scratch_orphans_dir()
     }
 
+    fn inspect_scratch_consistency(&self) -> MetaResult<ScratchConsistencyReport> {
+        self.inner.inspect_scratch_consistency()
+    }
+
+    fn repair_scratch_consistency(&self) -> MetaResult<ScratchConsistencyRepairSummary> {
+        Err(read_only_error(ROOT_INO))
+    }
+
     fn metadata_write_observability(&self) -> MetadataWriteObservability {
         self.inner.metadata_write_observability()
     }

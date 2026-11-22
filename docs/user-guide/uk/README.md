@@ -40,6 +40,7 @@
 - [20. Кеш: чому хмара використовує мій SSD?](20-cache-why-is-the-cloud-using-my-ssd.md)
 - [21. Двоє людей, один файл: співпраця та конфлікти](21-two-people-one-file-collaboration-and-conflicts.md)
 - [22. Налаштування, стан і активність](22-settings-status-and-activity.md)
+- [31. Локальний scratch-шар та `.studiofsignore`](31-scratch-layer-and-studiofsignore.md)
 
 ## Безпека та обслуговування
 

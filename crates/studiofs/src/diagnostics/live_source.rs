@@ -121,9 +121,14 @@ impl DiagnosticsDataSource for LiveMountDiagnosticsSource {
             tracing::warn!(%error, "logical quota status unavailable for diagnostics");
             None
         });
+        let scratch_status = self.vfs.scratch_status_snapshot().unwrap_or_else(|error| {
+            tracing::warn!(%error, "scratch status unavailable for diagnostics");
+            studiofs_vfs::VfsScratchStatusSnapshot::default()
+        });
         DiagnosticsRuntimeSnapshot {
             cache_scrub: self.vfs.cache_scrub_snapshot(),
             scratch_auto_promote: Some(self.vfs.scratch_auto_promote_snapshot()),
+            scratch_status: Some(scratch_status),
             logical_quota,
             schema_version: DIAGNOSTICS_RUNTIME_SNAPSHOT_SCHEMA_VERSION,
             generated_unix_ms: health.generated_unix_ms,
@@ -192,6 +197,53 @@ impl DiagnosticsDataSource for LiveMountDiagnosticsSource {
                 .await
                 .map_err(anyhow::Error::from)
         })
+    }
+
+    fn list_scratch_entries(
+        &self,
+        path: Option<&str>,
+    ) -> Result<Vec<studiofs_vfs::ScratchListEntry>> {
+        self.vfs
+            .list_scratch_entries(path)
+            .map_err(anyhow::Error::from)
+    }
+
+    fn list_scratch_orphans(
+        &self,
+        path: Option<&str>,
+    ) -> Result<Vec<studiofs_vfs::ScratchOrphanSummary>> {
+        self.vfs
+            .list_scratch_orphan_entries(path)
+            .map_err(anyhow::Error::from)
+    }
+
+    fn clean_scratch_entries(
+        &self,
+        path: Option<&str>,
+        older_than_secs: Option<u64>,
+    ) -> Result<studiofs_vfs::ScratchCleanOutcome> {
+        if self.identity.read_only {
+            anyhow::bail!("cannot clean scratch entries on a read-only mount");
+        }
+        crate::runtime_bridge::block_on(async {
+            self.vfs
+                .clean_scratch_entries(path, older_than_secs)
+                .await
+                .map_err(anyhow::Error::from)
+        })
+    }
+
+    fn restore_scratch_orphan(
+        &self,
+        orphan: &str,
+        target_path: Option<&str>,
+    ) -> Result<studiofs_vfs::ScratchRestoreOutcome> {
+        if self.identity.read_only {
+            anyhow::bail!("cannot restore scratch orphans on a read-only mount");
+        }
+        self.vfs
+            .restore_scratch_orphan_by_spec(orphan, target_path)
+            .map_err(anyhow::Error::from)
     }
 }
 
