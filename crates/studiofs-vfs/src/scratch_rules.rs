@@ -130,6 +130,16 @@ impl CompiledDirRules {
 }
 
 impl ScratchRules {
+    /// Rules for a directory whose children are always tracked, regardless of
+    /// any rule file (for example below a reserved trash root).
+    pub(crate) fn compile_tracked_directory(&self) -> CompiledDirRules {
+        CompiledDirRules {
+            case_insensitive: self.case_insensitive,
+            ancestor_excluded: false,
+            scopes: Vec::new(),
+        }
+    }
+
     /// Pre-resolve the rule scopes applicable to direct children of `dir_path`
     /// (empty for the volume root).
     pub(crate) fn compile_directory(&self, dir_path: &[u8]) -> CompiledDirRules {

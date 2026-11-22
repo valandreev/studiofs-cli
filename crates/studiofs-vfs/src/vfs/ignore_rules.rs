@@ -567,20 +567,22 @@ impl StudioVfs {
         // Descendants of reserved trash roots must also stay out of scratch
         // (for example `$RECYCLE.BIN/S-1-5-21-...` or `desktop.ini` when
         // retention is disabled and `.studiofsignore` matches `/$RECYCLE.BIN/`
-        // or `**/`).
-        if dir_path
+        // or `**/`). The decision is cached like any compiled directory so
+        // Recycle Bin traffic does not re-walk the path on every create.
+        let below_trash_root = dir_path
             .as_deref()
             .and_then(|path| path.split(|byte| *byte == b'/').next())
-            .is_some_and(super::is_probable_trash_component)
-        {
-            return Ok(ScratchClass::Tracked);
-        }
+            .is_some_and(super::is_probable_trash_component);
         let (snapshot, observed_rule_gen) = {
             let guard = self.ignore_rules.snapshot.read();
             let current_rule_gen = self.ignore_rules.rule_generation.load(Ordering::Acquire);
             (Arc::clone(&guard), current_rule_gen)
         };
-        let compiled = Arc::new(snapshot.compile_directory(dir_path.as_deref().unwrap_or(b"")));
+        let compiled = Arc::new(if below_trash_root {
+            snapshot.compile_tracked_directory()
+        } else {
+            snapshot.compile_directory(dir_path.as_deref().unwrap_or(b""))
+        });
         if dir_path.is_some()
             && self.ignore_rules.dir_rename_epoch.load(Ordering::Acquire) == observed_rename_epoch
         {
@@ -1018,6 +1020,10 @@ mod tests {
                     .unwrap(),
                 ScratchClass::Tracked,
                 "reserved trash root child dir, retention {trash_days}"
+            );
+            assert!(
+                vfs.ignore_rules.dir_rule_cache.lock().contains(&trash.ino),
+                "trash root classification is cached, retention {trash_days}"
             );
             assert_eq!(
                 vfs.classify_new_entry(trash.ino, b"desktop.ini", false)
