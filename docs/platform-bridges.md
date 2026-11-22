@@ -1066,15 +1066,22 @@ layer:
     `listxattr`)
   - emits zero `event_log` rows and queues zero S3 uploads, keeping shared
     directories clean for peers while remaining locally durable across remounts
-  - can be overridden per directory with `!.studiofsignore` negation rules (for
+  - can be overridden per directory with `.studiofsignore` negation rules (for
     example `!._*`)
-- **Root indexing/event directories (`.Spotlight-V100`, `.fseventsd`) and trash
-  components → ephemeral discard layer:**
+- **Root indexing/event directories (`.Spotlight-V100`, `.fseventsd`), and
+  trash components while the volume's `trash days` is zero → ephemeral discard
+  layer:**
   - `create` / `open` / `mkdir` flows succeed locally as ephemeral synthesized
     inodes so Finder and macOS daemons do not surface errors
   - any nested activity underneath an ignored metadata directory is blackholed
   - no inode, xattr, cache, or object-store state is persisted for these names
   - these root metadata directories are filtered from `readdir`
+- **Native trash containers while `trash days` is positive → retained-trash
+  projection:** the active profile's root (`$RECYCLE.BIN`, `.Trash-<uid>`, or
+  `.Trashes`) is listed and projects shared retained receipts and payloads; see
+  [Trash and recycle-bin behavior](#trash-and-recycle-bin-behavior). Reserved
+  trash roots and their descendants bypass `.studiofsignore` scratch rules in
+  both modes.
 
 StudioFS also enforces a size limit on xattr values to avoid unbounded metadata
 in-memory pressure from very large native `com.apple.*` writes:
