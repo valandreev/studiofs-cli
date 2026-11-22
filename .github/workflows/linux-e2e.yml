@@ -78,8 +78,14 @@ jobs:
               --scenario mounted-recoverable-trash-janitor-gc
               --scenario mounted-logical-quota
               --scenario mounted-cache-scrub
-              --scenario mounted-scratch-demote-two-client
+              --scenario mounted-scratch-isolation-two-client
+              --scenario mounted-scratch-atomic-save-two-client
+              --scenario mounted-scratch-durability
               --scenario mounted-scratch-auto-promote-two-client
+              --scenario mounted-scratch-conflict-two-client
+              --scenario mounted-scratch-orphan-restore-two-client
+              --scenario mounted-scratch-demote-two-client
+              --scenario mounted-scratch-appledouble-two-client
             )
           fi
 
