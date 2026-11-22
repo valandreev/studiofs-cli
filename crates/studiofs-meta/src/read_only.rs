@@ -172,6 +172,17 @@ where
         self.inner.inspect_scratch_consistency()
     }
 
+    fn clean_scratch_entry(
+        &self,
+        parent: Ino,
+        _name: &[u8],
+        _expected_ino: Ino,
+        _kind: FileType,
+        _mtime_cutoff: Option<i64>,
+    ) -> MetaResult<(InodeAttr, Vec<u64>)> {
+        Err(read_only_error(parent))
+    }
+
     fn repair_scratch_consistency(&self) -> MetaResult<ScratchConsistencyRepairSummary> {
         Err(read_only_error(ROOT_INO))
     }

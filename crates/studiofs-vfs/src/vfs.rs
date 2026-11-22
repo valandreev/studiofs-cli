@@ -10768,6 +10768,7 @@ impl StudioVfs {
         read_ahead_owner: ReadAheadOwner,
     ) -> VfsResult<u64> {
         let _timer = VfsForegroundWriteTimer::new(self, VfsForegroundWriteOp::OpenFile);
+        let scratch_cleanup_epoch = *self.handle_table.scratch_cleanup_epoch.read();
         let required_access = if Self::write_access_requested(flags, trunc) {
             AccessLevel::ReadWrite
         } else {
@@ -10843,6 +10844,10 @@ impl StudioVfs {
             );
         }
 
+        let admission = self.handle_table.scratch_cleanup_epoch.read();
+        if *admission != scratch_cleanup_epoch {
+            read_context = ReadRequestContext::from_attr(self, ino, self.getattr(ino)?);
+        }
         let active_open_overlay = Self::active_open_overlay_required(flags, trunc);
         let open_file = self.open_file_handle(
             ino,
@@ -10850,6 +10855,7 @@ impl StudioVfs {
             Some(read_context.attr.clone()),
             active_open_overlay,
         );
+        drop(admission);
         if flags.allows_write()
             && let Some(guard) = open_trunc_guard.as_mut()
         {

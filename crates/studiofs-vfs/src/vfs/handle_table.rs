@@ -28,6 +28,8 @@ pub(super) struct HandleTable {
     /// Monotonically increasing file handle counter. Zero is reserved for
     /// bridge callbacks that use `fh == 0` as "no VFS handle".
     next_fh: AtomicU64,
+    /// Serializes scratch cleanup with final handle admission.
+    pub(super) scratch_cleanup_epoch: RwLock<u64>,
     /// All open handles: fh -> OpenFile.
     handles: RwLock<HandleTableData>,
     /// Inodes that were unlinked while still open (deferred deletion).
@@ -41,6 +43,7 @@ impl HandleTable {
     pub(super) fn new() -> Self {
         Self {
             next_fh: AtomicU64::new(1),
+            scratch_cleanup_epoch: RwLock::new(0),
             handles: RwLock::new(HandleTableData::default()),
             orphans: Mutex::new(HashSet::new()),
             closed: tokio::sync::Notify::new(),

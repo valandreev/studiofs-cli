@@ -1638,6 +1638,19 @@ pub trait MetaEngineCore: Send + Sync + MetaInodes {
         Err(MetaError::Storage("scratch storage is unsupported".into()))
     }
 
+    /// Remove a scratch entry only if its inode identity and age still match.
+    /// The checks and removal share one metadata transaction.
+    fn clean_scratch_entry(
+        &self,
+        _parent: Ino,
+        _name: &[u8],
+        _expected_ino: Ino,
+        _kind: FileType,
+        _mtime_cutoff: Option<i64>,
+    ) -> MetaResult<(InodeAttr, Vec<u64>)> {
+        Err(MetaError::Storage("scratch storage is unsupported".into()))
+    }
+
     /// Remove an unlinked (`nlink == 0`) scratch inode and return its freed object IDs.
     fn finalize_orphan_scratch_inode(&self, _ino: Ino) -> MetaResult<Vec<u64>> {
         Ok(Vec::new())

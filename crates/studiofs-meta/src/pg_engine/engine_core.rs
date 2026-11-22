@@ -85,6 +85,18 @@ impl MetaEngineCore for PgMetaEngine {
             .unlink_scratch_entry(parent, name, keep_open_inode)
     }
 
+    fn clean_scratch_entry(
+        &self,
+        parent: Ino,
+        name: &[u8],
+        expected_ino: Ino,
+        kind: FileType,
+        mtime_cutoff: Option<i64>,
+    ) -> MetaResult<(InodeAttr, Vec<u64>)> {
+        self.local
+            .clean_scratch_entry(parent, name, expected_ino, kind, mtime_cutoff)
+    }
+
     fn finalize_orphan_scratch_inode(&self, ino: Ino) -> MetaResult<Vec<u64>> {
         self.local.finalize_orphan_scratch_inode(ino)
     }

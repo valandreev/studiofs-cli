@@ -707,6 +707,7 @@ impl RedbMetaEngine {
         parent: Ino,
         name: &[u8],
         keep_open_inode: bool,
+        expected: Option<(Ino, Option<i64>)>,
     ) -> MetaResult<(InodeAttr, Vec<u64>)> {
         let _mutation_guard = self
             .scratch_mutation_lock
@@ -725,6 +726,14 @@ impl RedbMetaEngine {
             let mut inodes = txn.open_table(SCRATCH_INODES).map_err(storage_error)?;
             let mut attr =
                 read_scratch_attr_from_table(&inodes, ino)?.ok_or(MetaError::InodeNotFound(ino))?;
+            if let Some((expected_ino, cutoff)) = expected
+                && (ino != expected_ino || cutoff.is_some_and(|cutoff| attr.mtime > cutoff))
+            {
+                return Err(MetaError::EntryNotFound {
+                    parent,
+                    name: String::from_utf8_lossy(name).into_owned(),
+                });
+            }
             if attr.kind == FileType::Directory {
                 return Err(MetaError::IsADirectory(ino));
             }
@@ -801,7 +810,12 @@ impl RedbMetaEngine {
         Ok(freed_objects)
     }
 
-    pub(super) fn remove_scratch_dir(&self, parent: Ino, name: &[u8]) -> MetaResult<InodeAttr> {
+    pub(super) fn remove_scratch_dir(
+        &self,
+        parent: Ino,
+        name: &[u8],
+        expected: Option<(Ino, Option<i64>)>,
+    ) -> MetaResult<InodeAttr> {
         let _mutation_guard = self
             .scratch_mutation_lock
             .lock()
@@ -819,6 +833,14 @@ impl RedbMetaEngine {
             let mut inodes = txn.open_table(SCRATCH_INODES).map_err(storage_error)?;
             let mut attr =
                 read_scratch_attr_from_table(&inodes, ino)?.ok_or(MetaError::InodeNotFound(ino))?;
+            if let Some((expected_ino, cutoff)) = expected
+                && (ino != expected_ino || cutoff.is_some_and(|cutoff| attr.mtime > cutoff))
+            {
+                return Err(MetaError::EntryNotFound {
+                    parent,
+                    name: String::from_utf8_lossy(name).into_owned(),
+                });
+            }
             if attr.kind != FileType::Directory {
                 return Err(MetaError::NotADirectory(ino));
             }
@@ -6182,5 +6204,29 @@ mod tests {
                 .unwrap()
                 .contains(&700)
         );
+    }
+    #[test]
+    fn clean_scratch_entry_checks_identity_and_current_age_atomically() {
+        let temp = studiofs_test_support::workspace_target_tempdir("scratch-clean-conditional-");
+        let meta = RedbMetaEngine::open(temp.path().join("meta.db")).unwrap();
+        meta.init_root(0, 0).unwrap();
+        let mut attr = InodeAttr::new_file(50, ROOT_INO, 0, 0, 0o644);
+        attr.mtime = 200;
+        meta.create_scratch_entry(ROOT_INO, b"file.tmp", &attr)
+            .unwrap();
+        assert!(matches!(
+            meta.clean_scratch_entry(ROOT_INO, b"file.tmp", 51, FileType::RegularFile, None),
+            Err(MetaError::EntryNotFound { .. })
+        ));
+        assert!(matches!(
+            meta.clean_scratch_entry(ROOT_INO, b"file.tmp", 50, FileType::RegularFile, Some(100)),
+            Err(MetaError::EntryNotFound { .. })
+        ));
+        assert_eq!(meta.get_scratch_attr(50).unwrap().mtime, 200);
+        let (removed, _) = meta
+            .clean_scratch_entry(ROOT_INO, b"file.tmp", 50, FileType::RegularFile, Some(200))
+            .unwrap();
+        assert_eq!(removed.ino, 50);
+        assert!(meta.get_scratch_attr(50).is_err());
     }
 }

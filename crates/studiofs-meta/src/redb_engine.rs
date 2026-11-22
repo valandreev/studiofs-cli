@@ -1553,7 +1553,24 @@ impl MetaEngineCore for RedbMetaEngine {
         name: &[u8],
         keep_open_inode: bool,
     ) -> MetaResult<(InodeAttr, Vec<u64>)> {
-        self.remove_scratch_entry(parent, name, keep_open_inode)
+        self.remove_scratch_entry(parent, name, keep_open_inode, None)
+    }
+
+    fn clean_scratch_entry(
+        &self,
+        parent: Ino,
+        name: &[u8],
+        expected_ino: Ino,
+        kind: FileType,
+        mtime_cutoff: Option<i64>,
+    ) -> MetaResult<(InodeAttr, Vec<u64>)> {
+        let expected = Some((expected_ino, mtime_cutoff));
+        if kind == FileType::Directory {
+            self.remove_scratch_dir(parent, name, expected)
+                .map(|attr| (attr, Vec::new()))
+        } else {
+            self.remove_scratch_entry(parent, name, false, expected)
+        }
     }
 
     fn finalize_orphan_scratch_inode(&self, ino: Ino) -> MetaResult<Vec<u64>> {
@@ -1561,7 +1578,7 @@ impl MetaEngineCore for RedbMetaEngine {
     }
 
     fn rmdir_scratch_entry(&self, parent: Ino, name: &[u8]) -> MetaResult<InodeAttr> {
-        self.remove_scratch_dir(parent, name)
+        self.remove_scratch_dir(parent, name, None)
     }
 
     fn rename_scratch_entry(

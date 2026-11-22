@@ -1,6 +1,7 @@
 //! Mounted and offline scratch-layer tooling operations: status inspection,
 //! listing, cleanup, offline promotion, and orphan restoration.
 
+use super::file_session::FileSessionOperation;
 use super::metrics::{
     ScratchCleanOutcome, ScratchConflictSummary, ScratchListEntry, ScratchOrphanSummary,
     ScratchPromoteOverLimitEntry, ScratchPromotePathOutcome, ScratchRestoreOutcome,
@@ -175,8 +176,6 @@ fn collect_tracked_matching_rule_entries<M: MetaEngineCore + MetaNamespace + ?Si
                 if samples.len() < MAX_STATUS_SAMPLE_PATHS {
                     samples.push(format_relative_path(&child_rel));
                 }
-                // A matched tracked directory already explains its descendants.
-                continue;
             }
             if is_dir {
                 stack.push((child.ino, child_rel));
@@ -696,19 +695,13 @@ impl StudioVfs {
         let walked = walk_all_scratch_entries(meta.as_ref())?;
         let mut outcome = ScratchCleanOutcome::default();
         let mut kept_dirs: HashSet<Ino> = HashSet::new();
-        let mut removed_inos: HashSet<Ino> = HashSet::new();
-        let mut touched_parents: HashSet<Ino> = HashSet::new();
-        let mut kernel_entries: Vec<(Ino, Vec<u8>)> = Vec::new();
-
         for item in walked.into_iter().rev() {
             let rel_str = format_relative_path(&item.rel_path);
             if !path_matches_filter(&rel_str, filter.as_deref()) {
                 kept_dirs.insert(item.parent);
                 continue;
             }
-            if let Some(cutoff_ts) = cutoff
-                && item.attr.mtime > cutoff_ts
-            {
+            if cutoff.is_some_and(|cutoff| item.attr.mtime > cutoff) {
                 outcome.skipped_newer += 1;
                 kept_dirs.insert(item.parent);
                 if item.attr.kind == FileType::Directory {
@@ -716,66 +709,98 @@ impl StudioVfs {
                 }
                 continue;
             }
-            if self.handle_table.open_count(item.attr.ino) > 0 {
-                outcome.skipped_open_handles += 1;
+            if item.attr.kind == FileType::Directory && kept_dirs.contains(&item.attr.ino) {
                 kept_dirs.insert(item.parent);
-                if item.attr.kind == FileType::Directory {
-                    kept_dirs.insert(item.attr.ino);
-                }
                 continue;
             }
-            if item.attr.kind == FileType::Directory {
-                if kept_dirs.contains(&item.attr.ino) {
+
+            if item.parent == item.attr.ino {
+                return Err(VfsError::InvalidName("scratch directory cycle".into()));
+            }
+            let _parent_session = self.file_session_cleanup(item.parent).with_permit(
+                self.state
+                    .file_session
+                    .enter_op(item.parent, FileSessionOperation::Delete)
+                    .await,
+            );
+            self.wait_for_deferred_materialization_inflight(item.attr.ino)
+                .await;
+            let target_operation = if item.attr.kind == FileType::Directory {
+                FileSessionOperation::Read
+            } else {
+                FileSessionOperation::Delete
+            };
+            let _inode_session = self.file_session_cleanup(item.attr.ino).with_permit(
+                self.state
+                    .file_session
+                    .enter_op(item.attr.ino, target_operation)
+                    .await,
+            );
+            let namespace_mutations = self.namespace_mutations();
+            let removed = {
+                let mut admission = self.handle_table.scratch_cleanup_epoch.write();
+                if item.attr.kind != FileType::Directory
+                    && let Some(cutoff) = cutoff
+                    && self
+                        .peek_dirty_attr(item.attr.ino)
+                        .is_some_and(|attr| attr.mtime > cutoff)
+                {
+                    outcome.skipped_newer += 1;
                     kept_dirs.insert(item.parent);
                     continue;
                 }
-                match meta.rmdir_scratch_entry(item.parent, &item.name) {
-                    Ok(_) => {
-                        outcome.removed_entries += 1;
-                        removed_inos.insert(item.attr.ino);
-                        touched_parents.insert(item.parent);
-                        self.dentry_cache_invalidate(item.parent, &item.name);
-                        kernel_entries.push((item.parent, item.name));
+                if self.handle_table.open_count(item.attr.ino) > 0 {
+                    outcome.skipped_open_handles += 1;
+                    kept_dirs.insert(item.parent);
+                    if item.attr.kind == FileType::Directory {
+                        kept_dirs.insert(item.attr.ino);
                     }
-                    Err(MetaError::DirNotEmpty(_)) => {
-                        kept_dirs.insert(item.parent);
-                    }
-                    Err(MetaError::EntryNotFound { .. }) => {}
-                    Err(error) => return Err(error.into()),
+                    continue;
                 }
-            } else {
-                match meta.unlink_scratch_entry(item.parent, &item.name, false) {
-                    Ok((attr, freed_objects)) => {
-                        outcome.removed_entries += 1;
-                        if attr.kind == FileType::RegularFile {
-                            outcome.freed_bytes = outcome.freed_bytes.saturating_add(attr.size);
-                        }
-                        removed_inos.insert(item.attr.ino);
-                        touched_parents.insert(item.parent);
-                        self.dentry_cache_invalidate(item.parent, &item.name);
-                        kernel_entries.push((item.parent, item.name));
-                        self.cleanup_scratch_inode_runtime_and_payloads(
-                            item.attr.ino,
-                            freed_objects,
-                        )
-                        .await;
+                // Child removal changes directory mtime; age was checked before the walk.
+                let current_cutoff = if item.attr.kind == FileType::Directory {
+                    None
+                } else {
+                    cutoff
+                };
+                let removed = meta.clean_scratch_entry(
+                    item.parent,
+                    &item.name,
+                    item.attr.ino,
+                    item.attr.kind,
+                    current_cutoff,
+                );
+                if let Ok((attr, _)) = &removed {
+                    *admission = admission.wrapping_add(1);
+                    if attr.nlink == 0 {
+                        self.state.namespace.dirty_attrs.lock().remove(&attr.ino);
                     }
-                    Err(MetaError::EntryNotFound { .. }) => {}
-                    Err(error) => return Err(error.into()),
+                    namespace_mutations.record_scratch_removal(item.parent, &item.name, [attr.ino]);
                 }
+                removed
+            };
+            match removed {
+                Ok((attr, freed_objects)) => {
+                    self.invalidate_kernel_entries([(item.parent, item.name.clone())]);
+                    self.invalidate_kernel_inode_attrs([item.parent]);
+                    self.prune_over_limit_directories(|ino| ino == attr.ino);
+                    if attr.kind == FileType::Directory {
+                        self.bump_directory_generation(attr.ino);
+                    }
+                    outcome.removed_entries += 1;
+                    if attr.kind == FileType::RegularFile {
+                        outcome.freed_bytes = outcome.freed_bytes.saturating_add(attr.size);
+                    }
+                    if attr.nlink == 0 {
+                        self.cleanup_scratch_inode_runtime_and_payloads(attr.ino, freed_objects)
+                            .await;
+                    }
+                }
+                Err(MetaError::DirNotEmpty(_) | MetaError::EntryNotFound { .. }) => {
+                    kept_dirs.insert(item.parent);
+                }
+                Err(error) => return Err(error.into()),
             }
-        }
-
-        if !removed_inos.is_empty() {
-            self.invalidate_attr_read_cache(
-                touched_parents
-                    .iter()
-                    .copied()
-                    .chain(removed_inos.iter().copied()),
-            );
-            self.invalidate_kernel_entries(kernel_entries);
-            self.invalidate_kernel_inode_attrs(touched_parents);
-            self.prune_over_limit_directories(|ino| removed_inos.contains(&ino));
         }
         Ok(outcome)
     }
@@ -823,12 +848,17 @@ mod tests {
 
         // Install cached ignore rules including a pattern matching `.studiofsignore`.
         let mut sources: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
-        sources.insert(Vec::new(), b"*.tmp\n.*ignore\n".to_vec());
+        sources.insert(Vec::new(), b"*.tmp\n.*ignore\ntracked-dir/\n".to_vec());
         meta.store_ignore_rules_cache(&postcard::to_allocvec(&sources).unwrap())
             .unwrap();
 
         // Tracked entry matching a rule (`tracked.tmp`).
         meta.create_file(ROOT_INO, b"tracked.tmp", 0, 0, 0o644)
+            .unwrap();
+        let tracked_dir = meta
+            .create_dir(ROOT_INO, b"tracked-dir", 0, 0, 0o755)
+            .unwrap();
+        meta.create_file(tracked_dir.ino, b"child", 0, 0, 0o644)
             .unwrap();
 
         // Scratch entries: one matching (`a.tmp`), one no longer matching (`stale.txt`).
@@ -849,8 +879,11 @@ mod tests {
         assert_eq!(status.total_bytes, 52);
         assert_eq!(status.no_longer_matching_count, 1);
         assert_eq!(status.no_longer_matching_paths, vec!["stale.txt"]);
-        assert_eq!(status.tracked_matching_rule_count, 1);
-        assert_eq!(status.tracked_matching_rule_paths, vec!["tracked.tmp"]);
+        assert_eq!(status.tracked_matching_rule_count, 3);
+        assert_eq!(
+            status.tracked_matching_rule_paths,
+            vec!["tracked-dir", "tracked-dir/child", "tracked.tmp"]
+        );
         assert_eq!(status.rule_file_warnings.len(), 1);
         assert_eq!(
             status.rule_file_warnings[0].rule_file_path,
@@ -935,6 +968,80 @@ mod tests {
             let outcome2 = vfs.clean_scratch_entries(None, None).await.unwrap();
             assert_eq!(outcome2.removed_entries, 1);
             assert_eq!(outcome2.skipped_open_handles, 0);
+        });
+    }
+    #[test]
+    fn mounted_clean_rechecks_handles_after_waiting_for_writer() {
+        let temp = studiofs_test_support::workspace_target_tempdir("scratch-clean-writer-");
+        let (rt, vfs, _meta) = super::super::tests::make_unstarted_test_vfs(&temp, "clean-writer");
+        let _guard = rt.enter();
+        rt.block_on(async {
+            let attr = vfs
+                .store_scratch_entry(b"busy.tmp", InodeAttr::new_file(0, ROOT_INO, 0, 0, 0o644))
+                .unwrap();
+            let writer = vfs
+                .state
+                .file_session
+                .enter_op(
+                    attr.ino,
+                    super::super::file_session::FileSessionOperation::Write,
+                )
+                .await;
+            let clean = vfs.clean_scratch_entries(None, None);
+            tokio::pin!(clean);
+            assert!(
+                std::future::poll_fn(|cx| std::task::Poll::Ready(clean.as_mut().poll(cx)))
+                    .await
+                    .is_pending()
+            );
+            let fh = vfs.open_file(attr.ino, OpenFlags::RDONLY, false).unwrap();
+            drop(writer);
+            let outcome = clean.await.unwrap();
+            assert_eq!(outcome.removed_entries, 0);
+            assert_eq!(outcome.skipped_open_handles, 1);
+            assert!(vfs.is_scratch_inode(attr.ino).unwrap());
+            let _ = vfs.handle_table.close(fh);
+        });
+    }
+
+    #[test]
+    fn mounted_clean_does_not_remove_replacement_after_waiting() {
+        let temp = studiofs_test_support::workspace_target_tempdir("scratch-clean-replacement-");
+        let (rt, vfs, meta) =
+            super::super::tests::make_unstarted_test_vfs(&temp, "clean-replacement");
+        let _guard = rt.enter();
+        rt.block_on(async {
+            let attr = vfs
+                .store_scratch_entry(b"old.tmp", InodeAttr::new_file(0, ROOT_INO, 0, 0, 0o644))
+                .unwrap();
+            let writer = vfs
+                .state
+                .file_session
+                .enter_op(attr.ino, FileSessionOperation::Write)
+                .await;
+            let clean = vfs.clean_scratch_entries(None, None);
+            tokio::pin!(clean);
+            assert!(
+                std::future::poll_fn(|cx| std::task::Poll::Ready(clean.as_mut().poll(cx)))
+                    .await
+                    .is_pending()
+            );
+            meta.rename_scratch_entry(ROOT_INO, b"old.tmp", ROOT_INO, b"moved.tmp", false, false)
+                .unwrap();
+            let replacement = vfs
+                .store_scratch_entry(b"old.tmp", InodeAttr::new_file(0, ROOT_INO, 0, 0, 0o644))
+                .unwrap();
+            drop(writer);
+            let outcome = clean.await.unwrap();
+            assert_eq!(outcome.removed_entries, 0);
+            assert_eq!(
+                meta.lookup_scratch_entry(ROOT_INO, b"old.tmp").unwrap(),
+                Some(replacement.ino)
+            );
+            assert_eq!(
+                meta.lookup_scratch_entry(ROOT_INO, b"moved.tmp").unwrap(),
+                Some(attr.ino)
+            );
         });
     }
 }

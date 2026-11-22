@@ -219,13 +219,9 @@ fn collect_scratch_consistency(
     let Some(cache_path) = cache_path else {
         return Ok(());
     };
-    let detection = match detect_cache_backends(cache_path) {
-        Ok(detection) => detection,
-        Err(_) => return Ok(()),
-    };
-    if detection.runtime_backend() != Some(LocalPayloadBackendKind::Current)
-        || !detection.index_exists
-    {
+    let detection = detect_cache_backends(cache_path)?;
+    if !detection.index_exists {
+        report.scratch_entry_without_payload = scratch.referenced_payload_objects;
         return Ok(());
     }
 
@@ -256,11 +252,7 @@ fn collect_scratch_consistency(
         .into_iter()
         .collect();
 
-    let referenced_ids: HashSet<u64> = scratch
-        .referenced_payload_objects
-        .iter()
-        .map(|item| item.object_id)
-        .collect();
+    let referenced_ids = meta.get_local_cache_referenced_object_ids()?;
 
     let mut payload_without_entry: Vec<u64> = indexed_scratch_ids
         .into_iter()
@@ -274,7 +266,7 @@ fn collect_scratch_consistency(
         let on_disk = detection
             .layout
             .payload_object_path(item.object_id)
-            .exists();
+            .try_exists()?;
         if !all_indexed_ids.contains(&item.object_id) || !on_disk {
             entry_without_payload.push(item);
         }
@@ -777,6 +769,10 @@ fn repair_with_cache(
     scratch_payloads_to_remove.extend(report.scratch_payload_without_entry.iter().copied());
     scratch_payloads_to_remove.sort_unstable();
     scratch_payloads_to_remove.dedup();
+    if !scratch_payloads_to_remove.is_empty() {
+        let still_live = meta.get_local_cache_referenced_object_ids()?;
+        scratch_payloads_to_remove.retain(|object_id| !still_live.contains(object_id));
+    }
     let mut removed_scratch_payloads = 0usize;
     if !scratch_payloads_to_remove.is_empty()
         && let (Some(cache_path), Some(volume_uuid)) = (cache_path, volume_uuid)
@@ -1231,7 +1227,13 @@ mod tests {
             .unlink_scratch_entry(ROOT_INO, b"orphan.tmp", true)
             .unwrap();
 
-        let report = collect_report_with_cache(&engine, Some(&cache_path)).unwrap();
+        let missing_cache =
+            collect_report_with_cache(&engine, Some(&_dir.path().join("absent"))).unwrap();
+        assert_eq!(missing_cache.scratch_entry_without_payload.len(), 2);
+
+        // Simulate a promotion interrupted before the cache origin was updated.
+        studiofs_vfs::promote_scratch_path_offline(&engine, "live.tmp").unwrap();
+        let mut report = collect_report_with_cache(&engine, Some(&cache_path)).unwrap();
         assert!(report.has_findings());
         assert_eq!(report.scratch_orphan_inodes.len(), 1);
         assert_eq!(report.scratch_orphan_inodes[0].ino, orphan.ino);
@@ -1243,7 +1245,12 @@ mod tests {
         );
         assert_eq!(report.scratch_entry_without_payload[0].object_id, 402);
 
+        // The repair must revalidate reachability even for a stale report.
+        report.scratch_payload_without_entry.push(401);
         repair_with_cache(&engine, Some(&cache_path), Some(&volume_uuid), &report).unwrap();
+
+        let detection = detect_cache_backends(&cache_path).unwrap();
+        assert!(detection.layout.payload_object_path(401).is_file());
 
         let post = collect_report_with_cache(&engine, Some(&cache_path)).unwrap();
         assert!(post.scratch_orphan_inodes.is_empty());
