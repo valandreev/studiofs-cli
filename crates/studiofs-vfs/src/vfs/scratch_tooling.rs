@@ -749,7 +749,7 @@ impl StudioVfs {
                     kept_dirs.insert(item.parent);
                     continue;
                 }
-                if self.handle_table.open_count(item.attr.ino) > 0 {
+                if self.handle_table.cleanup_open_count(item.attr.ino) > 0 {
                     outcome.skipped_open_handles += 1;
                     kept_dirs.insert(item.parent);
                     if item.attr.kind == FileType::Directory {
@@ -969,6 +969,32 @@ mod tests {
             let outcome2 = vfs.clean_scratch_entries(None, None).await.unwrap();
             assert_eq!(outcome2.removed_entries, 1);
             assert_eq!(outcome2.skipped_open_handles, 0);
+        });
+    }
+
+    #[test]
+    fn mounted_clean_skips_pending_truncate_open() {
+        let temp = studiofs_test_support::workspace_target_tempdir("scratch-clean-truncate-open-");
+        let (rt, vfs, _meta) = super::super::tests::make_unstarted_test_vfs(&temp, "clean-trunc");
+        let _guard = rt.enter();
+        rt.block_on(async {
+            let attr = vfs
+                .store_scratch_entry(
+                    b"truncate.tmp",
+                    InodeAttr::new_file(0, ROOT_INO, 0, 0, 0o644),
+                )
+                .unwrap();
+            let pending = vfs.handle_table.admit_pending_truncate_open(attr.ino);
+
+            let outcome = vfs.clean_scratch_entries(None, None).await.unwrap();
+            assert_eq!(outcome.removed_entries, 0);
+            assert_eq!(outcome.skipped_open_handles, 1);
+            assert!(vfs.is_scratch_inode(attr.ino).unwrap());
+
+            drop(pending);
+            let outcome = vfs.clean_scratch_entries(None, None).await.unwrap();
+            assert_eq!(outcome.removed_entries, 1);
+            assert!(!vfs.is_scratch_inode(attr.ino).unwrap());
         });
     }
     #[test]

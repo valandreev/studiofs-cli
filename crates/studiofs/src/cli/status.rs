@@ -188,12 +188,19 @@ fn format_scratch_over_limit_directories(
 
 fn format_scratch_status_section(
     volume_name: &str,
-    scratch: &studiofs_vfs::VfsScratchStatusSnapshot,
+    scratch: Option<&studiofs_vfs::VfsScratchStatusSnapshot>,
+    over_limit_fallback: &[studiofs_vfs::ScratchPromoteOverLimitEntry],
 ) -> Vec<String> {
-    let mut lines = vec![
-        String::new(),
-        "Scratch".to_string(),
-        "───────".to_string(),
+    let mut lines = vec![String::new(), "Scratch".to_string(), "───────".to_string()];
+    let Some(scratch) = scratch else {
+        lines.push("  Status unavailable".to_string());
+        lines.extend(format_scratch_over_limit_directories(
+            volume_name,
+            over_limit_fallback,
+        ));
+        return lines;
+    };
+    lines.extend([
         format!("  Entries:                 {}", scratch.entry_count),
         format!(
             "  Bytes:                   {}",
@@ -217,7 +224,7 @@ fn format_scratch_status_section(
             "  Rule file warnings:      {}",
             scratch.rule_file_warnings.len()
         ),
-    ];
+    ]);
 
     for path in scratch.no_longer_matching_paths.iter().take(10) {
         lines.push(format!("    no longer matching: {path}"));
@@ -290,9 +297,10 @@ fn format_scratch_status_section(
 
 fn print_scratch_status_section(
     volume_name: &str,
-    scratch: &studiofs_vfs::VfsScratchStatusSnapshot,
+    scratch: Option<&studiofs_vfs::VfsScratchStatusSnapshot>,
+    over_limit_fallback: &[studiofs_vfs::ScratchPromoteOverLimitEntry],
 ) {
-    for line in format_scratch_status_section(volume_name, scratch) {
+    for line in format_scratch_status_section(volume_name, scratch, over_limit_fallback) {
         println!("{line}");
     }
 }
@@ -865,15 +873,17 @@ pub fn run(
                 if let Some(scrub) = snapshot.cache_scrub {
                     println!("{}", format_cache_scrub(&scrub, current_unix_ms()));
                 }
-                if let Some(scratch_status) = snapshot.scratch_status.as_ref() {
-                    print_scratch_status_section(name, scratch_status);
-                } else if let Some(auto_promote) = snapshot.scratch_auto_promote.as_ref() {
-                    let fallback = studiofs_vfs::VfsScratchStatusSnapshot {
-                        over_limit_directories: auto_promote.over_limit_directories.clone(),
-                        ..Default::default()
-                    };
-                    print_scratch_status_section(name, &fallback);
-                }
+                let over_limit_fallback = snapshot
+                    .scratch_auto_promote
+                    .as_ref()
+                    .map_or(&[][..], |auto_promote| {
+                        auto_promote.over_limit_directories.as_slice()
+                    });
+                print_scratch_status_section(
+                    name,
+                    snapshot.scratch_status.as_ref(),
+                    over_limit_fallback,
+                );
                 let cache_root = cache_dir
                     .map(Path::to_path_buf)
                     .unwrap_or_else(|| meta_dir.join("cache"));
@@ -1081,7 +1091,7 @@ pub fn run(
         studiofs_vfs::scratch_promote_entry_limit_from_env(),
     ) {
         Ok(scratch_status) => {
-            print_scratch_status_section(name, &scratch_status);
+            print_scratch_status_section(name, Some(&scratch_status), &[]);
         }
         Err(error) => {
             eprintln!("warning: failed to inspect scratch status: {error}");
@@ -1820,6 +1830,22 @@ mod tests {
     }
 
     #[test]
+    fn format_scratch_status_section_preserves_unknown_counts() {
+        let fallback = [studiofs_vfs::ScratchPromoteOverLimitEntry {
+            dir_ino: 77,
+            relative_path: "renders".to_string(),
+            path_is_lossy: false,
+            entry_count: 4,
+            entry_limit: 3,
+        }];
+        let rendered = format_scratch_status_section("proj", None, &fallback).join("\n");
+
+        assert!(rendered.contains("Status unavailable"));
+        assert!(rendered.contains("Scratch dir `renders` exceeds promote limit"));
+        assert!(!rendered.contains("Entries:"));
+    }
+
+    #[test]
     fn format_scratch_status_section_renders_all_required_fields() {
         let snapshot = studiofs_vfs::VfsScratchStatusSnapshot {
             entry_count: 3,
@@ -1855,7 +1881,7 @@ mod tests {
             }],
         };
 
-        let rendered = format_scratch_status_section("proj", &snapshot).join("\n");
+        let rendered = format_scratch_status_section("proj", Some(&snapshot), &[]).join("\n");
         assert!(rendered.contains("Scratch"));
         assert!(rendered.contains("Entries:                 3"));
         assert!(rendered.contains(&format!("Bytes:                   {}", format_bytes(2048))));

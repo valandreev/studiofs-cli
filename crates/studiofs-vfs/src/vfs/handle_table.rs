@@ -21,6 +21,8 @@ struct HandleTableData {
     handles_by_inode: HashMap<Ino, HashSet<u64>>,
     /// Inode -> currently open file descriptor counters.
     counts: HashMap<Ino, HandleCounts>,
+    /// Inodes with an O_TRUNC open admitted but not yet registered as a handle.
+    pending_truncate_opens: HashMap<Ino, u32>,
 }
 
 /// Per-VFS handle table tracking all open file descriptors.
@@ -39,6 +41,27 @@ pub(super) struct HandleTable {
     pub(super) closed: tokio::sync::Notify,
 }
 
+/// Keeps scratch cleanup from removing an inode while an O_TRUNC open is
+/// applying its truncate and registering its real handle.
+pub(super) struct PendingTruncateOpen<'a> {
+    table: &'a HandleTable,
+    ino: Ino,
+}
+
+impl Drop for PendingTruncateOpen<'_> {
+    fn drop(&mut self) {
+        let mut handles = self.table.handles.write();
+        let count = handles
+            .pending_truncate_opens
+            .get_mut(&self.ino)
+            .expect("pending truncate open must remain registered");
+        *count -= 1;
+        if *count == 0 {
+            handles.pending_truncate_opens.remove(&self.ino);
+        }
+    }
+}
+
 impl HandleTable {
     pub(super) fn new() -> Self {
         Self {
@@ -48,6 +71,15 @@ impl HandleTable {
             orphans: Mutex::new(HashSet::new()),
             closed: tokio::sync::Notify::new(),
         }
+    }
+
+    /// Admit an O_TRUNC open before its side effect. The epoch read lock makes
+    /// this registration atomic with scratch cleanup's open-count check.
+    pub(super) fn admit_pending_truncate_open(&self, ino: Ino) -> PendingTruncateOpen<'_> {
+        let _admission = self.scratch_cleanup_epoch.read();
+        let mut handles = self.handles.write();
+        *handles.pending_truncate_opens.entry(ino).or_default() += 1;
+        PendingTruncateOpen { table: self, ino }
     }
 
     /// Allocate a new file handle and register it.
@@ -186,6 +218,24 @@ impl HandleTable {
             .unwrap_or(0)
     }
 
+    /// Get real and in-progress O_TRUNC opens while cleanup holds the epoch
+    /// write lock.
+    pub(super) fn cleanup_open_count(&self, ino: Ino) -> u32 {
+        let handles = self.handles.read();
+        handles
+            .counts
+            .get(&ino)
+            .map(|counts| counts.open)
+            .unwrap_or(0)
+            .saturating_add(
+                handles
+                    .pending_truncate_opens
+                    .get(&ino)
+                    .copied()
+                    .unwrap_or(0),
+            )
+    }
+
     /// Get the number of write-capable open handles for an inode.
     pub(super) fn write_open_count(&self, ino: Ino) -> u32 {
         self.handles
@@ -299,6 +349,32 @@ mod tests {
         let (_, remaining) = ht.close(opened.fh).expect("opened handle must be closable");
         assert_eq!(remaining, 0);
         assert!(!ht.handles.read().counts.contains_key(&42));
+    }
+
+    #[test]
+    fn pending_truncate_open_is_visible_to_cleanup_without_becoming_a_handle() {
+        let ht = HandleTable::new();
+        let pending = ht.admit_pending_truncate_open(42);
+
+        assert_eq!(ht.open_count(42), 0);
+        assert_eq!(ht.cleanup_open_count(42), 1);
+
+        let opened = ht.open(42, OpenFlags::RDWR, None, false);
+        drop(pending);
+        assert_eq!(ht.cleanup_open_count(42), 1);
+
+        let _ = ht.close(opened.fh).expect("opened handle must be closable");
+        assert_eq!(ht.cleanup_open_count(42), 0);
+    }
+
+    #[test]
+    fn failed_truncate_open_admission_is_removed_on_drop() {
+        let ht = HandleTable::new();
+        {
+            let _pending = ht.admit_pending_truncate_open(42);
+            assert_eq!(ht.cleanup_open_count(42), 1);
+        }
+        assert_eq!(ht.cleanup_open_count(42), 0);
     }
 
     #[test]

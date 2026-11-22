@@ -183,6 +183,10 @@ where
         Err(read_only_error(parent))
     }
 
+    fn finalize_orphan_scratch_inode(&self, ino: Ino) -> MetaResult<Vec<u64>> {
+        Err(read_only_error(ino))
+    }
+
     fn repair_scratch_consistency(&self) -> MetaResult<ScratchConsistencyRepairSummary> {
         Err(read_only_error(ROOT_INO))
     }
@@ -891,6 +895,18 @@ mod tests {
             Err(MetaError::AccessDenied { .. })
         ));
         assert_eq!(inner.lookup(ROOT_INO, b"entry").unwrap(), entry);
+    }
+
+    #[test]
+    fn read_only_meta_rejects_scratch_orphan_finalization() {
+        let dir = studiofs_test_support::workspace_target_tempdir("read-only-scratch-orphan-");
+        let inner = Arc::new(RedbMetaEngine::open(dir.path().join("meta.redb")).unwrap());
+        let read_only = ReadOnlyMetaEngine::new(inner);
+
+        assert!(matches!(
+            read_only.finalize_orphan_scratch_inode(42),
+            Err(MetaError::AccessDenied { ino: 42, .. })
+        ));
     }
 
     #[test]

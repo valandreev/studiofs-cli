@@ -121,14 +121,17 @@ impl DiagnosticsDataSource for LiveMountDiagnosticsSource {
             tracing::warn!(%error, "logical quota status unavailable for diagnostics");
             None
         });
-        let scratch_status = self.vfs.scratch_status_snapshot().unwrap_or_else(|error| {
-            tracing::warn!(%error, "scratch status unavailable for diagnostics");
-            studiofs_vfs::VfsScratchStatusSnapshot::default()
-        });
+        let scratch_status = self
+            .vfs
+            .scratch_status_snapshot()
+            .inspect_err(|error| {
+                tracing::warn!(%error, "scratch status unavailable for diagnostics");
+            })
+            .ok();
         DiagnosticsRuntimeSnapshot {
             cache_scrub: self.vfs.cache_scrub_snapshot(),
             scratch_auto_promote: Some(self.vfs.scratch_auto_promote_snapshot()),
-            scratch_status: Some(scratch_status),
+            scratch_status,
             logical_quota,
             schema_version: DIAGNOSTICS_RUNTIME_SNAPSHOT_SCHEMA_VERSION,
             generated_unix_ms: health.generated_unix_ms,

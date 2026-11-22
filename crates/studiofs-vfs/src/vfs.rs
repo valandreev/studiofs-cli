@@ -10836,6 +10836,11 @@ impl StudioVfs {
         // rule refresh cannot load the empty post-truncate state before the
         // handle is registered in `handle_table`.
         let mut open_trunc_guard = trunc.then(|| self.ignore_rules.begin_open_trunc(ino));
+        // Register truncate opens before their side effect. Scratch cleanup
+        // sees this admission even though the real handle is not installed
+        // until the post-truncate attribute snapshot is available.
+        let pending_truncate_open =
+            trunc.then(|| self.handle_table.admit_pending_truncate_open(ino));
         if trunc {
             read_context = ReadRequestContext::from_attr(
                 self,
@@ -10855,6 +10860,7 @@ impl StudioVfs {
             Some(read_context.attr.clone()),
             active_open_overlay,
         );
+        drop(pending_truncate_open);
         drop(admission);
         if flags.allows_write()
             && let Some(guard) = open_trunc_guard.as_mut()

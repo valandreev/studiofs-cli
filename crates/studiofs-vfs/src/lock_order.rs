@@ -94,13 +94,15 @@
 //! status reads clone it before re-checking entries against metadata.
 //!
 //! `HandleTable::scratch_cleanup_epoch` orders mounted `scratch clean` against
-//! handle opens. Clean takes the write guard after its file session permit and
-//! holds it across the open-count check, `dirty_attrs`, and the local redb
-//! commit of one entry. Open takes the read guard before `getattr` and
-//! `open_file_handle`, so both paths take it before `dirty_attrs`, handle
-//! table locks, and metadata transactions. No path may take it while holding
-//! those locks or across an await. It is outside `LockTier` and
-//! `LockOrderGuard`.
+//! open admission. Clean takes the write guard after its file session permit
+//! and holds it across the cleanup-open-count check, `dirty_attrs`, and the
+//! local redb commit of one entry. An O_TRUNC open briefly takes the read guard
+//! to register a pending open before its truncate side effect; the pending
+//! count remains visible until the real handle is installed or the open fails.
+//! The final handle-registration path also reads the epoch and refreshes attrs
+//! if cleanup changed it. Acquire the epoch before `dirty_attrs` and handle-table
+//! locks. Release the epoch before acquiring a file-session permit or awaiting.
+//! It is outside `LockTier` and `LockOrderGuard`.
 //!
 //! With `LocalPayloadBackendRuntime`, cached-store first/final pin transitions
 //! acquire locks in this order:
