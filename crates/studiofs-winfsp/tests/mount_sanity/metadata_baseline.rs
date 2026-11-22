@@ -171,7 +171,7 @@ mod tests {
     }
 }
 
-impl tracing::Subscriber for CallbackCounter {
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CallbackCounter {
     fn register_callsite(
         &self,
         metadata: &'static tracing::Metadata<'static>,
@@ -183,18 +183,15 @@ impl tracing::Subscriber for CallbackCounter {
         }
     }
 
-    fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+    fn enabled(
+        &self,
+        metadata: &tracing::Metadata<'_>,
+        _: tracing_subscriber::layer::Context<'_, S>,
+    ) -> bool {
         self.event_index_for(metadata.target()).is_some()
     }
 
-    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
-        tracing::span::Id::from_u64(1)
-    }
-    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
-    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
-    fn enter(&self, _: &tracing::span::Id) {}
-    fn exit(&self, _: &tracing::span::Id) {}
-    fn event(&self, event: &tracing::Event<'_>) {
+    fn on_event(&self, event: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
         if let Some(index) = self.event_index_for(event.metadata().target()) {
             self.counts[index].fetch_add(1, Ordering::Relaxed);
         }
@@ -242,11 +239,9 @@ fn winfsp_metadata_baseline() {
     let instrumentation_enabled =
         configured_value("STUDIOFS_METADATA_INSTRUMENTATION").as_deref() != Some("disabled");
     let counter = CallbackCounter::new(instrumentation_enabled);
-    // This integration binary invokes the baseline once per process. Keep the
-    // installation fail-fast so an existing subscriber cannot hide zero counts.
-    // Native callbacks run on dispatcher threads, so a thread-local subscriber
-    // cannot observe the workload.
-    tracing::subscriber::set_global_default(counter.clone()).expect("install callback counter");
+    // Swapping the shared global layer makes the counter the only active
+    // observer, so an earlier probe's subscriber cannot hide zero counts.
+    super::set_probe_tracing_layer(Box::new(counter.clone()));
     let tmp = studiofs_test_support::workspace_target_tempdir("metadata-baseline-");
     let rt = Arc::new(tokio::runtime::Runtime::new().expect("runtime"));
     let format_info = super::test_format_info_without_loading_env("metadata_baseline");

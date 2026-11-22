@@ -1020,8 +1020,30 @@ fn install_probe_trace_log() {
     }
 }
 
+type ProbeLayer = Box<dyn tracing_subscriber::Layer<tracing_subscriber::Registry> + Send + Sync>;
+
+/// Native callbacks run on WinFSP dispatcher threads, so probes need the global
+/// subscriber. It can be set once per process; tests sharing this binary swap the
+/// active layer instead, so an earlier test's subscriber cannot swallow later traces.
+fn set_probe_tracing_layer(layer: ProbeLayer) {
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::reload;
+    static HANDLE: OnceLock<reload::Handle<Option<ProbeLayer>, tracing_subscriber::Registry>> =
+        OnceLock::new();
+    let handle = HANDLE.get_or_init(|| {
+        let (router, handle) = reload::Layer::new(None);
+        tracing::subscriber::set_global_default(tracing_subscriber::registry().with(router))
+            .expect("install WinFSP probe tracing router");
+        handle
+    });
+    handle
+        .reload(Some(layer))
+        .expect("swap WinFSP probe tracing layer");
+}
+
 fn install_trace_log_at(path: &std::path::Path) {
     use std::sync::Mutex;
+    use tracing_subscriber::Layer;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).expect("create WinFSP probe trace directory");
     }
@@ -1030,14 +1052,13 @@ fn install_trace_log_at(path: &std::path::Path) {
             .to_string()
     });
     let file = std::fs::File::create(path).expect("create WinFSP probe trace log");
-    let subscriber = tracing_subscriber::fmt()
+    let fmt = tracing_subscriber::fmt::layer()
         .with_writer(Mutex::new(file))
         .with_ansi(false)
-        .with_thread_ids(true)
-        .with_env_filter(tracing_subscriber::EnvFilter::new(filter))
-        .finish();
-    // A second install in the same process keeps the first subscriber.
-    let _ = tracing::subscriber::set_global_default(subscriber);
+        .with_thread_ids(true);
+    set_probe_tracing_layer(Box::new(
+        tracing_subscriber::EnvFilter::new(filter).and_then(fmt),
+    ));
 }
 
 /// Ignored Shell round trip on an owned mount with retention enabled.
