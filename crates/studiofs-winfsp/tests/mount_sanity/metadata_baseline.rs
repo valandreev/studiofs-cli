@@ -240,8 +240,9 @@ fn winfsp_metadata_baseline() {
         configured_value("STUDIOFS_METADATA_INSTRUMENTATION").as_deref() != Some("disabled");
     let counter = CallbackCounter::new(instrumentation_enabled);
     // Swapping the shared global layer makes the counter the only active
-    // observer, so an earlier probe's subscriber cannot hide zero counts.
-    super::set_probe_tracing_layer(Box::new(counter.clone()));
+    // observer (under the documented `--test-threads=1` gate), so an earlier
+    // probe's subscriber cannot hide zero counts.
+    let _counter_layer = super::set_probe_tracing_layer(Box::new(counter.clone()));
     let tmp = studiofs_test_support::workspace_target_tempdir("metadata-baseline-");
     let rt = Arc::new(tokio::runtime::Runtime::new().expect("runtime"));
     let format_info = super::test_format_info_without_loading_env("metadata_baseline");
