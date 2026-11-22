@@ -93,6 +93,15 @@
 //! commit while still holding their session permits or frozen subtree, and
 //! status reads clone it before re-checking entries against metadata.
 //!
+//! `HandleTable::scratch_cleanup_epoch` orders mounted `scratch clean` against
+//! handle opens. Clean takes the write guard after its file session permit and
+//! holds it across the open-count check, `dirty_attrs`, and the local redb
+//! commit of one entry. Open takes the read guard before `getattr` and
+//! `open_file_handle`, so both paths take it before `dirty_attrs`, handle
+//! table locks, and metadata transactions. No path may take it while holding
+//! those locks or across an await. It is outside `LockTier` and
+//! `LockOrderGuard`.
+//!
 //! With `LocalPayloadBackendRuntime`, cached-store first/final pin transitions
 //! acquire locks in this order:
 //! `CachedStore::pinned` -> local backend payload mutation stripe gates ->

@@ -820,10 +820,11 @@ impl StudioVfs {
         };
         let meta = self.sync_meta();
         let outcome = restore_scratch_orphan_with_meta(meta.as_ref(), orphan_spec, target_path)?;
-        let parent = meta
-            .get_scratch_attr(outcome.ino)
-            .map(|attr| attr.parent)
-            .unwrap_or(ROOT_INO);
+        let parent = meta.get_scratch_attr(outcome.ino)?.parent;
+        if let Some(name) = outcome.restored_path.rsplit('/').next() {
+            self.invalidate_kernel_entries([(parent, name.as_bytes().to_vec())]);
+        }
+        self.invalidate_kernel_inode_attrs([parent]);
         self.invalidate_attr_read_cache([parent, outcome.ino]);
         self.dentry_cache_invalidate_parent(parent);
         if parent != ROOT_INO {

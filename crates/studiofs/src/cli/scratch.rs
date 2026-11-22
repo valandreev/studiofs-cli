@@ -351,9 +351,13 @@ fn execute_clean(
             )?;
             if !outcome.freed_payload_object_ids.is_empty() {
                 let cache_path = local_cache_path(meta_dir, cache_dir, &format_info.uuid);
-                if let Ok(detection) = detect_cache_backends(&cache_path)
-                    && detection.runtime_backend() == Some(LocalPayloadBackendKind::Current)
-                {
+                let detection = detect_cache_backends(&cache_path).map_err(|error| {
+                    anyhow::anyhow!(
+                        "failed to inspect local cache at '{}': {error}",
+                        cache_path.display()
+                    )
+                })?;
+                if detection.runtime_backend() == Some(LocalPayloadBackendKind::Current) {
                     let opened = open_local_payload_backend(&cache_path, &format_info.uuid)
                         .map_err(|error| {
                             anyhow::anyhow!(
@@ -407,13 +411,19 @@ fn execute_promote(
                 studiofs_vfs::promote_scratch_path_offline(meta.as_ref(), rel)?;
             if !payload_objects.is_empty() {
                 let cache_path = local_cache_path(meta_dir, cache_dir, &format_info.uuid);
-                if let Ok(detection) = detect_cache_backends(&cache_path)
-                    && detection.runtime_backend() == Some(LocalPayloadBackendKind::Current)
+                let detection = detect_cache_backends(&cache_path).map_err(|error| {
+                    anyhow::anyhow!(
+                        "failed to inspect local cache at '{}': {error}",
+                        cache_path.display()
+                    )
+                })?;
+                if detection.runtime_backend() == Some(LocalPayloadBackendKind::Current)
                     && detection.index_exists
                 {
                     let index = CacheIndex::open(&detection.layout.redb_index_path)?;
                     for object_id in payload_objects {
-                        let _ = index.mark_scratch_dirty(object_id)?;
+                        // `false` = object absent from the index; startup replay reconciles it.
+                        index.mark_scratch_dirty(object_id)?;
                     }
                 }
             }
