@@ -805,6 +805,8 @@ impl StudioVfs {
             if self.handle_table.write_open_count(open_file.ino) == 0 {
                 streams.remove(&open_file.ino);
             }
+            drop(streams);
+            self.ignore_rules.note_last_write_close(open_file.ino);
         }
         let (os_cache_writer_lease, os_cache_foreground_read_lease) =
             open_file.take_os_cache_release_lifetimes();

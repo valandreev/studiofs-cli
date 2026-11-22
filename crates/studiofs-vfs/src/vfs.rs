@@ -10824,7 +10824,11 @@ impl StudioVfs {
             return Err(VfsError::RemoteContentPending);
         }
 
-        // If O_TRUNC requested, truncate to 0
+        // If O_TRUNC requested, truncate to 0. Keep watched `.studiofsignore`
+        // files marked as open for writing across the truncate so a concurrent
+        // rule refresh cannot load the empty post-truncate state before the
+        // handle is registered in `handle_table`.
+        let mut open_trunc_guard = trunc.then(|| self.ignore_rules.begin_open_trunc(ino));
         if trunc {
             read_context = ReadRequestContext::from_attr(
                 self,
@@ -10840,6 +10844,12 @@ impl StudioVfs {
             Some(read_context.attr.clone()),
             active_open_overlay,
         );
+        if flags.allows_write()
+            && let Some(guard) = open_trunc_guard.as_mut()
+        {
+            guard.disarm_notify();
+        }
+        drop(open_trunc_guard);
         let fh = open_file.fh;
         open_file.set_read_ahead_owner(read_ahead_owner);
         self.register_os_cache_writer(&open_file, required_access == AccessLevel::ReadWrite);
@@ -10896,6 +10906,8 @@ impl StudioVfs {
         if starts_writer_epoch {
             streams.remove(&ino);
         }
+        drop(streams);
+        self.ignore_rules.note_write_open(ino);
         open_file
     }
     // =========================================================================
