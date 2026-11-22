@@ -1033,6 +1033,12 @@ mod tests {
                 "reserved trash root child file, retention {trash_days}"
             );
             assert_eq!(
+                vfs.classify_new_entry(trash.ino, b"._metadata", false)
+                    .unwrap(),
+                ScratchClass::Tracked,
+                "reserved trash root bypasses built-in scratch rules, retention {trash_days}"
+            );
+            assert_eq!(
                 vfs.classify_new_entry(nested_recycle.ino, b"desktop.ini", false)
                     .unwrap(),
                 ScratchClass::Scratch,
