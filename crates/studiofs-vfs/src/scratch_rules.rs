@@ -83,6 +83,7 @@ type GroupSource = (Vec<String>, Vec<(usize, ScratchClass)>);
 /// Pre-resolved compiled rules for direct children of one tracked directory.
 #[derive(Clone, Debug)]
 pub(crate) struct CompiledDirRules {
+    track_all: bool,
     case_insensitive: bool,
     ancestor_excluded: bool,
     /// Applicable rule sets ordered innermost-to-outermost, paired with the
@@ -95,6 +96,9 @@ impl CompiledDirRules {
     /// Classify a direct child entry name of this directory without re-walking
     /// ancestor paths or looking up rule-file maps.
     pub(crate) fn classify_child(&self, name: &[u8], is_dir: bool) -> ScratchClass {
+        if self.track_all {
+            return ScratchClass::Tracked;
+        }
         let folded = if self.case_insensitive {
             fold_dentry_name(name)
         } else {
@@ -130,6 +134,17 @@ impl CompiledDirRules {
 }
 
 impl ScratchRules {
+    /// Keep all children tracked below a reserved trash root, bypassing user
+    /// and built-in scratch rules.
+    pub(crate) fn compile_tracked_directory(&self) -> CompiledDirRules {
+        CompiledDirRules {
+            track_all: true,
+            case_insensitive: self.case_insensitive,
+            ancestor_excluded: false,
+            scopes: Vec::new(),
+        }
+    }
+
     /// Pre-resolve the rule scopes applicable to direct children of `dir_path`
     /// (empty for the volume root).
     pub(crate) fn compile_directory(&self, dir_path: &[u8]) -> CompiledDirRules {
@@ -186,6 +201,7 @@ impl ScratchRules {
         }
 
         CompiledDirRules {
+            track_all: false,
             case_insensitive: self.case_insensitive,
             ancestor_excluded,
             scopes,

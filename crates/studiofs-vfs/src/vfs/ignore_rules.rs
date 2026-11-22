@@ -536,6 +536,10 @@ impl StudioVfs {
         name: &[u8],
         is_dir: bool,
     ) -> VfsResult<ScratchClass> {
+        // Reserved trash roots keep the existing discard/retained namespace routing.
+        if parent == ROOT_INO && super::is_probable_trash_component(name) {
+            return Ok(ScratchClass::Tracked);
+        }
         if self.is_scratch_inode(parent)? {
             return Ok(ScratchClass::Scratch);
         }
@@ -560,12 +564,25 @@ impl StudioVfs {
 
         let observed_rename_epoch = self.ignore_rules.dir_rename_epoch.load(Ordering::Acquire);
         let dir_path = self.resolve_tracked_directory_path(parent)?;
+        // Descendants of reserved trash roots must also stay out of scratch
+        // (for example `$RECYCLE.BIN/S-1-5-21-...` or `desktop.ini` when
+        // retention is disabled and `.studiofsignore` matches `/$RECYCLE.BIN/`
+        // or `**/`). The decision is cached like any compiled directory so
+        // Recycle Bin traffic does not re-walk the path on every create.
+        let below_trash_root = dir_path
+            .as_deref()
+            .and_then(|path| path.split(|byte| *byte == b'/').next())
+            .is_some_and(super::is_probable_trash_component);
         let (snapshot, observed_rule_gen) = {
             let guard = self.ignore_rules.snapshot.read();
             let current_rule_gen = self.ignore_rules.rule_generation.load(Ordering::Acquire);
             (Arc::clone(&guard), current_rule_gen)
         };
-        let compiled = Arc::new(snapshot.compile_directory(dir_path.as_deref().unwrap_or(b"")));
+        let compiled = Arc::new(if below_trash_root {
+            snapshot.compile_tracked_directory()
+        } else {
+            snapshot.compile_directory(dir_path.as_deref().unwrap_or(b""))
+        });
         if dir_path.is_some()
             && self.ignore_rules.dir_rename_epoch.load(Ordering::Acquire) == observed_rename_epoch
         {
@@ -947,6 +964,103 @@ mod tests {
     use std::future::Future;
     use std::task::{Context, Waker};
     use studiofs_meta::{MetaEngineCore, MetaNamespace, MetaPayloadObjects};
+
+    #[test]
+    fn ignore_rules_preserve_reserved_trash_root_routing() {
+        use studiofs_meta::MetaFsOps as _;
+        use studiofs_meta::trash::MetaVolumeSettings as _;
+
+        for trash_days in [0, 7] {
+            let tmp = studiofs_test_support::workspace_target_tempdir("ignore-rules-trash-root-");
+            let (_runtime, vfs, meta) =
+                super::super::tests::make_unstarted_test_vfs(&tmp, "ignore-rules-trash-root");
+            vfs.set_native_trash_profile(super::super::NativeTrashProfile::Windows);
+            if trash_days != 0 {
+                meta.compare_and_set_trash_days(0, trash_days)
+                    .unwrap()
+                    .unwrap();
+            }
+            let mut rules = ScratchRules::new(true);
+            rules.update(b"", b"**/\n*.ini\n").unwrap();
+            *vfs.ignore_rules.snapshot.write() = Arc::new(rules);
+
+            let parent = meta.create_dir(ROOT_INO, b"work", 0, 0, 0o755).unwrap();
+            let nested_recycle = meta
+                .create_dir(parent.ino, b"$RECYCLE.BIN", 0, 0, 0o755)
+                .unwrap();
+            for name in [
+                b"$RECYCLE.BIN".as_slice(),
+                b"$recycle.bin",
+                b".Trash",
+                b".Trashes",
+                b".Trash-1000",
+            ] {
+                assert_eq!(
+                    vfs.classify_new_entry(ROOT_INO, name, true).unwrap(),
+                    ScratchClass::Tracked,
+                    "reserved root {name:?}, retention {trash_days}"
+                );
+                assert_eq!(
+                    vfs.classify_new_entry(parent.ino, name, true).unwrap(),
+                    ScratchClass::Scratch,
+                    "ordinary nested name {name:?}"
+                );
+            }
+            let trash = vfs.mkdir(ROOT_INO, b"$RECYCLE.BIN", 0, 0, 0o755).unwrap();
+            assert_eq!(
+                meta.lookup(ROOT_INO, b"$RECYCLE.BIN").unwrap().ino,
+                trash.ino
+            );
+            assert!(
+                meta.lookup_scratch_entry(ROOT_INO, b"$RECYCLE.BIN")
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(
+                vfs.classify_new_entry(trash.ino, b"S-1-5-21-1000", true)
+                    .unwrap(),
+                ScratchClass::Tracked,
+                "reserved trash root child dir, retention {trash_days}"
+            );
+            assert!(
+                vfs.ignore_rules.dir_rule_cache.lock().contains(&trash.ino),
+                "trash root classification is cached, retention {trash_days}"
+            );
+            assert_eq!(
+                vfs.classify_new_entry(trash.ino, b"desktop.ini", false)
+                    .unwrap(),
+                ScratchClass::Tracked,
+                "reserved trash root child file, retention {trash_days}"
+            );
+            assert_eq!(
+                vfs.classify_new_entry(trash.ino, b"._metadata", false)
+                    .unwrap(),
+                ScratchClass::Tracked,
+                "reserved trash root bypasses built-in scratch rules, retention {trash_days}"
+            );
+            assert_eq!(
+                vfs.classify_new_entry(nested_recycle.ino, b"desktop.ini", false)
+                    .unwrap(),
+                ScratchClass::Scratch,
+                "ordinary nested $RECYCLE.BIN child file, retention {trash_days}"
+            );
+            if trash_days == 0 {
+                let non_native_trash = vfs.mkdir(ROOT_INO, b".Trash", 0, 0, 0o755).unwrap();
+                let child_dir = vfs
+                    .mkdir(non_native_trash.ino, b"child", 0, 0, 0o755)
+                    .unwrap();
+                assert_eq!(
+                    meta.lookup(non_native_trash.ino, b"child").unwrap().ino,
+                    child_dir.ino
+                );
+                assert!(
+                    meta.lookup_scratch_entry(non_native_trash.ino, b"child")
+                        .unwrap()
+                        .is_none()
+                );
+            }
+        }
+    }
 
     fn take_refresh_permit(rules: &IgnoreRules) -> bool {
         let mut notified = std::pin::pin!(rules.refresh.notified());
