@@ -137,8 +137,8 @@ source, and ignored -> normal unlinks the source without creating the target.
 - The tooling design covers `studiofs scratch list|clean|promote|restore`
   through the mounted control API and offline against redb. The design for
   `clean` skips entries with open handles and supports `--older-than`.
-- `studiofs scratch promote --volume <volume> -- <path>` currently requires a
-  writable mount and accepts a UTF-8 path relative to the volume root. It
+- `studiofs scratch promote --volume <volume> -- <path>` works on a writable
+  mount or offline and accepts a UTF-8 path relative to the volume root. It
   bypasses the background entry limit and fails atomically if a tracked entry
   already holds the target name. When the target stopped matching an ignore
   rule, descendants that still match remain scratch.

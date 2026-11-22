@@ -293,6 +293,19 @@ impl ScratchRules {
         self.directories.remove(directory.as_ref());
     }
 
+    /// Return all directories whose `.studiofsignore` contains patterns that
+    /// would match `.studiofsignore` itself, sorted by directory path.
+    pub fn rule_file_diagnostics(&self) -> Vec<(Vec<u8>, Vec<RuleDiagnostic>)> {
+        let mut out: Vec<(Vec<u8>, Vec<RuleDiagnostic>)> = self
+            .directories
+            .iter()
+            .filter(|(_, set)| !set.diagnostics.is_empty())
+            .map(|(dir, set)| (dir.clone(), set.diagnostics.clone()))
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+
     /// Classify a canonical volume-relative path of slash-separated dentry
     /// names. Callers supply a path with no empty, dot, or dot-dot components,
     /// and whether its final entry is a directory.

@@ -51,6 +51,7 @@ mod retained_views;
 mod runtime_stats_surface;
 mod scratch_auto_promote;
 mod scratch_storage;
+mod scratch_tooling;
 mod startup;
 mod startup_replay;
 mod statfs;
@@ -74,24 +75,25 @@ pub use locking::LockKind;
 pub use metrics::{
     LogicalQuotaStatus, RUNTIME_STATS_SCHEMA_VERSION, RUNTIME_STATS_SECTIONS, RuntimeLatencyBucket,
     RuntimeLatencyHistogram, RuntimeScalarMetric, RuntimeStatsParseError, RuntimeStatsSection,
-    RuntimeStatsSnapshot, ScratchPromoteOverLimitEntry, ScratchPromotePathOutcome, StatFs,
-    VfsAttrReadCacheSnapshot, VfsCachePipelineMaterializeStats, VfsCachePipelineStats,
-    VfsCacheScrubCorruption, VfsCacheScrubProgress, VfsCacheScrubSnapshot, VfsCacheStateSnapshot,
-    VfsFetchStats, VfsForegroundReadProtectionStats, VfsFuseAsyncReadSnapshot,
-    VfsFuseAsyncWriteSnapshot, VfsFuseCallbackStats, VfsFuseConnectionSnapshot,
-    VfsFuseInvalidationSnapshot, VfsFuseIoStats, VfsIngressLane, VfsIngressPressure,
-    VfsIngressStats, VfsLatencyHistogramSnapshot, VfsLinuxFuseOpenCacheStats,
-    VfsMacFuseOpenCacheDecision, VfsMacFuseOpenCacheStats, VfsMacFuseOpenMemoryDirectIo,
-    VfsNamespaceCacheSnapshot, VfsNamespaceCreateObservabilityStats, VfsPortableAllocatorStats,
-    VfsReadPathStats, VfsRuntimeEvent, VfsScratchAutoPromoteSnapshot, VfsSyncSafetyReason,
-    VfsSyncSafetySnapshot, VfsSyncSafetyState, VfsSynchronizationStateSnapshot,
-    VfsTransitMemorySnapshot, VfsUploadStats, VfsWritePathBackpressureStats,
-    VfsWritePathBurstStats, VfsWritePathCadenceStats, VfsWritePathDirtyPressureStats,
-    VfsWritePathDrainLagStats, VfsWritePathEagerFlushStats, VfsWritePathLandingZoneStats,
-    VfsWritePathLatencyQuantilesMs, VfsWritePathLatencyQuantilesSaturated,
-    VfsWritePathLocalCacheIoStats, VfsWritePathObservabilitySnapshot,
-    VfsWritePathStageLatencyStats, VfsWritePathSyncDataStats, VfsWritePathTuningStats,
-    VfsWritePathVfsWriteStats, VfsWritePathWinfspCallbackStats,
+    RuntimeStatsSnapshot, ScratchCleanOutcome, ScratchConflictSummary, ScratchListEntry,
+    ScratchOrphanSummary, ScratchPromoteOverLimitEntry, ScratchPromotePathOutcome,
+    ScratchRestoreOutcome, ScratchRuleFileWarning, StatFs, VfsAttrReadCacheSnapshot,
+    VfsCachePipelineMaterializeStats, VfsCachePipelineStats, VfsCacheScrubCorruption,
+    VfsCacheScrubProgress, VfsCacheScrubSnapshot, VfsCacheStateSnapshot, VfsFetchStats,
+    VfsForegroundReadProtectionStats, VfsFuseAsyncReadSnapshot, VfsFuseAsyncWriteSnapshot,
+    VfsFuseCallbackStats, VfsFuseConnectionSnapshot, VfsFuseInvalidationSnapshot, VfsFuseIoStats,
+    VfsIngressLane, VfsIngressPressure, VfsIngressStats, VfsLatencyHistogramSnapshot,
+    VfsLinuxFuseOpenCacheStats, VfsMacFuseOpenCacheDecision, VfsMacFuseOpenCacheStats,
+    VfsMacFuseOpenMemoryDirectIo, VfsNamespaceCacheSnapshot, VfsNamespaceCreateObservabilityStats,
+    VfsPortableAllocatorStats, VfsReadPathStats, VfsRuntimeEvent, VfsScratchAutoPromoteSnapshot,
+    VfsScratchStatusSnapshot, VfsSyncSafetyReason, VfsSyncSafetySnapshot, VfsSyncSafetyState,
+    VfsSynchronizationStateSnapshot, VfsTransitMemorySnapshot, VfsUploadStats,
+    VfsWritePathBackpressureStats, VfsWritePathBurstStats, VfsWritePathCadenceStats,
+    VfsWritePathDirtyPressureStats, VfsWritePathDrainLagStats, VfsWritePathEagerFlushStats,
+    VfsWritePathLandingZoneStats, VfsWritePathLatencyQuantilesMs,
+    VfsWritePathLatencyQuantilesSaturated, VfsWritePathLocalCacheIoStats,
+    VfsWritePathObservabilitySnapshot, VfsWritePathStageLatencyStats, VfsWritePathSyncDataStats,
+    VfsWritePathTuningStats, VfsWritePathVfsWriteStats, VfsWritePathWinfspCallbackStats,
     VfsWritePathWinfspForegroundFlushStats, VfsWritePathWinfspWritePathStats,
     VfsZeroIoCacheBytesSnapshot, VfsZeroIoDrilldownEntry, VfsZeroIoHealthSignal,
     VfsZeroIoRuntimeSnapshot, VfsZeroIoShutdownSnapshot, VfsZeroIoStartupReplaySnapshot,
@@ -109,6 +111,10 @@ pub use runtime_stats_surface::{
     RUNTIME_STATS_FILE_REPORTED_SIZE, read_runtime_stats_buffer,
 };
 pub use scratch_auto_promote::find_over_limit_scratch_directories;
+pub use scratch_tooling::{
+    clean_scratch_offline, inspect_scratch_status, list_scratch_entries_offline,
+    list_scratch_orphans_offline, promote_scratch_path_offline, restore_scratch_orphan_offline,
+};
 
 use crate::coherence::{CoherenceHealthBudget, CoherenceHealthSnapshot, CoherenceHealthTracker};
 use acl::AclState;
@@ -10762,6 +10768,7 @@ impl StudioVfs {
         read_ahead_owner: ReadAheadOwner,
     ) -> VfsResult<u64> {
         let _timer = VfsForegroundWriteTimer::new(self, VfsForegroundWriteOp::OpenFile);
+        let scratch_cleanup_epoch = *self.handle_table.scratch_cleanup_epoch.read();
         let required_access = if Self::write_access_requested(flags, trunc) {
             AccessLevel::ReadWrite
         } else {
@@ -10829,6 +10836,11 @@ impl StudioVfs {
         // rule refresh cannot load the empty post-truncate state before the
         // handle is registered in `handle_table`.
         let mut open_trunc_guard = trunc.then(|| self.ignore_rules.begin_open_trunc(ino));
+        // Register truncate opens before their side effect. Scratch cleanup
+        // sees this admission even though the real handle is not installed
+        // until the post-truncate attribute snapshot is available.
+        let pending_truncate_open =
+            trunc.then(|| self.handle_table.admit_pending_truncate_open(ino));
         if trunc {
             read_context = ReadRequestContext::from_attr(
                 self,
@@ -10837,6 +10849,10 @@ impl StudioVfs {
             );
         }
 
+        let admission = self.handle_table.scratch_cleanup_epoch.read();
+        if *admission != scratch_cleanup_epoch {
+            read_context = ReadRequestContext::from_attr(self, ino, self.getattr(ino)?);
+        }
         let active_open_overlay = Self::active_open_overlay_required(flags, trunc);
         let open_file = self.open_file_handle(
             ino,
@@ -10844,6 +10860,8 @@ impl StudioVfs {
             Some(read_context.attr.clone()),
             active_open_overlay,
         );
+        drop(pending_truncate_open);
+        drop(admission);
         if flags.allows_write()
             && let Some(guard) = open_trunc_guard.as_mut()
         {

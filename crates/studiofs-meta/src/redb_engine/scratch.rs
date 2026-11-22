@@ -707,6 +707,7 @@ impl RedbMetaEngine {
         parent: Ino,
         name: &[u8],
         keep_open_inode: bool,
+        expected: Option<(Ino, Option<i64>)>,
     ) -> MetaResult<(InodeAttr, Vec<u64>)> {
         let _mutation_guard = self
             .scratch_mutation_lock
@@ -725,6 +726,14 @@ impl RedbMetaEngine {
             let mut inodes = txn.open_table(SCRATCH_INODES).map_err(storage_error)?;
             let mut attr =
                 read_scratch_attr_from_table(&inodes, ino)?.ok_or(MetaError::InodeNotFound(ino))?;
+            if let Some((expected_ino, cutoff)) = expected
+                && (ino != expected_ino || cutoff.is_some_and(|cutoff| attr.mtime > cutoff))
+            {
+                return Err(MetaError::EntryNotFound {
+                    parent,
+                    name: String::from_utf8_lossy(name).into_owned(),
+                });
+            }
             if attr.kind == FileType::Directory {
                 return Err(MetaError::IsADirectory(ino));
             }
@@ -801,7 +810,12 @@ impl RedbMetaEngine {
         Ok(freed_objects)
     }
 
-    pub(super) fn remove_scratch_dir(&self, parent: Ino, name: &[u8]) -> MetaResult<InodeAttr> {
+    pub(super) fn remove_scratch_dir(
+        &self,
+        parent: Ino,
+        name: &[u8],
+        expected: Option<(Ino, Option<i64>)>,
+    ) -> MetaResult<InodeAttr> {
         let _mutation_guard = self
             .scratch_mutation_lock
             .lock()
@@ -819,6 +833,14 @@ impl RedbMetaEngine {
             let mut inodes = txn.open_table(SCRATCH_INODES).map_err(storage_error)?;
             let mut attr =
                 read_scratch_attr_from_table(&inodes, ino)?.ok_or(MetaError::InodeNotFound(ino))?;
+            if let Some((expected_ino, cutoff)) = expected
+                && (ino != expected_ino || cutoff.is_some_and(|cutoff| attr.mtime > cutoff))
+            {
+                return Err(MetaError::EntryNotFound {
+                    parent,
+                    name: String::from_utf8_lossy(name).into_owned(),
+                });
+            }
             if attr.kind != FileType::Directory {
                 return Err(MetaError::NotADirectory(ino));
             }
@@ -3195,6 +3217,452 @@ impl RedbMetaEngine {
 
         restored_root_attr.ok_or_else(|| storage_error("restored scratch orphan root missing"))
     }
+
+    pub(super) fn inspect_scratch_consistency_inner(&self) -> MetaResult<ScratchConsistencyReport> {
+        let txn = self.begin_read_txn()?;
+        let mut report = ScratchConsistencyReport::default();
+
+        let mut scratch_inodes: HashMap<Ino, InodeAttr> = HashMap::new();
+        match txn.open_table(SCRATCH_INODES) {
+            Ok(table) => {
+                for row in table.iter().map_err(storage_error)? {
+                    let (ino, value) = row.map_err(storage_error)?;
+                    let attr: InodeAttr =
+                        postcard::from_bytes(value.value()).map_err(storage_error)?;
+                    scratch_inodes.insert(ino.value(), attr);
+                }
+            }
+            Err(redb::TableError::TableDoesNotExist(_)) => {}
+            Err(error) => return Err(storage_error(error)),
+        }
+
+        let mut children_by_parent: HashMap<Ino, Vec<(Vec<u8>, Ino)>> = HashMap::new();
+        match txn.open_table(SCRATCH_DENTRIES) {
+            Ok(table) => {
+                for row in table.iter().map_err(storage_error)? {
+                    let (key, value) = row.map_err(storage_error)?;
+                    let (parent, name) = decode_dentry_key(key.value())?;
+                    children_by_parent
+                        .entry(parent)
+                        .or_default()
+                        .push((name.to_vec(), value.value()));
+                }
+            }
+            Err(redb::TableError::TableDoesNotExist(_)) => {}
+            Err(error) => return Err(storage_error(error)),
+        }
+
+        let base_inodes = txn.open_table(BASE_INODES_TABLE).map_err(storage_error)?;
+        let current_inodes = txn.open_table(INODES_TABLE).map_err(storage_error)?;
+        let inode_tombstones = txn
+            .open_table(INODE_TOMBSTONES_TABLE)
+            .map_err(storage_error)?;
+
+        let mut stack: Vec<Ino> = Vec::new();
+        let mut valid_tracked_parents: HashSet<Ino> = HashSet::new();
+        for (&parent, entries) in &children_by_parent {
+            if scratch_inodes.contains_key(&parent) {
+                continue;
+            }
+            let is_tracked_dir = matches!(
+                Self::resolve_attr_from_opened_tables(
+                    &base_inodes,
+                    &current_inodes,
+                    &inode_tombstones,
+                    parent,
+                    true,
+                ),
+                Ok(attr) if attr.kind == FileType::Directory
+            );
+            if is_tracked_dir {
+                valid_tracked_parents.insert(parent);
+                stack.push(parent);
+            } else {
+                for (name, child_ino) in entries {
+                    report.dangling_dentries.push(ScratchDanglingDentry {
+                        parent,
+                        name: name.clone(),
+                        ino: *child_ino,
+                    });
+                }
+            }
+        }
+
+        let mut reachable: HashSet<Ino> = HashSet::new();
+        let mut visited_parents: HashSet<Ino> = HashSet::new();
+        while let Some(parent) = stack.pop() {
+            if !visited_parents.insert(parent) {
+                continue;
+            }
+            let Some(entries) = children_by_parent.get(&parent) else {
+                continue;
+            };
+            for (name, child_ino) in entries {
+                if let Some(attr) = scratch_inodes.get(child_ino) {
+                    if reachable.insert(*child_ino) && attr.kind == FileType::Directory {
+                        stack.push(*child_ino);
+                    }
+                } else {
+                    report.dangling_dentries.push(ScratchDanglingDentry {
+                        parent,
+                        name: name.clone(),
+                        ino: *child_ino,
+                    });
+                }
+            }
+        }
+
+        // Also flag dangling dentries inside unreachable scratch directories.
+        for (&parent, entries) in &children_by_parent {
+            if valid_tracked_parents.contains(&parent) || visited_parents.contains(&parent) {
+                continue;
+            }
+            if !scratch_inodes.contains_key(&parent) {
+                continue;
+            }
+            for (name, child_ino) in entries {
+                if !scratch_inodes.contains_key(child_ino) {
+                    report.dangling_dentries.push(ScratchDanglingDentry {
+                        parent,
+                        name: name.clone(),
+                        ino: *child_ino,
+                    });
+                }
+            }
+        }
+
+        for (&ino, attr) in &scratch_inodes {
+            if !reachable.contains(&ino) {
+                report.orphan_inodes.push(ScratchOrphanInode {
+                    ino,
+                    kind: attr.kind,
+                    nlink: attr.nlink,
+                });
+            }
+        }
+        report.orphan_inodes.sort_by_key(|item| item.ino);
+        report
+            .dangling_dentries
+            .sort_by(|a, b| (a.parent, &a.name, a.ino).cmp(&(b.parent, &b.name, b.ino)));
+
+        let mut seen_payload_refs: HashSet<(Ino, u64)> = HashSet::new();
+        match txn.open_table(SCRATCH_OVERLAY) {
+            Ok(table) => {
+                for row in table.iter().map_err(storage_error)? {
+                    let (key, value) = row.map_err(storage_error)?;
+                    let (ino, _) = decode_regular_file_chunk_key(key.value())?;
+                    if !scratch_inodes.contains_key(&ino) {
+                        report.orphan_aux_rows.push(ScratchOrphanAuxRow {
+                            table: ScratchAuxTable::Overlay,
+                            ino,
+                        });
+                    } else {
+                        let state: RegularFileChunkState = decode(value.value())?;
+                        for payload in state.slices.values().filter_map(|slice| slice.payload) {
+                            if seen_payload_refs.insert((ino, payload.object_id)) {
+                                report
+                                    .referenced_payload_objects
+                                    .push(ScratchPayloadObjectRef {
+                                        ino,
+                                        object_id: payload.object_id,
+                                    });
+                            }
+                        }
+                    }
+                }
+            }
+            Err(redb::TableError::TableDoesNotExist(_)) => {}
+            Err(error) => return Err(storage_error(error)),
+        }
+
+        match txn.open_table(SCRATCH_XATTRS) {
+            Ok(table) => {
+                for row in table.iter().map_err(storage_error)? {
+                    let (key, _) = row.map_err(storage_error)?;
+                    let key_bytes = key.value();
+                    if key_bytes.len() < 8 {
+                        return Err(storage_error("invalid scratch xattr key length"));
+                    }
+                    let ino = u64::from_be_bytes(
+                        key_bytes[..8]
+                            .try_into()
+                            .map_err(|_| storage_error("invalid scratch xattr key"))?,
+                    );
+                    if !scratch_inodes.contains_key(&ino) {
+                        report.orphan_aux_rows.push(ScratchOrphanAuxRow {
+                            table: ScratchAuxTable::Xattrs,
+                            ino,
+                        });
+                    }
+                }
+            }
+            Err(redb::TableError::TableDoesNotExist(_)) => {}
+            Err(error) => return Err(storage_error(error)),
+        }
+
+        match txn.open_table(SCRATCH_SYMLINKS) {
+            Ok(table) => {
+                for row in table.iter().map_err(storage_error)? {
+                    let (ino, _) = row.map_err(storage_error)?;
+                    if !scratch_inodes.contains_key(&ino.value()) {
+                        report.orphan_aux_rows.push(ScratchOrphanAuxRow {
+                            table: ScratchAuxTable::Symlinks,
+                            ino: ino.value(),
+                        });
+                    }
+                }
+            }
+            Err(redb::TableError::TableDoesNotExist(_)) => {}
+            Err(error) => return Err(storage_error(error)),
+        }
+
+        match txn.open_table(SCRATCH_CONFLICTS) {
+            Ok(table) => {
+                for row in table.iter().map_err(storage_error)? {
+                    let (ino, _) = row.map_err(storage_error)?;
+                    if !scratch_inodes.contains_key(&ino.value()) {
+                        report.orphan_aux_rows.push(ScratchOrphanAuxRow {
+                            table: ScratchAuxTable::Conflicts,
+                            ino: ino.value(),
+                        });
+                    }
+                }
+            }
+            Err(redb::TableError::TableDoesNotExist(_)) => {}
+            Err(error) => return Err(storage_error(error)),
+        }
+
+        let mut orphan_objects = HashSet::new();
+        Self::scratch_orphan_object_ids_from_read_txn(&txn, &mut orphan_objects)?;
+        for object_id in orphan_objects {
+            if seen_payload_refs.insert((0, object_id)) {
+                report
+                    .referenced_payload_objects
+                    .push(ScratchPayloadObjectRef { ino: 0, object_id });
+            }
+        }
+        report
+            .referenced_payload_objects
+            .sort_by_key(|item| (item.ino, item.object_id));
+        Ok(report)
+    }
+
+    pub(super) fn repair_scratch_consistency_inner(
+        &self,
+    ) -> MetaResult<ScratchConsistencyRepairSummary> {
+        let _mutation_guard = self
+            .scratch_mutation_lock
+            .lock()
+            .map_err(|_| storage_error("scratch mutation lock poisoned"))?;
+        let txn = self.begin_immediate_write_txn()?;
+        let mut summary = ScratchConsistencyRepairSummary::default();
+        let mut freed_objects: HashSet<u64> = HashSet::new();
+
+        {
+            let mut scratch_inodes: HashMap<Ino, InodeAttr> = HashMap::new();
+            {
+                let inodes = txn.open_table(SCRATCH_INODES).map_err(storage_error)?;
+                for row in inodes.iter().map_err(storage_error)? {
+                    let (ino, value) = row.map_err(storage_error)?;
+                    let attr: InodeAttr =
+                        postcard::from_bytes(value.value()).map_err(storage_error)?;
+                    scratch_inodes.insert(ino.value(), attr);
+                }
+            }
+
+            let mut children_by_parent: HashMap<Ino, Vec<(Vec<u8>, Ino)>> = HashMap::new();
+            {
+                let dentries = txn.open_table(SCRATCH_DENTRIES).map_err(storage_error)?;
+                for row in dentries.iter().map_err(storage_error)? {
+                    let (key, value) = row.map_err(storage_error)?;
+                    let (parent, _) = decode_dentry_key(key.value())?;
+                    children_by_parent
+                        .entry(parent)
+                        .or_default()
+                        .push((key.value().to_vec(), value.value()));
+                }
+            }
+
+            let mut stack: Vec<Ino> = Vec::new();
+            let mut dangling_keys: Vec<Vec<u8>> = Vec::new();
+            for (&parent, entries) in &children_by_parent {
+                if scratch_inodes.contains_key(&parent) {
+                    continue;
+                }
+                let is_tracked_dir = matches!(
+                    Self::get_attr_merged_in_write_txn(&txn, parent),
+                    Ok(attr) if attr.kind == FileType::Directory
+                );
+                if is_tracked_dir {
+                    stack.push(parent);
+                } else {
+                    for (raw_key, _) in entries {
+                        dangling_keys.push(raw_key.clone());
+                    }
+                }
+            }
+
+            let mut reachable: HashSet<Ino> = HashSet::new();
+            let mut visited_parents: HashSet<Ino> = HashSet::new();
+            while let Some(parent) = stack.pop() {
+                if !visited_parents.insert(parent) {
+                    continue;
+                }
+                let Some(entries) = children_by_parent.get(&parent) else {
+                    continue;
+                };
+                for (raw_key, child_ino) in entries {
+                    if let Some(attr) = scratch_inodes.get(child_ino) {
+                        if reachable.insert(*child_ino) && attr.kind == FileType::Directory {
+                            stack.push(*child_ino);
+                        }
+                    } else {
+                        dangling_keys.push(raw_key.clone());
+                    }
+                }
+            }
+
+            let orphan_inodes: Vec<Ino> = scratch_inodes
+                .keys()
+                .copied()
+                .filter(|ino| !reachable.contains(ino))
+                .collect();
+
+            // Remove dentries pointing from unreachable scratch parents too.
+            for &orphan_parent in &orphan_inodes {
+                if let Some(entries) = children_by_parent.get(&orphan_parent) {
+                    for (raw_key, _) in entries {
+                        dangling_keys.push(raw_key.clone());
+                    }
+                }
+            }
+            dangling_keys.sort();
+            dangling_keys.dedup();
+
+            {
+                let mut dentries = txn.open_table(SCRATCH_DENTRIES).map_err(storage_error)?;
+                for key in &dangling_keys {
+                    if dentries
+                        .remove(key.as_slice())
+                        .map_err(storage_error)?
+                        .is_some()
+                    {
+                        summary.removed_dangling_dentries += 1;
+                    }
+                }
+            }
+
+            for ino in &orphan_inodes {
+                {
+                    let mut inodes = txn.open_table(SCRATCH_INODES).map_err(storage_error)?;
+                    if inodes.remove(*ino).map_err(storage_error)?.is_some() {
+                        summary.removed_orphan_inodes += 1;
+                    }
+                }
+                let freed = remove_scratch_inode_aux_in_txn(&txn, *ino)?;
+                freed_objects.extend(freed);
+                scratch_inodes.remove(ino);
+            }
+
+            // Clean orphaned auxiliary rows whose inode is absent from SCRATCH_INODES.
+            {
+                let mut overlay = txn.open_table(SCRATCH_OVERLAY).map_err(storage_error)?;
+                let mut orphan_keys: Vec<Vec<u8>> = Vec::new();
+                for row in overlay.iter().map_err(storage_error)? {
+                    let (key, value) = row.map_err(storage_error)?;
+                    let (ino, _) = decode_regular_file_chunk_key(key.value())?;
+                    if !scratch_inodes.contains_key(&ino) {
+                        let state: RegularFileChunkState = decode(value.value())?;
+                        for payload in state.slices.values().filter_map(|slice| slice.payload) {
+                            freed_objects.insert(payload.object_id);
+                        }
+                        orphan_keys.push(key.value().to_vec());
+                    }
+                }
+                for key in orphan_keys {
+                    if overlay
+                        .remove(key.as_slice())
+                        .map_err(storage_error)?
+                        .is_some()
+                    {
+                        summary.removed_orphan_aux_rows += 1;
+                    }
+                }
+            }
+            {
+                let mut xattrs = txn.open_table(SCRATCH_XATTRS).map_err(storage_error)?;
+                let mut orphan_keys: Vec<Vec<u8>> = Vec::new();
+                for row in xattrs.iter().map_err(storage_error)? {
+                    let (key, _) = row.map_err(storage_error)?;
+                    let key_bytes = key.value();
+                    if key_bytes.len() < 8 {
+                        orphan_keys.push(key_bytes.to_vec());
+                        continue;
+                    }
+                    let ino = u64::from_be_bytes(
+                        key_bytes[..8]
+                            .try_into()
+                            .map_err(|_| storage_error("invalid scratch xattr key"))?,
+                    );
+                    if !scratch_inodes.contains_key(&ino) {
+                        orphan_keys.push(key_bytes.to_vec());
+                    }
+                }
+                for key in orphan_keys {
+                    if xattrs
+                        .remove(key.as_slice())
+                        .map_err(storage_error)?
+                        .is_some()
+                    {
+                        summary.removed_orphan_aux_rows += 1;
+                    }
+                }
+            }
+            {
+                let mut symlinks = txn.open_table(SCRATCH_SYMLINKS).map_err(storage_error)?;
+                let mut orphan_inos: Vec<Ino> = Vec::new();
+                for row in symlinks.iter().map_err(storage_error)? {
+                    let (ino, _) = row.map_err(storage_error)?;
+                    if !scratch_inodes.contains_key(&ino.value()) {
+                        orphan_inos.push(ino.value());
+                    }
+                }
+                for ino in orphan_inos {
+                    if symlinks.remove(ino).map_err(storage_error)?.is_some() {
+                        summary.removed_orphan_aux_rows += 1;
+                    }
+                }
+            }
+            {
+                let mut conflicts = txn.open_table(SCRATCH_CONFLICTS).map_err(storage_error)?;
+                let mut orphan_inos: Vec<Ino> = Vec::new();
+                for row in conflicts.iter().map_err(storage_error)? {
+                    let (ino, _) = row.map_err(storage_error)?;
+                    if !scratch_inodes.contains_key(&ino.value()) {
+                        orphan_inos.push(ino.value());
+                    }
+                }
+                for ino in orphan_inos {
+                    if conflicts.remove(ino).map_err(storage_error)?.is_some() {
+                        summary.removed_orphan_aux_rows += 1;
+                    }
+                }
+            }
+        }
+
+        txn.commit()?;
+        self.refresh_scratch_index()?;
+
+        if !freed_objects.is_empty() {
+            let still_live = self.get_local_cache_referenced_object_ids()?;
+            summary.freed_payload_object_ids = freed_objects
+                .into_iter()
+                .filter(|id| !still_live.contains(id))
+                .collect();
+            summary.freed_payload_object_ids.sort_unstable();
+        }
+        Ok(summary)
+    }
 }
 
 /// Pre-mutation snapshot of volume-relative paths for tracked parents holding
@@ -5569,5 +6037,196 @@ mod tests {
             Some(overflow_file.ino)
         );
         assert!(meta.lookup(ROOT_INO, b"overflow").is_err());
+    }
+
+    #[test]
+    fn scratch_consistency_inspect_and_repair_handles_orphans_and_dangling_rows() {
+        let temp = studiofs_test_support::workspace_target_tempdir("scratch-fsck-");
+        let meta = RedbMetaEngine::open(temp.path().join("meta.db")).unwrap();
+        meta.init_root(0, 0).unwrap();
+
+        let live_file = InodeAttr::new_file(10, ROOT_INO, 0, 0, 0o644);
+        meta.create_scratch_entry(ROOT_INO, b"live.tmp", &live_file)
+            .unwrap();
+        meta.commit_scratch_overlay(
+            live_file.ino,
+            &[(
+                ChunkId(0),
+                vec![SliceRecord::new(
+                    SliceId(1),
+                    SliceOrder(1),
+                    SliceRange::new(0, 16).unwrap(),
+                    PayloadRef::new_partial(101, 16),
+                )],
+            )],
+        )
+        .unwrap();
+
+        let orphan_file = InodeAttr::new_file(11, ROOT_INO, 0, 0, 0o644);
+        meta.create_scratch_entry(ROOT_INO, b"orphan.tmp", &orphan_file)
+            .unwrap();
+        meta.commit_scratch_overlay(
+            orphan_file.ino,
+            &[(
+                ChunkId(0),
+                vec![SliceRecord::new(
+                    SliceId(1),
+                    SliceOrder(1),
+                    SliceRange::new(0, 16).unwrap(),
+                    PayloadRef::new_partial(102, 16),
+                )],
+            )],
+        )
+        .unwrap();
+        // Detach `orphan.tmp` while keeping its inode open-style (nlink == 0) to simulate an orphaned inode.
+        meta.unlink_scratch_entry(ROOT_INO, b"orphan.tmp", true)
+            .unwrap();
+
+        // Inject a dangling dentry and orphaned auxiliary rows directly into redb.
+        {
+            let txn = meta.begin_immediate_write_txn().unwrap();
+            {
+                let mut dentries = txn.open_table(SCRATCH_DENTRIES).unwrap();
+                dentries
+                    .insert(encode_dentry_key(ROOT_INO, b"dangling.tmp").as_slice(), 999)
+                    .unwrap();
+            }
+            {
+                let mut xattrs = txn.open_table(SCRATCH_XATTRS).unwrap();
+                xattrs
+                    .insert(
+                        encode_xattr_key(888, b"user.ghost").as_slice(),
+                        b"val".as_slice(),
+                    )
+                    .unwrap();
+            }
+            {
+                let mut symlinks = txn.open_table(SCRATCH_SYMLINKS).unwrap();
+                symlinks.insert(889u64, b"/nowhere".as_slice()).unwrap();
+            }
+            {
+                let mut overlay = txn.open_table(SCRATCH_OVERLAY).unwrap();
+                let mut state = RegularFileChunkState::default();
+                state.insert_slice(SliceRecord::new(
+                    SliceId(1),
+                    SliceOrder(1),
+                    SliceRange::new(0, 8).unwrap(),
+                    PayloadRef::new_partial(103, 8),
+                ));
+                overlay
+                    .insert(
+                        encode_regular_file_chunk_key(890, ChunkId(0)).as_slice(),
+                        encode(&state).unwrap().as_slice(),
+                    )
+                    .unwrap();
+            }
+            txn.commit().unwrap();
+        }
+        meta.refresh_scratch_index().unwrap();
+
+        let report = meta.inspect_scratch_consistency().unwrap();
+        assert_eq!(report.dangling_dentries.len(), 1);
+        assert_eq!(report.dangling_dentries[0].ino, 999);
+        assert_eq!(report.orphan_inodes.len(), 1);
+        assert_eq!(report.orphan_inodes[0].ino, orphan_file.ino);
+        assert_eq!(report.orphan_aux_rows.len(), 3);
+        assert!(
+            report
+                .referenced_payload_objects
+                .iter()
+                .any(|item| item.ino == live_file.ino && item.object_id == 101)
+        );
+
+        let repair = meta.repair_scratch_consistency().unwrap();
+        assert_eq!(repair.removed_dangling_dentries, 1);
+        assert_eq!(repair.removed_orphan_inodes, 1);
+        assert_eq!(repair.removed_orphan_aux_rows, 3);
+        assert_eq!(repair.freed_payload_object_ids, vec![102, 103]);
+
+        let post = meta.inspect_scratch_consistency().unwrap();
+        assert!(post.dangling_dentries.is_empty());
+        assert!(post.orphan_inodes.is_empty());
+        assert!(post.orphan_aux_rows.is_empty());
+        assert_eq!(
+            post.referenced_payload_objects,
+            vec![ScratchPayloadObjectRef {
+                ino: live_file.ino,
+                object_id: 101,
+            }]
+        );
+    }
+
+    #[test]
+    fn export_snapshot_excludes_all_scratch_entries() {
+        let temp = studiofs_test_support::workspace_target_tempdir("scratch-snapshot-");
+        let meta = RedbMetaEngine::open(temp.path().join("meta.db")).unwrap();
+        meta.init_root(0, 0).unwrap();
+
+        let tracked = meta
+            .create_file(ROOT_INO, b"tracked.txt", 0, 0, 0o644)
+            .unwrap();
+        let scratch = InodeAttr::new_file(50, ROOT_INO, 0, 0, 0o644);
+        meta.create_scratch_entry(ROOT_INO, b"local.tmp", &scratch)
+            .unwrap();
+        meta.set_scratch_xattr(scratch.ino, b"user.local", b"1")
+            .unwrap();
+        meta.commit_scratch_overlay(
+            scratch.ino,
+            &[(
+                ChunkId(0),
+                vec![SliceRecord::new(
+                    SliceId(1),
+                    SliceOrder(1),
+                    SliceRange::new(0, 8).unwrap(),
+                    PayloadRef::new_partial(700, 8),
+                )],
+            )],
+        )
+        .unwrap();
+
+        let snapshot = meta.export_snapshot().unwrap();
+        assert!(snapshot.inodes.iter().any(|(ino, _)| *ino == tracked.ino));
+        assert!(!snapshot.inodes.iter().any(|(ino, _)| *ino == scratch.ino));
+        assert!(
+            !snapshot
+                .regular_file_overlay
+                .iter()
+                .any(|(ino, _)| *ino == scratch.ino)
+        );
+        assert!(
+            !meta
+                .get_local_referenced_object_ids()
+                .unwrap()
+                .contains(&700)
+        );
+        assert!(
+            meta.get_local_cache_referenced_object_ids()
+                .unwrap()
+                .contains(&700)
+        );
+    }
+    #[test]
+    fn clean_scratch_entry_checks_identity_and_current_age_atomically() {
+        let temp = studiofs_test_support::workspace_target_tempdir("scratch-clean-conditional-");
+        let meta = RedbMetaEngine::open(temp.path().join("meta.db")).unwrap();
+        meta.init_root(0, 0).unwrap();
+        let mut attr = InodeAttr::new_file(50, ROOT_INO, 0, 0, 0o644);
+        attr.mtime = 200;
+        meta.create_scratch_entry(ROOT_INO, b"file.tmp", &attr)
+            .unwrap();
+        assert!(matches!(
+            meta.clean_scratch_entry(ROOT_INO, b"file.tmp", 51, FileType::RegularFile, None),
+            Err(MetaError::EntryNotFound { .. })
+        ));
+        assert!(matches!(
+            meta.clean_scratch_entry(ROOT_INO, b"file.tmp", 50, FileType::RegularFile, Some(100)),
+            Err(MetaError::EntryNotFound { .. })
+        ));
+        assert_eq!(meta.get_scratch_attr(50).unwrap().mtime, 200);
+        let (removed, _) = meta
+            .clean_scratch_entry(ROOT_INO, b"file.tmp", 50, FileType::RegularFile, Some(200))
+            .unwrap();
+        assert_eq!(removed.ino, 50);
+        assert!(meta.get_scratch_attr(50).is_err());
     }
 }

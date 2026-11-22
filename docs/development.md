@@ -212,6 +212,18 @@ studiofs smount <volume-name> <snapshot-id> <mount-point>
 studiofs umount <mount-point>
 ```
 
+Local-only scratch-layer management works both through the mounted control API
+and offline against the volume's local `redb` database:
+
+```bash
+studiofs status <volume-name>
+studiofs fsck <volume-name> [--repair] [--cache-dir <dir>]
+studiofs scratch list [path] [--orphaned] [--volume <volume-name>]
+studiofs scratch clean [--older-than <duration>] [path] [--volume <volume-name>]
+studiofs scratch promote <path> [--volume <volume-name>]
+studiofs scratch restore <orphan> [--to <path>] [--volume <volume-name>]
+```
+
 The CLI claimant uses the shared Snapshot v2 materializer and leaves the
 durable job available for takeover by a mounted client if the process exits.
 

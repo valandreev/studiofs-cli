@@ -326,6 +326,7 @@ impl<M: ?Sized + MetaEngineCore> MetaEngineCore for RuntimeMetaHandle<M> {
     forward_method!(fn lookup_scratch_slices(&self, ino: Ino, offset: u64, length: u64) -> MetaResult<Vec<studiofs_meta::ResolvedSliceSpan>>);
     forward_method!(fn get_scratch_symlink_target(&self, ino: Ino) -> MetaResult<Vec<u8>>);
     forward_method!(fn unlink_scratch_entry(&self, parent: Ino, name: &[u8], keep_open_inode: bool) -> MetaResult<(InodeAttr, Vec<u64>)>);
+    forward_method!(fn clean_scratch_entry(&self, parent: Ino, name: &[u8], expected_ino: Ino, kind: studiofs_meta::FileType, mtime_cutoff: Option<i64>) -> MetaResult<(InodeAttr, Vec<u64>)>);
     forward_method!(fn finalize_orphan_scratch_inode(&self, ino: Ino) -> MetaResult<Vec<u64>>);
     forward_method!(fn rmdir_scratch_entry(&self, parent: Ino, name: &[u8]) -> MetaResult<InodeAttr>);
     forward_method!(fn rename_scratch_entry(&self, parent: Ino, name: &[u8], new_parent: Ino, new_name: &[u8], replace_if_exists: bool, keep_displaced_open: bool) -> MetaResult<studiofs_meta::ScratchRenameResult>);
@@ -343,6 +344,8 @@ impl<M: ?Sized + MetaEngineCore> MetaEngineCore for RuntimeMetaHandle<M> {
     forward_method!(fn clear_scratch_conflict(&self, ino: Ino) -> MetaResult<bool>);
     forward_method!(fn list_scratch_orphans(&self) -> MetaResult<Vec<studiofs_meta::ScratchOrphanRecord>>);
     forward_method!(fn restore_scratch_orphan(&self, timestamp_unix_ms: u64, root_old_path: &[u8], target_parent: Option<Ino>, target_name: Option<&[u8]>) -> MetaResult<InodeAttr>);
+    forward_method!(fn inspect_scratch_consistency(&self) -> MetaResult<studiofs_meta::ScratchConsistencyReport>);
+    forward_method!(fn repair_scratch_consistency(&self) -> MetaResult<studiofs_meta::ScratchConsistencyRepairSummary>);
     forward_method!(fn set_scratch_cache_dir(&self, cache_dir: std::path::PathBuf) -> MetaResult<()>);
     forward_method!(fn scratch_orphans_dir(&self) -> MetaResult<std::path::PathBuf>);
     forward_method!(fn load_ignore_rules_cache(&self) -> MetaResult<Option<Vec<u8>>>);

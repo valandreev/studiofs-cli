@@ -662,6 +662,73 @@ impl CacheIndex {
         Ok(())
     }
 
+    /// Transition a local-only scratch payload row to a tracked dirty object
+    /// awaiting upload (used by offline `studiofs scratch promote`).
+    ///
+    /// Returns `Ok(true)` when a scratch row was transitioned, or `Ok(false)`
+    /// when the object is absent or already non-scratch.
+    pub fn mark_scratch_dirty(&self, object_id: u64) -> Result<bool, CacheIndexError> {
+        self.maybe_fail_write_for_test()?;
+        let txn = self.db.begin_write().map_err(storage_error)?;
+        let transitioned = {
+            let mut payloads = txn
+                .open_table(PAYLOAD_OBJECTS_TABLE)
+                .map_err(storage_error)?;
+            let mut dirty_order = txn.open_table(DIRTY_ORDER_TABLE).map_err(storage_error)?;
+            let mut access_order = txn.open_table(ACCESS_ORDER_TABLE).map_err(storage_error)?;
+            let mut counters = txn.open_table(COUNTERS_TABLE).map_err(storage_error)?;
+
+            let Some(old) = read_entry_write(&payloads, object_id)? else {
+                return Ok(false);
+            };
+            if old.origin != LocalPayloadOrigin::Scratch {
+                return Ok(false);
+            }
+
+            let mut new = old.clone();
+            new.origin = LocalPayloadOrigin::Local;
+            new.access_order = allocate_sequence(&mut counters, COUNTER_NEXT_ACCESS_SEQ)?;
+            new.lifecycle = LocalPayloadLifecycleState::Dirty;
+            new.upload_state = LocalPayloadUploadState::Pending;
+            new.evictable = false;
+            if new.dirty_order.is_none() {
+                new.dirty_order = Some(allocate_sequence(&mut counters, COUNTER_NEXT_DIRTY_SEQ)?);
+            }
+
+            apply_entry_change(
+                object_id,
+                Some(&old),
+                Some(&new),
+                &mut payloads,
+                &mut dirty_order,
+                &mut access_order,
+                &mut counters,
+            )?;
+            true
+        };
+
+        txn.commit().map_err(storage_error)?;
+        Ok(transitioned)
+    }
+
+    /// Return all indexed object IDs owned by the local-only scratch layer,
+    /// in ascending object-id order.
+    pub fn scratch_object_ids(&self) -> Result<Vec<u64>, CacheIndexError> {
+        let txn = self.db.begin_read().map_err(storage_error)?;
+        let payloads = txn
+            .open_table(PAYLOAD_OBJECTS_TABLE)
+            .map_err(storage_error)?;
+        let mut ids = Vec::new();
+        for pair in payloads.iter().map_err(storage_error)? {
+            let (key, value) = pair.map_err(storage_error)?;
+            let entry = decode_entry(value.value(), key.value())?;
+            if entry.origin == LocalPayloadOrigin::Scratch {
+                ids.push(key.value());
+            }
+        }
+        Ok(ids)
+    }
+
     /// Mark a dirty object as uploading.
     pub fn mark_uploading(&self, object_id: u64) -> Result<(), CacheIndexError> {
         self.mark_uploading_with_order(object_id).map(|_| ())
@@ -3044,5 +3111,26 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![101, 102]
         );
+    }
+
+    #[test]
+    fn scratch_object_ids_and_mark_scratch_dirty_transition_accounting() {
+        let temp = studiofs_test_support::workspace_target_tempdir("test-scratch-dirty-");
+        let index = CacheIndex::open(temp.path().join("index.redb")).unwrap();
+        upsert_scratch(&index, 201, 16);
+        upsert_scratch(&index, 202, 24);
+        assert_eq!(index.scratch_object_ids().unwrap(), vec![201, 202]);
+        let before = index.stats().unwrap();
+        assert_eq!(before.scratch_bytes, 40);
+        assert_eq!(before.dirty_bytes, 0);
+
+        assert!(index.mark_scratch_dirty(201).unwrap());
+        assert!(!index.mark_scratch_dirty(201).unwrap());
+        assert!(!index.mark_scratch_dirty(999).unwrap());
+
+        assert_eq!(index.scratch_object_ids().unwrap(), vec![202]);
+        let after = index.stats().unwrap();
+        assert_eq!(after.scratch_bytes, 24);
+        assert_eq!(after.dirty_bytes, 16);
     }
 }

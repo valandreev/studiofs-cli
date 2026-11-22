@@ -84,6 +84,40 @@ impl LocalDiagnosticsHost {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn start_for_test(
+        runtime: &Handle,
+        dir: &Path,
+        base_name: &str,
+        source: Arc<dyn DiagnosticsDataSource>,
+    ) -> Result<(Self, LocalDiagnosticsDiscovery)> {
+        std::fs::create_dir_all(dir)?;
+        let endpoint = endpoint_for(dir, base_name, source.session_info().pid);
+        #[cfg(unix)]
+        let endpoint_path = bind_unix_listener_path(&endpoint)?;
+        let discovery = discovery_from_source(source.session_info(), endpoint.clone());
+        let lease_manager = Arc::new(ControllerLeaseManager::default());
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let task = runtime.spawn(run_server(
+            endpoint,
+            discovery.auth_token.clone(),
+            source,
+            lease_manager,
+            None,
+            None,
+            shutdown_rx,
+        ));
+        Ok((
+            Self {
+                #[cfg(unix)]
+                endpoint_path,
+                shutdown_tx,
+                task,
+            },
+            discovery,
+        ))
+    }
+
     pub(crate) async fn stop(self) {
         let _ = self.shutdown_tx.send(true);
         self.task.abort();

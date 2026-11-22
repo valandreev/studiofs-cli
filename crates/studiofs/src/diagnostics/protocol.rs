@@ -156,6 +156,24 @@ pub(super) enum DiagnosticsRequest {
         auth_token: String,
         path: String,
     },
+    ScratchList {
+        auth_token: String,
+        path: Option<String>,
+    },
+    ScratchListOrphans {
+        auth_token: String,
+        path: Option<String>,
+    },
+    ScratchClean {
+        auth_token: String,
+        path: Option<String>,
+        older_than_secs: Option<u64>,
+    },
+    ScratchRestore {
+        auth_token: String,
+        orphan: String,
+        target_path: Option<String>,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -221,6 +239,18 @@ pub(super) enum DiagnosticsResponse {
     },
     ScratchPromote {
         outcome: studiofs_vfs::ScratchPromotePathOutcome,
+    },
+    ScratchList {
+        entries: Vec<studiofs_vfs::ScratchListEntry>,
+    },
+    ScratchListOrphans {
+        orphans: Vec<studiofs_vfs::ScratchOrphanSummary>,
+    },
+    ScratchClean {
+        outcome: studiofs_vfs::ScratchCleanOutcome,
+    },
+    ScratchRestore {
+        outcome: studiofs_vfs::ScratchRestoreOutcome,
     },
     Error {
         code: String,

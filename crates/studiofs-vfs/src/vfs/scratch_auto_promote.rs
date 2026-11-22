@@ -155,7 +155,7 @@ impl AutoPromoteRateLimiter {
     }
 }
 
-fn join_relative_path(parent_rel: &[u8], name: &[u8]) -> Vec<u8> {
+pub(super) fn join_relative_path(parent_rel: &[u8], name: &[u8]) -> Vec<u8> {
     if parent_rel.is_empty() {
         return name.to_vec();
     }
@@ -166,11 +166,11 @@ fn join_relative_path(parent_rel: &[u8], name: &[u8]) -> Vec<u8> {
     path
 }
 
-fn format_relative_path(rel_path: &[u8]) -> String {
+pub(super) fn format_relative_path(rel_path: &[u8]) -> String {
     String::from_utf8_lossy(rel_path).into_owned()
 }
 
-fn parse_volume_relative_components(raw_path: &str) -> VfsResult<Vec<&str>> {
+pub(super) fn parse_volume_relative_components(raw_path: &str) -> VfsResult<Vec<&str>> {
     if raw_path.is_empty() {
         return Err(VfsError::InvalidName(
             "scratch promote path must name a file or directory inside the volume".to_string(),
@@ -188,7 +188,9 @@ fn parse_volume_relative_components(raw_path: &str) -> VfsResult<Vec<&str>> {
     Ok(components)
 }
 
-fn load_compiled_scratch_rules_from_meta(meta: &dyn MetaEngine) -> VfsResult<ScratchRules> {
+pub(super) fn load_compiled_scratch_rules_from_meta(
+    meta: &dyn MetaEngine,
+) -> VfsResult<ScratchRules> {
     let sources: BTreeMap<Vec<u8>, Vec<u8>> = match meta.load_ignore_rules_cache()? {
         Some(bytes) => match postcard::from_bytes(&bytes) {
             Ok(sources) => sources,
@@ -221,7 +223,7 @@ pub(super) enum ScratchPromoteSubtreeWalk {
 
 /// How the subtree walk treats an inode it reaches a second time.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum ScratchPromoteRevisit {
+pub(super) enum ScratchPromoteRevisit {
     /// Promotion freezes an exact set, so a repeated inode means the subtree
     /// changed under the walk.
     TargetChanged,
@@ -232,7 +234,7 @@ enum ScratchPromoteRevisit {
 /// Walks the scratch subtree under `root_attr`. Every direct child counts
 /// toward `entry_limit`, including children `keep_child_scratch` leaves in
 /// scratch; their own descendants are not visited.
-fn collect_scratch_promote_subtree<M: MetaEngineCore + ?Sized>(
+pub(super) fn collect_scratch_promote_subtree<M: MetaEngineCore + ?Sized>(
     meta: &M,
     root_attr: InodeAttr,
     root_rel_path: &[u8],

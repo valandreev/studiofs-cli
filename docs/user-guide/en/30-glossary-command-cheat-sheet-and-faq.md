@@ -46,6 +46,10 @@ In the examples, `projectfs` is your volume name and `Z:` is an available Window
 | Check the snapshot schedule | `studiofs snapshot projectfs policy show` | The same chapter |
 | Preview cleanup | `studiofs janitor projectfs --dry-run` | [Maintenance](27-maintenance-and-removing-a-volume.md) |
 | Clean up in small steps | `studiofs janitor projectfs --max-deletes 100` | The same chapter |
+| List local scratch entries or orphans | `studiofs scratch list --volume projectfs [--orphaned]` | [Scratch layer and `.studiofsignore`](31-scratch-layer-and-studiofsignore.md) |
+| Clean old scratch entries | `studiofs scratch clean --volume projectfs --older-than 7d` | The same chapter |
+| Promote a scratch path to tracked | `studiofs scratch promote --volume projectfs -- renders/tmp` | The same chapter |
+| Restore an orphaned scratch entry | `studiofs scratch restore --volume projectfs <orphan>` | The same chapter |
 
 For a snapshot, copy its actual identifier from the list. For example, if it is `projectfs.2026-08-12T14-07-09.482Z`:
 

@@ -25,6 +25,9 @@ pub(super) enum DiagnosticsServiceError {
     ProfilingStop(anyhow::Error),
     PayloadLimitUpdate(anyhow::Error),
     ScratchPromote(anyhow::Error),
+    ScratchList(anyhow::Error),
+    ScratchClean(anyhow::Error),
+    ScratchRestore(anyhow::Error),
 }
 
 impl DiagnosticsServiceError {
@@ -76,6 +79,18 @@ impl DiagnosticsServiceError {
             },
             Self::ScratchPromote(error) => DiagnosticsResponse::Error {
                 code: "scratch_promote_failed".to_string(),
+                message: error.to_string(),
+            },
+            Self::ScratchList(error) => DiagnosticsResponse::Error {
+                code: "scratch_list_failed".to_string(),
+                message: error.to_string(),
+            },
+            Self::ScratchClean(error) => DiagnosticsResponse::Error {
+                code: "scratch_clean_failed".to_string(),
+                message: error.to_string(),
+            },
+            Self::ScratchRestore(error) => DiagnosticsResponse::Error {
+                code: "scratch_restore_failed".to_string(),
                 message: error.to_string(),
             },
         }
@@ -363,6 +378,48 @@ impl<'a> DiagnosticsSessionService<'a> {
             .source
             .promote_scratch_path(path)
             .map_err(DiagnosticsServiceError::ScratchPromote)
+    }
+
+    pub(super) fn list_scratch_entries(
+        &self,
+        path: Option<&str>,
+    ) -> DiagnosticsServiceResult<Vec<studiofs_vfs::ScratchListEntry>> {
+        self.deps
+            .source
+            .list_scratch_entries(path)
+            .map_err(DiagnosticsServiceError::ScratchList)
+    }
+
+    pub(super) fn list_scratch_orphans(
+        &self,
+        path: Option<&str>,
+    ) -> DiagnosticsServiceResult<Vec<studiofs_vfs::ScratchOrphanSummary>> {
+        self.deps
+            .source
+            .list_scratch_orphans(path)
+            .map_err(DiagnosticsServiceError::ScratchList)
+    }
+
+    pub(super) fn clean_scratch_entries(
+        &self,
+        path: Option<&str>,
+        older_than_secs: Option<u64>,
+    ) -> DiagnosticsServiceResult<studiofs_vfs::ScratchCleanOutcome> {
+        self.deps
+            .source
+            .clean_scratch_entries(path, older_than_secs)
+            .map_err(DiagnosticsServiceError::ScratchClean)
+    }
+
+    pub(super) fn restore_scratch_orphan(
+        &self,
+        orphan: &str,
+        target_path: Option<&str>,
+    ) -> DiagnosticsServiceResult<studiofs_vfs::ScratchRestoreOutcome> {
+        self.deps
+            .source
+            .restore_scratch_orphan(orphan, target_path)
+            .map_err(DiagnosticsServiceError::ScratchRestore)
     }
 
     pub(super) fn create_case(
@@ -1102,6 +1159,44 @@ pub(super) fn dispatch_protocol(
             auth_token,
             || service.promote_scratch_path(&path),
             |outcome| DiagnosticsResponse::ScratchPromote { outcome },
+        ),
+        DiagnosticsRequest::ScratchList {
+            auth_token: provided,
+            path,
+        } => authorized_response(
+            &provided,
+            auth_token,
+            || service.list_scratch_entries(path.as_deref()),
+            |entries| DiagnosticsResponse::ScratchList { entries },
+        ),
+        DiagnosticsRequest::ScratchListOrphans {
+            auth_token: provided,
+            path,
+        } => authorized_response(
+            &provided,
+            auth_token,
+            || service.list_scratch_orphans(path.as_deref()),
+            |orphans| DiagnosticsResponse::ScratchListOrphans { orphans },
+        ),
+        DiagnosticsRequest::ScratchClean {
+            auth_token: provided,
+            path,
+            older_than_secs,
+        } => authorized_response(
+            &provided,
+            auth_token,
+            || service.clean_scratch_entries(path.as_deref(), older_than_secs),
+            |outcome| DiagnosticsResponse::ScratchClean { outcome },
+        ),
+        DiagnosticsRequest::ScratchRestore {
+            auth_token: provided,
+            orphan,
+            target_path,
+        } => authorized_response(
+            &provided,
+            auth_token,
+            || service.restore_scratch_orphan(&orphan, target_path.as_deref()),
+            |outcome| DiagnosticsResponse::ScratchRestore { outcome },
         ),
     }
 }

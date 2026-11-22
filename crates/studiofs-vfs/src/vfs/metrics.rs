@@ -2453,6 +2453,127 @@ pub struct ScratchPromotePathOutcome {
     pub promoted_inodes: usize,
 }
 
+/// Warning about patterns in a `.studiofsignore` file that would match `.studiofsignore` itself.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScratchRuleFileWarning {
+    /// Volume-relative path to the `.studiofsignore` file (e.g. `.studiofsignore` or `shots/.studiofsignore`).
+    pub rule_file_path: String,
+    /// One-based line numbers of patterns that would match `.studiofsignore`.
+    pub lines: Vec<usize>,
+}
+
+/// Summary of one persisted scratch name-conflict record (`<name>.scratch-conflict-<n>`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScratchConflictSummary {
+    /// Scratch inode number.
+    pub ino: u64,
+    /// Original scratch name before conflict renaming.
+    pub original_name: String,
+    /// Renamed scratch name.
+    pub conflict_name: String,
+    /// Volume-relative path when the parent directory is reachable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relative_path: Option<String>,
+}
+
+/// Summary of one orphaned scratch subtree relocated outside the namespace.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScratchOrphanSummary {
+    /// Stable identifier `<timestamp_unix_ms>/<root_old_path>` accepted by `studiofs scratch restore`.
+    pub id: String,
+    /// Relocation timestamp in Unix milliseconds.
+    pub timestamp_unix_ms: u64,
+    /// Original volume-relative path before parent removal.
+    pub root_old_path: String,
+    /// Number of entries in the orphaned subtree.
+    pub entry_count: usize,
+    /// Total logical bytes across regular files in the orphaned subtree.
+    pub total_bytes: u64,
+    /// Whether the orphan has been materialized under `<cache>/scratch-orphans`.
+    pub materialized: bool,
+}
+
+/// Comprehensive scratch-layer status snapshot reported by `studiofs status`
+/// in both mounted and offline modes.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VfsScratchStatusSnapshot {
+    /// Total number of reachable scratch entries (files, directories, symlinks).
+    pub entry_count: usize,
+    /// Total logical bytes across reachable scratch regular files.
+    pub total_bytes: u64,
+    /// Scratch entries attached to tracked parents that no longer match any ignore rule.
+    pub no_longer_matching_count: usize,
+    /// Sample of volume-relative paths for entries no longer matching any ignore rule.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub no_longer_matching_paths: Vec<String>,
+    /// Scratch directory subtrees currently blocked by the background promote entry limit.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub over_limit_directories: Vec<ScratchPromoteOverLimitEntry>,
+    /// Persisted scratch name-conflict records.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub conflicts: Vec<ScratchConflictSummary>,
+    /// Orphaned scratch subtrees relocated outside the namespace.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub orphans: Vec<ScratchOrphanSummary>,
+    /// Number of tracked entries (files or top-level matched directories) matching a current ignore rule.
+    pub tracked_matching_rule_count: usize,
+    /// Sample of volume-relative paths for tracked entries matching a current ignore rule.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tracked_matching_rule_paths: Vec<String>,
+    /// `.studiofsignore` files containing patterns that would match `.studiofsignore` itself.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rule_file_warnings: Vec<ScratchRuleFileWarning>,
+}
+
+/// One scratch entry returned by `studiofs scratch list`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScratchListEntry {
+    /// Volume-relative path.
+    pub relative_path: String,
+    /// Entry kind (`file`, `dir`, `symlink`).
+    pub kind: String,
+    /// Logical size in bytes.
+    pub size: u64,
+    /// Modification time in Unix seconds.
+    pub mtime_secs: i64,
+    /// Whether this entry has a persisted scratch name-conflict record.
+    #[serde(default)]
+    pub is_conflict: bool,
+    /// Whether this entry no longer matches any ignore rule.
+    #[serde(default)]
+    pub no_longer_matches: bool,
+    /// Whether this entry currently has open handles on a live mount.
+    #[serde(default)]
+    pub has_open_handles: bool,
+}
+
+/// Summary returned by `studiofs scratch clean`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScratchCleanOutcome {
+    /// Number of scratch entries removed.
+    pub removed_entries: usize,
+    /// Total logical bytes freed from removed regular files.
+    pub freed_bytes: u64,
+    /// Number of entries skipped because of open file handles.
+    pub skipped_open_handles: usize,
+    /// Number of entries skipped because they were newer than `--older-than`.
+    pub skipped_newer: usize,
+    /// Local payload object IDs freed (for offline cleanup of the local cache store).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub freed_payload_object_ids: Vec<u64>,
+}
+
+/// Summary returned by `studiofs scratch restore`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScratchRestoreOutcome {
+    /// Restored orphan identifier `<timestamp_unix_ms>/<root_old_path>`.
+    pub orphan_id: String,
+    /// Volume-relative path where the orphan was restored.
+    pub restored_path: String,
+    /// Inode number of the restored root entry.
+    pub ino: u64,
+}
+
 /// Observability snapshot for the background scratch-layer automatic promotion worker.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VfsScratchAutoPromoteSnapshot {

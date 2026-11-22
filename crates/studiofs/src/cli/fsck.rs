@@ -2,12 +2,15 @@
 
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use clap::Args;
+use studiofs_cache::open_local_payload_backend;
+use studiofs_cache::runtime::{CacheIndex, LocalPayloadBackendKind, detect_cache_backends};
 use studiofs_meta::engine::UndoLogKind;
 use studiofs_meta::{
     DirEntry, FileType, MetaEngine, MetaError, MetaOpenOptions, MetadataBackend, ROOT_INO,
+    ScratchDanglingDentry, ScratchOrphanAuxRow, ScratchOrphanInode, ScratchPayloadObjectRef,
     open_meta_engine_with_options,
 };
 use thiserror::Error;
@@ -51,6 +54,11 @@ struct FsckReport {
     deferred_deletes: usize,
     undo_pending_create: usize,
     undo_deferred_delete: usize,
+    scratch_dangling_dentries: Vec<ScratchDanglingDentry>,
+    scratch_orphan_inodes: Vec<ScratchOrphanInode>,
+    scratch_orphan_aux_rows: Vec<ScratchOrphanAuxRow>,
+    scratch_payload_without_entry: Vec<u64>,
+    scratch_entry_without_payload: Vec<ScratchPayloadObjectRef>,
 }
 
 impl FsckReport {
@@ -62,6 +70,17 @@ impl FsckReport {
             || self.deferred_deletes > 0
             || self.undo_pending_create > 0
             || self.undo_deferred_delete > 0
+            || !self.scratch_dangling_dentries.is_empty()
+            || !self.scratch_orphan_inodes.is_empty()
+            || !self.scratch_orphan_aux_rows.is_empty()
+            || !self.scratch_payload_without_entry.is_empty()
+            || !self.scratch_entry_without_payload.is_empty()
+    }
+
+    fn has_scratch_metadata_orphans(&self) -> bool {
+        !self.scratch_dangling_dentries.is_empty()
+            || !self.scratch_orphan_inodes.is_empty()
+            || !self.scratch_orphan_aux_rows.is_empty()
     }
 }
 
@@ -109,6 +128,10 @@ pub(crate) struct FsckArgs {
     /// Volume name
     name: String,
 
+    /// Override local cache base directory (defaults to `<meta-dir>/cache`)
+    #[arg(long)]
+    cache_dir: Option<PathBuf>,
+
     /// Repair findings immediately without interactive confirmation
     #[arg(long)]
     repair: bool,
@@ -117,7 +140,12 @@ pub(crate) struct FsckArgs {
 impl FsckArgs {
     pub(crate) fn dispatch(self) -> anyhow::Result<()> {
         let meta_dir = super::utils::get_default_meta_dir(&self.name)?;
-        run(&self.name, &meta_dir, self.repair)?;
+        run(
+            &self.name,
+            &meta_dir,
+            self.cache_dir.as_deref(),
+            self.repair,
+        )?;
         Ok(())
     }
 }
@@ -178,7 +206,80 @@ fn scan_namespace(meta: &dyn MetaEngine) -> FsckResult<NamespaceScan> {
     Ok(scan)
 }
 
-fn collect_report_with_progress(meta: &dyn MetaEngine, progress: bool) -> FsckResult<FsckReport> {
+fn collect_scratch_consistency(
+    meta: &dyn MetaEngine,
+    cache_path: Option<&Path>,
+    report: &mut FsckReport,
+) -> FsckResult<()> {
+    let scratch = meta.inspect_scratch_consistency()?;
+    report.scratch_dangling_dentries = scratch.dangling_dentries;
+    report.scratch_orphan_inodes = scratch.orphan_inodes;
+    report.scratch_orphan_aux_rows = scratch.orphan_aux_rows;
+
+    let Some(cache_path) = cache_path else {
+        return Ok(());
+    };
+    let detection = detect_cache_backends(cache_path)?;
+    if !detection.index_exists {
+        report.scratch_entry_without_payload = scratch.referenced_payload_objects;
+        return Ok(());
+    }
+
+    let index = CacheIndex::open(&detection.layout.redb_index_path).map_err(|error| {
+        FsckError::Message(format!(
+            "failed to open local cache index '{}': {error}",
+            detection.layout.redb_index_path.display()
+        ))
+    })?;
+    let indexed_scratch_ids: HashSet<u64> = index
+        .scratch_object_ids()
+        .map_err(|error| {
+            FsckError::Message(format!(
+                "failed to list scratch payload objects from '{}': {error}",
+                detection.layout.redb_index_path.display()
+            ))
+        })?
+        .into_iter()
+        .collect();
+    let all_indexed_ids: HashSet<u64> = index
+        .all_object_ids()
+        .map_err(|error| {
+            FsckError::Message(format!(
+                "failed to list indexed payload objects from '{}': {error}",
+                detection.layout.redb_index_path.display()
+            ))
+        })?
+        .into_iter()
+        .collect();
+
+    let referenced_ids = meta.get_local_cache_referenced_object_ids()?;
+
+    let mut payload_without_entry: Vec<u64> = indexed_scratch_ids
+        .into_iter()
+        .filter(|id| !referenced_ids.contains(id))
+        .collect();
+    payload_without_entry.sort_unstable();
+    report.scratch_payload_without_entry = payload_without_entry;
+
+    let mut entry_without_payload = Vec::new();
+    for item in scratch.referenced_payload_objects {
+        let on_disk = detection
+            .layout
+            .payload_object_path(item.object_id)
+            .try_exists()?;
+        if !all_indexed_ids.contains(&item.object_id) || !on_disk {
+            entry_without_payload.push(item);
+        }
+    }
+    report.scratch_entry_without_payload = entry_without_payload;
+    Ok(())
+}
+
+fn collect_report_with_progress(
+    meta: &dyn MetaEngine,
+    cache_path: Option<&Path>,
+    progress: bool,
+) -> FsckResult<FsckReport> {
     if progress {
         println!("Collecting fsck inputs...");
         println!("  reading pending create records...");
@@ -250,11 +351,24 @@ fn collect_report_with_progress(meta: &dyn MetaEngine, progress: bool) -> FsckRe
         }
     }
 
+    if progress {
+        println!("  checking scratch table and local payload consistency...");
+    }
+    collect_scratch_consistency(meta, cache_path, &mut report)?;
+
     Ok(report)
 }
 
 fn collect_report(meta: &dyn MetaEngine) -> FsckResult<FsckReport> {
-    collect_report_with_progress(meta, false)
+    collect_report_with_progress(meta, None, false)
+}
+
+#[cfg(test)]
+fn collect_report_with_cache(
+    meta: &dyn MetaEngine,
+    cache_path: Option<&Path>,
+) -> FsckResult<FsckReport> {
+    collect_report_with_progress(meta, cache_path, false)
 }
 
 fn print_report(name: &str, report: &FsckReport) {
@@ -267,6 +381,26 @@ fn print_report(name: &str, report: &FsckReport) {
     println!("  deferred deletes:     {}", report.deferred_deletes);
     println!("  undo pending_create:  {}", report.undo_pending_create);
     println!("  undo deferred_delete: {}", report.undo_deferred_delete);
+    println!(
+        "  scratch dangling dentries:   {}",
+        report.scratch_dangling_dentries.len()
+    );
+    println!(
+        "  scratch orphan inodes:       {}",
+        report.scratch_orphan_inodes.len()
+    );
+    println!(
+        "  scratch orphan aux rows:     {}",
+        report.scratch_orphan_aux_rows.len()
+    );
+    println!(
+        "  scratch payload w/o entry:   {}",
+        report.scratch_payload_without_entry.len()
+    );
+    println!(
+        "  scratch entry w/o payload:   {}",
+        report.scratch_entry_without_payload.len()
+    );
 
     if !report.dangling.is_empty() {
         println!();
@@ -301,6 +435,73 @@ fn print_report(name: &str, report: &FsckReport) {
         }
         if report.nlink_mismatches.len() > 25 {
             println!("  ... and {} more", report.nlink_mismatches.len() - 25);
+        }
+    }
+
+    if !report.scratch_dangling_dentries.is_empty() {
+        println!();
+        println!("Scratch dangling dentries (up to 25):");
+        for d in report.scratch_dangling_dentries.iter().take(25) {
+            println!("  parent={} name={:?} ino={}", d.parent, d.name, d.ino);
+        }
+        if report.scratch_dangling_dentries.len() > 25 {
+            println!(
+                "  ... and {} more",
+                report.scratch_dangling_dentries.len() - 25
+            );
+        }
+    }
+
+    if !report.scratch_orphan_inodes.is_empty() {
+        println!();
+        println!("Scratch orphan inodes (up to 25):");
+        for o in report.scratch_orphan_inodes.iter().take(25) {
+            println!("  ino={} kind={:?} nlink={}", o.ino, o.kind, o.nlink);
+        }
+        if report.scratch_orphan_inodes.len() > 25 {
+            println!("  ... and {} more", report.scratch_orphan_inodes.len() - 25);
+        }
+    }
+
+    if !report.scratch_orphan_aux_rows.is_empty() {
+        println!();
+        println!("Scratch orphan aux rows (up to 25):");
+        for row in report.scratch_orphan_aux_rows.iter().take(25) {
+            println!("  table={:?} ino={}", row.table, row.ino);
+        }
+        if report.scratch_orphan_aux_rows.len() > 25 {
+            println!(
+                "  ... and {} more",
+                report.scratch_orphan_aux_rows.len() - 25
+            );
+        }
+    }
+
+    if !report.scratch_payload_without_entry.is_empty() {
+        println!();
+        println!("Scratch payload objects without metadata entry (up to 25):");
+        for object_id in report.scratch_payload_without_entry.iter().take(25) {
+            println!("  object_id={object_id}");
+        }
+        if report.scratch_payload_without_entry.len() > 25 {
+            println!(
+                "  ... and {} more",
+                report.scratch_payload_without_entry.len() - 25
+            );
+        }
+    }
+
+    if !report.scratch_entry_without_payload.is_empty() {
+        println!();
+        println!("Scratch entries missing local payload objects (up to 25):");
+        for missing in report.scratch_entry_without_payload.iter().take(25) {
+            println!("  ino={} object_id={}", missing.ino, missing.object_id);
+        }
+        if report.scratch_entry_without_payload.len() > 25 {
+            println!(
+                "  ... and {} more",
+                report.scratch_entry_without_payload.len() - 25
+            );
         }
     }
 }
@@ -466,7 +667,17 @@ fn repair_orphan_directory(
     Ok(())
 }
 
+#[cfg(test)]
 fn repair(meta: &dyn MetaEngine, report: &FsckReport) -> FsckResult<()> {
+    repair_with_cache(meta, None, None, report)
+}
+
+fn repair_with_cache(
+    meta: &dyn MetaEngine,
+    cache_path: Option<&Path>,
+    volume_uuid: Option<&str>,
+    report: &FsckReport,
+) -> FsckResult<()> {
     let replayed = meta.recover_undo_logs()?;
     if !replayed.is_empty() {
         println!(
@@ -549,6 +760,42 @@ fn repair(meta: &dyn MetaEngine, report: &FsckReport) -> FsckResult<()> {
         repaired_nlinks += 1;
     }
 
+    let mut scratch_repair = studiofs_meta::ScratchConsistencyRepairSummary::default();
+    if report.has_scratch_metadata_orphans() {
+        scratch_repair = meta.repair_scratch_consistency()?;
+    }
+
+    let mut scratch_payloads_to_remove: Vec<u64> = scratch_repair.freed_payload_object_ids.clone();
+    scratch_payloads_to_remove.extend(report.scratch_payload_without_entry.iter().copied());
+    scratch_payloads_to_remove.sort_unstable();
+    scratch_payloads_to_remove.dedup();
+    if !scratch_payloads_to_remove.is_empty() {
+        let still_live = meta.get_local_cache_referenced_object_ids()?;
+        scratch_payloads_to_remove.retain(|object_id| !still_live.contains(object_id));
+    }
+    let mut removed_scratch_payloads = 0usize;
+    if !scratch_payloads_to_remove.is_empty()
+        && let (Some(cache_path), Some(volume_uuid)) = (cache_path, volume_uuid)
+        && let Ok(detection) = detect_cache_backends(cache_path)
+        && detection.runtime_backend() == Some(LocalPayloadBackendKind::Current)
+    {
+        let opened = open_local_payload_backend(cache_path, volume_uuid).map_err(|error| {
+            FsckError::Message(format!(
+                "failed to open local payload backend at '{}': {error}",
+                cache_path.display()
+            ))
+        })?;
+        opened
+            .backend
+            .remove_batch(&scratch_payloads_to_remove)
+            .map_err(|error| {
+                FsckError::Message(format!(
+                    "failed to remove unreferenced scratch payloads: {error}"
+                ))
+            })?;
+        removed_scratch_payloads = scratch_payloads_to_remove.len();
+    }
+
     println!("Repair summary:");
     println!("  replayed undo parents: {}", replayed.len());
     println!("  dangling entries removed: {}", removed_dangling);
@@ -561,13 +808,34 @@ fn repair(meta: &dyn MetaEngine, report: &FsckReport) -> FsckResult<()> {
     println!("  orphan dirs skipped: {}", skipped_dir_orphans);
     println!("  orphan hardlinks skipped: {}", skipped_hardlink_orphans);
     println!("  nlink mismatches repaired: {}", repaired_nlinks);
+    println!(
+        "  scratch dangling dentries removed: {}",
+        scratch_repair.removed_dangling_dentries
+    );
+    println!(
+        "  scratch orphan inodes removed: {}",
+        scratch_repair.removed_orphan_inodes
+    );
+    println!(
+        "  scratch orphan aux rows removed: {}",
+        scratch_repair.removed_orphan_aux_rows
+    );
+    println!(
+        "  scratch unreferenced payloads removed: {}",
+        removed_scratch_payloads
+    );
     if skipped_dir_orphans > 0 {
         println!("  skipped orphan dirs: {skipped_dir_orphans}");
     }
     Ok(())
 }
 
-pub fn run<AutoRepair>(name: &str, meta_dir: &Path, auto_repair: AutoRepair) -> FsckResult<()>
+pub fn run<AutoRepair>(
+    name: &str,
+    meta_dir: &Path,
+    cache_dir: Option<&Path>,
+    auto_repair: AutoRepair,
+) -> FsckResult<()>
 where
     AutoRepair: Into<FsckRepairMode>,
 {
@@ -587,6 +855,10 @@ where
         },
     )?;
     let format_info = meta.get_format_info()?;
+    let cache_path = cache_dir
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| meta_dir.join("cache"))
+        .join(&format_info.uuid);
 
     if format_info.metadata.backend == MetadataBackend::Postgres {
         println!("Syncing local metadata from PostgreSQL before fsck...");
@@ -594,7 +866,7 @@ where
     }
 
     println!("Collecting fsck report...");
-    let report = collect_report_with_progress(meta.as_ref(), true)?;
+    let report = collect_report_with_progress(meta.as_ref(), Some(&cache_path), true)?;
     print_report(name, &report);
 
     if !report.has_findings() {
@@ -616,11 +888,16 @@ where
     }
 
     println!("Running repair...");
-    repair(meta.as_ref(), &report)?;
+    repair_with_cache(
+        meta.as_ref(),
+        Some(&cache_path),
+        Some(&format_info.uuid),
+        &report,
+    )?;
 
     println!();
     println!("Rescanning...");
-    let post = collect_report_with_progress(meta.as_ref(), true)?;
+    let post = collect_report_with_progress(meta.as_ref(), Some(&cache_path), true)?;
     print_report(name, &post);
     if post.has_findings() {
         println!("Some issues remain; rerun fsck or inspect logs.");
@@ -853,8 +1130,13 @@ mod tests {
     fn fsck_parses_defaults() {
         let cli = crate::cli::parse_for_test(&["fsck", "vol"]).unwrap();
         match cli.command {
-            crate::cli::Commands::Fsck(FsckArgs { name, repair }) => {
+            crate::cli::Commands::Fsck(FsckArgs {
+                name,
+                cache_dir,
+                repair,
+            }) => {
                 assert_eq!(name, "vol");
+                assert!(cache_dir.is_none());
                 assert!(!repair);
             }
             other => panic!("expected Fsck, got {other:?}"),
@@ -868,5 +1150,113 @@ mod tests {
             crate::cli::Commands::Fsck(FsckArgs { repair, .. }) => assert!(repair),
             other => panic!("expected Fsck, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn fsck_detects_and_repairs_scratch_inconsistencies() {
+        use studiofs_meta::{InodeAttr, MetaEngineCore};
+
+        let TestEngine { engine, _dir } = temp_engine();
+        let volume_uuid = uuid::Uuid::new_v4().to_string();
+        let cache_path = _dir.path().join("cache").join(&volume_uuid);
+
+        // Create two scratch files: one with a present payload (401), one with a missing payload (402).
+        // Also leave an unreferenced scratch payload (403) in the local cache store,
+        // and an orphaned scratch inode (unlinked with keep_open_inode=true).
+        let opened = open_local_payload_backend(&cache_path, &volume_uuid).unwrap();
+        opened
+            .backend
+            .put_scratch_batch(&[
+                studiofs_cache::local::LocalPayloadPut {
+                    object_id: 401,
+                    data: bytes::Bytes::from_static(b"present-scratch"),
+                    evictable: false,
+                },
+                studiofs_cache::local::LocalPayloadPut {
+                    object_id: 403,
+                    data: bytes::Bytes::from_static(b"orphan-payload-no-entry"),
+                    evictable: false,
+                },
+            ])
+            .unwrap();
+        drop(opened);
+
+        let live = InodeAttr::new_file(200, ROOT_INO, 0, 0, 0o644);
+        engine
+            .create_scratch_entry(ROOT_INO, b"live.tmp", &live)
+            .unwrap();
+        engine
+            .commit_scratch_overlay(
+                live.ino,
+                &[(
+                    ChunkId(0),
+                    vec![SliceRecord::new(
+                        SliceId(1),
+                        SliceOrder(1),
+                        SliceRange::new(0, 15).unwrap(),
+                        PayloadRef::new_partial(401, 15),
+                    )],
+                )],
+            )
+            .unwrap();
+
+        let missing_payload = InodeAttr::new_file(201, ROOT_INO, 0, 0, 0o644);
+        engine
+            .create_scratch_entry(ROOT_INO, b"missing.tmp", &missing_payload)
+            .unwrap();
+        engine
+            .commit_scratch_overlay(
+                missing_payload.ino,
+                &[(
+                    ChunkId(0),
+                    vec![SliceRecord::new(
+                        SliceId(1),
+                        SliceOrder(1),
+                        SliceRange::new(0, 10).unwrap(),
+                        PayloadRef::new_partial(402, 10),
+                    )],
+                )],
+            )
+            .unwrap();
+
+        let orphan = InodeAttr::new_file(202, ROOT_INO, 0, 0, 0o644);
+        engine
+            .create_scratch_entry(ROOT_INO, b"orphan.tmp", &orphan)
+            .unwrap();
+        engine
+            .unlink_scratch_entry(ROOT_INO, b"orphan.tmp", true)
+            .unwrap();
+
+        let missing_cache =
+            collect_report_with_cache(&engine, Some(&_dir.path().join("absent"))).unwrap();
+        assert_eq!(missing_cache.scratch_entry_without_payload.len(), 2);
+
+        // Simulate a promotion interrupted before the cache origin was updated.
+        studiofs_vfs::promote_scratch_path_offline(&engine, "live.tmp").unwrap();
+        let mut report = collect_report_with_cache(&engine, Some(&cache_path)).unwrap();
+        assert!(report.has_findings());
+        assert_eq!(report.scratch_orphan_inodes.len(), 1);
+        assert_eq!(report.scratch_orphan_inodes[0].ino, orphan.ino);
+        assert_eq!(report.scratch_payload_without_entry, vec![403]);
+        assert_eq!(report.scratch_entry_without_payload.len(), 1);
+        assert_eq!(
+            report.scratch_entry_without_payload[0].ino,
+            missing_payload.ino
+        );
+        assert_eq!(report.scratch_entry_without_payload[0].object_id, 402);
+
+        // The repair must revalidate reachability even for a stale report.
+        report.scratch_payload_without_entry.push(401);
+        repair_with_cache(&engine, Some(&cache_path), Some(&volume_uuid), &report).unwrap();
+
+        let detection = detect_cache_backends(&cache_path).unwrap();
+        assert!(detection.layout.payload_object_path(401).is_file());
+
+        let post = collect_report_with_cache(&engine, Some(&cache_path)).unwrap();
+        assert!(post.scratch_orphan_inodes.is_empty());
+        assert!(post.scratch_payload_without_entry.is_empty());
+        // Missing payload cannot be fabricated; it remains reported for operator action.
+        assert_eq!(post.scratch_entry_without_payload.len(), 1);
+        assert_eq!(post.scratch_entry_without_payload[0].object_id, 402);
     }
 }

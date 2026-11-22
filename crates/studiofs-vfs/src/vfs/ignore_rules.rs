@@ -229,6 +229,11 @@ impl IgnoreRules {
         }
     }
 
+    /// Returns the currently published compiled rule snapshot.
+    pub(super) fn current_rules(&self) -> Arc<ScratchRules> {
+        self.snapshot.read().clone()
+    }
+
     /// Request a refresh after a local flush or close of a known rule file.
     pub(super) fn note_local_barrier(&self, ino: Ino) {
         if self.watched.lock().files.contains(&ino) {

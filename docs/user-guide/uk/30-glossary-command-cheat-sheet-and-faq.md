@@ -46,6 +46,10 @@
 | Перевірити розклад знімків | `studiofs snapshot projectfs policy show` | Та сама глава |
 | Попередньо оцінити прибирання | `studiofs janitor projectfs --dry-run` | [Обслуговування](27-maintenance-and-removing-a-volume.md) |
 | Прибирати невеликими кроками | `studiofs janitor projectfs --max-deletes 100` | Та сама глава |
+| Показати локальні scratch-записи або осиротілі піддерева | `studiofs scratch list --volume projectfs [--orphaned]` | [Scratch-шар та `.studiofsignore`](31-scratch-layer-and-studiofsignore.md) |
+| Очистити старі scratch-записи | `studiofs scratch clean --volume projectfs --older-than 7d` | Та сама глава |
+| Перевести scratch-шлях у відстежувані | `studiofs scratch promote --volume projectfs -- renders/tmp` | Та сама глава |
+| Відновити осиротілий scratch-запис | `studiofs scratch restore --volume projectfs <orphan>` | Та сама глава |
 
 Для знімка скопіюйте справжній ідентифікатор зі списку. Наприклад, якщо він `projectfs.2026-08-12T14-07-09.482Z`:
 

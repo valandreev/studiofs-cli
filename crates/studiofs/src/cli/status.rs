@@ -186,6 +186,125 @@ fn format_scratch_over_limit_directories(
         .collect()
 }
 
+fn format_scratch_status_section(
+    volume_name: &str,
+    scratch: Option<&studiofs_vfs::VfsScratchStatusSnapshot>,
+    over_limit_fallback: &[studiofs_vfs::ScratchPromoteOverLimitEntry],
+) -> Vec<String> {
+    let mut lines = vec![String::new(), "Scratch".to_string(), "───────".to_string()];
+    let Some(scratch) = scratch else {
+        lines.push("  Status unavailable".to_string());
+        lines.extend(format_scratch_over_limit_directories(
+            volume_name,
+            over_limit_fallback,
+        ));
+        return lines;
+    };
+    lines.extend([
+        format!("  Entries:                 {}", scratch.entry_count),
+        format!(
+            "  Bytes:                   {}",
+            format_bytes(scratch.total_bytes)
+        ),
+        format!(
+            "  No longer matching rule: {}",
+            scratch.no_longer_matching_count
+        ),
+        format!(
+            "  Over promote limit:      {}",
+            scratch.over_limit_directories.len()
+        ),
+        format!("  Conflicts:               {}", scratch.conflicts.len()),
+        format!("  Orphans:                 {}", scratch.orphans.len()),
+        format!(
+            "  Tracked matching rule:   {}",
+            scratch.tracked_matching_rule_count
+        ),
+        format!(
+            "  Rule file warnings:      {}",
+            scratch.rule_file_warnings.len()
+        ),
+    ]);
+
+    for path in scratch.no_longer_matching_paths.iter().take(10) {
+        lines.push(format!("    no longer matching: {path}"));
+    }
+    if scratch.no_longer_matching_count > 10 {
+        lines.push(format!(
+            "    ... and {} more",
+            scratch.no_longer_matching_count - 10
+        ));
+    }
+
+    lines.extend(format_scratch_over_limit_directories(
+        volume_name,
+        &scratch.over_limit_directories,
+    ));
+
+    for conflict in scratch.conflicts.iter().take(10) {
+        let display = conflict
+            .relative_path
+            .as_deref()
+            .unwrap_or(&conflict.conflict_name);
+        lines.push(format!(
+            "    conflict: `{display}` (was `{}`)",
+            conflict.original_name
+        ));
+    }
+    if scratch.conflicts.len() > 10 {
+        lines.push(format!(
+            "    ... and {} more conflicts",
+            scratch.conflicts.len() - 10
+        ));
+    }
+
+    for orphan in scratch.orphans.iter().take(10) {
+        lines.push(format!(
+            "    orphan: {} ({} entries, {})",
+            orphan.id,
+            orphan.entry_count,
+            format_bytes(orphan.total_bytes)
+        ));
+    }
+    if scratch.orphans.len() > 10 {
+        lines.push(format!(
+            "    ... and {} more orphans",
+            scratch.orphans.len() - 10
+        ));
+    }
+
+    for path in scratch.tracked_matching_rule_paths.iter().take(10) {
+        lines.push(format!("    tracked matching rule: {path}"));
+    }
+    if scratch.tracked_matching_rule_count > 10 {
+        lines.push(format!(
+            "    ... and {} more tracked entries matching a rule",
+            scratch.tracked_matching_rule_count - 10
+        ));
+    }
+
+    for warning in &scratch.rule_file_warnings {
+        let line_list: Vec<String> = warning.lines.iter().map(ToString::to_string).collect();
+        lines.push(format!(
+            "    warning: `{}` line(s) {} match `.studiofsignore` (rule files are always tracked)",
+            warning.rule_file_path,
+            line_list.join(", ")
+        ));
+    }
+
+    lines
+}
+
+fn print_scratch_status_section(
+    volume_name: &str,
+    scratch: Option<&studiofs_vfs::VfsScratchStatusSnapshot>,
+    over_limit_fallback: &[studiofs_vfs::ScratchPromoteOverLimitEntry],
+) {
+    for line in format_scratch_status_section(volume_name, scratch, over_limit_fallback) {
+        println!("{line}");
+    }
+}
+
 fn mounted_runtime_snapshot(
     volume_name: &str,
 ) -> Option<crate::diagnostics::DiagnosticsRuntimeSnapshot> {
@@ -754,14 +873,17 @@ pub fn run(
                 if let Some(scrub) = snapshot.cache_scrub {
                     println!("{}", format_cache_scrub(&scrub, current_unix_ms()));
                 }
-                if let Some(auto_promote) = snapshot.scratch_auto_promote.as_ref() {
-                    for line in format_scratch_over_limit_directories(
-                        name,
-                        &auto_promote.over_limit_directories,
-                    ) {
-                        println!("{line}");
-                    }
-                }
+                let over_limit_fallback = snapshot
+                    .scratch_auto_promote
+                    .as_ref()
+                    .map_or(&[][..], |auto_promote| {
+                        auto_promote.over_limit_directories.as_slice()
+                    });
+                print_scratch_status_section(
+                    name,
+                    snapshot.scratch_status.as_ref(),
+                    over_limit_fallback,
+                );
                 let cache_root = cache_dir
                     .map(Path::to_path_buf)
                     .unwrap_or_else(|| meta_dir.join("cache"));
@@ -964,17 +1086,15 @@ pub fn run(
     }
 
     println!("  Pending uploads:    {}", pending_uploads);
-    match studiofs_vfs::find_over_limit_scratch_directories(
+    match studiofs_vfs::inspect_scratch_status(
         engine.as_ref(),
         studiofs_vfs::scratch_promote_entry_limit_from_env(),
     ) {
-        Ok(over_limit) => {
-            for line in format_scratch_over_limit_directories(name, &over_limit) {
-                println!("{line}");
-            }
+        Ok(scratch_status) => {
+            print_scratch_status_section(name, Some(&scratch_status), &[]);
         }
         Err(error) => {
-            eprintln!("warning: failed to scan over-limit scratch directories: {error}");
+            eprintln!("warning: failed to inspect scratch status: {error}");
         }
     }
 
@@ -1707,5 +1827,98 @@ mod tests {
             }
             other => panic!("expected Status, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn format_scratch_status_section_preserves_unknown_counts() {
+        let fallback = [studiofs_vfs::ScratchPromoteOverLimitEntry {
+            dir_ino: 77,
+            relative_path: "renders".to_string(),
+            path_is_lossy: false,
+            entry_count: 4,
+            entry_limit: 3,
+        }];
+        let rendered = format_scratch_status_section("proj", None, &fallback).join("\n");
+
+        assert!(rendered.contains("Status unavailable"));
+        assert!(rendered.contains("Scratch dir `renders` exceeds promote limit"));
+        assert!(!rendered.contains("Entries:"));
+    }
+
+    #[test]
+    fn format_scratch_status_section_renders_all_required_fields() {
+        let snapshot = studiofs_vfs::VfsScratchStatusSnapshot {
+            entry_count: 3,
+            total_bytes: 2048,
+            no_longer_matching_count: 1,
+            no_longer_matching_paths: vec!["renders/old.tmp".to_string()],
+            over_limit_directories: vec![studiofs_vfs::ScratchPromoteOverLimitEntry {
+                dir_ino: 42,
+                relative_path: "renders/big".to_string(),
+                path_is_lossy: false,
+                entry_count: 100_005,
+                entry_limit: 100_000,
+            }],
+            conflicts: vec![studiofs_vfs::ScratchConflictSummary {
+                ino: 77,
+                original_name: "shot.tmp".to_string(),
+                conflict_name: "shot.tmp.scratch-conflict-1".to_string(),
+                relative_path: Some("shots/shot.tmp.scratch-conflict-1".to_string()),
+            }],
+            orphans: vec![studiofs_vfs::ScratchOrphanSummary {
+                id: "1700000000000/deleted_dir/auto.tmp".to_string(),
+                timestamp_unix_ms: 1_700_000_000_000,
+                root_old_path: "deleted_dir/auto.tmp".to_string(),
+                entry_count: 1,
+                total_bytes: 512,
+                materialized: true,
+            }],
+            tracked_matching_rule_count: 1,
+            tracked_matching_rule_paths: vec!["legacy.tmp".to_string()],
+            rule_file_warnings: vec![studiofs_vfs::ScratchRuleFileWarning {
+                rule_file_path: ".studiofsignore".to_string(),
+                lines: vec![4],
+            }],
+        };
+
+        let rendered = format_scratch_status_section("proj", Some(&snapshot), &[]).join("\n");
+        assert!(rendered.contains("Scratch"));
+        assert!(rendered.contains("Entries:                 3"));
+        assert!(rendered.contains(&format!("Bytes:                   {}", format_bytes(2048))));
+        assert!(rendered.contains("No longer matching rule: 1"));
+        assert!(rendered.contains("renders/old.tmp"));
+        assert!(rendered.contains("Over promote limit:      1"));
+        assert!(rendered.contains("studiofs scratch promote --volume proj -- renders/big"));
+        assert!(rendered.contains("Conflicts:               1"));
+        assert!(rendered.contains("shots/shot.tmp.scratch-conflict-1"));
+        assert!(rendered.contains("Orphans:                 1"));
+        assert!(rendered.contains("1700000000000/deleted_dir/auto.tmp"));
+        assert!(rendered.contains("Tracked matching rule:   1"));
+        assert!(rendered.contains("legacy.tmp"));
+        assert!(rendered.contains("Rule file warnings:      1"));
+        assert!(rendered.contains("`.studiofsignore` line(s) 4 match `.studiofsignore`"));
+    }
+
+    #[test]
+    fn scratch_payloads_never_count_as_dirty_or_pending_upload_in_status() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("status-scratch-dirty-");
+        let uuid = Uuid::new_v4().to_string();
+        let cache_path = tmp.path().join(&uuid);
+        let opened = open_local_payload_backend(&cache_path, &uuid).unwrap();
+        opened
+            .backend
+            .put_scratch_batch(&[studiofs_cache::local::LocalPayloadPut {
+                object_id: 501,
+                data: bytes::Bytes::from_static(b"scratch-payload-bytes"),
+                evictable: false,
+            }])
+            .unwrap();
+        drop(opened);
+
+        let detection = detect_cache_backends(&cache_path).unwrap();
+        let usage = scan_local_payload_cache(&detection).unwrap();
+        assert_eq!(usage.dirty_bytes, 0);
+        let pending = scan_pending_uploads(&cache_path, &uuid, Some(&detection)).unwrap();
+        assert_eq!(pending, 0);
     }
 }

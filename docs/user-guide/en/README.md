@@ -40,6 +40,7 @@
 - [20. Cache: Why Is the Cloud Using My SSD?](20-cache-why-is-the-cloud-using-my-ssd.md)
 - [21. Two People, One File: Collaboration and Conflicts](21-two-people-one-file-collaboration-and-conflicts.md)
 - [22. Settings, Status and Activity](22-settings-status-and-activity.md)
+- [31. Local Scratch Layer and `.studiofsignore`](31-scratch-layer-and-studiofsignore.md)
 
 ## Safety and Maintenance
 
