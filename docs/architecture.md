@@ -157,7 +157,8 @@ Temporary build artifacts, editor scratch files, and macOS AppleDouble (`._*`)
 sidecars matched by `.studiofsignore` rules (or built-in defaults) live in a
 mount-local scratch layer backed by non-replicated `redb` tables
 (`scratch_inodes`, `scratch_dentries`, `scratch_overlay`, `scratch_xattrs`,
-`scratch_symlinks`) and the local payload cache:
+`scratch_symlinks`, `scratch_conflicts`, `scratch_orphans`) and the local
+payload cache:
 
 - Entry class (`Tracked` vs `Scratch`) is decided once at `create`, `mkdir`, or
   `symlink` time using cached per-directory compiled rules and stored with the

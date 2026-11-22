@@ -1,7 +1,6 @@
 # Paths Matched By `.studiofsignore` Live In A Local-Only Scratch Layer
 
-Status: accepted (SFS-1068, SFS-1072). Implemented in the Linear project
-"[0.2.4] Scratch layer".
+Status: accepted.
 
 ## Context
 
@@ -164,6 +163,6 @@ sticky, a disagreement affects only the creating client.
 Moving a tracked file whose payload is not cached into a scratch directory
 returns `EXDEV`, so applications copy instead of renaming.
 
-Rename across the discard boundary (`.Spotlight-V100`, `.fseventsd`, trash
-components) was fixed separately (SFS-1073); this decision does not cover
+Rename across the discard boundary (`.Spotlight-V100`, `.fseventsd`, reserved
+trash roots) was fixed separately (SFS-1073); this decision does not cover
 discard semantics. Native WinFSP validation is a separate gate (SFS-1084).
