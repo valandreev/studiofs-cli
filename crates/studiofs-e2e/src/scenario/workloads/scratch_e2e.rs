@@ -288,13 +288,23 @@ impl Scenario for ScratchIsolation {
             return Err(io::Error::other("scratch isolation acceptance incomplete").into());
         }
         #[cfg(windows)]
-        if summary["case_folded_rule"] != true
-            || summary["recycle_discard_verified"] != true
-            || summary["nonempty_scratch_rmdir_rejected"] != true
-            || summary["empty_scratch_rmdir_succeeded"] != true
-            || read_summary(context, "scratch-shell.json")?["verified"] != true
         {
-            return Err(io::Error::other("native scratch isolation acceptance incomplete").into());
+            let recycle = read_summary(context, "scratch-recycle.json")?;
+            let step = read_summary(context, "scratch-native-step.json")?;
+            if summary["case_folded_rule"] != true
+                || summary["recycle_discard_verified"] != true
+                || summary["nonempty_scratch_rmdir_rejected"] != true
+                || summary["empty_scratch_rmdir_succeeded"] != true
+                || read_summary(context, "scratch-shell.json")?["verified"] != true
+                || recycle["mkdir_succeeded"] != true
+                || recycle["absent_after_close"] != true
+                || recycle["absent_in_scratch_list"] != true
+                || step["step"] != "complete"
+            {
+                return Err(
+                    io::Error::other("native scratch isolation acceptance incomplete").into(),
+                );
+            }
         }
         let mut artifacts = vec![format!(
             "artifacts/scenarios/{SCRATCH_ISOLATION}/scratch-isolation.json"
@@ -1429,12 +1439,16 @@ fn replace_mounted_file(source: &Path, destination: &Path) -> io::Result<()> {
     unsafe extern "system" {
         fn MoveFileExW(source: *const u16, destination: *const u16, flags: u32) -> i32;
     }
-    let source: Vec<u16> = source.as_os_str().encode_wide().chain(Some(0)).collect();
-    let destination: Vec<u16> = destination
-        .as_os_str()
-        .encode_wide()
-        .chain(Some(0))
-        .collect();
+    let mut source: Vec<u16> = source.as_os_str().encode_wide().collect();
+    let mut destination: Vec<u16> = destination.as_os_str().encode_wide().collect();
+    if source.contains(&0) || destination.contains(&0) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "path contains interior NUL",
+        ));
+    }
+    source.push(0);
+    destination.push(0);
     const MOVEFILE_REPLACE_EXISTING: u32 = 1;
     // SAFETY: Both pointers reference live, NUL-terminated UTF-16 buffers for this call.
     if unsafe {
@@ -1481,25 +1495,59 @@ if ($b -contains 'work.tmp' -or $b -contains 'scratch-dir') { throw 'Peer Shell 
 "#])
             .env("SFS_SHELL_CREATOR", creator)
             .env("SFS_SHELL_PEER", peer)
+            .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
     crate::process_job::ChildJob::prepare_command(&mut command)?;
     let mut child = command.spawn()?;
-    let job = crate::process_job::ChildJob::assign_to_child(&child)?;
+    let job = match crate::process_job::ChildJob::assign_to_child(&child) {
+        Ok(job) => job,
+        Err(error) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error.into());
+        }
+    };
+    let mut stdout_pipe = child
+        .stdout
+        .take()
+        .ok_or_else(|| io::Error::other("Explorer Shell stdout pipe unavailable"))?;
+    let mut stderr_pipe = child
+        .stderr
+        .take()
+        .ok_or_else(|| io::Error::other("Explorer Shell stderr pipe unavailable"))?;
+    let stdout_reader = thread::spawn(move || {
+        let mut buf = Vec::new();
+        stdout_pipe.read_to_end(&mut buf)?;
+        Ok::<Vec<u8>, io::Error>(buf)
+    });
+    let stderr_reader = thread::spawn(move || {
+        let mut buf = Vec::new();
+        stderr_pipe.read_to_end(&mut buf)?;
+        Ok::<Vec<u8>, io::Error>(buf)
+    });
     if !crate::process_job::wait_for_child_exit(&mut child, WAIT)? {
-        job.force_kill()?;
+        let _ = job.force_kill();
         let _ = child.wait();
+        let _ = stdout_reader.join();
+        let _ = stderr_reader.join();
         return Err(io::Error::other("Explorer Shell namespace enumeration timed out").into());
     }
-    let output = child.wait_with_output()?;
-    if !output.status.success() {
+    let status = child.wait()?;
+    let stdout = stdout_reader
+        .join()
+        .map_err(|_| io::Error::other("Explorer Shell stdout reader thread panicked"))??;
+    let stderr = stderr_reader
+        .join()
+        .map_err(|_| io::Error::other("Explorer Shell stderr reader thread panicked"))??;
+    if !status.success() {
         return Err(io::Error::other(format!(
             "Explorer Shell enumeration failed: {}",
-            String::from_utf8_lossy(&output.stderr)
+            String::from_utf8_lossy(&stderr)
         ))
         .into());
     }
-    let summary: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    let summary: serde_json::Value = serde_json::from_slice(&stdout)?;
     write_summary(context, "scratch-shell.json", &summary)
 }
 
@@ -1529,7 +1577,9 @@ fn windows_recycle_discard(
         "enumerate after recycle discard",
         WAIT,
     )?;
-    let readdir_contains_trash = names.iter().any(|name| name == "$RECYCLE.BIN");
+    let readdir_contains_trash = names
+        .iter()
+        .any(|name| name.eq_ignore_ascii_case("$RECYCLE.BIN"));
     let output = controller.run_cli(
         "client-a",
         "scratch-list-after-discard",
@@ -1540,8 +1590,19 @@ fn windows_recycle_discard(
             controller.clients()[0].volume_name.clone(),
         ],
     )?;
-    if !output.stdout.contains("work.tmp") || output.stdout.contains("$RECYCLE.BIN") {
-        return Err(io::Error::other("Recycle Bin discard entered scratch metadata").into());
+    if !output.stdout.contains("work.tmp") {
+        return Err(io::Error::other(format!(
+            "positive scratch list control `work.tmp` missing after recycle discard:\n{}",
+            output.stdout
+        ))
+        .into());
+    }
+    if output.stdout.to_ascii_lowercase().contains("$recycle.bin") {
+        return Err(io::Error::other(format!(
+            "Recycle Bin discard entered scratch metadata:\n{}",
+            output.stdout
+        ))
+        .into());
     }
     write_summary(
         context,

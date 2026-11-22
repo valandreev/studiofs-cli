@@ -564,6 +564,17 @@ impl StudioVfs {
 
         let observed_rename_epoch = self.ignore_rules.dir_rename_epoch.load(Ordering::Acquire);
         let dir_path = self.resolve_tracked_directory_path(parent)?;
+        // Descendants of reserved trash roots must also stay out of scratch
+        // (for example `$RECYCLE.BIN/S-1-5-21-...` or `desktop.ini` when
+        // retention is disabled and `.studiofsignore` matches `/$RECYCLE.BIN/`
+        // or `**/`).
+        if dir_path
+            .as_deref()
+            .and_then(|path| path.split(|byte| *byte == b'/').next())
+            .is_some_and(super::is_probable_trash_component)
+        {
+            return Ok(ScratchClass::Tracked);
+        }
         let (snapshot, observed_rule_gen) = {
             let guard = self.ignore_rules.snapshot.read();
             let current_rule_gen = self.ignore_rules.rule_generation.load(Ordering::Acquire);
@@ -967,10 +978,13 @@ mod tests {
                     .unwrap();
             }
             let mut rules = ScratchRules::new(true);
-            rules.update(b"", b"**/\n").unwrap();
+            rules.update(b"", b"**/\n*.ini\n").unwrap();
             *vfs.ignore_rules.snapshot.write() = Arc::new(rules);
 
             let parent = meta.create_dir(ROOT_INO, b"work", 0, 0, 0o755).unwrap();
+            let nested_recycle = meta
+                .create_dir(parent.ino, b"$RECYCLE.BIN", 0, 0, 0o755)
+                .unwrap();
             for name in [
                 b"$RECYCLE.BIN".as_slice(),
                 b"$recycle.bin",
@@ -999,6 +1013,46 @@ mod tests {
                     .unwrap()
                     .is_none()
             );
+            assert_eq!(
+                vfs.classify_new_entry(trash.ino, b"S-1-5-21-1000", true)
+                    .unwrap(),
+                ScratchClass::Tracked,
+                "reserved trash root child dir, retention {trash_days}"
+            );
+            assert_eq!(
+                vfs.classify_new_entry(trash.ino, b"desktop.ini", false)
+                    .unwrap(),
+                ScratchClass::Tracked,
+                "reserved trash root child file, retention {trash_days}"
+            );
+            assert_eq!(
+                vfs.classify_new_entry(nested_recycle.ino, b"desktop.ini", false)
+                    .unwrap(),
+                ScratchClass::Scratch,
+                "ordinary nested $RECYCLE.BIN child file, retention {trash_days}"
+            );
+            if trash_days == 0 {
+                let non_native_root_name: &[u8] = if cfg!(windows) {
+                    b".Trash"
+                } else {
+                    b"$RECYCLE.BIN"
+                };
+                let non_native_trash = vfs
+                    .mkdir(ROOT_INO, non_native_root_name, 0, 0, 0o755)
+                    .unwrap();
+                let child_dir = vfs
+                    .mkdir(non_native_trash.ino, b"child", 0, 0, 0o755)
+                    .unwrap();
+                assert_eq!(
+                    meta.lookup(non_native_trash.ino, b"child").unwrap().ino,
+                    child_dir.ino
+                );
+                assert!(
+                    meta.lookup_scratch_entry(non_native_trash.ino, b"child")
+                        .unwrap()
+                        .is_none()
+                );
+            }
         }
     }
 
