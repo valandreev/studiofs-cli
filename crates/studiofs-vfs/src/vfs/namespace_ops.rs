@@ -4349,6 +4349,7 @@ impl StudioVfs {
             let _target_namespace_read = target_cleanup.with_permit(target_namespace_read);
             let removed_attr = meta.rmdir_scratch_entry(parent, name)?;
             namespace_mutations.record_scratch_removal(parent, name, [removed_attr.ino]);
+            self.prune_over_limit_directory(removed_attr.ino);
             self.state
                 .namespace
                 .dirty_attrs
@@ -5329,6 +5330,7 @@ impl StudioVfs {
         removed_object_ids: Vec<u64>,
     ) {
         if displaced.kind == FileType::Directory {
+            self.prune_over_limit_directory(displaced.ino);
             self.state
                 .namespace
                 .dirty_attrs
@@ -5401,6 +5403,7 @@ impl StudioVfs {
         // alone and drops cached attrs right before the payload hand-off.
         self.invalidate_attr_read_cache(attrs.iter().map(|attr| attr.ino));
         self.submit_promoted_subtree_uploads(&attrs);
+        self.prune_over_limit_directories(&frozen.frozen);
         drop(frozen);
         self.finish_rename_displacement(&meta, result.displaced.as_ref())
             .await?;

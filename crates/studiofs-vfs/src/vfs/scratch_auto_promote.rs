@@ -365,10 +365,155 @@ pub(super) enum FreezeScratchSubtreeOutcome<'a> {
 
 impl StudioVfs {
     /// Returns the latest observability snapshot of background scratch auto-promotion.
+    ///
+    /// Recorded `over_limit_directories` entries are re-checked against live metadata
+    /// and ignore rules so mounted `status` stays accurate after promotions, removals,
+    /// renames, or directories shrinking below `entry_limit` between passes.
     pub fn scratch_auto_promote_snapshot(&self) -> VfsScratchAutoPromoteSnapshot {
         let mut snapshot = self.scratch_auto_promote.status_tx.borrow().clone();
         snapshot.entry_limit = self.scratch_promote_entry_limit;
+        if !snapshot.over_limit_directories.is_empty() {
+            snapshot.over_limit_directories =
+                self.recheck_over_limit_directories(snapshot.over_limit_directories);
+        }
         snapshot
+    }
+
+    pub(super) fn prune_over_limit_directory(&self, dir_ino: Ino) {
+        self.scratch_auto_promote
+            .status_tx
+            .send_if_modified(|snapshot| {
+                let before = snapshot.over_limit_directories.len();
+                snapshot
+                    .over_limit_directories
+                    .retain(|entry| entry.dir_ino != dir_ino);
+                snapshot.over_limit_directories.len() != before
+            });
+    }
+
+    pub(super) fn prune_over_limit_directories(&self, removed_inos: &HashSet<Ino>) {
+        if removed_inos.is_empty() {
+            return;
+        }
+        self.scratch_auto_promote
+            .status_tx
+            .send_if_modified(|snapshot| {
+                let before = snapshot.over_limit_directories.len();
+                snapshot
+                    .over_limit_directories
+                    .retain(|entry| !removed_inos.contains(&entry.dir_ino));
+                snapshot.over_limit_directories.len() != before
+            });
+    }
+
+    fn recheck_over_limit_directories(
+        &self,
+        entries: Vec<ScratchPromoteOverLimitEntry>,
+    ) -> Vec<ScratchPromoteOverLimitEntry> {
+        let meta = self.sync_meta();
+        let entry_limit = self.scratch_promote_entry_limit;
+        let mut live: Vec<ScratchPromoteOverLimitEntry> = entries
+            .into_iter()
+            .filter_map(|entry| self.recheck_over_limit_entry(meta.as_ref(), entry_limit, entry))
+            .collect();
+        live.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
+        live
+    }
+
+    fn recheck_over_limit_entry(
+        &self,
+        meta: &dyn super::VfsMeta,
+        entry_limit: usize,
+        entry: ScratchPromoteOverLimitEntry,
+    ) -> Option<ScratchPromoteOverLimitEntry> {
+        let attr = match meta.get_scratch_attr(entry.dir_ino) {
+            Ok(attr) if attr.kind == FileType::Directory => attr,
+            Ok(_) | Err(MetaError::InodeNotFound(_)) => return None,
+            Err(error) => {
+                warn!(
+                    dir_ino = entry.dir_ino,
+                    %error,
+                    "could not re-check over-limit scratch directory attr"
+                );
+                return Some(entry);
+            }
+        };
+        match meta.get_scratch_attr(attr.parent) {
+            // Moved inside another scratch directory: no longer a tracked-parent candidate.
+            Ok(_) => return None,
+            Err(MetaError::InodeNotFound(_)) => {}
+            Err(error) => {
+                warn!(
+                    dir_ino = entry.dir_ino,
+                    parent = attr.parent,
+                    %error,
+                    "could not re-check over-limit scratch directory parent"
+                );
+                return Some(entry);
+            }
+        }
+        let name = match meta.readdir_scratch(attr.parent) {
+            Ok(children) => children
+                .into_iter()
+                .find_map(|(name, child)| (child.ino == entry.dir_ino).then_some(name))?,
+            Err(MetaError::InodeNotFound(_)) => return None,
+            Err(error) => {
+                warn!(
+                    dir_ino = entry.dir_ino,
+                    parent = attr.parent,
+                    %error,
+                    "could not re-check over-limit scratch directory binding"
+                );
+                return Some(entry);
+            }
+        };
+        let parent_path = match self.resolve_tracked_directory_path(attr.parent) {
+            Ok(Some(path)) => path,
+            Ok(None) => return None,
+            Err(error) => {
+                warn!(
+                    dir_ino = entry.dir_ino,
+                    parent = attr.parent,
+                    %error,
+                    "could not resolve tracked parent path for over-limit scratch directory"
+                );
+                return Some(entry);
+            }
+        };
+        let rel_path = join_relative_path(&parent_path, &name);
+        if self.classify_scratch_path(&rel_path, true) != ScratchClass::Tracked {
+            return None;
+        }
+        match collect_scratch_promote_subtree(
+            meta,
+            attr,
+            &rel_path,
+            entry_limit,
+            ScratchPromoteRevisit::Skip,
+            |child_path, child_is_dir| {
+                self.classify_scratch_path(child_path, child_is_dir) != ScratchClass::Tracked
+            },
+        ) {
+            Ok(ScratchPromoteSubtreeWalk::OverLimit { entry_count }) => {
+                Some(ScratchPromoteOverLimitEntry {
+                    dir_ino: entry.dir_ino,
+                    relative_path: format_relative_path(&rel_path),
+                    path_is_lossy: std::str::from_utf8(&rel_path).is_err(),
+                    entry_count,
+                    entry_limit,
+                })
+            }
+            Ok(ScratchPromoteSubtreeWalk::Ready(_))
+            | Err(VfsError::Meta(MetaError::InodeNotFound(_))) => None,
+            Err(error) => {
+                warn!(
+                    dir_ino = entry.dir_ino,
+                    %error,
+                    "could not re-check over-limit scratch directory subtree"
+                );
+                Some(entry)
+            }
+        }
     }
 
     /// Requests a pass when replay merged a local scratch directory into a replicated
@@ -1071,11 +1216,7 @@ impl StudioVfs {
         )?;
         self.apply_auto_promote_side_effects(meta.as_ref(), started_epoch, root_is_dir, &promoted);
         meta.request_eager_flush();
-        self.scratch_auto_promote.status_tx.send_modify(|snapshot| {
-            snapshot
-                .over_limit_directories
-                .retain(|entry| !frozen.frozen.contains(&entry.dir_ino));
-        });
+        self.prune_over_limit_directories(&frozen.frozen);
         Ok(ScratchPromotePathOutcome {
             relative_path: raw_path.to_owned(),
             promoted_inodes: promoted.attrs.len(),
@@ -2217,5 +2358,217 @@ mod tests {
         drop(_guard);
         drop(vfs);
         drop(meta);
+    }
+
+    #[test]
+    fn scratch_over_limit_status_clears_between_passes_on_shrink_delete_rename_and_promote() {
+        let temp = studiofs_test_support::workspace_target_tempdir("scratch-over-limit-stale-");
+        let (rt, vfs, _meta) =
+            make_started_vfs_with_limit(&temp, "scratch-over-limit-stale", Some(3), None, None);
+        let _guard = rt.enter();
+        rt.block_on(async {
+            install_ignore_rules(
+                &vfs,
+                ROOT_INO,
+                b"shrink/\nremove_me/\nreignore/\npromote_me/\n*.tmp\n",
+            )
+            .await;
+
+            // 1. Directory that will shrink below the limit, then rename into tracked.
+            let shrink = vfs.mkdir(ROOT_INO, b"shrink", 0, 0, 0o755).unwrap();
+            let _s1 = write_and_close_file(&vfs, shrink.ino, b"f1.txt", b"1").await;
+            let _s2 = write_and_close_file(&vfs, shrink.ino, b"f2.txt", b"2").await;
+            let _s3 = write_and_close_file(&vfs, shrink.ino, b"f3.txt", b"3").await;
+
+            // 2. Directory that will be deleted (`rmdir`) between passes.
+            let remove_me = vfs.mkdir(ROOT_INO, b"remove_me", 0, 0, 0o755).unwrap();
+            let _r1 = write_and_close_file(&vfs, remove_me.ino, b"f1.txt", b"1").await;
+            let _r2 = write_and_close_file(&vfs, remove_me.ino, b"f2.txt", b"2").await;
+            let _r3 = write_and_close_file(&vfs, remove_me.ino, b"f3.txt", b"3").await;
+
+            // 3. Directory that will be renamed within scratch to a rule-matching name.
+            let reignore = vfs.mkdir(ROOT_INO, b"reignore", 0, 0, 0o755).unwrap();
+            let _m1 = write_and_close_file(&vfs, reignore.ino, b"f1.txt", b"1").await;
+            let _m2 = write_and_close_file(&vfs, reignore.ino, b"f2.txt", b"2").await;
+            let _m3 = write_and_close_file(&vfs, reignore.ino, b"f3.txt", b"3").await;
+
+            // 4. Directory that will be explicitly promoted via the control API.
+            let promote_me = vfs.mkdir(ROOT_INO, b"promote_me", 0, 0, 0o755).unwrap();
+            let _p1 = write_and_close_file(&vfs, promote_me.ino, b"f1.txt", b"1").await;
+            let _p2 = write_and_close_file(&vfs, promote_me.ino, b"f2.txt", b"2").await;
+            let _p3 = write_and_close_file(&vfs, promote_me.ino, b"f3.txt", b"3").await;
+
+            let mut status_rx = vfs.subscribe_scratch_auto_promote_status();
+            install_ignore_rules(&vfs, ROOT_INO, b"*.tmp\n").await;
+            let snap =
+                wait_for_auto_promote_generation(&mut status_rx, vfs.ignore_rule_generation())
+                    .await;
+            let passes_after_discovery = snap.passes_completed;
+            let listed_paths = || {
+                vfs.scratch_auto_promote_snapshot()
+                    .over_limit_directories
+                    .into_iter()
+                    .map(|entry| entry.relative_path)
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(
+                listed_paths(),
+                vec!["promote_me", "reignore", "remove_me", "shrink"]
+            );
+
+            // Shrink `shrink` below the limit (1 dir + 2 files == 3 <= 3): mounted status
+            // immediately drops it without waiting for another pass.
+            vfs.unlink(shrink.ino, b"f3.txt").unwrap();
+            assert_eq!(
+                vfs.scratch_auto_promote_snapshot().passes_completed,
+                passes_after_discovery
+            );
+            assert_eq!(listed_paths(), vec!["promote_me", "reignore", "remove_me"]);
+
+            // Rename `shrink` into tracked (`promote_scratch_rename`): also pruned from
+            // the watch snapshot itself.
+            vfs.rename(ROOT_INO, b"shrink", ROOT_INO, b"shrink_tracked", false)
+                .unwrap();
+            assert!(!vfs.is_scratch_inode(shrink.ino).unwrap());
+            assert!(
+                !status_rx
+                    .borrow()
+                    .over_limit_directories
+                    .iter()
+                    .any(|entry| entry.dir_ino == shrink.ino)
+            );
+
+            // Delete `remove_me` (`unlink` children + `rmdir`): pruned from both watch
+            // snapshot and mounted status without another pass.
+            vfs.unlink(remove_me.ino, b"f1.txt").unwrap();
+            vfs.unlink(remove_me.ino, b"f2.txt").unwrap();
+            vfs.unlink(remove_me.ino, b"f3.txt").unwrap();
+            vfs.rmdir(ROOT_INO, b"remove_me").unwrap();
+            assert!(
+                !status_rx
+                    .borrow()
+                    .over_limit_directories
+                    .iter()
+                    .any(|entry| entry.dir_ino == remove_me.ino)
+            );
+            assert_eq!(listed_paths(), vec!["promote_me", "reignore"]);
+
+            // Rename `reignore` within scratch to match `*.tmp`: mounted status drops it
+            // immediately because its new path classifies as scratch.
+            vfs.rename(ROOT_INO, b"reignore", ROOT_INO, b"reignore.tmp", false)
+                .unwrap();
+            assert!(vfs.is_scratch_inode(reignore.ino).unwrap());
+            assert_eq!(listed_paths(), vec!["promote_me"]);
+
+            // Explicitly promote `promote_me`: pruned from both watch snapshot and status.
+            vfs.promote_scratch_path("promote_me").await.unwrap();
+            assert!(!vfs.is_scratch_inode(promote_me.ino).unwrap());
+            assert!(
+                !status_rx
+                    .borrow()
+                    .over_limit_directories
+                    .iter()
+                    .any(|entry| entry.dir_ino == promote_me.ino)
+            );
+            assert!(listed_paths().is_empty());
+            assert_eq!(
+                vfs.scratch_auto_promote_snapshot().passes_completed,
+                passes_after_discovery
+            );
+
+            vfs.shutdown(Duration::from_secs(5)).await.unwrap();
+        });
+    }
+
+    #[test]
+    fn scratch_auto_promote_skipped_candidate_clears_stale_over_limit_status() {
+        let temp = studiofs_test_support::workspace_target_tempdir("scratch-auto-skipped-");
+        let (rt, mut vfs, meta) = make_unstarted_test_vfs_at(
+            temp.path(),
+            "scratch-auto-skipped",
+            VfsConfig::default(),
+            None,
+        );
+        Arc::get_mut(&mut vfs).unwrap().scratch_promote_entry_limit = 3;
+        let _guard = rt.enter();
+        rt.block_on(async {
+            // Seed an over-limit scratch directory directly under root with empty rules
+            // (so it is eligible for auto-promotion).
+            let big = vfs
+                .store_scratch_entry(b"big", InodeAttr::new_dir(0, ROOT_INO, 0, 0, 0o755))
+                .unwrap();
+            for name in [b"f1.txt".as_slice(), b"f2.txt", b"f3.txt"] {
+                let child_ino = meta.next_inode().unwrap();
+                let child = InodeAttr::new_file(child_ino, big.ino, 0, 0, 0o644);
+                meta.create_scratch_entry(big.ino, name, &child).unwrap();
+            }
+
+            let cancel = CancellationToken::new();
+            let mut limiter = AutoPromoteRateLimiter::new(0, 1);
+
+            // Pass 1 records `big` as over-limit in the watch snapshot.
+            let needs_follow_up = vfs
+                .run_scratch_auto_promote_pass(&mut limiter, &cancel)
+                .await;
+            assert!(!needs_follow_up);
+            let after_pass_1 = vfs.scratch_auto_promote.status_tx.borrow().clone();
+            assert_eq!(after_pass_1.passes_completed, 1);
+            assert_eq!(after_pass_1.over_limit_directories.len(), 1);
+            assert_eq!(after_pass_1.over_limit_directories[0].dir_ino, big.ino);
+
+            // Hold a foreground local IO permit so pass 2 collects `big` as a candidate
+            // synchronously and pauses at `wait_foreground_local_io_idle()` on its first poll.
+            let local_io = vfs.qos.acquire_foreground_local_io(1).await.unwrap();
+            let mut pass_2 =
+                std::pin::pin!(vfs.run_scratch_auto_promote_pass(&mut limiter, &cancel));
+            let waker = std::task::Waker::noop();
+            let mut cx = std::task::Context::from_waker(waker);
+            assert!(
+                pass_2.as_mut().poll(&mut cx).is_pending(),
+                "pass 2 must pause on foreground local IO after collecting candidates"
+            );
+
+            // Remove `big` directly in metadata (bypassing VFS `rmdir` pruning) so the
+            // stored watch snapshot still lists `big` until pass 2 hits `CandidateOutcome::Skipped`.
+            for name in [b"f1.txt".as_slice(), b"f2.txt", b"f3.txt"] {
+                meta.unlink_scratch_entry(big.ino, name, false).unwrap();
+            }
+            meta.rmdir_scratch_entry(ROOT_INO, b"big").unwrap();
+            assert_eq!(
+                vfs.scratch_auto_promote
+                    .status_tx
+                    .borrow()
+                    .over_limit_directories
+                    .len(),
+                1,
+                "watch snapshot still has stale entry before pass 2 completes"
+            );
+
+            // Release foreground IO and let pass 2 finish: `promote_one_auto_candidate`
+            // returns `CandidateOutcome::Skipped` and pass 2 clears the stale over-limit list.
+            drop(local_io);
+            let needs_follow_up = pass_2.await;
+            assert!(!needs_follow_up);
+            let after_pass_2 = vfs.scratch_auto_promote.status_tx.borrow().clone();
+            assert_eq!(after_pass_2.passes_completed, 2);
+            assert_eq!(after_pass_2.promoted_entries, 0);
+            assert_eq!(after_pass_2.failed_entries, 0);
+            assert!(
+                after_pass_2.over_limit_directories.is_empty(),
+                "skipped candidate must not leave stale over-limit status"
+            );
+            assert!(
+                vfs.scratch_auto_promote_snapshot()
+                    .over_limit_directories
+                    .is_empty()
+            );
+
+            // Direct check of `CandidateOutcome::Skipped` for missing entry.
+            let outcome = vfs
+                .promote_one_auto_candidate(ROOT_INO, b"big")
+                .await
+                .unwrap();
+            assert!(matches!(outcome, CandidateOutcome::Skipped));
+        });
     }
 }
