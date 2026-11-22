@@ -1014,14 +1014,51 @@ Step "cleared"
 /// path. `STUDIOFS_WINFSP_TRACE_FILTER` narrows the levels (for example `=error` for a
 /// light trace that barely perturbs timing). Diagnostics only: the default probe run
 /// installs nothing.
-fn install_probe_trace_log() {
-    if let Some(path) = std::env::var_os("STUDIOFS_WINFSP_TRACE_LOG") {
-        install_trace_log_at(std::path::Path::new(&path));
+fn install_probe_trace_log() -> Option<ProbeTracingGuard> {
+    std::env::var_os("STUDIOFS_WINFSP_TRACE_LOG")
+        .map(|path| install_trace_log_at(std::path::Path::new(&path)))
+}
+
+type ProbeLayer = Box<dyn tracing_subscriber::Layer<tracing_subscriber::Registry> + Send + Sync>;
+type ProbeLayerHandle =
+    tracing_subscriber::reload::Handle<Option<ProbeLayer>, tracing_subscriber::Registry>;
+
+static PROBE_LAYER_HANDLE: OnceLock<ProbeLayerHandle> = OnceLock::new();
+
+/// Clears the active probe layer on drop, so a debug trace or counter cannot keep
+/// observing (and slowing) the tests that run after its owner in this process.
+#[must_use = "dropping the guard immediately clears the probe tracing layer"]
+struct ProbeTracingGuard;
+
+impl Drop for ProbeTracingGuard {
+    fn drop(&mut self) {
+        if let Some(handle) = PROBE_LAYER_HANDLE.get() {
+            let _ = handle.reload(None);
+        }
     }
 }
 
-fn install_trace_log_at(path: &std::path::Path) {
+/// Native callbacks run on WinFSP dispatcher threads, so probes need the global
+/// subscriber. It can be set once per process; tests sharing this binary swap the
+/// active layer instead, so an earlier test's subscriber cannot swallow later traces.
+/// One active layer assumes the documented `--test-threads=1` gate.
+fn set_probe_tracing_layer(layer: ProbeLayer) -> ProbeTracingGuard {
+    use tracing_subscriber::layer::SubscriberExt;
+    let handle = PROBE_LAYER_HANDLE.get_or_init(|| {
+        let (router, handle) = tracing_subscriber::reload::Layer::new(None);
+        tracing::subscriber::set_global_default(tracing_subscriber::registry().with(router))
+            .expect("install WinFSP probe tracing router");
+        handle
+    });
+    handle
+        .reload(Some(layer))
+        .expect("swap WinFSP probe tracing layer");
+    ProbeTracingGuard
+}
+
+fn install_trace_log_at(path: &std::path::Path) -> ProbeTracingGuard {
     use std::sync::Mutex;
+    use tracing_subscriber::Layer;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).expect("create WinFSP probe trace directory");
     }
@@ -1030,14 +1067,13 @@ fn install_trace_log_at(path: &std::path::Path) {
             .to_string()
     });
     let file = std::fs::File::create(path).expect("create WinFSP probe trace log");
-    let subscriber = tracing_subscriber::fmt()
+    let fmt = tracing_subscriber::fmt::layer()
         .with_writer(Mutex::new(file))
         .with_ansi(false)
-        .with_thread_ids(true)
-        .with_env_filter(tracing_subscriber::EnvFilter::new(filter))
-        .finish();
-    // A second install in the same process keeps the first subscriber.
-    let _ = tracing::subscriber::set_global_default(subscriber);
+        .with_thread_ids(true);
+    set_probe_tracing_layer(Box::new(
+        tracing_subscriber::EnvFilter::new(filter).and_then(fmt),
+    ))
 }
 
 /// Ignored Shell round trip on an owned mount with retention enabled.
@@ -1045,7 +1081,7 @@ fn install_trace_log_at(path: &std::path::Path) {
 #[ignore = "requires WinFSP runtime, an explicitly selected unused drive, and an owned test volume"]
 fn winfsp_native_trash_restore_and_clear_shell_probe() {
     use windows::Win32::Storage::FileSystem::GetLogicalDrives;
-    install_probe_trace_log();
+    let _probe_trace = install_probe_trace_log();
 
     let mount_point = test_mount_point();
     let bytes = mount_point.as_bytes();
@@ -1168,7 +1204,7 @@ Step "cleared"
 #[ignore = "requires WinFSP runtime, an explicitly selected unused drive, and an owned test volume"]
 fn winfsp_native_trash_directory_restore_and_clear_shell_probe() {
     use windows::Win32::Storage::FileSystem::GetLogicalDrives;
-    install_probe_trace_log();
+    let _probe_trace = install_probe_trace_log();
 
     let mount_point = test_mount_point();
     let bytes = mount_point.as_bytes();
@@ -1277,7 +1313,7 @@ $restoredNestedAbsent = -not (Test-Path -LiteralPath (Join-Path $env:F 'nested')
 #[ignore = "requires WinFSP runtime, an explicitly selected unused drive, and an owned test volume"]
 fn winfsp_native_trash_directory_partial_clear_shell_probe() {
     use windows::Win32::Storage::FileSystem::GetLogicalDrives;
-    install_probe_trace_log();
+    let _probe_trace = install_probe_trace_log();
 
     let mount_point = test_mount_point();
     let bytes = mount_point.as_bytes();
@@ -1461,7 +1497,7 @@ Step "after_alt blocked_refused=$blockedRenameRefused replace_refused=$replaceRe
 #[ignore = "requires WinFSP runtime, an explicitly selected unused drive, and an owned test volume"]
 fn winfsp_native_trash_directory_collision_shell_probe() {
     use windows::Win32::Storage::FileSystem::GetLogicalDrives;
-    install_probe_trace_log();
+    let _probe_trace = install_probe_trace_log();
 
     let mount_point = test_mount_point();
     let bytes = mount_point.as_bytes();
@@ -1775,7 +1811,7 @@ fn winfsp_native_trash_remote_only_retry_probe() {
     if !require_online_upload_backend("winfsp_native_trash_remote_only_retry_probe") {
         return;
     }
-    install_probe_trace_log();
+    let _probe_trace = install_probe_trace_log();
 
     let mount_point = test_mount_point();
     let bytes = mount_point.as_bytes();
@@ -2140,7 +2176,7 @@ fn mapped_writer_probe(restore: bool) {
     let trace_path = std::env::var_os("STUDIOFS_WINFSP_TRACE_LOG")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| workspace_root().join("target/probe-trace/mapped-writer.log"));
-    install_trace_log_at(&trace_path);
+    let _probe_trace = install_trace_log_at(&trace_path);
     let mount_point = test_mount_point();
     let bytes = mount_point.as_bytes();
     assert!(bytes.len() == 2 && bytes[0].is_ascii_uppercase() && bytes[1] == b':');
