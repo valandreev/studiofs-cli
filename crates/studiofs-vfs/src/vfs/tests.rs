@@ -20103,14 +20103,16 @@ fn shutdown_waits_for_deferred_create_admitted_before_cleanup_registration() {
         // Shared CI runners can deschedule the worker for a long time. Poll the
         // observable admission state with a pause so this loop does not compete
         // with that worker for CPU. A worker that returned before blocking can
-        // never hold the gate, so fail at once and report its result.
+        // never hold the gate, so fail at once and report its result. Observe
+        // the activity counter admission bumps after `try_read`: probing with
+        // `try_write` would briefly own the gate and reject the worker.
         tokio::time::timeout(ADMISSION_WAIT_BOUND, async {
             while vfs
                 .state
-                .shutdown
-                .mutating_operation_gate
-                .try_write()
-                .is_ok()
+                .sync_safety_activity
+                .active
+                .load(Ordering::Acquire)
+                == 0
             {
                 assert!(
                     !operation.is_finished(),
