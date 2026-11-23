@@ -659,7 +659,7 @@ mod tests {
 
     const LEGACY_FRAME_FIXTURE: &[u8] = include_bytes!("../tests/fixtures/sfec-v1-1mib.bin");
     const FRAME_SIZE_FIELD: std::ops::Range<usize> = 26..30;
-    const SMALL_FRAME_SIZE: u32 = 64 * 1024;
+    const SMALL_FRAME_SIZE: u32 = crate::envelope::SMALL_SFEC_FRAME_SIZE as u32;
     const UNSUPPORTED_FRAME_SIZE: u32 = 32 * 1024;
 
     #[test]

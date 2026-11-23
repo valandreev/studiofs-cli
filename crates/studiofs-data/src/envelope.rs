@@ -17,6 +17,9 @@ pub const SFEC_VERSION: u16 = 1;
 /// Default plaintext frame size for encrypted remote objects.
 pub const DEFAULT_SFEC_FRAME_SIZE: usize = 1024 * 1024;
 
+/// Plaintext frame size for compressed (STFS v3) encrypted objects (ADR 0015).
+pub const SMALL_SFEC_FRAME_SIZE: usize = 64 * 1024;
+
 /// XChaCha20-Poly1305 authentication tag length appended to each frame.
 pub const SFEC_FRAME_TAG_LEN: usize = 16;
 
@@ -574,7 +577,9 @@ fn validate_variable_len(field: &'static str, len: usize) -> Result<(), SfecErro
 }
 
 fn expected_frame_count(plaintext_len: u64, frame_size: u32) -> Result<u32, SfecError> {
-    if frame_size != 64 * 1024 && frame_size as usize != DEFAULT_SFEC_FRAME_SIZE {
+    if frame_size as usize != SMALL_SFEC_FRAME_SIZE
+        && frame_size as usize != DEFAULT_SFEC_FRAME_SIZE
+    {
         return Err(SfecError::InvalidFrameSize(frame_size));
     }
     if plaintext_len == 0 {
@@ -598,7 +603,7 @@ fn validate_ciphertext_len(header: &SfecHeader, actual_len: usize) -> Result<(),
 mod tests {
     use super::*;
 
-    const FRAME: u64 = 64 * 1024;
+    const FRAME: u64 = SMALL_SFEC_FRAME_SIZE as u64;
     const STRIDE: u64 = FRAME + SFEC_FRAME_TAG_LEN as u64;
     const PLAINTEXT_LEN: u64 = 2 * FRAME + 3;
 
