@@ -1201,8 +1201,9 @@ impl DataStore {
         let head_range = layout
             .ciphertext_range(0..first_end)
             .map_err(crypto::CryptoError::from)?;
-        // Round 2: the tail and frame 0 are contiguous; a target directly after
-        // frame 0 is merged into the same read.
+        // Round 2: the tail and frame 0 are contiguous; with large frames a target
+        // directly after frame 0 is merged into the same read. 64 KiB framing (v3)
+        // defers the target until the authenticated seek table gives stored offsets.
         let deferred_target = layout.frame_size() == SMALL_SFEC_FRAME_SIZE as u32;
         let merge_target = !deferred_target
             && target_range
@@ -1238,7 +1239,8 @@ impl DataStore {
         let header_bytes =
             Bytes::from([fixed.as_ref(), round2.slice(..tail_len).to_bytes().as_ref()].concat());
         // Authoritative strict parse of the header bytes read above.
-        SfecHeader::parse(header_bytes.clone()).map_err(crypto::CryptoError::from)?;
+        let sfec_header =
+            SfecHeader::parse(header_bytes.clone()).map_err(crypto::CryptoError::from)?;
         let local = |offset: u64| {
             usize::try_from(offset - SFEC_HEADER_FIXED_LEN as u64).map_err(|_| invalid_range())
         };
@@ -1255,7 +1257,14 @@ impl DataStore {
                 encrypted_bytes += read.len() as u64;
             }
             return self
-                .read_v3_payload_range(key, range, header_bytes, first, encrypted_bytes)
+                .read_v3_payload_range(
+                    key,
+                    range,
+                    sfec_header,
+                    header_bytes,
+                    first,
+                    encrypted_bytes,
+                )
                 .await;
         }
         if payload_len > crate::object::CLOUD_FRAGMENT_SIZE as u64 {
@@ -1304,11 +1313,11 @@ impl DataStore {
         &self,
         key: &str,
         range: Range<u64>,
+        layout: SfecHeader,
         header_bytes: Bytes,
         first: Bytes,
         mut encrypted_bytes: u64,
     ) -> DataResult<(Bytes, RemoteObjectReadStats)> {
-        let layout = SfecHeader::parse(header_bytes.clone()).map_err(crypto::CryptoError::from)?;
         let table = crate::object::V3SeekTable::parse_from_plaintext(&first)?;
         if ObjectHeader::SIZE as u64 + table.compressed_size() as u64 != layout.plaintext_len() {
             return Err(crate::object::ObjectError::InvalidV3Format(
@@ -2078,6 +2087,8 @@ mod tests {
             CLOUD_FRAGMENT_SIZE / 2,
             CLOUD_FRAGMENT_SIZE - 4096,
             DEFAULT_V3_CHUNK_SIZE - 2048,
+            // Compressed chunk 15 into raw chunk 16: zstd decode and raw slice in one read.
+            16 * DEFAULT_V3_CHUNK_SIZE - 2048,
         ] {
             reads.store(0, Ordering::SeqCst);
             let (bytes, stats) = store

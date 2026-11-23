@@ -283,7 +283,7 @@ closes.
 | Incompressible data exits at the probe and stays STFS v2 | probe tests; criterion benchmark with at most 3% upload loss against `off` (SFS-1089) |
 | The policy is shared, replicated, and read from the local view at upload preparation | settings serde, revision ordering, CLI CAS, replication tests (SFS-1088, SFS-1091) |
 | The local cache, stage files, and writer state never hold compressed bytes | upload and full-fetch round-trip tests (SFS-1090, SFS-1091) |
-| A small cold read of a compressed object needs at most three reads and does not fetch the whole object | range-read request and byte-count tests (SFS-1092) |
+| A small cold read of a compressed object needs at most three reads and does not fetch the whole object | `store::tests::payload_range_v3_reads_only_selected_chunks_with_three_requests` (SFS-1092) |
 | Logical quota is unchanged by compression | quota regression test (SFS-1093) |
 | Mounted write, cold range read, full read, and policy switch work across clients | `studiofs-e2e` compression scenario on macFUSE and Linux FUSE (SFS-1094) |
 
