@@ -24,7 +24,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use studiofs_cache::CachedStore;
-use studiofs_data::compression::decode_object_with_checksum;
 use studiofs_data::object::{CLOUD_FRAGMENT_SIZE, validate_cloud_fragment_layout};
 use studiofs_data::store::{DataError, DataStore};
 use tokio::sync::broadcast;
@@ -1206,7 +1205,10 @@ impl FetchScheduler {
                     } else {
                         // Decode STFS object payload (v2 or v3).
                         let decode_start = Instant::now();
-                        let decoded = decode_object_with_checksum(compressed).await;
+                        let decoded = self
+                            .data_store
+                            .decode_payload_with_checksum(compressed)
+                            .await;
                         self.record_object_decode(decode_start.elapsed());
                         let (payload, xxh64) = match decoded {
                             Ok(pair) => pair,

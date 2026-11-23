@@ -827,6 +827,7 @@ impl StudioVfs {
             "bytes",
             upload.encrypted_bytes_written,
         );
+        upload.insert_compression_metrics(&mut snapshot.object_io);
         insert_counter(
             &mut snapshot.object_io,
             "errors",
@@ -1267,6 +1268,73 @@ fn insert_foreground_read_protection(
     }
 }
 
+impl super::VfsUploadStats {
+    /// Add compression counters and effective policy/ratio gauges to object I/O stats.
+    /// Shared by the mounted text surface and diagnostics-backed performance reporting.
+    pub fn insert_compression_metrics(&self, section: &mut RuntimeStatsSection) {
+        let upload = self;
+
+        for (name, unit, value) in [
+            (
+                "logical_bytes_uploaded",
+                "bytes",
+                upload.logical_bytes_uploaded,
+            ),
+            (
+                "stored_bytes_uploaded",
+                "bytes",
+                upload.stored_bytes_uploaded,
+            ),
+            (
+                "v3_fragments_uploaded",
+                "count",
+                upload.v3_fragments_uploaded,
+            ),
+            (
+                "raw_probe_fragments_uploaded",
+                "count",
+                upload.raw_probe_fragments_uploaded,
+            ),
+            (
+                "raw_threshold_fragments_uploaded",
+                "count",
+                upload.raw_threshold_fragments_uploaded,
+            ),
+            ("decompression", "ns", upload.decompression_nanos),
+        ] {
+            insert_counter(section, name, unit, value);
+        }
+        insert_gauge(
+            section,
+            "compression_policy_known",
+            "bool",
+            u64::from(upload.compression_policy.is_some()),
+        );
+        if let Some(policy) = &upload.compression_policy {
+            insert_gauge(
+                section,
+                "compression_enabled",
+                "bool",
+                u64::from(policy.is_enabled()),
+            );
+            let level = if policy.is_enabled() {
+                u64::from(policy.level())
+            } else {
+                0
+            };
+            insert_gauge(section, "compression_level", "level", level);
+        }
+        if let Some(ratio) = upload.compression_stored_logical_ratio {
+            insert_gauge(
+                section,
+                "compression_stored_logical_ratio",
+                "millionths",
+                (ratio * 1_000_000.0) as u64,
+            );
+        }
+    }
+}
+
 fn insert_counter(section: &mut RuntimeStatsSection, name: &str, unit: &'static str, value: u64) {
     section.counters.insert(
         name.to_owned(),
@@ -1575,5 +1643,40 @@ mod tests {
             assert_eq!(metric.unit.as_ref(), expected_unit, "{name}");
             assert_eq!(metric.value, expected_value, "{name}");
         }
+    }
+}
+
+#[cfg(test)]
+mod compression_tests {
+    use super::*;
+
+    #[test]
+    fn compression_diagnostics_report_policy_ratio_and_legacy_defaults() {
+        let mut section = RuntimeStatsSection::default();
+        let upload = super::super::VfsUploadStats {
+            compression_policy: Some(studiofs_meta::trash::CompressionPolicy::zstd_default()),
+            compression_stored_logical_ratio: Some(0.25),
+            logical_bytes_uploaded: 4096,
+            stored_bytes_uploaded: 1024,
+            ..Default::default()
+        };
+        upload.insert_compression_metrics(&mut section);
+        assert_eq!(section.counters["logical_bytes_uploaded"].value, 4096);
+        assert_eq!(section.gauges["compression_level"].value, 3);
+        assert_eq!(
+            section.gauges["compression_stored_logical_ratio"].value,
+            250_000
+        );
+        let legacy: super::super::VfsUploadStats = serde_json::from_str("{}").unwrap();
+        assert!(legacy.compression_policy.is_none());
+        let mut unknown = RuntimeStatsSection::default();
+        legacy.insert_compression_metrics(&mut unknown);
+        assert_eq!(unknown.gauges["compression_policy_known"].value, 0);
+        assert!(!unknown.gauges.contains_key("compression_enabled"));
+        assert!(
+            !unknown
+                .gauges
+                .contains_key("compression_stored_logical_ratio")
+        );
     }
 }

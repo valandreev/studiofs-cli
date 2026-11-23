@@ -7410,7 +7410,18 @@ impl StudioVfs {
             download_throttle_wait_nanos,
         ) = self.payload_limit_status();
 
+        let compression = self.data_write.compression_stats();
         VfsUploadStats {
+            compression_policy: self.data_write.current_compression_policy().ok(),
+            compression_stored_logical_ratio: (compression.logical_bytes_uploaded > 0).then(|| {
+                compression.stored_bytes_uploaded as f64 / compression.logical_bytes_uploaded as f64
+            }),
+            logical_bytes_uploaded: compression.logical_bytes_uploaded,
+            stored_bytes_uploaded: compression.stored_bytes_uploaded,
+            v3_fragments_uploaded: compression.v3_fragments_uploaded,
+            raw_probe_fragments_uploaded: compression.raw_probe_fragments_uploaded,
+            raw_threshold_fragments_uploaded: compression.raw_threshold_fragments_uploaded,
+            decompression_nanos: compression.decompression_nanos,
             pending_uploads: pending.count,
             pending_upload_bytes,
             oldest_pending_upload_age_ms,

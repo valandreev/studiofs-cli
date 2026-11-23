@@ -29234,6 +29234,109 @@ fn retained_restore_concurrent_same_receipt_never_recopies_over_newer_writes() {
 }
 
 #[test]
+fn logical_quota_counts_compressed_payload_at_logical_size() {
+    use studiofs_meta::trash::CompressionPolicy;
+    let tmp = studiofs_test_support::workspace_target_tempdir("compression-quota-");
+    let (rt, mut vfs, meta) = make_unstarted_test_vfs(&tmp, "compression-quota");
+    let config = DataStoreConfig::from(&test_format_info("compression-quota"));
+    let raw = opendal::Operator::new(opendal::services::Memory::default())
+        .unwrap()
+        .finish();
+    let meta_reader = meta.clone();
+    let data_store = Arc::new(
+        studiofs_data::store::DataStore::with_operator_for_test(&config, raw)
+            .unwrap()
+            .with_compression_policy_reader(move || {
+                meta_reader
+                    .volume_settings()
+                    .map(|s| s.compression)
+                    .map_err(|e| studiofs_data::store::DataError::Storage(e.to_string()))
+            }),
+    );
+    Arc::get_mut(&mut vfs).unwrap().data_write = data_store.clone();
+    let vfs_config = VfsConfig::default();
+    Arc::get_mut(&mut vfs).unwrap().fetch_scheduler = Arc::new(crate::fetch::FetchScheduler::new(
+        data_store.clone(),
+        vfs.cached_store.clone(),
+        build_fetch_aimd_config(16, &vfs_config),
+        vfs_config.prefetch_foreground_reserve,
+        Arc::new(crate::qos::QosController::from_config(&vfs_config)),
+        crate::qos::TransitMemoryBudget::new(64 * 1024 * 1024),
+        &vfs_config,
+    ));
+
+    let logical_len = 256 * 1024;
+    meta.compare_and_set_compression(0, CompressionPolicy::zstd_default())
+        .unwrap()
+        .unwrap();
+    meta.compare_and_set_logical_quota_bytes(1, Some(logical_len))
+        .unwrap()
+        .unwrap();
+    let file = vfs
+        .create(ROOT_INO, b"compressible.bin", 0, 0, 0o644)
+        .unwrap();
+    let fh = vfs.open_file(file.ino, OpenFlags::RDWR, false).unwrap();
+    let payload = vec![0; logical_len as usize];
+    rt.block_on(vfs.write_fh(fh, file.ino, 0, &payload))
+        .unwrap();
+    rt.block_on(vfs.fsync_fh(fh)).unwrap();
+    let prepared = rt
+        .block_on(vfs.data_write.prepare_payload_with_policy(
+            "test-volume/objects/compression-quota",
+            Bytes::from(payload),
+            CompressionPolicy::zstd_default(),
+        ))
+        .unwrap();
+    assert!(prepared.encrypted_len() < logical_len as usize / 10);
+    rt.block_on(data_store.put_prepared_by_key("test-volume/objects/compression-quota", prepared))
+        .unwrap();
+    let stats = vfs.upload_stats();
+    assert_eq!(stats.v3_fragments_uploaded, 1);
+    assert_eq!(stats.logical_bytes_uploaded, logical_len);
+    assert!(stats.stored_bytes_uploaded < logical_len / 10);
+    assert_eq!(
+        stats.compression_policy,
+        Some(CompressionPolicy::zstd_default())
+    );
+    assert!(stats.compression_stored_logical_ratio.unwrap() < 0.1);
+    let keys = vec!["test-volume/objects/compression-quota".into()];
+    let object_id = 999_999;
+    assert_eq!(
+        rt.block_on(vfs.fetch_scheduler.fetch_block_range_after_local_miss(
+            object_id,
+            &keys,
+            0..4096
+        ))
+        .unwrap()
+        .len(),
+        4096
+    );
+    let range_nanos = vfs.upload_stats().decompression_nanos;
+    assert!(range_nanos > 0);
+    assert_eq!(
+        rt.block_on(
+            vfs.fetch_scheduler
+                .fetch_block_after_local_miss(object_id, &keys)
+        )
+        .unwrap()
+        .len(),
+        logical_len as usize
+    );
+    assert!(vfs.upload_stats().decompression_nanos > range_nanos);
+
+    assert_eq!(
+        vfs.logical_quota_status().unwrap().unwrap().used_bytes,
+        u128::from(logical_len)
+    );
+    assert_eq!(vfs.capacity_bytes().unwrap().free_bytes, 0);
+    assert!(
+        rt.block_on(vfs.write_fh(fh, file.ino, logical_len, b"x"))
+            .is_err()
+    );
+    assert_eq!(meta.get_attr(file.ino).unwrap().size, logical_len);
+}
+
+#[test]
 fn logical_quota_rejects_sparse_growth_but_allows_non_growing_operations() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "logical-quota-sparse");

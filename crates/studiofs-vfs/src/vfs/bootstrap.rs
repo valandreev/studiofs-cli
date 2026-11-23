@@ -350,14 +350,6 @@ impl VfsBootstrapResources {
             config.upload_limit,
             config.download_limit,
         ));
-        let data_read = Arc::new(
-            DataStore::with_profile_and_throttle(
-                data_config,
-                IoProfile::Read,
-                payload_throttle.clone(),
-            )
-            .map_err(|e| VfsError::Other(format!("failed to create read data store: {e}")))?,
-        );
         let meta_for_compression = meta.clone();
         let data_write = Arc::new(
             DataStore::with_profile_and_throttle(data_config, IoProfile::Write, payload_throttle)
@@ -375,6 +367,13 @@ impl VfsBootstrapResources {
                             ))
                         })
                 }),
+        );
+
+        // Separate read pool, shared client accounting and transfer budget.
+        let data_read = Arc::new(
+            data_write
+                .clone_for_reads()
+                .map_err(|e| VfsError::Other(format!("failed to create read data store: {e}")))?,
         );
 
         let qos = Arc::new(QosController::from_config(config));
