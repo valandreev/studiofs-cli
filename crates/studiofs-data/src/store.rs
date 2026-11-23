@@ -1,22 +1,28 @@
 //! DataStore — S3 storage abstraction via OpenDAL.
 
+use crate::compression::{EncodedFragment, compress_fragment};
 use crate::crypto::{self, ObjectCipher, VolumeMasterKey};
-use crate::envelope::{SFEC_HEADER_FIXED_LEN, SfecError, SfecHeader, SfecHeaderLayout};
-use crate::object::{ObjectHeader, validate_object_payload_size};
+use crate::envelope::{
+    DEFAULT_SFEC_FRAME_SIZE, SFEC_HEADER_FIXED_LEN, SMALL_SFEC_FRAME_SIZE, SfecError, SfecHeader,
+    SfecHeaderLayout,
+};
+use crate::object::{ObjectHeader, create_object_buffer, validate_object_payload_size};
 use crate::payload_throttle::PayloadThrottle;
 use crate::snapshot_key::{SnapshotArtifactKey, SnapshotArtifactPrefix};
 use async_trait::async_trait;
-use bytes::Bytes;
+use bytes::{Buf, Bytes};
 use futures::{Stream, StreamExt};
 use opendal::layers::{ConcurrentLimitLayer, RetryLayer, TimeoutLayer};
 use opendal::{Buffer, EntryMode, Operator, services::S3};
 use reqsign::{AwsCredential, AwsCredentialLoad};
+use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::fmt;
 use std::net::Ipv6Addr;
 use std::ops::Range;
 use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 use std::time::{Duration, SystemTime};
+use studiofs_meta::trash::CompressionPolicy;
 use studiofs_meta::{EncryptionConfig, FormatInfo};
 use thiserror::Error;
 use tokio::sync::Semaphore;
@@ -109,8 +115,11 @@ pub struct DataStoreObjectEntry {
 /// Byte accounting for an encrypted remote write.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RemoteObjectWriteStats {
-    /// Plaintext STFS object bytes accepted at the DataStore boundary.
+    /// Plaintext bytes before SFEC encryption (STFS v2/v3 object bytes for
+    /// payload fragments, or raw plaintext bytes for generic objects).
     pub plaintext_bytes: u64,
+    /// Logical (uncompressed) payload bytes represented by the uploaded object.
+    pub logical_bytes: u64,
     /// Ciphertext SFEC bytes written to the remote object store.
     pub encrypted_bytes: u64,
 }
@@ -120,6 +129,36 @@ pub struct RemoteObjectWriteStats {
 pub struct PreparedPayload {
     encrypted: Buffer,
     plaintext_len: usize,
+    logical_len: usize,
+    stfs_sha256: [u8; 32],
+    payload_xxh64: u64,
+}
+
+impl PreparedPayload {
+    /// Encrypted SFEC byte length transferred to object storage.
+    pub fn encrypted_len(&self) -> usize {
+        self.encrypted.len()
+    }
+
+    /// Plaintext byte length before SFEC encryption (STFS v2 or v3 object length).
+    pub fn plaintext_len(&self) -> usize {
+        self.plaintext_len
+    }
+
+    /// Logical (uncompressed) payload byte length.
+    pub fn logical_len(&self) -> usize {
+        self.logical_len
+    }
+
+    /// SHA-256 of the exact plaintext STFS object bytes sealed inside SFEC.
+    pub fn stfs_sha256(&self) -> [u8; 32] {
+        self.stfs_sha256
+    }
+
+    /// XXH64 checksum of the logical (uncompressed) fragment payload.
+    pub fn payload_xxh64(&self) -> u64 {
+        self.payload_xxh64
+    }
 }
 
 /// Byte accounting for an encrypted remote read.
@@ -474,6 +513,8 @@ pub fn validate_s3_endpoint_transport(endpoint: &str) -> DataResult<()> {
     normalize_s3_endpoint_transport(endpoint).map(|_| ())
 }
 
+type CompressionPolicyReader = Arc<dyn Fn() -> DataResult<CompressionPolicy> + Send + Sync>;
+
 /// DataStore — manages payload-object I/O to S3-compatible storage.
 pub struct DataStore {
     op: Operator,
@@ -483,6 +524,7 @@ pub struct DataStore {
     config: DataStoreConfig,
     profile: IoProfile,
     payload_throttle: Arc<PayloadThrottle>,
+    compression_policy_reader: Option<CompressionPolicyReader>,
 }
 
 fn is_ip_endpoint(endpoint: &str) -> bool {
@@ -696,6 +738,7 @@ impl DataStore {
             config,
             profile,
             payload_throttle,
+            compression_policy_reader: None,
         })
     }
 
@@ -712,7 +755,25 @@ impl DataStore {
             config,
             profile: IoProfile::Default,
             payload_throttle: Arc::new(PayloadThrottle::default()),
+            compression_policy_reader: None,
         })
+    }
+
+    /// Attach a reader that supplies the current volume compression policy
+    /// from local metadata when preparing remote payload fragments for upload.
+    pub fn with_compression_policy_reader<F>(mut self, reader: F) -> Self
+    where
+        F: Fn() -> DataResult<CompressionPolicy> + Send + Sync + 'static,
+    {
+        self.compression_policy_reader = Some(Arc::new(reader));
+        self
+    }
+
+    fn current_compression_policy(&self) -> DataResult<CompressionPolicy> {
+        match &self.compression_policy_reader {
+            Some(reader) => reader(),
+            None => Ok(CompressionPolicy::off()),
+        }
     }
 
     /// Create a read-optimised clone with its own connection pool.
@@ -728,6 +789,7 @@ impl DataStore {
             self.crypto.clone(),
         )?;
         store.volume_uuid = self.volume_uuid.clone();
+        store.compression_policy_reader = self.compression_policy_reader.clone();
         Ok(store)
     }
 
@@ -740,6 +802,7 @@ impl DataStore {
             self.crypto.clone(),
         )?;
         store.volume_uuid = self.volume_uuid.clone();
+        store.compression_policy_reader = self.compression_policy_reader.clone();
         Ok(store)
     }
 
@@ -858,19 +921,98 @@ impl DataStore {
         key: &str,
         data: impl Into<Buffer>,
     ) -> DataResult<RemoteObjectWriteStats> {
-        let prepared = self.prepare_payload(key, data.into()).await?;
+        let prepared = self.prepare_raw_payload(key, data.into()).await?;
         self.acquire_upload_budget(&prepared).await?;
         self.put_prepared_by_key(key, prepared).await
     }
 
-    /// Encrypt an object before the request timeout and upload AIMD permit begin.
-    pub async fn prepare_payload(&self, key: &str, data: Buffer) -> DataResult<PreparedPayload> {
+    /// Encrypt arbitrary non-fragment bytes (such as snapshot artifacts or test keys)
+    /// without STFS framing or payload compression.
+    async fn prepare_raw_payload(&self, key: &str, data: Buffer) -> DataResult<PreparedPayload> {
         let plaintext_len = data.len();
         let encrypted = self.encrypt_payload(key, data).await?;
         Ok(PreparedPayload {
             encrypted,
             plaintext_len,
+            logical_len: plaintext_len,
+            stfs_sha256: [0; 32],
+            payload_xxh64: 0,
         })
+    }
+
+    /// Compress (according to the current volume compression policy) and encrypt a
+    /// remote payload fragment before the request timeout and upload AIMD permit begin.
+    ///
+    /// - `off`: produces an STFS v2 object sealed with 1 MiB SFEC frames.
+    /// - `zstd`: runs the 64 KiB level-1 entropy probe and chunk compressor;
+    ///   "store raw" produces STFS v2 with 1 MiB SFEC frames, otherwise STFS v3
+    ///   sealed with 64 KiB SFEC frames.
+    pub async fn prepare_payload(&self, key: &str, payload: Bytes) -> DataResult<PreparedPayload> {
+        let policy = self.current_compression_policy()?;
+        self.prepare_payload_with_policy(key, payload, policy).await
+    }
+
+    /// Compress and encrypt a remote payload fragment under an explicit compression policy.
+    pub async fn prepare_payload_with_policy(
+        &self,
+        key: &str,
+        payload: Bytes,
+        policy: CompressionPolicy,
+    ) -> DataResult<PreparedPayload> {
+        let logical_len = payload.len();
+        if policy.is_enabled() {
+            let compressed = compress_fragment(payload, policy).await?;
+            match compressed.fragment {
+                EncodedFragment::V3(v3_buf) => {
+                    self.seal_stfs_object(key, v3_buf, logical_len, SMALL_SFEC_FRAME_SIZE)
+                        .await
+                }
+                EncodedFragment::StoreRaw { payload, .. } => {
+                    self.build_v2_and_seal(key, payload, logical_len).await
+                }
+            }
+        } else {
+            self.build_v2_and_seal(key, payload, logical_len).await
+        }
+    }
+
+    async fn build_v2_and_seal(
+        &self,
+        key: &str,
+        payload: Bytes,
+        logical_len: usize,
+    ) -> DataResult<PreparedPayload> {
+        let key = key.to_string();
+        let crypto = self.crypto.clone();
+        let max_workers = crypto_worker_hint(payload.len().saturating_add(ObjectHeader::SIZE));
+        run_crypto_blocking(&CRYPTO_ADMISSION, max_workers, move |workers| {
+            let stfs_buf = create_object_buffer(payload)?;
+            seal_stfs_buffer_blocking(
+                &crypto,
+                &key,
+                stfs_buf,
+                logical_len,
+                DEFAULT_SFEC_FRAME_SIZE,
+                workers,
+            )
+        })
+        .await
+    }
+
+    async fn seal_stfs_object(
+        &self,
+        key: &str,
+        stfs_buf: Buffer,
+        logical_len: usize,
+        frame_size: usize,
+    ) -> DataResult<PreparedPayload> {
+        let key = key.to_string();
+        let crypto = self.crypto.clone();
+        let max_workers = stfs_buf.len().div_ceil(frame_size.max(1)).max(1);
+        run_crypto_blocking(&CRYPTO_ADMISSION, max_workers, move |workers| {
+            seal_stfs_buffer_blocking(&crypto, &key, stfs_buf, logical_len, frame_size, workers)
+        })
+        .await
     }
 
     /// Charge one prepared object's full encrypted size before its network request.
@@ -892,17 +1034,20 @@ impl DataStore {
         prepared: PreparedPayload,
     ) -> DataResult<RemoteObjectWriteStats> {
         let plaintext_len = prepared.plaintext_len;
+        let logical_len = prepared.logical_len;
         let encrypted = prepared.encrypted;
         let encrypted_len = encrypted.len();
         debug!(
             key,
             plaintext_bytes = plaintext_len,
+            logical_bytes = logical_len,
             remote_bytes = encrypted_len,
             "uploading encrypted object"
         );
         self.op.write(key, encrypted).await?;
         Ok(RemoteObjectWriteStats {
             plaintext_bytes: plaintext_len as u64,
+            logical_bytes: logical_len as u64,
             encrypted_bytes: encrypted_len as u64,
         })
     }
@@ -1284,6 +1429,43 @@ impl DataStore {
         })
         .await
     }
+}
+
+fn seal_stfs_buffer_blocking(
+    crypto: &DataStoreCryptoRuntime,
+    key: &str,
+    stfs_buf: Buffer,
+    logical_len: usize,
+    frame_size: usize,
+    workers: usize,
+) -> DataResult<PreparedPayload> {
+    let plaintext_len = stfs_buf.len();
+    let mut header_bytes = [0u8; ObjectHeader::SIZE];
+    stfs_buf
+        .slice(..ObjectHeader::SIZE)
+        .copy_to_slice(&mut header_bytes);
+    let payload_xxh64 = ObjectHeader::from_bytes(&header_bytes)?.checksum;
+
+    let mut hasher = Sha256::new();
+    for chunk in stfs_buf.clone() {
+        hasher.update(&chunk);
+    }
+    let stfs_sha256: [u8; 32] = hasher.finalize().into();
+
+    let frame_size = u32::try_from(frame_size)
+        .map_err(|_| crypto::CryptoError::from(SfecError::InvalidFrameSize(u32::MAX)))?;
+    let encrypted =
+        crypto
+            .cipher
+            .encrypt_object(stfs_buf, key, crypto.key_id, frame_size, workers)?;
+
+    Ok(PreparedPayload {
+        encrypted,
+        plaintext_len,
+        logical_len,
+        stfs_sha256,
+        payload_xxh64,
+    })
 }
 
 #[cfg(test)]
@@ -2617,7 +2799,7 @@ mod tests {
         let store = DataStore::with_operator_for_test(&encrypted_test_config(), raw).unwrap();
         let key = "unit-volume/objects/aa/bb/prepared-limit";
         let prepared = store
-            .prepare_payload(key, Buffer::from(vec![0x5a; 125_000]))
+            .prepare_payload(key, Bytes::from(vec![0x5a; 125_000]))
             .await
             .unwrap();
         let bytes = prepared.encrypted.len();
@@ -2938,5 +3120,255 @@ mod tests {
         };
 
         assert!(matches!(error, DataError::InvalidObjectKey(_)));
+    }
+
+    fn deterministic_random_bytes(len: usize) -> Bytes {
+        let mut state: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut out = Vec::with_capacity(len);
+        while out.len() < len {
+            state ^= state >> 12;
+            state ^= state << 25;
+            state ^= state >> 27;
+            let word = state.wrapping_mul(0x2545_f491_4f6c_dd1d).to_le_bytes();
+            let take = (len - out.len()).min(word.len());
+            out.extend_from_slice(&word[..take]);
+        }
+        Bytes::from(out)
+    }
+
+    fn compressible_bytes(len: usize) -> Bytes {
+        let pattern = b"studiofs-compressible-fragment-payload-0123456789-abcdef\n";
+        let mut out = Vec::with_capacity(len);
+        while out.len() < len {
+            let take = (len - out.len()).min(pattern.len());
+            out.extend_from_slice(&pattern[..take]);
+        }
+        Bytes::from(out)
+    }
+
+    #[tokio::test]
+    async fn prepare_payload_policy_off_writes_v2_and_zstd_writes_v3_or_v2_for_random() {
+        use crate::compression::decode_object_with_checksum;
+        use crate::envelope::{DEFAULT_SFEC_FRAME_SIZE, SMALL_SFEC_FRAME_SIZE, SfecEnvelope};
+        use crate::object::{VERSION, VERSION_V3};
+
+        let raw = Operator::new(Memory::default()).unwrap().finish();
+        let store =
+            DataStore::with_operator_for_test(&encrypted_test_config(), raw.clone()).unwrap();
+        let compressible = compressible_bytes(256 * 1024);
+        let random = deterministic_random_bytes(256 * 1024);
+
+        // 1. Policy `off`: STFS v2 with 1 MiB SFEC frames.
+        let key_off = "unit-volume/objects/0001/policy-off";
+        let prepared_off = store
+            .prepare_payload_with_policy(key_off, compressible.clone(), CompressionPolicy::off())
+            .await
+            .unwrap();
+        let stats_off = store
+            .put_prepared_by_key(key_off, prepared_off)
+            .await
+            .unwrap();
+        let raw_off = raw.read(key_off).await.unwrap().to_bytes();
+        let env_off = SfecEnvelope::parse(raw_off.clone()).unwrap();
+        assert_eq!(
+            env_off.header().frame_size(),
+            DEFAULT_SFEC_FRAME_SIZE as u32
+        );
+        let (stfs_off, _) = store.get_payload_by_key_with_stats(key_off).await.unwrap();
+        let header_off =
+            ObjectHeader::from_bytes(&stfs_off.slice(..ObjectHeader::SIZE).to_bytes()).unwrap();
+        assert_eq!(header_off.version, VERSION);
+        assert_eq!(stats_off.logical_bytes, compressible.len() as u64);
+        assert_eq!(stats_off.encrypted_bytes, raw_off.len() as u64);
+        let (decoded_off, _) = decode_object_with_checksum(stfs_off).await.unwrap();
+        assert_eq!(decoded_off, compressible);
+
+        // 2. Policy `zstd` with compressible data: STFS v3 with 64 KiB SFEC frames.
+        let key_v3 = "unit-volume/objects/0001/policy-zstd-compressible";
+        let prepared_v3 = store
+            .prepare_payload_with_policy(
+                key_v3,
+                compressible.clone(),
+                CompressionPolicy::zstd_default(),
+            )
+            .await
+            .unwrap();
+        let stats_v3 = store
+            .put_prepared_by_key(key_v3, prepared_v3)
+            .await
+            .unwrap();
+        let raw_v3 = raw.read(key_v3).await.unwrap().to_bytes();
+        let env_v3 = SfecEnvelope::parse(raw_v3.clone()).unwrap();
+        assert_eq!(env_v3.header().frame_size(), SMALL_SFEC_FRAME_SIZE as u32);
+        let (stfs_v3, _) = store.get_payload_by_key_with_stats(key_v3).await.unwrap();
+        let header_v3 =
+            ObjectHeader::from_bytes(&stfs_v3.slice(..ObjectHeader::SIZE).to_bytes()).unwrap();
+        assert_eq!(header_v3.version, VERSION_V3);
+        assert_eq!(stats_v3.logical_bytes, compressible.len() as u64);
+        assert_eq!(stats_v3.encrypted_bytes, raw_v3.len() as u64);
+        assert!(
+            stats_v3.encrypted_bytes < stats_v3.logical_bytes,
+            "compressed v3 object should be smaller than logical payload"
+        );
+        let (decoded_v3, _) = decode_object_with_checksum(stfs_v3).await.unwrap();
+        assert_eq!(decoded_v3, compressible);
+
+        // 3. Policy `zstd` with random data: store raw -> STFS v2 with 1 MiB SFEC frames.
+        let key_raw = "unit-volume/objects/0001/policy-zstd-random";
+        let prepared_raw = store
+            .prepare_payload_with_policy(key_raw, random.clone(), CompressionPolicy::zstd_default())
+            .await
+            .unwrap();
+        let stats_raw = store
+            .put_prepared_by_key(key_raw, prepared_raw)
+            .await
+            .unwrap();
+        let raw_rand = raw.read(key_raw).await.unwrap().to_bytes();
+        let env_rand = SfecEnvelope::parse(raw_rand.clone()).unwrap();
+        assert_eq!(
+            env_rand.header().frame_size(),
+            DEFAULT_SFEC_FRAME_SIZE as u32
+        );
+        let (stfs_rand, _) = store.get_payload_by_key_with_stats(key_raw).await.unwrap();
+        let header_rand =
+            ObjectHeader::from_bytes(&stfs_rand.slice(..ObjectHeader::SIZE).to_bytes()).unwrap();
+        assert_eq!(header_rand.version, VERSION);
+        assert_eq!(stats_raw.logical_bytes, random.len() as u64);
+        assert_eq!(stats_raw.encrypted_bytes, raw_rand.len() as u64);
+        let (decoded_rand, _) = decode_object_with_checksum(stfs_rand).await.unwrap();
+        assert_eq!(decoded_rand, random);
+    }
+
+    #[tokio::test]
+    async fn prepare_payload_reads_policy_at_preparation_time_without_rewriting_uploaded() {
+        use crate::envelope::{DEFAULT_SFEC_FRAME_SIZE, SMALL_SFEC_FRAME_SIZE, SfecEnvelope};
+        use crate::object::{VERSION, VERSION_V3};
+
+        let raw = Operator::new(Memory::default()).unwrap().finish();
+        let active_policy = Arc::new(Mutex::new(CompressionPolicy::off()));
+        let policy_reader = active_policy.clone();
+        let store = DataStore::with_operator_for_test(&encrypted_test_config(), raw.clone())
+            .unwrap()
+            .with_compression_policy_reader(move || Ok(*policy_reader.lock().unwrap()));
+
+        let payload = compressible_bytes(256 * 1024);
+
+        let key_first = "unit-volume/objects/0002/first-off";
+        let prepared_first = store
+            .prepare_payload(key_first, payload.clone())
+            .await
+            .unwrap();
+        store
+            .put_prepared_by_key(key_first, prepared_first)
+            .await
+            .unwrap();
+
+        // Switch policy before preparing the second fragment.
+        *active_policy.lock().unwrap() = CompressionPolicy::zstd_default();
+        let key_second = "unit-volume/objects/0002/second-zstd";
+        let prepared_second = store
+            .prepare_payload(key_second, payload.clone())
+            .await
+            .unwrap();
+        store
+            .put_prepared_by_key(key_second, prepared_second)
+            .await
+            .unwrap();
+
+        // First uploaded object stays v2 with 1 MiB frames; second is v3 with 64 KiB frames.
+        let env_first = SfecEnvelope::parse(raw.read(key_first).await.unwrap().to_bytes()).unwrap();
+        let env_second =
+            SfecEnvelope::parse(raw.read(key_second).await.unwrap().to_bytes()).unwrap();
+        assert_eq!(
+            env_first.header().frame_size(),
+            DEFAULT_SFEC_FRAME_SIZE as u32
+        );
+        assert_eq!(
+            env_second.header().frame_size(),
+            SMALL_SFEC_FRAME_SIZE as u32
+        );
+
+        let (stfs_first, _) = store
+            .get_payload_by_key_with_stats(key_first)
+            .await
+            .unwrap();
+        let (stfs_second, _) = store
+            .get_payload_by_key_with_stats(key_second)
+            .await
+            .unwrap();
+        assert_eq!(
+            ObjectHeader::from_bytes(&stfs_first.slice(..ObjectHeader::SIZE).to_bytes())
+                .unwrap()
+                .version,
+            VERSION
+        );
+        assert_eq!(
+            ObjectHeader::from_bytes(&stfs_second.slice(..ObjectHeader::SIZE).to_bytes())
+                .unwrap()
+                .version,
+            VERSION_V3
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn prepare_payload_upload_budget_charges_compressed_encrypted_size() {
+        let raw = Operator::new(Memory::default()).unwrap().finish();
+        let store = DataStore::with_operator_for_test(&encrypted_test_config(), raw)
+            .unwrap()
+            .with_compression_policy_reader(|| Ok(CompressionPolicy::zstd_default()));
+        let key = "unit-volume/objects/0003/zstd-budget";
+        let payload = compressible_bytes(512 * 1024);
+
+        let prepared = store.prepare_payload(key, payload.clone()).await.unwrap();
+        assert!(
+            prepared.encrypted_len() < payload.len() / 4,
+            "expected strong compression ratio on repetitive payload"
+        );
+        assert_eq!(prepared.logical_len(), payload.len());
+
+        // 1 Mbps = 125_000 B/s: charging 512 KiB would take >4s, while charging the
+        // compressed encrypted size takes well under 1s.
+        store.set_payload_limits(Some(1), Some(0));
+        let start = tokio::time::Instant::now();
+        store.acquire_upload_budget(&prepared).await.unwrap();
+        let elapsed = tokio::time::Instant::now() - start;
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "upload budget must charge stored encrypted size, not logical size (elapsed={elapsed:?})"
+        );
+        let stats = store.put_prepared_by_key(key, prepared).await.unwrap();
+        assert_eq!(stats.logical_bytes, payload.len() as u64);
+        assert!(stats.encrypted_bytes < stats.logical_bytes);
+    }
+
+    #[tokio::test]
+    async fn put_snapshot_artifact_is_never_compressed_under_zstd_policy() {
+        use crate::envelope::{DEFAULT_SFEC_FRAME_SIZE, SfecEnvelope};
+
+        let raw = Operator::new(Memory::default()).unwrap().finish();
+        let config = encrypted_test_config();
+        let store = DataStore::with_operator_for_test(&config, raw.clone())
+            .unwrap()
+            .with_compression_policy_reader(|| Ok(CompressionPolicy::zstd_default()));
+        let key = SnapshotArtifactKey::final_artifact(
+            &config.data_prefix,
+            7,
+            &config.volume_uuid,
+            &studiofs_meta::snapshot::SnapshotId::parse("unit-volume.2026-10-16T12-00-00.000Z")
+                .unwrap(),
+        )
+        .unwrap();
+        let artifact = compressible_bytes(128 * 1024);
+
+        store
+            .put_snapshot_artifact(&key, artifact.clone())
+            .await
+            .unwrap();
+
+        let remote = raw.read(key.as_str()).await.unwrap().to_bytes();
+        let env = SfecEnvelope::parse(remote).unwrap();
+        assert_eq!(env.header().frame_size(), DEFAULT_SFEC_FRAME_SIZE as u32);
+        let decrypted = store.get_snapshot_artifact(&key).await.unwrap().to_bytes();
+        assert_eq!(decrypted, artifact);
     }
 }

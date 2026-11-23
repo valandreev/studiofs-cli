@@ -5,7 +5,8 @@
 use crate::aimd::{AimdConfig, AimdController};
 use crate::runtime::{TimeoutOrCancel, run_with_timeout_or_cancel, sleep_or_cancel};
 use crate::vfs::VfsConfig;
-use opendal::{Buffer, ErrorKind};
+use bytes::Bytes;
+use opendal::ErrorKind;
 use std::convert::TryFrom;
 use std::future::Future;
 use std::sync::Arc;
@@ -35,8 +36,10 @@ pub struct UploadMetrics {
     pub status_5xx_err: AtomicU64,
     /// Number of failures classified as network-related.
     pub network_err: AtomicU64,
-    /// Total number of bytes successfully uploaded.
+    /// Total number of plaintext STFS bytes successfully uploaded.
     pub bytes_uploaded: AtomicU64,
+    /// Total number of logical (uncompressed) payload bytes successfully uploaded.
+    pub logical_bytes_uploaded: AtomicU64,
     /// Number of encrypted remote objects successfully written.
     pub encrypted_objects_written: AtomicU64,
     /// Number of encrypted remote bytes successfully written.
@@ -58,6 +61,7 @@ impl UploadMetrics {
             status_5xx_err: AtomicU64::new(0),
             network_err: AtomicU64::new(0),
             bytes_uploaded: AtomicU64::new(0),
+            logical_bytes_uploaded: AtomicU64::new(0),
             encrypted_objects_written: AtomicU64::new(0),
             encrypted_bytes_written: AtomicU64::new(0),
             encrypted_object_write_failures: AtomicU64::new(0),
@@ -69,7 +73,7 @@ impl std::fmt::Display for UploadMetrics {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "attempts={} ok={} err={} retries={} exhausted={} timeout={} temporary={} http_5xx={} network={} bytes={} encrypted_objects={} encrypted_bytes={} crypto_write_failures={}",
+            "attempts={} ok={} err={} retries={} exhausted={} timeout={} temporary={} http_5xx={} network={} bytes={} logical_bytes={} encrypted_objects={} encrypted_bytes={} crypto_write_failures={}",
             self.attempts.load(Ordering::Relaxed),
             self.uploads_ok.load(Ordering::Relaxed),
             self.uploads_err.load(Ordering::Relaxed),
@@ -80,6 +84,7 @@ impl std::fmt::Display for UploadMetrics {
             self.status_5xx_err.load(Ordering::Relaxed),
             self.network_err.load(Ordering::Relaxed),
             self.bytes_uploaded.load(Ordering::Relaxed),
+            self.logical_bytes_uploaded.load(Ordering::Relaxed),
             self.encrypted_objects_written.load(Ordering::Relaxed),
             self.encrypted_bytes_written.load(Ordering::Relaxed),
             self.encrypted_object_write_failures.load(Ordering::Relaxed),
@@ -108,11 +113,12 @@ pub trait UploadObjectStore: Send + Sync + 'static {
     /// Payload prepared before throttling, AIMD admission, and request timeout.
     type Prepared: Clone + Send + 'static;
 
-    /// Prepare the encrypted object without starting the remote request.
+    /// Prepare the compressed (if enabled) and encrypted object without starting
+    /// the remote request.
     fn prepare_upload<'a>(
         &'a self,
         key: &'a str,
-        payload: Buffer,
+        payload: Bytes,
     ) -> impl Future<Output = Result<Self::Prepared, DataError>> + Send + 'a;
 
     /// Wait for the complete object budget before acquiring an AIMD slot.
@@ -121,7 +127,7 @@ pub trait UploadObjectStore: Send + Sync + 'static {
         prepared: &'a Self::Prepared,
     ) -> impl Future<Output = Result<(), DataError>> + Send + 'a;
 
-    /// Upload already-serialized STFS object bytes to a remote storage key.
+    /// Upload an already-prepared encrypted object to a remote storage key.
     fn put_by_key<'a>(
         &'a self,
         key: &'a str,
@@ -135,7 +141,7 @@ impl UploadObjectStore for DataStore {
     fn prepare_upload<'a>(
         &'a self,
         key: &'a str,
-        payload: Buffer,
+        payload: Bytes,
     ) -> impl Future<Output = Result<Self::Prepared, DataError>> + Send + 'a {
         DataStore::prepare_payload(self, key, payload)
     }
@@ -221,19 +227,11 @@ where
         self.adaptive_penalty_ms.load(Ordering::Relaxed)
     }
 
-    /// Upload object bytes to `key` with adaptive retries.
-    pub async fn put(
-        &self,
-        key: &str,
-        payload: Buffer,
-        cancel_token: &CancellationToken,
-    ) -> Result<(), UploadError> {
-        let mut last_err: Option<DataError> = None;
-        let overall_start = Instant::now();
-        let mut attempts_made = 0;
-        let prepared = self
-            .data_store
-            .prepare_upload(key, payload.clone())
+    /// Prepare a raw fragment payload for upload using the current compression
+    /// policy and SFEC encryption without starting the remote request.
+    pub async fn prepare(&self, key: &str, payload: Bytes) -> Result<S::Prepared, UploadError> {
+        self.data_store
+            .prepare_upload(key, payload)
             .await
             .map_err(|source| {
                 classify_data_error(&self.metrics, &source);
@@ -241,7 +239,19 @@ where
                     attempts: 0,
                     source,
                 }
-            })?;
+            })
+    }
+
+    /// Upload a previously prepared payload to `key` with adaptive retries.
+    pub async fn put_prepared(
+        &self,
+        key: &str,
+        prepared: S::Prepared,
+        cancel_token: &CancellationToken,
+    ) -> Result<(), UploadError> {
+        let mut last_err: Option<DataError> = None;
+        let overall_start = Instant::now();
+        let mut attempts_made = 0;
 
         for attempt in 0..self.max_attempts {
             if cancel_token.is_cancelled() {
@@ -274,6 +284,9 @@ where
                         .bytes_uploaded
                         .fetch_add(stats.plaintext_bytes, Ordering::Relaxed);
                     self.metrics
+                        .logical_bytes_uploaded
+                        .fetch_add(stats.logical_bytes, Ordering::Relaxed);
+                    self.metrics
                         .encrypted_objects_written
                         .fetch_add(1, Ordering::Relaxed);
                     self.metrics
@@ -281,7 +294,9 @@ where
                         .fetch_add(stats.encrypted_bytes, Ordering::Relaxed);
                     debug!(
                         key,
-                        bytes = payload.len(),
+                        logical_bytes = stats.logical_bytes,
+                        plaintext_bytes = stats.plaintext_bytes,
+                        encrypted_bytes = stats.encrypted_bytes,
                         req_ms,
                         total_ms = overall_start.elapsed().as_millis() as u64,
                         attempt,
@@ -396,6 +411,17 @@ where
         })
     }
 
+    /// Prepare and upload raw fragment bytes to `key` with adaptive retries.
+    pub async fn put(
+        &self,
+        key: &str,
+        payload: Bytes,
+        cancel_token: &CancellationToken,
+    ) -> Result<(), UploadError> {
+        let prepared = self.prepare(key, payload).await?;
+        self.put_prepared(key, prepared, cancel_token).await
+    }
+
     /// Returns the current AIMD window size as a floating-point control value.
     pub fn window(&self) -> f64 {
         self.aimd.window()
@@ -476,7 +502,7 @@ mod tests {
     use crate::AimdConfig;
     use crate::vfs::VfsConfig;
     use bytes::Bytes;
-    use opendal::{Buffer, Operator, services::Memory};
+    use opendal::{Operator, services::Memory};
     use parking_lot::Mutex;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -541,23 +567,23 @@ mod tests {
             AimdConfig::upload_default(),
             &upload_test_config(),
         );
-        let plaintext_object =
-            create_object_buffer(Bytes::from_static(b"upload plaintext")).unwrap();
-        assert!(plaintext_object.to_bytes().starts_with(STFS_MAGIC));
+        let raw_payload = Bytes::from_static(b"upload plaintext");
+        let expected_stfs = create_object_buffer(raw_payload.clone()).unwrap();
+        assert!(expected_stfs.to_bytes().starts_with(STFS_MAGIC));
 
         let key = "unit-volume/objects/aa/bb/scheduler-upload";
         scheduler
-            .put(key, plaintext_object.clone(), &CancellationToken::new())
+            .put(key, raw_payload.clone(), &CancellationToken::new())
             .await
             .unwrap();
 
         let remote_bytes = raw.read(key).await.unwrap().to_bytes();
         assert!(remote_bytes.starts_with(SFEC_MAGIC));
         assert!(!remote_bytes.starts_with(STFS_MAGIC));
-        assert!(remote_bytes.len() > plaintext_object.len());
+        assert!(remote_bytes.len() > expected_stfs.len());
         assert_eq!(
             store.get_by_key(key).await.unwrap().to_bytes(),
-            plaintext_object.to_bytes()
+            expected_stfs.to_bytes()
         );
         assert_eq!(
             scheduler
@@ -572,6 +598,13 @@ mod tests {
                 .encrypted_bytes_written
                 .load(Ordering::Relaxed),
             remote_bytes.len() as u64
+        );
+        assert_eq!(
+            scheduler
+                .metrics
+                .logical_bytes_uploaded
+                .load(Ordering::Relaxed),
+            raw_payload.len() as u64
         );
         assert!(
             scheduler
@@ -591,9 +624,9 @@ mod tests {
     }
 
     impl UploadObjectStore for RetryOnceUploadStore {
-        type Prepared = Buffer;
+        type Prepared = Bytes;
 
-        async fn prepare_upload(&self, _key: &str, payload: Buffer) -> Result<Buffer, DataError> {
+        async fn prepare_upload(&self, _key: &str, payload: Bytes) -> Result<Bytes, DataError> {
             if self.prepare_error {
                 Err(DataError::InvalidCryptoConfig(
                     studiofs_meta::EncryptionContractError::Disabled,
@@ -603,7 +636,7 @@ mod tests {
             }
         }
 
-        async fn acquire_upload_budget(&self, _prepared: &Buffer) -> Result<(), DataError> {
+        async fn acquire_upload_budget(&self, _prepared: &Bytes) -> Result<(), DataError> {
             tokio::time::sleep(self.budget_delay).await;
             Ok(())
         }
@@ -611,18 +644,17 @@ mod tests {
         async fn put_by_key(
             &self,
             key: &str,
-            data: Buffer,
+            data: Bytes,
         ) -> Result<RemoteObjectWriteStats, DataError> {
             let plaintext_bytes = data.len() as u64;
-            self.payloads
-                .lock()
-                .push((key.to_string(), data.to_bytes()));
+            self.payloads.lock().push((key.to_string(), data));
             let attempt = self.attempts.fetch_add(1, Ordering::Relaxed);
             if attempt == 0 {
                 return Err(DataError::Storage("temporary encrypted put failure".into()));
             }
             Ok(RemoteObjectWriteStats {
                 plaintext_bytes,
+                logical_bytes: plaintext_bytes,
                 encrypted_bytes: plaintext_bytes + 16,
             })
         }
@@ -640,7 +672,7 @@ mod tests {
             scheduler
                 .put(
                     "bad-config",
-                    Buffer::from("payload"),
+                    Bytes::from_static(b"payload"),
                     &CancellationToken::new()
                 )
                 .await
@@ -667,7 +699,7 @@ mod tests {
         scheduler
             .put(
                 "budget-timeout",
-                Buffer::from("payload"),
+                Bytes::from_static(b"payload"),
                 &CancellationToken::new(),
             )
             .await
@@ -680,20 +712,20 @@ mod tests {
     }
 
     impl UploadObjectStore for NonRetryableUploadStore {
-        type Prepared = Buffer;
+        type Prepared = Bytes;
 
-        async fn prepare_upload(&self, _key: &str, payload: Buffer) -> Result<Buffer, DataError> {
+        async fn prepare_upload(&self, _key: &str, payload: Bytes) -> Result<Bytes, DataError> {
             Ok(payload)
         }
 
-        async fn acquire_upload_budget(&self, _prepared: &Buffer) -> Result<(), DataError> {
+        async fn acquire_upload_budget(&self, _prepared: &Bytes) -> Result<(), DataError> {
             Ok(())
         }
 
         async fn put_by_key(
             &self,
             _key: &str,
-            _data: Buffer,
+            _data: Bytes,
         ) -> Result<RemoteObjectWriteStats, DataError> {
             self.attempts.fetch_add(1, Ordering::Relaxed);
             Err(DataError::Crypto(CryptoError::AuthenticationFailed))
@@ -710,8 +742,7 @@ mod tests {
             AimdConfig::upload_default(),
             &upload_test_config(),
         );
-        let plaintext_object =
-            create_object_buffer(Bytes::from_static(b"non retryable plaintext")).unwrap();
+        let plaintext_object = Bytes::from_static(b"non retryable plaintext");
 
         let err = scheduler
             .put(
@@ -744,8 +775,7 @@ mod tests {
             AimdConfig::upload_default(),
             &upload_test_config(),
         );
-        let plaintext_object =
-            create_object_buffer(Bytes::from_static(b"retry plaintext")).unwrap();
+        let plaintext_object = Bytes::from_static(b"retry plaintext");
 
         scheduler
             .put(
@@ -759,17 +789,96 @@ mod tests {
         assert_eq!(store.attempts.load(Ordering::Relaxed), 2);
         let payloads = store.payloads.lock();
         assert_eq!(payloads.len(), 2);
-        assert!(
-            payloads
-                .iter()
-                .all(|(_, bytes)| bytes.starts_with(STFS_MAGIC))
-        );
-        assert!(
-            payloads
-                .iter()
-                .all(|(_, bytes)| bytes == &plaintext_object.to_bytes())
-        );
+        assert!(payloads.iter().all(|(_, bytes)| bytes == &plaintext_object));
         assert_eq!(scheduler.metrics.retries.load(Ordering::Relaxed), 1);
         assert_eq!(scheduler.metrics.uploads_ok.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn scheduler_reads_redb_compression_policy_at_preparation_time() {
+        use studiofs_data::compression::decode_object_with_checksum;
+        use studiofs_data::envelope::{
+            DEFAULT_SFEC_FRAME_SIZE, SMALL_SFEC_FRAME_SIZE, SfecEnvelope,
+        };
+        use studiofs_data::object::{ObjectHeader, VERSION, VERSION_V3};
+        use studiofs_meta::RedbMetaEngine;
+        use studiofs_meta::trash::{CompressionPolicy, MetaVolumeSettings};
+
+        let tmp = studiofs_test_support::workspace_target_tempdir("upload-policy-");
+        let meta = Arc::new(RedbMetaEngine::open(tmp.path().join("meta.redb")).unwrap());
+        let raw = Operator::new(Memory::default()).unwrap().finish();
+        let meta_for_store = meta.clone();
+        let store = Arc::new(
+            DataStore::with_operator_for_test(&encrypted_test_config(), raw.clone())
+                .unwrap()
+                .with_compression_policy_reader(move || {
+                    meta_for_store
+                        .volume_settings()
+                        .map(|s| s.compression)
+                        .map_err(|err| DataError::Storage(err.to_string()))
+                }),
+        );
+        let scheduler = UploadScheduler::new(
+            store.clone(),
+            AimdConfig::upload_default(),
+            &upload_test_config(),
+        );
+
+        let payload =
+            Bytes::from(b"upload-scheduler-compressible-pattern-0123456789\n".repeat(4096));
+        let key_off = "unit-volume/objects/aa/bb/redb-policy-off";
+        scheduler
+            .put(key_off, payload.clone(), &CancellationToken::new())
+            .await
+            .unwrap();
+
+        // Update redb volume settings to zstd:3 before preparing the next object.
+        meta.compare_and_set_compression(0, CompressionPolicy::zstd_default())
+            .unwrap()
+            .expect("CAS compression to zstd:3");
+
+        let key_zstd = "unit-volume/objects/aa/bb/redb-policy-zstd";
+        scheduler
+            .put(key_zstd, payload.clone(), &CancellationToken::new())
+            .await
+            .unwrap();
+
+        let env_off = SfecEnvelope::parse(raw.read(key_off).await.unwrap().to_bytes()).unwrap();
+        let env_zstd = SfecEnvelope::parse(raw.read(key_zstd).await.unwrap().to_bytes()).unwrap();
+        assert_eq!(
+            env_off.header().frame_size(),
+            DEFAULT_SFEC_FRAME_SIZE as u32
+        );
+        assert_eq!(env_zstd.header().frame_size(), SMALL_SFEC_FRAME_SIZE as u32);
+
+        let (stfs_off, _) = store.get_payload_by_key_with_stats(key_off).await.unwrap();
+        let (stfs_zstd, _) = store.get_payload_by_key_with_stats(key_zstd).await.unwrap();
+        assert_eq!(
+            ObjectHeader::from_bytes(&stfs_off.slice(..ObjectHeader::SIZE).to_bytes())
+                .unwrap()
+                .version,
+            VERSION
+        );
+        assert_eq!(
+            ObjectHeader::from_bytes(&stfs_zstd.slice(..ObjectHeader::SIZE).to_bytes())
+                .unwrap()
+                .version,
+            VERSION_V3
+        );
+        assert_eq!(
+            decode_object_with_checksum(stfs_off).await.unwrap().0,
+            payload
+        );
+        assert_eq!(
+            decode_object_with_checksum(stfs_zstd).await.unwrap().0,
+            payload
+        );
+        assert_eq!(
+            scheduler
+                .metrics
+                .logical_bytes_uploaded
+                .load(Ordering::Relaxed),
+            (payload.len() * 2) as u64
+        );
     }
 }

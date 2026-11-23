@@ -282,6 +282,7 @@ struct VfsBootstrapResources {
 
 impl VfsBootstrapResources {
     fn open(
+        meta: &Arc<dyn VfsMeta>,
         data_config: &DataStoreConfig,
         cache_dir: &str,
         plan: &VfsBootstrapPlan,
@@ -357,9 +358,23 @@ impl VfsBootstrapResources {
             )
             .map_err(|e| VfsError::Other(format!("failed to create read data store: {e}")))?,
         );
+        let meta_for_compression = meta.clone();
         let data_write = Arc::new(
             DataStore::with_profile_and_throttle(data_config, IoProfile::Write, payload_throttle)
-                .map_err(|e| VfsError::Other(format!("failed to create write data store: {e}")))?,
+                .map_err(|e| VfsError::Other(format!("failed to create write data store: {e}")))?
+                .with_compression_policy_reader(move || {
+                    let Some(store) = meta_for_compression.retained_store() else {
+                        return Ok(studiofs_meta::trash::CompressionPolicy::off());
+                    };
+                    store
+                        .volume_settings()
+                        .map(|settings| settings.compression)
+                        .map_err(|err| {
+                            studiofs_data::store::DataError::Storage(format!(
+                                "failed to read volume compression policy: {err}"
+                            ))
+                        })
+                }),
         );
 
         let qos = Arc::new(QosController::from_config(config));
@@ -446,8 +461,14 @@ impl VfsBootstrap {
             &config,
         )?;
         plan.log_summary(cache_size, &config);
-        let resources =
-            VfsBootstrapResources::open(data_config, cache_dir, &plan, &config, cache_runtime)?;
+        let resources = VfsBootstrapResources::open(
+            &meta,
+            data_config,
+            cache_dir,
+            &plan,
+            &config,
+            cache_runtime,
+        )?;
         meta.set_scratch_cache_dir(PathBuf::from(cache_dir))?;
         Ok(Self {
             meta,

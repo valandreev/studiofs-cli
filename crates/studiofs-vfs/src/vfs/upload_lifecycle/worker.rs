@@ -1,13 +1,11 @@
 use super::super::{FileSessionOperation, Ino, InodeAttr, StudioVfs, VfsError, VfsResult};
 use crate::VfsMeta;
 use crate::runtime::{
-    MetaExecutor, TimeoutOrCancel, run_blocking, run_meta_maintenance, run_with_timeout_or_cancel,
+    MetaExecutor, TimeoutOrCancel, run_meta_maintenance, run_with_timeout_or_cancel,
 };
 use crate::utils::now_unix_millis;
 use bytes::Bytes;
 use futures::future::join_all;
-use opendal::Buffer;
-use sha2::{Digest, Sha256};
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::sync::Arc;
@@ -15,8 +13,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use studiofs_cache::upload_queue::{ObjectFileMapping, PendingUpload};
 use studiofs_data::object::{
-    CLOUD_FRAGMENT_COUNT, CLOUD_FRAGMENT_SIZE, ObjectHeader, create_object_buffer,
-    format_object_fragment_keys,
+    CLOUD_FRAGMENT_COUNT, CLOUD_FRAGMENT_SIZE, format_object_fragment_keys,
 };
 use studiofs_meta::schema::{
     ChunkId, DEFAULT_CHUNK_SIZE, FileType, PayloadRef, PayloadRefState, ResolvedSliceSource,
@@ -1985,13 +1982,6 @@ struct VfsRemoteUploadPort {
     ledger_volume_id: Arc<AsyncMutex<Option<studiofs_meta::snapshot::VolumeId>>>,
 }
 
-struct BuiltFragment {
-    xxh64: u64,
-    payload: Buffer,
-    expected_byte_length: u64,
-    expected_sha256: [u8; 32],
-}
-
 impl VfsRemoteUploadPort {
     async fn ledger_volume_id(&self) -> VfsResult<studiofs_meta::snapshot::VolumeId> {
         let mut cached = self.ledger_volume_id.lock().await;
@@ -2006,14 +1996,17 @@ impl VfsRemoteUploadPort {
         Ok(volume_id)
     }
 
-    fn whole_payload_checksum(raw_len: usize, fragments: &[BuiltFragment]) -> Option<u64> {
+    fn whole_payload_checksum(
+        raw_len: usize,
+        fragments: &[studiofs_data::store::PreparedPayload],
+    ) -> Option<u64> {
         match fragments {
-            [fragment] if raw_len <= CLOUD_FRAGMENT_SIZE => Some(fragment.xxh64),
+            [fragment] if raw_len <= CLOUD_FRAGMENT_SIZE => Some(fragment.payload_xxh64()),
             _ => None,
         }
     }
 
-    fn build_fragments(raw_payload: Bytes) -> VfsResult<Vec<BuiltFragment>> {
+    fn slice_fragments(raw_payload: Bytes) -> Vec<Bytes> {
         let mut fragments = Vec::with_capacity(CLOUD_FRAGMENT_COUNT);
         for fragment_index in 0..CLOUD_FRAGMENT_COUNT {
             let start = fragment_index * CLOUD_FRAGMENT_SIZE;
@@ -2023,21 +2016,9 @@ impl VfsRemoteUploadPort {
             } else {
                 Bytes::new()
             };
-            let payload = create_object_buffer(fragment_payload)?;
-            let xxh64 = ObjectHeader::from_bytes(&payload.current())?.checksum;
-            // Hash the object chunks in place; the ledger digest stays the SHA-256 of the exact uploaded bytes.
-            let mut hasher = Sha256::new();
-            for chunk in payload.clone() {
-                hasher.update(&chunk);
-            }
-            fragments.push(BuiltFragment {
-                xxh64,
-                expected_byte_length: payload.len() as u64,
-                expected_sha256: hasher.finalize().into(),
-                payload,
-            });
+            fragments.push(fragment_payload);
         }
-        Ok(fragments)
+        fragments
     }
 }
 
@@ -2136,29 +2117,58 @@ impl RemoteUploadPort for VfsRemoteUploadPort {
         };
         let object_id = op.object_id;
         let raw_len = raw_payload.len();
-        let built_fragments = match run_blocking(move || Self::build_fragments(raw_payload)).await {
-            Ok(fragments) => fragments,
-            Err(error) => return UploadPutOutcome::Failed(error),
-        };
+        let raw_fragments = Self::slice_fragments(raw_payload);
         if cancel_token.is_cancelled() {
             return UploadPutOutcome::Cancelled;
         }
-        let mut fragment_uploads = Vec::with_capacity(fragment_keys.len());
-        let mut ledger_entries = Vec::with_capacity(fragment_keys.len());
-        let checksum = Self::whole_payload_checksum(raw_len, &built_fragments);
-        for (fragment_index, (key, fragment)) in
-            fragment_keys.iter().zip(built_fragments).enumerate()
+        let prepared_results = join_all(fragment_keys.iter().zip(raw_fragments).enumerate().map(
+            |(fragment_index, (key, fragment_payload))| async move {
+                let prepared = self
+                    .vfs
+                    .upload_scheduler
+                    .prepare(key, fragment_payload)
+                    .await
+                    .map_err(|error| (fragment_index, key.clone(), error))?;
+                Ok::<_, (usize, String, crate::upload::UploadError)>((key.clone(), prepared))
+            },
+        ))
+        .await;
+        if cancel_token.is_cancelled() {
+            return UploadPutOutcome::Cancelled;
+        }
+        let mut prepared_fragments = Vec::with_capacity(fragment_keys.len());
+        let mut prepared_keys = Vec::with_capacity(fragment_keys.len());
+        for result in prepared_results {
+            match result {
+                Ok((key, prepared)) => {
+                    prepared_keys.push(key);
+                    prepared_fragments.push(prepared);
+                }
+                Err((fragment_index, key, error)) => {
+                    return UploadPutOutcome::Failed(VfsError::Other(format!(
+                        "fragment upload preparation failed (idx={fragment_index}, key={key}): {error}"
+                    )));
+                }
+            }
+        }
+        let mut fragment_uploads = Vec::with_capacity(prepared_fragments.len());
+        let mut ledger_entries = Vec::with_capacity(prepared_fragments.len());
+        let checksum = Self::whole_payload_checksum(raw_len, &prepared_fragments);
+        for (fragment_index, (key, prepared)) in prepared_keys
+            .into_iter()
+            .zip(prepared_fragments)
+            .enumerate()
         {
             let entry = UploadedFragmentLedgerEntry {
                 volume_id,
                 object_id,
                 fragment_index: fragment_index as u32,
                 object_key: key.clone(),
-                expected_byte_length: fragment.expected_byte_length,
-                expected_sha256: fragment.expected_sha256,
+                expected_byte_length: prepared.plaintext_len() as u64,
+                expected_sha256: prepared.stfs_sha256(),
             };
             ledger_entries.push(entry.clone());
-            fragment_uploads.push((key.clone(), fragment.payload, entry));
+            fragment_uploads.push((key, prepared, entry));
         }
         if let Err(error) = self
             .ledger_batcher
@@ -2168,7 +2178,7 @@ impl RemoteUploadPort for VfsRemoteUploadPort {
             return UploadPutOutcome::Failed(error);
         }
         let uploads = fragment_uploads.into_iter().enumerate().map(
-            |(fragment_index, (key, payload, entry))| {
+            |(fragment_index, (key, prepared, entry))| {
                 let cancel_token = cancel_token.clone();
                 async move {
                     let err_key = key.clone();
@@ -2178,7 +2188,7 @@ impl RemoteUploadPort for VfsRemoteUploadPort {
                     if let Err(error) = self
                         .vfs
                         .upload_scheduler
-                        .put(&key, payload, &cancel_token)
+                        .put_prepared(&key, prepared, &cancel_token)
                         .await
                     {
                         return match error {
@@ -3018,32 +3028,69 @@ mod tests {
     }
 
     #[test]
-    fn built_fragments_need_no_shared_metadata() {
-        let fragments = VfsRemoteUploadPort::build_fragments(Bytes::from_static(b"local-upload"))
-            .expect("build upload fragments");
+    fn sliced_fragments_need_no_shared_metadata() {
+        let fragments = VfsRemoteUploadPort::slice_fragments(Bytes::from_static(b"local-upload"));
 
         assert_eq!(fragments.len(), CLOUD_FRAGMENT_COUNT);
-        let bytes = fragments[0].payload.to_bytes();
-        assert!(!bytes.is_empty());
-        assert_eq!(fragments[0].expected_byte_length, bytes.len() as u64);
-        let digest: [u8; 32] = Sha256::digest(&bytes).into();
-        assert_eq!(fragments[0].expected_sha256, digest);
+        assert_eq!(fragments[0], Bytes::from_static(b"local-upload"));
     }
 
-    #[test]
-    fn built_fragments_ledger_matches_materialized_bytes_across_chunk_boundaries() {
-        for size in [0, 1024 * 1024 + 128, CLOUD_FRAGMENT_SIZE + 1] {
-            let raw = Bytes::from((0..size).map(|i| (i % 251) as u8).collect::<Vec<_>>());
-            for fragment in VfsRemoteUploadPort::build_fragments(raw).expect("build fragments") {
-                let bytes = fragment.payload.to_bytes();
-                assert_eq!(fragment.expected_byte_length, bytes.len() as u64);
-                let (_, verified_checksum) =
-                    studiofs_data::object::read_object_with_checksum(bytes.clone()).unwrap();
-                assert_eq!(fragment.xxh64, verified_checksum);
-                assert_eq!(
-                    fragment.expected_sha256,
-                    <[u8; 32]>::from(Sha256::digest(&bytes))
-                );
+    #[tokio::test]
+    async fn prepared_fragments_ledger_matches_materialized_bytes_across_chunk_boundaries() {
+        use opendal::{Operator, services::Memory};
+        use sha2::{Digest, Sha256};
+        use studiofs_data::store::{DataStore, DataStoreConfig, DataStoreCryptoConfig};
+        use studiofs_meta::EncryptionConfig;
+        use studiofs_meta::trash::CompressionPolicy;
+
+        let config = DataStoreConfig {
+            endpoint: "memory://".into(),
+            bucket: "unit-test".into(),
+            access_key: "access".into(),
+            secret_key: "secret".into(),
+            rotating_credentials: None,
+            region: "us-east-1".into(),
+            volume_name: "unit-volume".into(),
+            data_prefix: "unit-volume/objects/".into(),
+            volume_uuid: "worker-ledger-test-volume".into(),
+            crypto: DataStoreCryptoConfig::from(EncryptionConfig::new([0x44; 32])),
+        };
+        let raw_op = Operator::new(Memory::default()).unwrap().finish();
+        let store = DataStore::with_operator_for_test(&config, raw_op).unwrap();
+
+        for policy in [CompressionPolicy::off(), CompressionPolicy::zstd_default()] {
+            for size in [0, 1024 * 1024 + 128, CLOUD_FRAGMENT_SIZE] {
+                let raw = Bytes::from((0..size).map(|i| (i % 13) as u8).collect::<Vec<_>>());
+                for (idx, fragment) in VfsRemoteUploadPort::slice_fragments(raw)
+                    .into_iter()
+                    .enumerate()
+                {
+                    let key = format!("unit-volume/objects/0001/{policy}/{size}/{idx}");
+                    let prepared = store
+                        .prepare_payload_with_policy(&key, fragment.clone(), policy)
+                        .await
+                        .expect("prepare fragment");
+                    store
+                        .put_prepared_by_key(&key, prepared.clone())
+                        .await
+                        .expect("put prepared fragment");
+                    let (remote_stfs, _) = store
+                        .get_payload_by_key_with_stats(&key)
+                        .await
+                        .expect("read back remote stfs");
+                    let bytes = remote_stfs.to_bytes();
+                    assert_eq!(prepared.plaintext_len(), bytes.len());
+                    let (decoded, verified_checksum) =
+                        studiofs_data::compression::decode_object_with_checksum(bytes.clone())
+                            .await
+                            .expect("decode remote stfs");
+                    assert_eq!(decoded, fragment);
+                    assert_eq!(prepared.payload_xxh64(), verified_checksum);
+                    assert_eq!(
+                        prepared.stfs_sha256(),
+                        <[u8; 32]>::from(Sha256::digest(&bytes))
+                    );
+                }
             }
         }
     }
@@ -4492,16 +4539,18 @@ mod tests {
                     );
                 }
 
-                let fragments: Vec<_> = (0..payload.len())
-                    .step_by(CLOUD_FRAGMENT_SIZE)
-                    .flat_map(|start| {
-                        let end = (start + CLOUD_FRAGMENT_SIZE).min(payload.len());
-                        VfsRemoteUploadPort::build_fragments(payload.slice(start..end)).unwrap()
-                    })
-                    .collect();
-                *remote.upload_result.lock() = Some(UploadPutOutcome::Uploaded(
-                    VfsRemoteUploadPort::whole_payload_checksum(payload.len(), &fragments),
-                ));
+                let expected_checksum = if payload.len() <= CLOUD_FRAGMENT_SIZE {
+                    let stfs =
+                        studiofs_data::object::create_object_buffer(payload.clone()).unwrap();
+                    Some(
+                        studiofs_data::object::ObjectHeader::from_bytes(&stfs.current())
+                            .unwrap()
+                            .checksum,
+                    )
+                } else {
+                    None
+                };
+                *remote.upload_result.lock() = Some(UploadPutOutcome::Uploaded(expected_checksum));
                 let processor = UploadProcessor {
                     coordinator: fixture.coordinator,
                     local_payloads: VfsUploadLocalPayloadPort { vfs: vfs.clone() },
@@ -6392,5 +6441,241 @@ mod tests {
             vec![101, 201, 301, 102, 202],
             "ready queue should rotate across inodes instead of letting one inode monopolize dispatch"
         );
+    }
+
+    #[tokio::test]
+    async fn restart_mid_upload_queue_keeps_plaintext_locally_and_uses_current_policy_on_requeue() {
+        use crate::AimdConfig;
+        use crate::upload::UploadScheduler;
+        use crate::vfs::VfsConfig;
+        use opendal::{Operator, services::Memory};
+        use studiofs_cache::{
+            CachedStore, CachedStoreConfig,
+            open_local_payload_backend_with_budget_sync_and_write_mode,
+        };
+        use studiofs_data::compression::decode_object_with_checksum;
+        use studiofs_data::envelope::{
+            DEFAULT_SFEC_FRAME_SIZE, SMALL_SFEC_FRAME_SIZE, SfecEnvelope,
+        };
+        use studiofs_data::object::{ObjectHeader, VERSION, VERSION_V3};
+        use studiofs_data::store::{DataError, DataStore, DataStoreConfig, DataStoreCryptoConfig};
+        use studiofs_meta::trash::{CompressionPolicy, MetaVolumeSettings};
+        use studiofs_meta::{EncryptionConfig, RedbMetaEngine};
+
+        let tmp = studiofs_test_support::workspace_target_tempdir("upload-queue-restart-");
+        let cache_dir = tmp.path().join("cache");
+        let meta_path = tmp.path().join("meta.redb");
+        let volume_uuid = "restart-compression-test-uuid";
+        let raw_op = Operator::new(Memory::default()).unwrap().finish();
+        let data_config = DataStoreConfig {
+            endpoint: "memory://".into(),
+            bucket: "unit-test".into(),
+            access_key: "access".into(),
+            secret_key: "secret".into(),
+            rotating_credentials: None,
+            region: "us-east-1".into(),
+            volume_name: "unit-volume".into(),
+            data_prefix: "unit-volume/objects/".into(),
+            volume_uuid: volume_uuid.into(),
+            crypto: DataStoreCryptoConfig::from(EncryptionConfig::new([0x66; 32])),
+        };
+
+        let payload_first =
+            Bytes::from(b"first-queued-compressible-block-0123456789\n".repeat(4096));
+        let payload_second =
+            Bytes::from(b"second-queued-compressible-block-abcdefghij\n".repeat(4096));
+
+        // Phase 1: enqueue two fragments while compression policy is `off`, upload only the first.
+        {
+            let meta = Arc::new(RedbMetaEngine::open(&meta_path).unwrap());
+            let opened = open_local_payload_backend_with_budget_sync_and_write_mode(
+                &cache_dir,
+                volume_uuid,
+                64 * 1024 * 1024,
+                studiofs_cache::LocalPayloadSyncMode::default(),
+                studiofs_cache::LocalPayloadWriteMode::default(),
+            )
+            .unwrap();
+            let (cached_store, _upload_rx) =
+                CachedStore::open(CachedStoreConfig::new(&cache_dir), opened.backend).unwrap();
+
+            cached_store.put(1001, &payload_first, false).unwrap();
+            cached_store.put(1002, &payload_second, false).unwrap();
+            cached_store.submit_uploads_batch(&[
+                (
+                    10,
+                    0,
+                    Some(ObjectFileMapping::whole(0, payload_first.len() as u64)),
+                    1001,
+                    1,
+                    payload_first.len() as u64,
+                ),
+                (
+                    10,
+                    CLOUD_FRAGMENT_SIZE as u64,
+                    Some(ObjectFileMapping::whole(0, payload_second.len() as u64)),
+                    1002,
+                    1,
+                    payload_second.len() as u64,
+                ),
+            ]);
+
+            // Local payload backend and upload stage must store plaintext uncompressed bytes.
+            assert_eq!(
+                cached_store.get_for_upload(1001).as_deref(),
+                Some(payload_first.as_ref())
+            );
+            assert_eq!(
+                cached_store.get_for_upload(1002).as_deref(),
+                Some(payload_second.as_ref())
+            );
+
+            let meta_for_store = meta.clone();
+            let store = Arc::new(
+                DataStore::with_operator_for_test(&data_config, raw_op.clone())
+                    .unwrap()
+                    .with_compression_policy_reader(move || {
+                        meta_for_store
+                            .volume_settings()
+                            .map(|s| s.compression)
+                            .map_err(|err| DataError::Storage(err.to_string()))
+                    }),
+            );
+            let scheduler =
+                UploadScheduler::new(store, AimdConfig::upload_default(), &VfsConfig::default());
+
+            let claimed = cached_store.claim_pending_uploads(1, Duration::ZERO, &HashSet::new());
+            assert_eq!(claimed.len(), 1);
+            let first_op = claimed[0].clone();
+            assert_eq!(first_op.object_id, 1001);
+            let first_key =
+                format_object_fragment_keys(&data_config.data_prefix, first_op.object_id)[0]
+                    .clone();
+            let first_bytes = cached_store
+                .get_for_upload(first_op.object_id)
+                .expect("first plaintext payload");
+            scheduler
+                .put(&first_key, first_bytes, &CancellationToken::new())
+                .await
+                .unwrap();
+            cached_store.complete_upload(&first_op);
+            // Simulate crash/restart before object 1002 is processed.
+        }
+
+        // Phase 2: switch compression policy to zstd:3 and restart from persisted local state.
+        {
+            let meta = Arc::new(RedbMetaEngine::open(&meta_path).unwrap());
+            meta.compare_and_set_compression(0, CompressionPolicy::zstd_default())
+                .unwrap()
+                .expect("CAS compression to zstd:3");
+
+            let opened = open_local_payload_backend_with_budget_sync_and_write_mode(
+                &cache_dir,
+                volume_uuid,
+                64 * 1024 * 1024,
+                studiofs_cache::LocalPayloadSyncMode::default(),
+                studiofs_cache::LocalPayloadWriteMode::default(),
+            )
+            .unwrap();
+            let (cached_store, _upload_rx) =
+                CachedStore::open(CachedStoreConfig::new(&cache_dir), opened.backend).unwrap();
+
+            // Persisted local payload and upload stage must still hold plaintext uncompressed bytes
+            // across restart, and startup requeue must upload under the current volume policy.
+            assert_eq!(
+                cached_store.get_for_upload(1002).as_deref(),
+                Some(payload_second.as_ref())
+            );
+            assert_eq!(
+                cached_store.get_staged_for_upload(1002).as_deref(),
+                Some(payload_second.as_ref())
+            );
+            cached_store.submit_uploads_batch(&[(
+                10,
+                CLOUD_FRAGMENT_SIZE as u64,
+                Some(ObjectFileMapping::whole(0, payload_second.len() as u64)),
+                1002,
+                1,
+                payload_second.len() as u64,
+            )]);
+            let claimed = cached_store.claim_pending_uploads(4, Duration::ZERO, &HashSet::new());
+            assert_eq!(claimed.len(), 1);
+            let requeued_op = claimed[0].clone();
+            assert_eq!(requeued_op.object_id, 1002);
+            let local_bytes = cached_store
+                .get_for_upload(requeued_op.object_id)
+                .expect("plaintext payload must survive restart");
+            assert_eq!(local_bytes, payload_second);
+
+            let meta_for_store = meta.clone();
+            let store = Arc::new(
+                DataStore::with_operator_for_test(&data_config, raw_op.clone())
+                    .unwrap()
+                    .with_compression_policy_reader(move || {
+                        meta_for_store
+                            .volume_settings()
+                            .map(|s| s.compression)
+                            .map_err(|err| DataError::Storage(err.to_string()))
+                    }),
+            );
+            let scheduler = UploadScheduler::new(
+                store.clone(),
+                AimdConfig::upload_default(),
+                &VfsConfig::default(),
+            );
+
+            let second_key =
+                format_object_fragment_keys(&data_config.data_prefix, requeued_op.object_id)[0]
+                    .clone();
+            scheduler
+                .put(&second_key, local_bytes, &CancellationToken::new())
+                .await
+                .unwrap();
+            cached_store.complete_upload(&requeued_op);
+
+            // Verify object 1001 stayed STFS v2 (1 MiB SFEC) and requeued 1002 became STFS v3 (64 KiB SFEC).
+            let first_key = format_object_fragment_keys(&data_config.data_prefix, 1001)[0].clone();
+            let env_first =
+                SfecEnvelope::parse(raw_op.read(&first_key).await.unwrap().to_bytes()).unwrap();
+            let env_second =
+                SfecEnvelope::parse(raw_op.read(&second_key).await.unwrap().to_bytes()).unwrap();
+            assert_eq!(
+                env_first.header().frame_size(),
+                DEFAULT_SFEC_FRAME_SIZE as u32
+            );
+            assert_eq!(
+                env_second.header().frame_size(),
+                SMALL_SFEC_FRAME_SIZE as u32
+            );
+
+            let (stfs_first, _) = store
+                .get_payload_by_key_with_stats(&first_key)
+                .await
+                .unwrap();
+            let (stfs_second, _) = store
+                .get_payload_by_key_with_stats(&second_key)
+                .await
+                .unwrap();
+            assert_eq!(
+                ObjectHeader::from_bytes(&stfs_first.slice(..ObjectHeader::SIZE).to_bytes())
+                    .unwrap()
+                    .version,
+                VERSION
+            );
+            assert_eq!(
+                ObjectHeader::from_bytes(&stfs_second.slice(..ObjectHeader::SIZE).to_bytes())
+                    .unwrap()
+                    .version,
+                VERSION_V3
+            );
+            assert_eq!(
+                decode_object_with_checksum(stfs_first).await.unwrap().0,
+                payload_first
+            );
+            assert_eq!(
+                decode_object_with_checksum(stfs_second).await.unwrap().0,
+                payload_second
+            );
+        }
     }
 }
