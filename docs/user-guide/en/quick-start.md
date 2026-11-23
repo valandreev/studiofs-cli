@@ -90,7 +90,9 @@ Performance tuning and backups: [chapter 07](07-postgresql-the-brain-behind-the-
 
 ## 3. Storage for homesilo: RustFS + Caddy
 
-You need a domain, for example `s3.example.com`, with an A record pointing to the server's public IP address, and ports 80 and 443 open. Without a domain you can also reach RustFS at `IP:port`, for example `http://203.0.113.10:9000`, but it is less convenient: the connection has no HTTPS, and if the server's IP address changes, the endpoint has to be updated on every computer. RustFS and Caddy run from a single `compose.yaml`: Caddy accepts HTTPS connections and obtains and renews the Let's Encrypt certificate by itself, while RustFS is not published to the outside at all. All data lives in folders next to `compose.yaml`.
+You need a domain, for example `s3.example.com`, with an A record pointing to the server's public IP address, and ports 80 and 443 open. Without a domain you can also reach RustFS at `IP:port`, for example `http://203.0.113.10:9000`, but it is less convenient: the connection has no HTTPS, and if the server's IP address changes, the endpoint has to be updated on every computer.
+
+RustFS and Caddy run from a single `compose.yaml`: Caddy accepts HTTPS connections and obtains and renews the Let's Encrypt certificate by itself, while RustFS is not published to the outside at all. All data lives in folders next to `compose.yaml`.
 
 ```bash
 mkdir -p ~/rustfs && cd ~/rustfs
@@ -144,7 +146,9 @@ docker compose up -d
 docker compose logs -f caddy   # wait for the certificate message, exit with Ctrl+C
 ```
 
-Nothing else needs configuring: by default Caddy does not limit request size, streams data, and keeps the `Host` header intact, which S3 request signatures depend on. Check: `curl -I https://s3.example.com/` should return a response from RustFS (usually `403` without a signature, which is fine), not a connection or certificate error.
+Nothing else needs configuring: by default Caddy does not limit request size, streams data, and keeps the `Host` header intact, which S3 request signatures depend on.
+
+To check that it works, run `curl -I https://s3.example.com/`. It should return a response from RustFS (usually `403`, because the request is unsigned, which is fine), not a connection or certificate error.
 
 What lives where:
 
@@ -317,7 +321,7 @@ studiofs init cloudsilo `
   --meta 'postgresql://studiofs:YOUR_PASSWORD@100.101.102.103:5432/studiofs'
 ```
 
-Success looks like these lines:
+If everything worked, you will see these lines:
 
 ```text
 ✓ Volume 'homesilo' initialized

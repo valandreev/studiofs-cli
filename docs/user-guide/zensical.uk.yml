@@ -17,7 +17,7 @@ nav:
       - "04. StudioFS та альтернативи: що обрати?": 04-studiofs-vs-alternatives-which-tool-fits-your-workflow.md
   - "Підготовка інфраструктури":
       - "05. Обираємо конфігурацію": 05-choose-your-setup.md
-      - "06. S3 — дім для наших файлів": 06-s3-a-home-for-your-files.md
+      - "06. S3 — дім для ваших файлів": 06-s3-a-home-for-your-files.md
       - "07. PostgreSQL — мозок, який пам’ятає, де лежать файли": 07-postgresql-the-brain-behind-the-files.md
       - "08. Tailscale — приватний шлях до PostgreSQL": 08-tailscale-netbird-a-private-path-to-postgresql.md
       - "09. Перевіряємо інфраструктуру": 09-check-your-infrastructure.md
@@ -32,11 +32,11 @@ nav:
       - "16. Підключаємо другий комп’ютер — studiofs discover": 16-connect-a-second-computer-studiofs-discover.md
       - "17. Безпечне відключення — studiofs umount": 17-unplug-safely-studiofs-umount.md
   - "Щоденна робота":
-      - "18. Для чого підходить StudioFS і де потрібна обережність": 18-studiofs-workloads.md
+      - "18. Для чого підходить StudioFS і де варто бути обережними": 18-studiofs-workloads.md
       - "19. Синхронізація, поганий Wi-Fi та інші несподіванки": 19-sync-bad-wi-fi-and-other-surprises.md
       - "20. Кеш: чому хмара використовує мій SSD?": 20-cache-why-is-the-cloud-using-my-ssd.md
       - "21. Двоє людей, один файл: співпраця та конфлікти": 21-two-people-one-file-collaboration-and-conflicts.md
-      - "22. Налаштування, стан і активність": 22-settings-status-and-activity.md
+      - "22. Налаштування, стан та активність": 22-settings-status-and-activity.md
       - "31. Локальний scratch-шар та .studiofsignore": 31-scratch-layer-and-studiofsignore.md
   - "Безпека та обслуговування":
       - "23. Видалення файлів: чарівного кошика немає": 23-deleting-files-there-is-no-magic-trash-can.md

@@ -62,7 +62,7 @@ After creating a volume with `init` or connecting to an existing one with `disco
 studiofs mount myvolume /Volumes/Studiofs --foreground
 ```
 
-This example assumes that the local client is already set up for the `myvolume` volume. If it is not, first follow Chapter 13 or [Chapter 16 on connecting a second computer](16-connect-a-second-computer-studiofs-discover.md). Do not create a new volume in place of the one your team invited you to join.
+This example assumes that the local client is already set up for the `myvolume` volume. If it is not, first follow the steps in [Chapter 13](13-create-your-first-volume-studiofs-init.md) or [Chapter 16 on connecting a second computer](16-connect-a-second-computer-studiofs-discover.md). Do not create a new volume in place of the one your team invited you to join.
 
 Leave the terminal running the mount open. In another window, you can open the folder in Finder:
 

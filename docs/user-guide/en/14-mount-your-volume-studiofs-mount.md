@@ -25,7 +25,7 @@ On macOS, use the `/Volumes/Studiofs` directory prepared in the previous chapter
 studiofs mount myvolume /Volumes/Studiofs
 ```
 
-StudioFS appends the volume name to the supplied path unless its last component already matches that name. The actual mount point will be **`/Volumes/Studiofs/myvolume`**. On Linux, use a folder in your home directory:
+StudioFS appends the volume name to the supplied path unless its last component already matches that name. The actual mount point will be **`/Volumes/Studiofs/myvolume`**. On Linux, use the `/mnt/StudioFS` directory prepared in [Chapter 12](12-install-studiofs-on-linux.md):
 
 ```bash
 studiofs mount myvolume /mnt/StudioFS

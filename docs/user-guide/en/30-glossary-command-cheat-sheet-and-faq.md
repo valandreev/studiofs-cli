@@ -27,7 +27,7 @@ For more about how these parts fit together, see [How Does This Thing Work?](02-
 
 ## Command cheat sheet
 
-In the examples, `projectfs` is your volume name and `Z:` is an available Windows drive letter. On macOS, use a prepared directory instead. Check current platform support in the [requirements chapter](03-capabilities-limits-and-requirements.md) and the [Linux instructions](12-install-studiofs-on-linux.md).
+In the examples, `projectfs` is your volume name and `Z:` is an available Windows drive letter. On macOS and Linux, use the prepared directory instead (`/Volumes/Studiofs` or `/mnt/StudioFS`). Check current platform support in the [requirements chapter](03-capabilities-limits-and-requirements.md) and the [Linux instructions](12-install-studiofs-on-linux.md).
 
 | What you need | Command | Where to find details |
 | --- | --- | --- |
