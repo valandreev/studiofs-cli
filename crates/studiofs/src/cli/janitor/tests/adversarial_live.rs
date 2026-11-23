@@ -1,4 +1,7 @@
-//! Disposable PostgreSQL/RustFS acceptance for the standalone janitor CLI.
+//! Live PostgreSQL/S3 acceptance for the standalone janitor CLI.
+//!
+//! Uses `STUDIOFS_TEST_PG_DSN` and `STUDIOFS_S3_*` from the environment or workspace
+//! `.env`. Each test isolates itself with a fresh volume row and a unique bucket prefix.
 
 use super::*;
 use opendal::Operator;
@@ -6,76 +9,41 @@ use opendal::services::S3;
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use studiofs_e2e::infra::{ComposeConfig, DockerComposeStack, SystemCommandExecutor};
 
-const ACCESS_KEY: &str = "rustfsadmin";
-const SECRET_KEY: &str = "rustfsadmin";
-const REGION: &str = "us-east-1";
-
-struct DisposableStack {
-    compose: DockerComposeStack,
-    executor: SystemCommandExecutor,
+struct LiveStack {
     artifact_root: PathBuf,
     postgres_url: String,
     endpoint: String,
     bucket: String,
+    access_key: String,
+    secret_key: String,
+    region: String,
     root: PathBuf,
 }
 
-impl DisposableStack {
-    async fn start() -> anyhow::Result<Self> {
+impl LiveStack {
+    fn start() -> anyhow::Result<Self> {
+        let env = |key: &str, default: &str| test_env(key).unwrap_or_else(|| default.to_string());
         let run_id = format!(
-            "janitor-adversarial-{}-{}",
+            "janitor-live-{}-{}",
             std::process::id(),
             SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
         );
         let artifact_root = studiofs_test_support::workspace_root()
-            .join("target/janitor-adversarial")
+            .join("target/janitor-live")
             .join(&run_id);
         std::fs::create_dir_all(&artifact_root)?;
-        let compose = DockerComposeStack::new(ComposeConfig::for_run(
-            &run_id,
-            &artifact_root,
-            Some(free_port_range()?),
-        ))?;
-        let executor = SystemCommandExecutor;
-        compose.prepare_artifacts()?;
-        let mut stack = Self {
-            postgres_url: String::new(),
-            endpoint: String::new(),
-            bucket: format!(
-                "sfsjanitor{}",
-                SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
-            ),
+        Ok(Self {
+            postgres_url: test_env("STUDIOFS_TEST_PG_DSN")
+                .context("STUDIOFS_TEST_PG_DSN must be set (environment or workspace .env)")?,
+            endpoint: env("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:9000"),
+            bucket: env("STUDIOFS_S3_BUCKET", "studiofs-test"),
+            access_key: env("STUDIOFS_S3_ACCESS_KEY", "studiofs"),
+            secret_key: env("STUDIOFS_S3_SECRET_KEY", "studiofs123"),
+            region: env("STUDIOFS_S3_REGION", "us-east-1"),
             root: artifact_root.join("client"),
             artifact_root,
-            compose,
-            executor,
-        };
-        stack.compose.start(&stack.executor)?;
-        let port = |service: &str| {
-            stack
-                .compose
-                .ports()
-                .iter()
-                .find(|port| port.service == service)
-                .map(|port| port.host_port)
-                .ok_or_else(|| anyhow::anyhow!("missing Compose port for {service}"))
-        };
-        stack.postgres_url = format!(
-            "host=127.0.0.1 port={} user=studiofs password=studiofs dbname=studiofs",
-            port("postgres")?
-        );
-        stack.endpoint = format!("http://127.0.0.1:{}", port("rustfs")?);
-        crate::cli::test::bucket_create(
-            &stack.endpoint,
-            &stack.bucket,
-            ACCESS_KEY,
-            SECRET_KEY,
-            REGION,
-        )
-        .await?;
-        Ok(stack)
+        })
     }
 
     fn writer(&self) -> anyhow::Result<Operator> {
@@ -83,9 +51,9 @@ impl DisposableStack {
             S3::default()
                 .endpoint(&self.endpoint)
                 .bucket(&self.bucket)
-                .access_key_id(ACCESS_KEY)
-                .secret_access_key(SECRET_KEY)
-                .region(REGION)
+                .access_key_id(&self.access_key)
+                .secret_access_key(&self.secret_key)
+                .region(&self.region)
                 .disable_config_load()
                 .disable_ec2_metadata(),
         )?
@@ -98,9 +66,9 @@ impl DisposableStack {
         LiveS3Config {
             endpoint: &self.endpoint,
             bucket: &self.bucket,
-            access_key: ACCESS_KEY,
-            secret_key: SECRET_KEY,
-            region: REGION,
+            access_key: &self.access_key,
+            secret_key: &self.secret_key,
+            region: &self.region,
             prefix,
         }
     }
@@ -116,14 +84,9 @@ impl DisposableStack {
         })
     }
 
+    /// A sanitized CLI command with its client root set to `client_root`.
     fn command(&self, args: &[String], client_root: &Path) -> anyhow::Result<Command> {
-        let binary = super::cli_binary()?;
-        Ok(Self::command_for(&binary, args, client_root))
-    }
-
-    /// A sanitized CLI command for `binary` with its client root set to `client_root`.
-    fn command_for(binary: &Path, args: &[String], client_root: &Path) -> Command {
-        let mut command = Command::new(binary);
+        let mut command = Command::new(super::cli_binary()?);
         command.args(args).env_clear();
         for key in [
             "PATH",
@@ -143,19 +106,7 @@ impl DisposableStack {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        command
-    }
-}
-
-impl Drop for DisposableStack {
-    fn drop(&mut self) {
-        let _ = self.compose.collect_logs(&self.executor);
-        if let Err(error) = self.compose.teardown(&self.executor) {
-            eprintln!(
-                "janitor adversarial Compose teardown failed; artifacts retained at {}: {error}",
-                self.artifact_root.display()
-            );
-        }
+        Ok(command)
     }
 }
 
@@ -208,23 +159,6 @@ fn run_child_bounded(
     })
 }
 
-/// Probes a free loopback window so concurrent stacks do not share host ports.
-fn free_port_range() -> anyhow::Result<String> {
-    const WIDTH: u16 = 16;
-    const SLOTS: u32 = 2_500;
-    let seed = SystemTime::now().duration_since(UNIX_EPOCH)?.subsec_nanos() ^ std::process::id();
-    for attempt in 0..256_u32 {
-        let slot = u16::try_from(seed.wrapping_add(attempt.wrapping_mul(7_919)) % SLOTS)?;
-        let start = 20_000 + slot * WIDTH;
-        if (start..start + WIDTH)
-            .all(|port| std::net::TcpListener::bind(("127.0.0.1", port)).is_ok())
-        {
-            return Ok(format!("{start}-{}", start + WIDTH - 1));
-        }
-    }
-    anyhow::bail!("no free loopback port window for the disposable Compose stack")
-}
-
 /// Every canonical key the CLI may delete for one object.
 fn object_keys(prefix: &str, id: u64) -> Vec<String> {
     std::iter::once(studiofs_data::object::format_object_key(prefix, id))
@@ -250,7 +184,7 @@ fn object_id(offset: u64) -> anyhow::Result<u64> {
     Ok((base & ((1_u64 << 50) - 32)) + offset)
 }
 
-async fn seed_live_object(stack: &DisposableStack, prefix: &str, id: u64) -> anyhow::Result<()> {
+async fn seed_live_object(stack: &LiveStack, prefix: &str, id: u64) -> anyhow::Result<()> {
     let writer = stack.writer()?;
     let keys = object_keys(prefix, id);
     for key in &keys {
@@ -292,7 +226,7 @@ fn summary(events: &[serde_json::Value]) -> &serde_json::Value {
 }
 
 async fn connection(
-    stack: &DisposableStack,
+    stack: &LiveStack,
 ) -> anyhow::Result<(
     tokio_postgres::Client,
     tokio::task::JoinHandle<Result<(), tokio_postgres::Error>>,
@@ -303,7 +237,7 @@ async fn connection(
 }
 
 async fn seed_protection_matrix(
-    stack: &DisposableStack,
+    stack: &LiveStack,
     volume_id: i64,
     base: u64,
 ) -> anyhow::Result<()> {
@@ -380,10 +314,10 @@ async fn seed_protection_matrix(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires Docker; creates isolated PostgreSQL and RustFS containers"]
+#[ignore = "requires local STUDIOFS_TEST_PG_DSN and a live STUDIOFS_S3_* bucket"]
 async fn live_cli_disposable_adversarial_protection_cleanup_dry_run_and_budget()
 -> anyhow::Result<()> {
-    let stack = DisposableStack::start().await?;
+    let stack = LiveStack::start()?;
     let base = object_id(0)?;
     let prefix = format!("sfsjanitor/{base:016x}/objects/");
     let s3 = stack.s3(&prefix);
@@ -516,7 +450,7 @@ async fn live_cli_disposable_adversarial_protection_cleanup_dry_run_and_budget()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires Docker; creates isolated PostgreSQL and RustFS containers"]
+#[ignore = "requires local STUDIOFS_TEST_PG_DSN and a live STUDIOFS_S3_* bucket"]
 async fn live_cli_disposable_retires_abandoned_upload_but_protects_delayed_publication()
 -> anyhow::Result<()> {
     use sha2::{Digest, Sha256};
@@ -526,7 +460,7 @@ async fn live_cli_disposable_retires_abandoned_upload_but_protects_delayed_publi
     use studiofs_meta::snapshot_ports::{UploadedFragmentLedger, UploadedFragmentLedgerEntry};
     use studiofs_meta::{PgMetaEngine, PgOpenOptions};
 
-    let stack = DisposableStack::start().await?;
+    let stack = LiveStack::start()?;
     let base = object_id(0)?;
     let abandoned = base;
     let waiting_publication = base + 1;
@@ -732,80 +666,4 @@ async fn live_cli_disposable_retires_abandoned_upload_but_protects_delayed_publi
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires Docker; creates isolated PostgreSQL and RustFS containers"]
-async fn live_cli_disposable_fixture_recovers_after_postgres_restart() -> anyhow::Result<()> {
-    let stack = DisposableStack::start().await?;
-    let base = object_id(20)?;
-    let prefix = format!("sfsjanitor-stale/{base:016x}/objects/");
-    let s3 = stack.s3(&prefix);
-    seed_live_object(&stack, &prefix, base).await?;
-    let client_root = stack.root.join("stale");
-    let meta_dir = client_root.join("meta/janitor-live");
-    let (volume_id, _, _) =
-        create_live_postgres_janitor_fixture(&stack.postgres_url, &s3, &meta_dir, base).await?;
-    let keys = object_keys(&prefix, base);
-
-    stack.compose.stop_service("postgres", &stack.executor)?;
-    let unavailable = stack.cli(&cli_args(false, 10), &client_root)?;
-    anyhow::ensure!(
-        unavailable.status.code() == Some(5),
-        "PostgreSQL outage must return backend failure"
-    );
-    for key in &keys {
-        assert_eq!(
-            stack.writer()?.read(key).await?.to_vec(),
-            b"janitor fixture"
-        );
-    }
-    stack.compose.start_service("postgres", &stack.executor)?;
-    let (client, task) = connection(&stack).await?;
-    let reachable: i32 = client.query_one("SELECT 1", &[]).await?.get(0);
-    anyhow::ensure!(reachable == 1, "PostgreSQL did not recover after restart");
-    assert_eq!(
-        janitor_ownership(&client, volume_id, base).await?,
-        (false, 0),
-        "failed runs must leave the candidate pending and unowned"
-    );
-    let recovered = stack.cli(&cli_args(false, 10), &client_root)?;
-    anyhow::ensure!(
-        recovered.status.success(),
-        "janitor did not resume after PostgreSQL restart"
-    );
-    for key in &keys {
-        assert!(!stack.writer()?.exists(key).await?);
-    }
-    assert_eq!(
-        janitor_ownership(&client, volume_id, base).await?,
-        (true, 0),
-        "recovered run must acknowledge the deletion and release its claim"
-    );
-    task.abort();
-    Ok(())
-}
-
-/// Whether the object's queue entry is acknowledged, and how many claim owners remain.
-async fn janitor_ownership(
-    client: &tokio_postgres::Client,
-    volume_id: i64,
-    object_id: u64,
-) -> anyhow::Result<(bool, i64)> {
-    let acknowledged: bool = client
-        .query_one(
-            "SELECT acknowledged_at IS NOT NULL FROM snapshot_payload_gc_candidates WHERE vol = $1 AND object_id = $2",
-            &[&volume_id, &i64::try_from(object_id)?],
-        )
-        .await?
-        .get(0);
-    let owners: i64 = client
-        .query_one(
-            "SELECT count(*) FROM snapshot_payload_upload_objects WHERE vol = $1 AND reconcile_owner IS NOT NULL",
-            &[&volume_id],
-        )
-        .await?
-        .get(0);
-    Ok((acknowledged, owners))
-}
-
-mod benchmark;
 mod process;

@@ -116,5 +116,4 @@ studiofs-bridge = { path = "crates/studiofs-bridge" }
 studiofs-linux-fuse = { path = "crates/studiofs-linux-fuse" }
 studiofs-macfuse = { path = "crates/studiofs-macfuse" }
 studiofs-winfsp = { path = "crates/studiofs-winfsp" }
-studiofs-e2e = { path = "crates/studiofs-e2e" }
 studiofs-test-support = { path = "crates/studiofs-test-support" }

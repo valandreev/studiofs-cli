@@ -245,10 +245,11 @@ use super::types::{Scenario, ScenarioContext, ScenarioDefinition, ScenarioError}
 mod actions;
 mod advanced_mounted;
 mod assertions;
-mod cache_scrub;
+pub(super) mod cache_scrub;
 pub(super) mod compression;
 mod concurrent_mkdir;
 mod faults;
+pub(super) mod janitor_cli;
 mod logical_quota;
 mod macos_mmap_exec;
 mod namespace_collision;
@@ -275,7 +276,6 @@ pub use actions::{
 };
 pub(super) use advanced_mounted::*;
 pub(super) use assertions::*;
-pub(super) use cache_scrub::MountedCacheScrub;
 pub(super) use concurrent_mkdir::ConcurrentMkdirMerge;
 pub(super) use faults::*;
 pub(super) use logical_quota::LogicalQuota;

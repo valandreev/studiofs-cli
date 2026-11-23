@@ -97,13 +97,16 @@ The RSS peaks include about 7 MiB that the fake metadata retains by recording ev
 
 ## Reproducing
 
-Build the release CLI and the test binary from the repository root, then run either benchmark. Each writes JSON to `target/janitor-benchmark/`.
+Build the release CLI and the test binary from the repository root. The synthetic benchmark writes JSON to `target/janitor-benchmark/`:
 
     cargo build --release -p studiofs --bin studiofs --tests
     cargo test -p studiofs --bin studiofs --release janitor_synthetic_listing_benchmark -- --ignored --nocapture
-    cargo test -p studiofs --bin studiofs --release live_cli_janitor_benchmark -- --ignored --nocapture
 
-To run several live configurations at once, invoke the built test executable (`target/release/deps/studiofs-<hash>.exe live_cli_janitor_benchmark --ignored --nocapture`) instead of several `cargo test` processes. Concurrent `cargo test` processes can fail to relink an executable that is still running. Each live run starts its own Compose project, so parallel runs do not share state.
+The live benchmark is the opt-in `studiofs-e2e` scenario `janitor-live-benchmark`. It runs against the E2E Compose stack and writes its JSON report and per-run CLI output under `target/e2e-runs/<run-id>/artifacts/scenarios/janitor-live-benchmark/`:
+
+    cargo run -p studiofs-e2e -- run janitor-live-benchmark --studiofs-bin target/release/studiofs --infra compose --retain always
+
+It applies `docker update` limits to the run's PostgreSQL container, and those limits stay for the rest of the run, so run it as the only scenario. Each run gets its own Compose project, so separate runs do not share state.
 
 Synthetic knobs: `STUDIOFS_JANITOR_SYNTHETIC_KEYS` (default 1,000,000), `_ORPHAN_EVERY` (1,000), `_RPS` (32), `_FAULT_EVERY` (0 means no faults), and `_FAULT` (`503` by default, or `429`).
 

@@ -60,7 +60,7 @@ fn copy_dir_contents(source: &Path, destination: &Path) -> Result<(), ScenarioEr
     Ok(())
 }
 
-fn _test_config(root: &Path) -> ClientControllerConfig {
+pub(super) fn _test_config(root: &Path) -> ClientControllerConfig {
     ClientControllerConfig {
         studiofs_bin: PathBuf::from("studiofs-test-bin"),
         sandbox: root.join("run-1"),

@@ -259,10 +259,12 @@ regressions without external services:
 cargo test -p studiofs --bin studiofs sfs978_ -- --nocapture
 ```
 
-The disposable acceptance tests start their own PostgreSQL 18/RustFS Compose
-project using `docker/compose.e2e.yml`, fresh named volumes and a loopback port
-window probed free for each run. They never select credentials or endpoints from `.env`.
-Run the focused selection serially (the same commands work in PowerShell):
+The live CLI acceptance tests use the shared test services from
+`STUDIOFS_TEST_PG_DSN` and `STUDIOFS_S3_*` (process environment first, then the
+workspace `.env`). Each test isolates itself with a fresh volume row and a unique
+bucket prefix, and the bucket must already exist. Run the focused selection
+serially, because the janitor holds one global PostgreSQL lock (the same commands
+work in PowerShell):
 
 ```sh
 cargo build -p studiofs --bin studiofs
@@ -272,14 +274,20 @@ cargo test -p studiofs --bin studiofs live_cli_disposable_ -- --ignored --nocapt
 For the workspace command `cargo test --workspace --all-targets -- --ignored
 --nocapture --test-threads=1`, Cargo builds the standalone CLI because integration
 test targets are selected. The ignored tests locate it from their harness path in
-either `deps` or `build`, so that command needs no separate build step. Docker Compose
-must be available and able to pull/start the repository's images. An unavailable
-Docker daemon is a failure, not a skipped pass. Per-run diagnostics
-are retained under `target/janitor-adversarial/`; teardown removes only that
-run's containers and named volumes. These tests mutate only their disposable
-stack. Existing opt-in provider verification remains separately selectable with
-`sfs973_live_s3_resumable_listing_covers_every_object`; it requires explicitly
-configured test resources and is not run by the disposable selection.
+either `deps` or `build`, so that command needs no separate build step. CLI output
+is retained under `target/janitor-live/`. Existing opt-in provider verification
+remains separately selectable with
+`sfs973_live_s3_resumable_listing_covers_every_object`.
+
+Scenarios that control the services themselves run in `studiofs-e2e` with Compose
+infrastructure. `janitor-postgres-restart-recovery` stops PostgreSQL around a CLI
+deletion and is part of the full E2E target. `janitor-live-benchmark` is the
+opt-in SFS-979 benchmark described in
+[the benchmark notes](perf/sfs-979-janitor-benchmark.md):
+
+```sh
+cargo run -p studiofs-e2e -- run janitor-postgres-restart-recovery --studiofs-bin target/debug/studiofs --infra compose --retain always
+```
 
 For SFS-1066, select
 `live_cli_disposable_retires_abandoned_upload_but_protects_delayed_publication`
