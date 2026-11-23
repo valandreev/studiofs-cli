@@ -66,7 +66,11 @@ impl Scenario for MountedCompression {
     fn validate(&self, context: &ScenarioContext) -> Result<Vec<String>, ScenarioError> {
         let summary: serde_json::Value =
             serde_json::from_slice(&fs::read(context.scenario_dir.join(SUMMARY))?)?;
-        if summary["cold_ranges"].as_array().map(Vec::len) != Some(RANGE_SIZES.len())
+        let rows = |key: &str| summary[key].as_array().map_or(0, Vec::len);
+        // A retried upload may leave a second matching object, so require at least one per fixture.
+        if rows("cold_ranges") != RANGE_SIZES.len()
+            || rows("objects") < 3
+            || rows("off_objects") < 1
             || summary["full_peer_verified"] != true
             || summary["off_peer_verified_old_and_new"] != true
         {
@@ -143,26 +147,30 @@ fn write_files(mount: &Path, files: &[(String, Vec<u8>)]) -> Result<(), Scenario
 fn wait_safe(
     context: &ScenarioContext,
     writer: &Controller,
-    phase: &str,
+    mode: &str,
 ) -> Result<(), ScenarioError> {
     let deadline = Instant::now() + LIMIT;
     loop {
         let snapshot = writer.runtime_snapshot("client-a")?;
-        save(context, &format!("{phase}-writer-runtime.json"), &snapshot)?;
-        let expected = if phase == "zstd" { "zstd" } else { "off" };
+        save(context, &format!("{mode}-writer-runtime.json"), &snapshot)?;
+        let upload = &snapshot["upload"];
+        // "safe" alone can precede enqueue; also require drained upload queues.
         if snapshot["sync_safety"]["state"] == "safe"
-            && snapshot["upload"]["compression_policy"]["mode"] == expected
-            && snapshot["upload"]["compression_policy"]["level"] == 3
+            && upload["pending_uploads"] == 0
+            && upload["active_uploads"] == 0
+            && upload["compression_policy"]["mode"] == mode
+            && (mode == "off" || upload["compression_policy"]["level"] == 3)
         {
             return Ok(());
         }
-        if Instant::now() >= deadline {
+        let now = Instant::now();
+        if now >= deadline {
             return Err(io::Error::other(format!(
-                "{phase}: remote publication never became safe; see writer runtime"
+                "{mode}: remote publication never became safe; see writer runtime"
             ))
             .into());
         }
-        thread::sleep(Duration::from_millis(200));
+        thread::sleep(Duration::from_millis(200).min(deadline - now));
     }
 }
 
@@ -337,12 +345,11 @@ fn verify_peer(
     }
     let after = peer.runtime_snapshot("client-b")?;
     save(context, &format!("{label}-runtime-after.json"), &after)?;
-    let gets =
-        |snapshot: &serde_json::Value| snapshot["write_path"]["fetch"]["s3_get_calls"].as_u64();
-    if !matches!((gets(&before), gets(&after)), (Some(before), Some(after)) if after > before) {
+    let (gets_before, gets_after) = (metric(&before, "gets")?, metric(&after, "gets")?);
+    if gets_after <= gets_before {
         return Err(io::Error::other("cold peer reads did not increase S3 GET count").into());
     }
-    let evidence = json!({"fresh_cache": true, "reads": reads, "s3_gets_before": gets(&before), "s3_gets_after": gets(&after)});
+    let evidence = json!({"fresh_cache": true, "reads": reads, "s3_gets_before": gets_before, "s3_gets_after": gets_after});
     save(context, &format!("{label}-reads.json"), &evidence)?;
     Ok(evidence)
 }
@@ -351,7 +358,8 @@ fn metric(snapshot: &serde_json::Value, name: &str) -> io::Result<u64> {
     let value = match name {
         "gets" => &snapshot["write_path"]["fetch"]["s3_get_calls"],
         "puts" => &snapshot["write_path"]["fetch"]["local_cache_put_calls"],
-        _ => &snapshot["upload"]["decompression_nanos"],
+        "decode" => &snapshot["upload"]["decompression_nanos"],
+        _ => return Err(io::Error::other(format!("unknown cold-read metric {name}"))),
     };
     value
         .as_u64()
@@ -364,7 +372,7 @@ fn inspect_remote(
     files: &[(String, Vec<u8>)],
     off: bool,
 ) -> Result<serde_json::Value, ScenarioError> {
-    let runtime = tokio::runtime::Builder::new_multi_thread()
+    let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
     runtime.block_on(async {
