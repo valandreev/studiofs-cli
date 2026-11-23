@@ -8,8 +8,9 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
+use studiofs_data::compression::decode_object;
 use studiofs_data::object::{
-    CLOUD_FRAGMENT_COUNT, CLOUD_FRAGMENT_SIZE, format_object_fragment_keys, read_object,
+    CLOUD_FRAGMENT_COUNT, CLOUD_FRAGMENT_SIZE, format_object_fragment_keys,
     validate_cloud_fragment_layout,
 };
 use studiofs_data::snapshot_key::{
@@ -354,7 +355,7 @@ impl DataStoreSnapshotPayloadReader {
                             error,
                         )
                     })?;
-                let fragment = read_object(object).map_err(|_| {
+                let fragment = decode_object(object).await.map_err(|_| {
                     SnapshotPortError::permanent(
                         "payload_object",
                         "snapshot payload object is invalid",
@@ -2597,6 +2598,81 @@ mod tests {
             .await
             .expect_err("out-of-range payload must fail");
         assert!(matches!(error, SnapshotPortError::Permanent { .. }));
+    }
+
+    #[tokio::test]
+    async fn datastore_payload_reader_decodes_v3_compressed_object_and_returns_exact_range() {
+        use studiofs_data::compression::{EncodedFragment, compress_fragment};
+        use studiofs_data::crypto::{ObjectCipher, VolumeMasterKey};
+        use studiofs_data::envelope::SMALL_SFEC_FRAME_SIZE;
+        use studiofs_meta::trash::CompressionPolicy;
+
+        let config = studiofs_data::DataStoreConfig {
+            endpoint: "memory://".to_owned(),
+            bucket: "payload-tests".to_owned(),
+            access_key: "access".to_owned(),
+            secret_key: "secret".to_owned(),
+            rotating_credentials: None,
+            region: "us-east-1".to_owned(),
+            volume_name: "projectfs".to_owned(),
+            data_prefix: "tenant/demo/objects/".to_owned(),
+            volume_uuid: VOLUME_UUID.to_owned(),
+            crypto: studiofs_data::DataStoreCryptoConfig::from(EncryptionConfig::new([0x42; 32])),
+        };
+        let raw = opendal::Operator::new(Memory::default())
+            .expect("memory operator")
+            .finish();
+        let data_store = Arc::new(
+            studiofs_data::DataStore::with_operator_for_test(&config, raw.clone())
+                .expect("data store"),
+        );
+        let volume =
+            SnapshotVolumeContext::new(7, "projectfs", VOLUME_UUID).expect("volume context");
+        let reader =
+            DataStoreSnapshotPayloadReader::new(data_store.clone(), volume).expect("reader");
+
+        let plaintext = Bytes::from(
+            b"snapshot-v3-payload-line-0123456789-abcdefghijklmnopqrstuvwxyz\n".repeat(4096),
+        );
+        let compressed = compress_fragment(plaintext.clone(), CompressionPolicy::zstd_default())
+            .await
+            .expect("compress v3 payload");
+        let EncodedFragment::V3(v3_buf) = compressed.fragment else {
+            panic!("expected v3 encoded fragment");
+        };
+        let key = studiofs_data::object::format_object_fragment_keys(data_store.data_prefix(), 78)
+            [0]
+        .clone();
+        let cipher = ObjectCipher::new(
+            &VolumeMasterKey::from_bytes(config.crypto.encryption.volume_master_key),
+            &config.volume_uuid,
+        )
+        .expect("cipher");
+        let sealed = cipher
+            .encrypt_object(
+                v3_buf.to_bytes(),
+                &key,
+                config.crypto.encryption.active_key_id,
+                SMALL_SFEC_FRAME_SIZE as u32,
+                1,
+            )
+            .expect("seal v3 object");
+        raw.write(&key, sealed).await.expect("write sealed v3");
+
+        let offset = 131_000u32;
+        let length = 256u32;
+        let expected_slice = &plaintext[offset as usize..(offset + length) as usize];
+        let payload = reader
+            .stat_and_read(&PayloadRef {
+                object_id: 78,
+                offset,
+                length,
+                flags: studiofs_meta::schema::BlockFlags::empty(),
+            })
+            .await
+            .expect("read v3 snapshot payload");
+        assert_eq!(payload.bytes, expected_slice);
+        assert_eq!(payload.sha256, digest(expected_slice));
     }
 
     #[tokio::test]

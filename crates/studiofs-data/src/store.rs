@@ -948,8 +948,10 @@ impl DataStore {
 
     /// Download a regular STFS fragment with a bound on the encrypted response body.
     ///
-    /// Accepts at most `CLOUD_FRAGMENT_SIZE` payload bytes plus the STFS header;
-    /// actual encrypted bytes must fit the SFEC prefix's header/frame geometry.
+    /// Accepts at most `MAX_REGULAR_OBJECT_PLAINTEXT_LEN` plaintext bytes (the STFS
+    /// header, up to `CLOUD_FRAGMENT_SIZE` payload bytes, and the largest valid v3
+    /// seek table); actual encrypted bytes must fit the SFEC prefix's header/frame
+    /// geometry (including 64 KiB-frame tag overhead for v3 objects).
     /// Snapshot artifacts and other larger objects must use the generic full-read API.
     pub async fn get_payload_by_key_with_stats(
         &self,
@@ -971,7 +973,7 @@ impl DataStore {
                     let layout = SfecHeaderLayout::from_prefix(&prefix)
                         .map_err(crypto::CryptoError::from)?;
                     if layout.plaintext_len()
-                        > (crate::object::CLOUD_FRAGMENT_SIZE + ObjectHeader::SIZE) as u64
+                        > crate::object::MAX_REGULAR_OBJECT_PLAINTEXT_LEN as u64
                     {
                         return Err(
                             crypto::CryptoError::from(SfecError::ObjectLengthOverflow).into()
@@ -1584,9 +1586,7 @@ mod tests {
         .unwrap();
         let payload = Bytes::from(vec![
             0x5a;
-            crate::object::CLOUD_FRAGMENT_SIZE
-                + ObjectHeader::SIZE
-                + 1
+            crate::object::MAX_REGULAR_OBJECT_PLAINTEXT_LEN + 1
         ]);
         store
             .put_snapshot_artifact(&key, payload.clone())
@@ -1615,6 +1615,169 @@ mod tests {
         assert!(!error.is_retryable());
         assert_eq!(consumed.load(Ordering::SeqCst), 51);
         assert!(consumed.load(Ordering::SeqCst) < encrypted.len());
+    }
+
+    #[tokio::test]
+    async fn full_payload_reads_v3_with_64k_and_1m_sfec_frames_and_enforces_bound() {
+        use crate::compression::{EncodedFragment, compress_fragment, decode_object_with_checksum};
+        use crate::envelope::{DEFAULT_SFEC_FRAME_SIZE, SMALL_SFEC_FRAME_SIZE};
+        use crate::object::{
+            CLOUD_FRAGMENT_SIZE, CompressionCodec, DEFAULT_V3_CHUNK_SIZE,
+            MAX_REGULAR_OBJECT_PLAINTEXT_LEN, MIN_V3_CHUNK_LOG2, ObjectError, ObjectFlags,
+            V3EncodedChunk, create_v3_object_buffer,
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use studiofs_meta::trash::CompressionPolicy;
+        use xxhash_rust::xxh64::xxh64;
+
+        const STFS_V3_BASELINE_FIXTURE: &[u8] =
+            include_bytes!("../tests/fixtures/stfs-v3-mixed.bin");
+
+        let config = encrypted_test_config();
+        let raw = Operator::new(Memory::default()).unwrap().finish();
+        let store = DataStore::with_operator_for_test(&config, raw.clone()).unwrap();
+        let cipher = ObjectCipher::new(
+            &VolumeMasterKey::from_bytes(config.crypto.encryption.volume_master_key),
+            &config.volume_uuid,
+        )
+        .unwrap();
+
+        // 1. Pinned v3 baseline fixture sealed with both 64 KiB and 1 MiB SFEC frames.
+        let mut expected_fixture = vec![0x42u8; DEFAULT_V3_CHUNK_SIZE];
+        expected_fixture.extend_from_slice(b"v3 raw tail chunk");
+        let fixture_xxh64 = xxh64(&expected_fixture, 0);
+
+        for frame_size in [SMALL_SFEC_FRAME_SIZE as u32, DEFAULT_SFEC_FRAME_SIZE as u32] {
+            let key = format!("unit-volume/objects/v3-fixture-{frame_size}");
+            let sealed = cipher
+                .encrypt_object(
+                    Bytes::from_static(STFS_V3_BASELINE_FIXTURE),
+                    &key,
+                    config.crypto.encryption.active_key_id,
+                    frame_size,
+                    1,
+                )
+                .unwrap();
+            let encrypted_len = sealed.len() as u64;
+            raw.write(&key, sealed).await.unwrap();
+
+            let (stfs_buf, stats) = store.get_payload_by_key_with_stats(&key).await.unwrap();
+            assert_eq!(stats.encrypted_bytes, encrypted_len);
+            assert_eq!(stats.plaintext_bytes, STFS_V3_BASELINE_FIXTURE.len() as u64);
+            let (decoded, checksum) = decode_object_with_checksum(stfs_buf).await.unwrap();
+            assert_eq!(decoded.as_ref(), expected_fixture.as_slice());
+            assert_eq!(checksum, fixture_xxh64);
+        }
+
+        // 2. Encoder-generated v3 object sealed with 64 KiB SFEC frames.
+        let generated_payload = Bytes::from(
+            b"def Xform \"hero_asset\" { double3 translate = (1.0, 2.0, 3.0) }\n".repeat(4096),
+        );
+        let compressed =
+            compress_fragment(generated_payload.clone(), CompressionPolicy::zstd_default())
+                .await
+                .unwrap();
+        let EncodedFragment::V3(v3_buf) = compressed.fragment else {
+            panic!("expected v3 encoded fragment");
+        };
+        let v3_bytes = v3_buf.to_bytes();
+        let gen_key = "unit-volume/objects/v3-generated-64k";
+        let sealed_gen = cipher
+            .encrypt_object(
+                v3_bytes.clone(),
+                gen_key,
+                config.crypto.encryption.active_key_id,
+                SMALL_SFEC_FRAME_SIZE as u32,
+                1,
+            )
+            .unwrap();
+        raw.write(gen_key, sealed_gen).await.unwrap();
+        let (stfs_buf, _) = store.get_payload_by_key_with_stats(gen_key).await.unwrap();
+        let (decoded_gen, checksum_gen) = decode_object_with_checksum(stfs_buf).await.unwrap();
+        assert_eq!(decoded_gen, generated_payload);
+        assert_eq!(checksum_gen, xxh64(generated_payload.as_ref(), 0));
+
+        // 3. Forged v3 object: SFEC frames authenticate with test key, but STFS XXH64 fails.
+        let mut forged_v3 = v3_bytes.to_vec();
+        forged_v3[16] ^= 0x01; // flip checksum bit
+        let forged_key = "unit-volume/objects/v3-forged-checksum";
+        let sealed_forged = cipher
+            .encrypt_object(
+                Bytes::from(forged_v3),
+                forged_key,
+                config.crypto.encryption.active_key_id,
+                SMALL_SFEC_FRAME_SIZE as u32,
+                1,
+            )
+            .unwrap();
+        raw.write(forged_key, sealed_forged).await.unwrap();
+        let (stfs_forged, _) = store
+            .get_payload_by_key_with_stats(forged_key)
+            .await
+            .unwrap();
+        let err = decode_object_with_checksum(stfs_forged).await.unwrap_err();
+        assert!(
+            matches!(err, DataError::Object(ObjectError::ChecksumMismatch { .. })),
+            "expected ChecksumMismatch corruption, got {err:?}"
+        );
+
+        // 4. Max-size v3 object (4 MiB all-raw chunks with largest seek table) sealed in 64 KiB
+        // SFEC frames fits the full-fetch bound (including seek table and 64 KiB frame tags),
+        // while trailing bytes past that bound are rejected before consuming the excess.
+        let chunk_size = 1usize << MIN_V3_CHUNK_LOG2;
+        let chunk_count = CLOUD_FRAGMENT_SIZE / chunk_size;
+        let max_payload = Bytes::from(vec![0x3Cu8; CLOUD_FRAGMENT_SIZE]);
+        let raw_chunks = (0..chunk_count)
+            .map(|i| V3EncodedChunk::Raw(max_payload.slice(i * chunk_size..(i + 1) * chunk_size)))
+            .collect();
+        let max_v3 = create_v3_object_buffer(
+            CLOUD_FRAGMENT_SIZE as u32,
+            xxh64(max_payload.as_ref(), 0),
+            CompressionCodec::Zstd,
+            MIN_V3_CHUNK_LOG2,
+            ObjectFlags::empty(),
+            raw_chunks,
+        )
+        .unwrap();
+        assert_eq!(max_v3.len(), MAX_REGULAR_OBJECT_PLAINTEXT_LEN);
+        let max_key = "unit-volume/objects/v3-max-64k";
+        let sealed_max = cipher
+            .encrypt_object(
+                max_v3,
+                max_key,
+                config.crypto.encryption.active_key_id,
+                SMALL_SFEC_FRAME_SIZE as u32,
+                1,
+            )
+            .unwrap()
+            .to_bytes();
+        raw.write(max_key, sealed_max.clone()).await.unwrap();
+        let (stfs_max, stats_max) = store.get_payload_by_key_with_stats(max_key).await.unwrap();
+        assert_eq!(
+            stats_max.plaintext_bytes,
+            MAX_REGULAR_OBJECT_PLAINTEXT_LEN as u64
+        );
+        assert_eq!(stats_max.encrypted_bytes, sealed_max.len() as u64);
+        let (decoded_max, _) = decode_object_with_checksum(stfs_max).await.unwrap();
+        assert_eq!(decoded_max, max_payload);
+
+        let mut trailing = sealed_max.to_vec();
+        trailing.resize(sealed_max.len() + 256 * 1024, 0);
+        let consumed = Arc::new(AtomicUsize::new(0));
+        let fake = raw.clone().layer(FullPayloadLayer {
+            body: Bytes::from(trailing.clone()),
+            advertised_size: Some(trailing.len() as u64),
+            consumed: consumed.clone(),
+        });
+        let bounded_store = DataStore::with_operator_for_test(&config, fake).unwrap();
+        let err = bounded_store
+            .get_payload_by_key_with_stats(max_key)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, DataError::Crypto(_)));
+        assert!(!err.is_retryable());
+        assert!(consumed.load(Ordering::SeqCst) <= sealed_max.len() + 17);
+        assert!(consumed.load(Ordering::SeqCst) < trailing.len());
     }
 
     #[tokio::test]
