@@ -112,12 +112,15 @@ current local durability contracts.
 
 - Complete fetch decrypts, decodes the seek table, decompresses every chunk,
   checks XXH64, and populates the local cache and singleflight with plaintext.
-- Cold range reads keep the existing request shape: round one reads the fixed
-  SFEC prefix; round two reads the header tail and frame 0, which holds the STFS
-  header and the whole seek table; the frames covering the stored bytes of the
-  needed chunks merge into round two when contiguous and otherwise are read
-  concurrently. Only those chunks are decompressed. Partial plaintext never
-  populates the complete cache, as today.
+- Cold range reads start with the fixed SFEC prefix, then read the header tail
+  and frame 0. For v3, frame 0 holds the STFS header and the whole seek table.
+  After authenticating frame 0 and validating the table, the reader reuses any
+  needed chunk bytes already in frame 0. A single additional read retrieves
+  the remaining frames covering the requested chunks, including when the
+  first of those frames is adjacent to frame 0. Only the requested compressed
+  chunks are decompressed. For v2, the prefix and logical offsets still let
+  the reader merge adjacent frames or fetch nonadjacent frames concurrently.
+  Partial plaintext never populates the complete cache.
 
 A small read of a compressed object therefore transfers the prefix, 64 KiB of
 frame 0, and the frames covering one or two compressed chunks, and costs at
