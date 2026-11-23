@@ -133,6 +133,7 @@ impl ObjectCipher {
 
     /// Encrypt one complete STFS object into an SFEC envelope.
     ///
+    /// Supported plaintext frame sizes are 64 KiB and 1 MiB.
     /// `plaintext` may be chunked (e.g. an OpenDAL `Buffer`); frames are
     /// copied straight from its chunks into the ciphertext allocation.
     /// Independent frames are sealed on up to `workers` threads; the output
@@ -142,6 +143,7 @@ impl ObjectCipher {
         plaintext: impl Buf,
         storage_key: &str,
         key_id: u32,
+        frame_size: u32,
         workers: usize,
     ) -> Result<Buffer, CryptoError> {
         let context = ObjectEncryptionContext {
@@ -161,14 +163,20 @@ impl ObjectCipher {
             .expect("fixed buffer");
         let plaintext_len =
             u64::try_from(plaintext.remaining()).map_err(|_| CryptoError::FrameLayoutOverflow)?;
-        let wrap_aad = wrap_aad(key_id, context, plaintext_len, data_nonce_prefix)?;
+        let wrap_aad = wrap_aad(
+            key_id,
+            context,
+            plaintext_len,
+            frame_size,
+            data_nonce_prefix,
+        )?;
         let wrapped_dek = encrypt_with_key(&self.wrapping_key, wrap_nonce, &wrap_aad, dek)?;
 
         let header = SfecHeader::new(
             SfecAlgorithm::XChaCha20Poly1305V1,
             key_id,
             plaintext_len,
-            DEFAULT_ENCRYPTION_FRAME_SIZE,
+            frame_size as usize,
             Bytes::copy_from_slice(wrap_nonce),
             Bytes::copy_from_slice(data_nonce_prefix),
             Bytes::from(wrapped_dek),
@@ -179,7 +187,7 @@ impl ObjectCipher {
             dek,
             data_nonce_prefix,
             &header_bytes,
-            key_id,
+            &header,
             context,
             workers,
         )?;
@@ -287,6 +295,7 @@ impl ObjectCipher {
             header.key_id(),
             context,
             header.plaintext_len(),
+            header.frame_size(),
             &data_nonce_prefix,
         )?;
         let dek = decrypt_with_key(
@@ -324,14 +333,15 @@ fn encrypt_frames(
     dek: &[u8; KEY_LEN],
     data_nonce_prefix: &[u8; DATA_NONCE_PREFIX_LEN],
     header_bytes: &[u8],
-    key_id: u32,
+    header: &SfecHeader,
     context: ObjectEncryptionContext<'_>,
     workers: usize,
 ) -> Result<Vec<u8>, CryptoError> {
     let cipher = XChaCha20Poly1305::new(Key::from_slice(dek));
     let tag_len = SfecAlgorithm::XChaCha20Poly1305V1.tag_len();
     let plaintext_len = plaintext.remaining();
-    let frame_count = plaintext_len.div_ceil(DEFAULT_ENCRYPTION_FRAME_SIZE);
+    let frame_size = header.frame_size() as usize;
+    let frame_count = header.frame_count() as usize;
     let output_len = plaintext_len
         .checked_add(
             frame_count
@@ -342,15 +352,15 @@ fn encrypt_frames(
     let mut output = Vec::with_capacity(output_len);
     // Lay out `body || tag slot` per frame, then seal the frames in place.
     while plaintext.has_remaining() {
-        let frame_len = plaintext.remaining().min(DEFAULT_ENCRYPTION_FRAME_SIZE);
+        let frame_len = plaintext.remaining().min(frame_size);
         output.put((&mut plaintext).take(frame_len));
         output.put_bytes(0, tag_len);
     }
-    let aad_base = frame_aad_base(key_id, context, header_bytes)?;
+    let aad_base = frame_aad_base(header.key_id(), context, header_bytes)?;
 
     for_each_frame(
         &mut output,
-        DEFAULT_ENCRYPTION_FRAME_SIZE + tag_len,
+        frame_size + tag_len,
         workers,
         &aad_base,
         0,
@@ -555,12 +565,13 @@ fn wrap_aad(
     key_id: u32,
     context: ObjectEncryptionContext<'_>,
     plaintext_len: u64,
+    frame_size: u32,
     data_nonce_prefix: &[u8; DATA_NONCE_PREFIX_LEN],
 ) -> Result<Vec<u8>, CryptoError> {
     let mut aad = Vec::with_capacity(256);
     put_common_aad(&mut aad, key_id, context)?;
     aad.put_u64_le(plaintext_len);
-    aad.put_u32_le(DEFAULT_ENCRYPTION_FRAME_SIZE as u32);
+    aad.put_u32_le(frame_size);
     aad.put_slice(data_nonce_prefix);
     Ok(aad)
 }
@@ -635,9 +646,147 @@ mod tests {
 
     fn encrypt(plaintext: &[u8], storage_key: &str) -> Bytes {
         cipher()
-            .encrypt_object(plaintext, storage_key, KEY_ID, 1)
+            .encrypt_object(
+                plaintext,
+                storage_key,
+                KEY_ID,
+                DEFAULT_ENCRYPTION_FRAME_SIZE as u32,
+                1,
+            )
             .unwrap()
             .to_bytes()
+    }
+
+    const LEGACY_FRAME_FIXTURE: &[u8] = include_bytes!("../tests/fixtures/sfec-v1-1mib.bin");
+    const FRAME_SIZE_FIELD: std::ops::Range<usize> = 26..30;
+    const SMALL_FRAME_SIZE: u32 = 64 * 1024;
+    const UNSUPPORTED_FRAME_SIZE: u32 = 32 * 1024;
+
+    #[test]
+    fn sfec_frame_size_64_kib_round_trip_and_ranges() {
+        use crate::envelope::{SFEC_HEADER_FIXED_LEN, SfecHeaderLayout};
+
+        let frame = u64::from(SMALL_FRAME_SIZE);
+        let end = 2 * frame + 37;
+        let plaintext: Bytes = (0..end).map(|offset| (offset % 251) as u8).collect();
+        let cipher = cipher();
+        let sealed = cipher
+            .encrypt_object(
+                fragment(&plaintext),
+                OBJECT_KEY,
+                KEY_ID,
+                SMALL_FRAME_SIZE,
+                3,
+            )
+            .unwrap()
+            .to_bytes();
+        let envelope = SfecEnvelope::parse(sealed.clone()).unwrap();
+        let layout = SfecHeaderLayout::from_prefix(&sealed[..SFEC_HEADER_FIXED_LEN]).unwrap();
+        assert_eq!(envelope.header().frame_size(), SMALL_FRAME_SIZE);
+        assert_eq!(envelope.header().frame_count(), 3);
+        assert_eq!(
+            cipher
+                .decrypt_object(fragment(&sealed), OBJECT_KEY, 3)
+                .unwrap(),
+            plaintext
+        );
+
+        for range in [
+            1..19,
+            frame + 3..frame + 31,
+            end - 13..end,
+            frame - 7..frame + 11,
+        ] {
+            let mapped = layout.ciphertext_range(range.clone()).unwrap();
+            let ciphertext = sealed.slice(mapped.start as usize..mapped.end as usize);
+            let actual = cipher
+                .decrypt_range(
+                    envelope.header_bytes().clone(),
+                    fragment(&ciphertext),
+                    OBJECT_KEY,
+                    range.clone(),
+                )
+                .unwrap();
+            assert_eq!(
+                actual,
+                plaintext.slice(range.start as usize..range.end as usize)
+            );
+        }
+    }
+
+    #[test]
+    fn sfec_frame_size_encrypt_rejects_unsupported_value() {
+        assert!(matches!(
+            cipher().encrypt_object(
+                &b"payload"[..],
+                OBJECT_KEY,
+                KEY_ID,
+                UNSUPPORTED_FRAME_SIZE,
+                1
+            ),
+            Err(CryptoError::MalformedEnvelope(SfecError::InvalidFrameSize(
+                UNSUPPORTED_FRAME_SIZE
+            )))
+        ));
+    }
+
+    #[test]
+    fn sfec_frame_size_decrypts_legacy_fixture() {
+        // Generated on origin/main with the test master key and 0x39 for the
+        // DEK, wrap nonce, and data nonce prefix.
+        let fixture = Bytes::from_static(LEGACY_FRAME_FIXTURE);
+        let envelope = SfecEnvelope::parse(fixture.clone()).unwrap();
+        assert_eq!(
+            envelope.header().frame_size(),
+            DEFAULT_ENCRYPTION_FRAME_SIZE as u32
+        );
+        assert_eq!(
+            cipher().decrypt_object(fixture, OBJECT_KEY, 1).unwrap(),
+            &b"legacy SFEC frame size"[..]
+        );
+    }
+
+    #[test]
+    fn sfec_frame_size_tampering_fails_key_unwrap() {
+        let mut tampered = LEGACY_FRAME_FIXTURE.to_vec();
+        tampered[FRAME_SIZE_FIELD].copy_from_slice(&SMALL_FRAME_SIZE.to_le_bytes());
+        let tampered = Bytes::from(tampered);
+        let envelope = SfecEnvelope::parse(tampered.clone()).unwrap();
+        assert_eq!(envelope.header().frame_count(), 1);
+        let cipher = cipher();
+        let context = ObjectEncryptionContext {
+            volume_uuid: UUID,
+            storage_key: OBJECT_KEY,
+        };
+        assert!(matches!(
+            cipher.unwrap_dek(envelope.header(), context),
+            Err(CryptoError::AuthenticationFailed)
+        ));
+        assert!(matches!(
+            cipher.decrypt_object(tampered, OBJECT_KEY, 1),
+            Err(CryptoError::AuthenticationFailed)
+        ));
+    }
+
+    #[test]
+    fn sfec_frame_size_rejects_unsupported_header_value() {
+        let envelope = SfecEnvelope::parse(Bytes::from_static(LEGACY_FRAME_FIXTURE)).unwrap();
+        let mut tampered = LEGACY_FRAME_FIXTURE.to_vec();
+        tampered[FRAME_SIZE_FIELD].copy_from_slice(&UNSUPPORTED_FRAME_SIZE.to_le_bytes());
+        let tampered = Bytes::from(tampered);
+        let header = tampered.slice(..envelope.header_bytes().len());
+        assert!(matches!(
+            cipher().decrypt_object(tampered, OBJECT_KEY, 1),
+            Err(CryptoError::MalformedEnvelope(SfecError::InvalidFrameSize(
+                UNSUPPORTED_FRAME_SIZE
+            )))
+        ));
+        assert!(matches!(
+            cipher().decrypt_range(header, envelope.ciphertext().clone(), OBJECT_KEY, 0..1),
+            Err(CryptoError::MalformedEnvelope(SfecError::InvalidFrameSize(
+                UNSUPPORTED_FRAME_SIZE
+            )))
+        ));
     }
 
     #[test]
@@ -667,7 +816,13 @@ mod tests {
             let sequential = encrypt(&plaintext, OBJECT_KEY);
             for workers in [2, 3, 4, 8] {
                 let parallel = cipher()
-                    .encrypt_object(fragment(&plaintext), OBJECT_KEY, KEY_ID, workers)
+                    .encrypt_object(
+                        fragment(&plaintext),
+                        OBJECT_KEY,
+                        KEY_ID,
+                        DEFAULT_ENCRYPTION_FRAME_SIZE as u32,
+                        workers,
+                    )
                     .unwrap()
                     .to_bytes();
                 assert_eq!(parallel.len(), sequential.len(), "size {size}");
@@ -748,13 +903,25 @@ mod tests {
         let parse = |bytes: Bytes| SfecEnvelope::parse(bytes).unwrap();
         let first = parse(
             cipher
-                .encrypt_object(&b"x"[..], "k", KEY_ID, 1)
+                .encrypt_object(
+                    &b"x"[..],
+                    "k",
+                    KEY_ID,
+                    DEFAULT_ENCRYPTION_FRAME_SIZE as u32,
+                    1,
+                )
                 .unwrap()
                 .to_bytes(),
         );
         let second = parse(
             cipher
-                .encrypt_object(&b"x"[..], "k", KEY_ID, 1)
+                .encrypt_object(
+                    &b"x"[..],
+                    "k",
+                    KEY_ID,
+                    DEFAULT_ENCRYPTION_FRAME_SIZE as u32,
+                    1,
+                )
                 .unwrap()
                 .to_bytes(),
         );
@@ -817,7 +984,13 @@ mod tests {
         ] {
             let plaintext = Bytes::from_iter((0..size).map(|idx| (idx % 251) as u8));
             let ciphertext = cipher()
-                .encrypt_object(fragment(&plaintext), OBJECT_KEY, KEY_ID, 1)
+                .encrypt_object(
+                    fragment(&plaintext),
+                    OBJECT_KEY,
+                    KEY_ID,
+                    DEFAULT_ENCRYPTION_FRAME_SIZE as u32,
+                    1,
+                )
                 .unwrap()
                 .to_bytes();
             assert_eq!(
@@ -881,7 +1054,13 @@ mod tests {
     #[test]
     fn decrypt_accepts_historical_key_id_from_envelope() {
         let ciphertext = cipher()
-            .encrypt_object(&b"historical key id"[..], OBJECT_KEY, KEY_ID + 1, 1)
+            .encrypt_object(
+                &b"historical key id"[..],
+                OBJECT_KEY,
+                KEY_ID + 1,
+                DEFAULT_ENCRYPTION_FRAME_SIZE as u32,
+                1,
+            )
             .unwrap()
             .to_bytes();
 
@@ -1041,9 +1220,9 @@ mod tests {
         );
 
         let mut swapped_header = header_bytes.to_vec();
-        swapped_header[26..30]
-            .copy_from_slice(&(DEFAULT_ENCRYPTION_FRAME_SIZE as u32 / 2).to_le_bytes());
-        swapped_header[30..34].copy_from_slice(&3u32.to_le_bytes());
+        swapped_header[FRAME_SIZE_FIELD].copy_from_slice(&SMALL_FRAME_SIZE.to_le_bytes());
+        let frame_count = DEFAULT_ENCRYPTION_FRAME_SIZE as u32 / SMALL_FRAME_SIZE + 1;
+        swapped_header[30..34].copy_from_slice(&frame_count.to_le_bytes());
         assert!(matches!(
             cipher().decrypt_range(
                 Bytes::from(swapped_header),
