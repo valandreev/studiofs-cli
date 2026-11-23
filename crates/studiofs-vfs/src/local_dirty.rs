@@ -779,6 +779,15 @@ fn clone_object_error(
         ObjectError::InvalidFragmentLayout(value) => {
             ObjectError::InvalidFragmentLayout(value.clone())
         }
+        ObjectError::UnsupportedCodec(codec) => ObjectError::UnsupportedCodec(*codec),
+        ObjectError::InvalidV3Format(value) => ObjectError::InvalidV3Format(value.clone()),
+        ObjectError::ChunkDecompression {
+            chunk_index,
+            message,
+        } => ObjectError::ChunkDecompression {
+            chunk_index: *chunk_index,
+            message: message.clone(),
+        },
     }
 }
 
