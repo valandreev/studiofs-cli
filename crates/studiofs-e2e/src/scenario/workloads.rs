@@ -247,6 +247,7 @@ mod actions;
 mod advanced_mounted;
 mod assertions;
 mod cache_scrub;
+mod compression;
 mod concurrent_mkdir;
 mod faults;
 mod logical_quota;
@@ -276,6 +277,7 @@ pub use actions::{
 pub(super) use advanced_mounted::*;
 pub(super) use assertions::*;
 pub(super) use cache_scrub::MountedCacheScrub;
+pub(super) use compression::MountedCompression;
 pub(super) use concurrent_mkdir::ConcurrentMkdirMerge;
 pub(super) use faults::*;
 pub(super) use logical_quota::LogicalQuota;

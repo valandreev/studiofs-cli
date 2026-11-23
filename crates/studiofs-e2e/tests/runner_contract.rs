@@ -163,6 +163,23 @@ fn full_e2e_selects_every_registered_scenario() {
 }
 
 #[test]
+fn compression_scenario_is_registered_and_selected_by_name() {
+    assert!(
+        studiofs_e2e::scenario::available_scenarios()
+            .iter()
+            .any(
+                |scenario| scenario.name == "mounted-compression" && scenario.requires_studiofs_bin
+            )
+    );
+    let cli =
+        Cli::try_parse_from(["studiofs-e2e", "run", "--scenario", "mounted-compression"]).unwrap();
+    let Commands::Run(args) = cli.command else {
+        panic!("expected run command")
+    };
+    assert_eq!(args.scenario_names(), ["mounted-compression"]);
+}
+
+#[test]
 fn local_first_baseline_gate_uses_scenarios_1_through_8() {
     assert_eq!(
         baseline_gate::SCENARIOS_1_THROUGH_8,

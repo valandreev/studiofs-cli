@@ -74,6 +74,7 @@ pub fn available_scenarios() -> &'static [ScenarioDefinition] {
             ScratchOrphanRestore.definition(),
             ScratchDemote.definition(),
             ScratchAppleDouble.definition(),
+            MountedCompression.definition(),
         ]
     })
 }
@@ -81,6 +82,7 @@ pub fn available_scenarios() -> &'static [ScenarioDefinition] {
 /// Resolves a scenario name to a concrete scenario implementation.
 pub(crate) fn resolve_scenario(name: &str) -> Option<Box<dyn Scenario>> {
     match name {
+        "mounted-compression" => Some(Box::new(MountedCompression)),
         "mounted-recoverable-trash-two-client" => Some(Box::new(RecoverableTrash)),
         "mounted-logical-quota" => Some(Box::new(LogicalQuota)),
         "mounted-cache-scrub" => Some(Box::new(MountedCacheScrub)),

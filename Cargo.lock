@@ -5086,6 +5086,7 @@ dependencies = [
  "ctrlc",
  "fs2",
  "libc",
+ "opendal",
  "percent-encoding",
  "postcard",
  "serde",
