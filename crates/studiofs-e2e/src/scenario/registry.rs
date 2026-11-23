@@ -3,6 +3,7 @@
 use std::sync::OnceLock;
 
 use super::types::{Scenario, ScenarioDefinition};
+use super::workloads::compression::MountedCompression;
 use super::workloads::scratch_auto_promote::{SCRATCH_AUTO_PROMOTE, ScratchAutoPromote};
 use super::workloads::scratch_demote::{SCRATCH_DEMOTE, ScratchDemote};
 use super::workloads::scratch_e2e::{
