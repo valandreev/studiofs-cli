@@ -8,7 +8,6 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
-use studiofs_data::compression::decode_object;
 use studiofs_data::object::{
     CLOUD_FRAGMENT_COUNT, CLOUD_FRAGMENT_SIZE, format_object_fragment_keys,
     validate_cloud_fragment_layout,
@@ -355,17 +354,22 @@ impl DataStoreSnapshotPayloadReader {
                             error,
                         )
                     })?;
-                let fragment = decode_object(object).await.map_err(|error| match error {
-                    DataError::Object(_) => SnapshotPortError::permanent(
-                        "payload_object",
-                        "snapshot payload object is invalid",
-                    ),
-                    // e.g. a cancelled decode worker at shutdown is not object corruption
-                    other => DataStoreSnapshotArtifactStore::map_data_error(
-                        "decode snapshot payload",
-                        other,
-                    ),
-                })?;
+                let fragment = self
+                    .data_store
+                    .decode_payload_with_checksum(object)
+                    .await
+                    .map(|(payload, _)| payload)
+                    .map_err(|error| match error {
+                        DataError::Object(_) => SnapshotPortError::permanent(
+                            "payload_object",
+                            "snapshot payload object is invalid",
+                        ),
+                        // e.g. a cancelled decode worker at shutdown is not object corruption
+                        other => DataStoreSnapshotArtifactStore::map_data_error(
+                            "decode snapshot payload",
+                            other,
+                        ),
+                    })?;
                 Ok::<_, SnapshotPortError>((fragment_index, fragment))
             },
         ))

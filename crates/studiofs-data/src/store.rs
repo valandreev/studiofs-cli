@@ -1,6 +1,6 @@
 //! DataStore — S3 storage abstraction via OpenDAL.
 
-use crate::compression::{EncodedFragment, compress_fragment};
+use crate::compression::{EncodedFragment, StoreRawReason, compress_fragment};
 use crate::crypto::{self, ObjectCipher, VolumeMasterKey};
 use crate::envelope::{
     DEFAULT_SFEC_FRAME_SIZE, SFEC_HEADER_FIXED_LEN, SMALL_SFEC_FRAME_SIZE, SfecError, SfecHeader,
@@ -124,6 +124,12 @@ pub struct RemoteObjectWriteStats {
     pub encrypted_bytes: u64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FragmentUploadOutcome {
+    V3,
+    Raw(StoreRawReason),
+}
+
 /// Encrypted payload prepared before upload throttling and request timeouts.
 #[derive(Clone)]
 pub struct PreparedPayload {
@@ -132,6 +138,7 @@ pub struct PreparedPayload {
     logical_len: usize,
     stfs_sha256: [u8; 32],
     payload_xxh64: u64,
+    compression_outcome: Option<FragmentUploadOutcome>,
 }
 
 impl PreparedPayload {
@@ -513,6 +520,41 @@ pub fn validate_s3_endpoint_transport(endpoint: &str) -> DataResult<()> {
     normalize_s3_endpoint_transport(endpoint).map(|_| ())
 }
 
+/// Client-lifetime successful fragment upload and v3 decode accounting.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CompressionStats {
+    /// Logical payload bytes of successful fragment PUTs, including repeated PUTs.
+    pub logical_bytes_uploaded: u64,
+    /// Stored payload bytes, including v3 seek tables, excluding STFS/SFEC framing.
+    pub stored_bytes_uploaded: u64,
+    /// Successfully uploaded STFS v3 fragments.
+    pub v3_fragments_uploaded: u64,
+    /// Successful raw fragment PUTs rejected by the entropy probe.
+    pub raw_probe_fragments_uploaded: u64,
+    /// Successful raw fragment PUTs rejected by the final savings threshold.
+    pub raw_threshold_fragments_uploaded: u64,
+    /// V3 decode wall time, including blocking admission but excluding remote I/O/decryption.
+    pub decompression_nanos: u64,
+}
+
+impl CompressionStats {
+    fn record_upload(&mut self, outcome: FragmentUploadOutcome, logical: u64, stored: u64) {
+        self.logical_bytes_uploaded = self.logical_bytes_uploaded.saturating_add(logical);
+        self.stored_bytes_uploaded = self.stored_bytes_uploaded.saturating_add(stored);
+        let counter = match outcome {
+            FragmentUploadOutcome::V3 => &mut self.v3_fragments_uploaded,
+            FragmentUploadOutcome::Raw(StoreRawReason::ProbeSkipped) => {
+                &mut self.raw_probe_fragments_uploaded
+            }
+            FragmentUploadOutcome::Raw(StoreRawReason::FinalThreshold) => {
+                &mut self.raw_threshold_fragments_uploaded
+            }
+            FragmentUploadOutcome::Raw(StoreRawReason::PolicyOff) => return,
+        };
+        *counter = counter.saturating_add(1);
+    }
+}
+
 type CompressionPolicyReader = Arc<dyn Fn() -> DataResult<CompressionPolicy> + Send + Sync>;
 
 /// DataStore — manages payload-object I/O to S3-compatible storage.
@@ -525,6 +567,7 @@ pub struct DataStore {
     profile: IoProfile,
     payload_throttle: Arc<PayloadThrottle>,
     compression_policy_reader: Option<CompressionPolicyReader>,
+    compression_stats: Arc<Mutex<CompressionStats>>,
 }
 
 fn is_ip_endpoint(endpoint: &str) -> bool {
@@ -739,6 +782,7 @@ impl DataStore {
             profile,
             payload_throttle,
             compression_policy_reader: None,
+            compression_stats: Arc::new(Mutex::new(CompressionStats::default())),
         })
     }
 
@@ -756,6 +800,7 @@ impl DataStore {
             profile: IoProfile::Default,
             payload_throttle: Arc::new(PayloadThrottle::default()),
             compression_policy_reader: None,
+            compression_stats: Arc::new(Mutex::new(CompressionStats::default())),
         })
     }
 
@@ -769,11 +814,48 @@ impl DataStore {
         self
     }
 
-    fn current_compression_policy(&self) -> DataResult<CompressionPolicy> {
+    /// Effective volume compression policy, preserving metadata lookup errors.
+    pub fn current_compression_policy(&self) -> DataResult<CompressionPolicy> {
         match &self.compression_policy_reader {
             Some(reader) => reader(),
             None => Ok(CompressionPolicy::off()),
         }
+    }
+
+    /// Return the counters shared by this client's read/write connection pools.
+    pub fn compression_stats(&self) -> CompressionStats {
+        *self
+            .compression_stats
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn record_decompression(&self, elapsed: std::time::Duration) {
+        let nanos = u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX);
+        let mut stats = self
+            .compression_stats
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        stats.decompression_nanos = stats.decompression_nanos.saturating_add(nanos);
+    }
+
+    /// Decode a full fragment and account v3 decode wall time, including failed decodes.
+    pub async fn decode_payload_with_checksum(&self, data: Buffer) -> DataResult<(Bytes, u64)> {
+        let mut header_bytes = [0; ObjectHeader::SIZE];
+        let is_v3 = if data.len() >= ObjectHeader::SIZE {
+            data.slice(..ObjectHeader::SIZE)
+                .copy_to_slice(&mut header_bytes);
+            ObjectHeader::from_bytes(&header_bytes)
+                .is_ok_and(|header| header.version == crate::object::VERSION_V3)
+        } else {
+            false
+        };
+        let start = std::time::Instant::now();
+        let result = crate::compression::decode_object_with_checksum(data).await;
+        if is_v3 {
+            self.record_decompression(start.elapsed());
+        }
+        result
     }
 
     /// Create a read-optimised clone with its own connection pool.
@@ -788,6 +870,7 @@ impl DataStore {
             self.payload_throttle.clone(),
             self.crypto.clone(),
         )?;
+        store.compression_stats = self.compression_stats.clone();
         store.volume_uuid = self.volume_uuid.clone();
         store.compression_policy_reader = self.compression_policy_reader.clone();
         Ok(store)
@@ -801,6 +884,7 @@ impl DataStore {
             self.payload_throttle.clone(),
             self.crypto.clone(),
         )?;
+        store.compression_stats = self.compression_stats.clone();
         store.volume_uuid = self.volume_uuid.clone();
         store.compression_policy_reader = self.compression_policy_reader.clone();
         Ok(store)
@@ -937,6 +1021,7 @@ impl DataStore {
             logical_len: plaintext_len,
             stfs_sha256: [0; 32],
             payload_xxh64: 0,
+            compression_outcome: None,
         })
     }
 
@@ -960,20 +1045,21 @@ impl DataStore {
         policy: CompressionPolicy,
     ) -> DataResult<PreparedPayload> {
         let logical_len = payload.len();
-        if policy.is_enabled() {
-            let compressed = compress_fragment(payload, policy).await?;
-            match compressed.fragment {
-                EncodedFragment::V3(v3_buf) => {
-                    self.seal_stfs_object(key, v3_buf, logical_len, SMALL_SFEC_FRAME_SIZE)
-                        .await
-                }
-                EncodedFragment::StoreRaw { payload, .. } => {
-                    self.build_v2_and_seal(key, payload, logical_len).await
-                }
+        let compressed = compress_fragment(payload, policy).await?;
+        let outcome = compressed
+            .raw_reason()
+            .map_or(FragmentUploadOutcome::V3, FragmentUploadOutcome::Raw);
+        let mut prepared = match compressed.fragment {
+            EncodedFragment::V3(v3_buf) => {
+                self.seal_stfs_object(key, v3_buf, logical_len, SMALL_SFEC_FRAME_SIZE)
+                    .await?
             }
-        } else {
-            self.build_v2_and_seal(key, payload, logical_len).await
-        }
+            EncodedFragment::StoreRaw { payload, .. } => {
+                self.build_v2_and_seal(key, payload, logical_len).await?
+            }
+        };
+        prepared.compression_outcome = Some(outcome);
+        Ok(prepared)
     }
 
     async fn build_v2_and_seal(
@@ -1035,6 +1121,7 @@ impl DataStore {
     ) -> DataResult<RemoteObjectWriteStats> {
         let plaintext_len = prepared.plaintext_len;
         let logical_len = prepared.logical_len;
+        let outcome = prepared.compression_outcome;
         let encrypted = prepared.encrypted;
         let encrypted_len = encrypted.len();
         debug!(
@@ -1045,6 +1132,16 @@ impl DataStore {
             "uploading encrypted object"
         );
         self.op.write(key, encrypted).await?;
+        if let Some(outcome) = outcome {
+            self.compression_stats
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .record_upload(
+                    outcome,
+                    logical_len as u64,
+                    plaintext_len.saturating_sub(ObjectHeader::SIZE) as u64,
+                );
+        }
         Ok(RemoteObjectWriteStats {
             plaintext_bytes: plaintext_len as u64,
             logical_bytes: logical_len as u64,
@@ -1347,7 +1444,10 @@ impl DataStore {
                 stored.extend_from_slice(&plaintext);
             }
         }
-        let payload = crate::compression::decompress_v3_range(mapping, Bytes::from(stored)).await?;
+        let decode_start = std::time::Instant::now();
+        let result = crate::compression::decompress_v3_range(mapping, Bytes::from(stored)).await;
+        self.record_decompression(decode_start.elapsed());
+        let payload = result?;
         let stats = RemoteObjectReadStats {
             encrypted_bytes,
             plaintext_bytes: payload.len() as u64,
@@ -1539,6 +1639,8 @@ fn seal_stfs_buffer_blocking(
         logical_len,
         stfs_sha256,
         payload_xxh64,
+        // Only `prepare_payload_with_policy` knows the outcome; v2 seals share this path.
+        compression_outcome: None,
     })
 }
 
@@ -3443,8 +3545,10 @@ mod tests {
         use crate::object::{VERSION, VERSION_V3};
 
         let raw = Operator::new(Memory::default()).unwrap().finish();
-        let store =
-            DataStore::with_operator_for_test(&encrypted_test_config(), raw.clone()).unwrap();
+        let mut config = encrypted_test_config();
+        // The read clone builds a runtime operator, but decoding below performs no I/O on it.
+        config.endpoint = "http://127.0.0.1:9000".into();
+        let store = DataStore::with_operator_for_test(&config, raw.clone()).unwrap();
         let compressible = compressible_bytes(256 * 1024);
         let random = deterministic_random_bytes(256 * 1024);
 
@@ -3527,6 +3631,91 @@ mod tests {
         assert_eq!(stats_raw.encrypted_bytes, raw_rand.len() as u64);
         let (decoded_rand, _) = decode_object_with_checksum(stfs_rand).await.unwrap();
         assert_eq!(decoded_rand, random);
+        let counts = store.compression_stats();
+        assert_eq!(
+            counts.logical_bytes_uploaded,
+            (3 * compressible.len()) as u64
+        );
+        assert_eq!(
+            counts.stored_bytes_uploaded,
+            2 * compressible.len() as u64 + u64::from(header_v3.compressed_size)
+        );
+        assert_eq!(counts.v3_fragments_uploaded, 1);
+        assert_eq!(counts.raw_probe_fragments_uploaded, 1);
+        assert_eq!(counts.raw_threshold_fragments_uploaded, 0);
+        assert_eq!(counts.decompression_nanos, 0);
+        let (stfs, _) = store.get_payload_by_key_with_stats(key_v3).await.unwrap();
+        let read_pool = store.clone_for_reads().unwrap();
+        read_pool.decode_payload_with_checksum(stfs).await.unwrap();
+        assert!(Arc::ptr_eq(
+            &store.compression_stats,
+            &read_pool.compression_stats
+        ));
+        let full_nanos = store.compression_stats().decompression_nanos;
+        assert!(full_nanos > 0);
+        store
+            .get_payload_range_by_key_with_stats(key_v3, 0..4096)
+            .await
+            .unwrap();
+        assert!(store.compression_stats().decompression_nanos > full_nanos);
+        // Generic objects and preparation alone do not count as successful fragment PUTs.
+        store
+            .put_by_key("unit-volume/snapshot", Bytes::from_static(b"generic"))
+            .await
+            .unwrap();
+        store
+            .prepare_payload_with_policy(key_raw, random, CompressionPolicy::off())
+            .await
+            .unwrap();
+        assert_eq!(
+            store.compression_stats().logical_bytes_uploaded,
+            counts.logical_bytes_uploaded
+        );
+    }
+
+    #[tokio::test]
+    async fn compression_accounting_counts_final_rejection_only_after_successful_put() {
+        let raw = Operator::new(Memory::default()).unwrap().finish();
+        let store = DataStore::with_operator_for_test(&encrypted_test_config(), raw).unwrap();
+        let mut payload = vec![0; crate::compression::PROBE_BYTES];
+        payload.extend_from_slice(&deterministic_random_bytes(
+            crate::object::CLOUD_FRAGMENT_SIZE - payload.len(),
+        ));
+        let key = "unit-volume/objects/0001/final-threshold";
+        let prepared = store
+            .prepare_payload_with_policy(
+                key,
+                Bytes::from(payload),
+                CompressionPolicy::zstd_default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(store.compression_stats().logical_bytes_uploaded, 0);
+        assert_eq!(
+            prepared.compression_outcome,
+            Some(FragmentUploadOutcome::Raw(StoreRawReason::FinalThreshold))
+        );
+        // A failed PUT does not consume the outcome; a retry counts only on success.
+        assert!(
+            store
+                .put_prepared_by_key("", prepared.clone())
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            store.compression_stats().raw_threshold_fragments_uploaded,
+            0
+        );
+        store.put_prepared_by_key(key, prepared).await.unwrap();
+        let counts = store.compression_stats();
+        assert_eq!(
+            counts.logical_bytes_uploaded,
+            crate::object::CLOUD_FRAGMENT_SIZE as u64
+        );
+        assert_eq!(counts.stored_bytes_uploaded, counts.logical_bytes_uploaded);
+        assert_eq!(counts.raw_threshold_fragments_uploaded, 1);
+        assert_eq!(counts.raw_probe_fragments_uploaded, 0);
+        assert_eq!(counts.v3_fragments_uploaded, 0);
     }
 
     #[tokio::test]

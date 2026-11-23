@@ -726,6 +726,7 @@ fn runtime_stats_from_diagnostics(
         "bytes",
         upload.encrypted_bytes_written,
     );
+    upload.insert_compression_metrics(&mut snapshot.object_io);
     insert_counter(
         &mut snapshot.object_io,
         "errors",
@@ -1459,10 +1460,35 @@ mod tests {
         diagnostics.upload.completed_upload_bytes = 41;
         diagnostics.upload.encrypted_bytes_written = 43;
         diagnostics.upload.encrypted_object_write_failures = 47;
+        diagnostics.upload.compression_policy =
+            Some(studiofs_meta::trash::CompressionPolicy::zstd_default());
+        diagnostics.upload.compression_stored_logical_ratio = Some(0.25);
+        diagnostics.upload.logical_bytes_uploaded = 4096;
+        diagnostics.upload.stored_bytes_uploaded = 1024;
+        diagnostics.upload.v3_fragments_uploaded = 3;
+        diagnostics.upload.raw_probe_fragments_uploaded = 2;
+        diagnostics.upload.raw_threshold_fragments_uploaded = 1;
+        diagnostics.upload.decompression_nanos = 12345;
+        let mut expected_compression = RuntimeStatsSection::default();
+        diagnostics
+            .upload
+            .insert_compression_metrics(&mut expected_compression);
 
         let snapshot = runtime_stats_from_diagnostics(diagnostics);
 
         assert_eq!(snapshot.generated_unix_ms, 42);
+        for (name, value) in expected_compression.counters {
+            assert_eq!(snapshot.object_io.counters[&name], value);
+        }
+        for (name, value) in expected_compression.gauges {
+            assert_eq!(snapshot.object_io.gauges[&name], value);
+        }
+        assert_eq!(snapshot.object_io.gauges["compression_level"].value, 3);
+        assert_eq!(
+            snapshot.object_io.gauges["compression_stored_logical_ratio"].value,
+            250_000
+        );
+
         assert_eq!(snapshot.system.gauges["cpu_percent_x10"].value, 123);
         assert_eq!(snapshot.system.gauges["rss_bytes"].value, 51 * 1024 * 1024);
         assert_eq!(snapshot.system.gauges["uptime_ms"].value, 3500);

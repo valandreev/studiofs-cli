@@ -1319,6 +1319,23 @@ pub fn run(
                 format_bytes(snapshot.upload.encrypted_bytes_written),
                 snapshot.upload.encrypted_object_write_failures
             );
+            let upload = &snapshot.upload;
+            let policy = upload
+                .compression_policy
+                .map_or_else(|| "unavailable".to_owned(), |policy| policy.to_string());
+            let ratio = upload
+                .compression_stored_logical_ratio
+                .map_or_else(|| "unavailable".to_owned(), |ratio| format!("{ratio:.6}"));
+            println!("  compression policy={policy} stored/logical={ratio}");
+            println!(
+                "  compression uploaded logical={} stored={} v3={} raw_probe={} raw_threshold={} decode_time={}",
+                format_bytes(upload.logical_bytes_uploaded),
+                format_bytes(upload.stored_bytes_uploaded),
+                upload.v3_fragments_uploaded,
+                upload.raw_probe_fragments_uploaded,
+                upload.raw_threshold_fragments_uploaded,
+                format_ms(upload.decompression_nanos as f64 / 1_000_000.0),
+            );
             println!("  {}", format_payload_limit_status(&snapshot.upload));
             println!(
                 "  fetch stages avg/max ms s3_get {}/{} decode {}/{} assemble_copy {}/{} cache_put {}/{} total {}/{}",

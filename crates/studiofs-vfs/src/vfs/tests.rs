@@ -29234,6 +29234,142 @@ fn retained_restore_concurrent_same_receipt_never_recopies_over_newer_writes() {
 }
 
 #[test]
+fn logical_quota_counts_compressed_payload_at_logical_size() {
+    use studiofs_data::object::{ObjectHeader, VERSION_V3, format_object_fragment_keys};
+    use studiofs_meta::trash::CompressionPolicy;
+    let tmp = studiofs_test_support::workspace_target_tempdir("compression-quota-");
+    let (rt, mut vfs, meta) = make_unstarted_test_vfs(&tmp, "compression-quota");
+    let config = DataStoreConfig::from(&test_format_info("compression-quota"));
+    let raw = opendal::Operator::new(opendal::services::Memory::default())
+        .unwrap()
+        .finish();
+    let meta_reader = meta.clone();
+    let data_store = Arc::new(
+        studiofs_data::store::DataStore::with_operator_for_test(&config, raw)
+            .unwrap()
+            .with_compression_policy_reader(move || {
+                meta_reader
+                    .volume_settings()
+                    .map(|s| s.compression)
+                    .map_err(|e| studiofs_data::store::DataError::Storage(e.to_string()))
+            }),
+    );
+    Arc::get_mut(&mut vfs).unwrap().data_write = data_store.clone();
+    let vfs_config = VfsConfig::default();
+    Arc::get_mut(&mut vfs).unwrap().upload_scheduler =
+        Arc::new(crate::upload::UploadScheduler::new(
+            data_store.clone(),
+            build_upload_aimd_config(&vfs_config),
+            &vfs_config,
+        ));
+    Arc::get_mut(&mut vfs).unwrap().fetch_scheduler = Arc::new(crate::fetch::FetchScheduler::new(
+        data_store.clone(),
+        vfs.cached_store.clone(),
+        build_fetch_aimd_config(16, &vfs_config),
+        vfs_config.prefetch_foreground_reserve,
+        Arc::new(crate::qos::QosController::from_config(&vfs_config)),
+        crate::qos::TransitMemoryBudget::new(64 * 1024 * 1024),
+        &vfs_config,
+    ));
+
+    let logical_len = 256 * 1024;
+    meta.compare_and_set_compression(0, CompressionPolicy::zstd_default())
+        .unwrap()
+        .unwrap();
+    meta.compare_and_set_logical_quota_bytes(1, Some(logical_len))
+        .unwrap()
+        .unwrap();
+    let file = vfs
+        .create(ROOT_INO, b"compressible.bin", 0, 0, 0o644)
+        .unwrap();
+    let fh = vfs.open_file(file.ino, OpenFlags::RDWR, false).unwrap();
+    let payload = Bytes::from(vec![0x5a; logical_len as usize]);
+    rt.block_on(vfs.write_fh(fh, file.ino, 0, &payload))
+        .unwrap();
+    rt.block_on(vfs.fsync_fh(fh)).unwrap();
+    let pending = vfs.cached_store.snapshot_pending_uploads();
+    assert_eq!(pending.len(), 1);
+    let upload = &pending[0];
+    assert_eq!(upload.ino, file.ino);
+    assert_eq!(upload.payload_len, logical_len);
+    assert_eq!(
+        vfs.cached_store.get_for_upload(upload.object_id).unwrap(),
+        payload
+    );
+    let referenced_objects: Vec<_> = meta
+        .lookup_regular_file_slices(file.ino, 0, logical_len)
+        .unwrap()
+        .into_iter()
+        .filter_map(|span| span.payload.map(|payload| payload.object_id))
+        .collect();
+    assert_eq!(referenced_objects, vec![upload.object_id]);
+    let keys = format_object_fragment_keys(&vfs.data_prefix, upload.object_id).to_vec();
+    rt.block_on(async {
+        vfs.start().unwrap();
+        assert!(vfs.wait_for_uploads_idle(Duration::from_secs(10)).await);
+        let (stored, _) = data_store
+            .get_payload_by_key_with_stats(&keys[0])
+            .await
+            .unwrap();
+        assert_eq!(
+            ObjectHeader::from_bytes(&stored.slice(..ObjectHeader::SIZE).to_bytes())
+                .unwrap()
+                .version,
+            VERSION_V3
+        );
+    });
+    let stats = vfs.upload_stats();
+    assert_eq!(stats.completed_uploads, 1);
+    assert_eq!(stats.v3_fragments_uploaded, 1);
+    assert_eq!(stats.logical_bytes_uploaded, logical_len);
+    assert!(stats.stored_bytes_uploaded < logical_len / 10);
+    assert_eq!(
+        stats.compression_policy,
+        Some(CompressionPolicy::zstd_default())
+    );
+    assert!(stats.compression_stored_logical_ratio.unwrap() < 0.1);
+    let object_id = upload.object_id;
+    // Force the reads through the remote decoder after proving the PUT succeeded.
+    vfs.cached_store.remove(object_id).unwrap();
+    assert!(vfs.cached_store.get(object_id).is_none());
+    assert_eq!(
+        rt.block_on(vfs.fetch_scheduler.fetch_block_range_after_local_miss(
+            object_id,
+            &keys,
+            0..4096
+        ))
+        .unwrap(),
+        payload.slice(..4096)
+    );
+    let range_nanos = vfs.upload_stats().decompression_nanos;
+    assert!(range_nanos > 0);
+    assert_eq!(
+        rt.block_on(
+            vfs.fetch_scheduler
+                .fetch_block_after_local_miss(object_id, &keys)
+        )
+        .unwrap(),
+        payload
+    );
+    assert!(vfs.upload_stats().decompression_nanos > range_nanos);
+
+    assert_eq!(
+        vfs.logical_quota_status().unwrap().unwrap().used_bytes,
+        u128::from(logical_len)
+    );
+    assert_eq!(vfs.capacity_bytes().unwrap().free_bytes, 0);
+    assert!(matches!(
+        rt.block_on(vfs.write_fh(fh, file.ino, logical_len, b"x")),
+        Err(VfsError::Io(error)) if error.kind() == std::io::ErrorKind::StorageFull
+    ));
+    assert_eq!(meta.get_attr(file.ino).unwrap().size, logical_len);
+    rt.block_on(async {
+        vfs.release_fh(fh).await.unwrap();
+        vfs.shutdown(Duration::from_secs(10)).await.unwrap();
+    });
+}
+
+#[test]
 fn logical_quota_rejects_sparse_growth_but_allows_non_growing_operations() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "logical-quota-sparse");

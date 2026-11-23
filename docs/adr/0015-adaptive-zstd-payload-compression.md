@@ -152,6 +152,32 @@ Logical quota keeps counting logical bytes. Clients report logical and stored
 upload bytes, the number of fragments written as v3 or stored raw by the probe
 or the final threshold, and decompression time.
 
+The client-lifetime upload counters advance after a successful fragment PUT.
+Preparation and failed PUT attempts do not count; another successful PUT of the
+same fragment counts again. Generic snapshot artifact uploads do not count.
+`logical_bytes_uploaded` counts uncompressed payload bytes.
+`stored_bytes_uploaded` counts the STFS body (including the v3 seek table),
+excluding the STFS header and SFEC envelope, frame tags, and key wrapping.
+Existing encrypted byte counters continue to describe network bytes.
+The observed ratio is stored bytes divided by logical bytes; smaller is better,
+and it is absent until at least one nonempty fragment has been uploaded.
+`compression_policy` is the effective policy read from local metadata, and is
+absent if policy lookup fails.
+
+The upload stats and local diagnostics expose those counters, v3 fragment count,
+probe and final-threshold raw fallback counts, and v3 `decompression_nanos`.
+Decode time is wall time around complete and range v3 decoding, including
+blocking admission and checksum work but excluding network I/O and decryption;
+failed decode work also counts. Local cached reads do not decode again.
+Read and write connection pools share the same client counters.
+The runtime stats text surface exposes the same byte/count counters under
+`object_io`, decode time as `decompression` in nanoseconds, effective policy as
+`compression_policy_known`, `compression_enabled`, and `compression_level`
+gauges, and the stored/logical ratio in millionths. Missing policy and ratio
+values are omitted from their gauges; `compression_policy_known` is zero when
+lookup fails. Quota continues to count logical inode sizes independently of
+these transfer counters.
+
 ### Security
 
 Compression makes each fragment's stored size depend on its content, and an

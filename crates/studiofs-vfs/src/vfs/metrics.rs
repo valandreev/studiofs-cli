@@ -1912,6 +1912,22 @@ pub struct VfsIngressPressure {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct VfsUploadStats {
+    /// Effective volume policy from local metadata; unavailable on lookup failure.
+    pub compression_policy: Option<studiofs_meta::trash::CompressionPolicy>,
+    /// Stored/logical payload byte ratio; absent before successful nonempty uploads.
+    pub compression_stored_logical_ratio: Option<f64>,
+    /// Logical payload bytes in successful fragment PUTs.
+    pub logical_bytes_uploaded: u64,
+    /// Stored payload bytes including seek table, excluding STFS/SFEC framing.
+    pub stored_bytes_uploaded: u64,
+    /// Successfully uploaded compressed fragments.
+    pub v3_fragments_uploaded: u64,
+    /// Successful raw PUTs rejected by the probe.
+    pub raw_probe_fragments_uploaded: u64,
+    /// Successful raw PUTs rejected by the final threshold.
+    pub raw_threshold_fragments_uploaded: u64,
+    /// V3 decode wall time including blocking admission, excluding remote I/O/decryption.
+    pub decompression_nanos: u64,
     /// Number of pending uploads.
     pub pending_uploads: usize,
     /// Total bytes of pending uploads.
