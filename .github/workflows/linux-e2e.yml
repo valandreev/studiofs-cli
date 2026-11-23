@@ -76,6 +76,7 @@ jobs:
               --scenario mounted-recoverable-trash-s3-crash-replay
               --scenario mounted-recoverable-trash-cold-bootstrap
               --scenario mounted-recoverable-trash-janitor-gc
+              --scenario janitor-postgres-restart-recovery
               --scenario mounted-logical-quota
               --scenario mounted-cache-scrub
               --scenario mounted-compression

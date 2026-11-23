@@ -1,14 +1,51 @@
-//! SFS-979 live benchmark: the janitor CLI binary against a disposable RustFS bucket
-//! and a CPU/memory-limited PostgreSQL reached through a latency-injecting proxy.
+//! SFS-979 live benchmark: the janitor CLI binary against the run's RustFS bucket and a
+//! CPU/memory-limited PostgreSQL container reached through a latency-injecting proxy.
 //!
 //! Knobs are `STUDIOFS_JANITOR_BENCH_*` variables; see
 //! `docs/perf/sfs-979-janitor-benchmark.md` for the recorded matrix.
 
-use super::*;
 use std::collections::HashSet;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::AtomicU64;
+
+use anyhow::Context as _;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+use super::*;
+
+pub(in crate::scenario) struct JanitorLiveBenchmark;
+
+const NAME: &str = "janitor-live-benchmark";
+
+impl Scenario for JanitorLiveBenchmark {
+    fn definition(&self) -> ScenarioDefinition {
+        ScenarioDefinition {
+            name: NAME,
+            description: "Opt-in SFS-979 janitor CLI benchmark with injected PostgreSQL/S3 latency and foreground load; it throttles the run's PostgreSQL container, so run it alone",
+            requires_studiofs_bin: true,
+        }
+    }
+
+    fn setup(&self, context: &ScenarioContext) -> Result<(), ScenarioError> {
+        fs::create_dir_all(&context.scenario_dir)?;
+        Ok(())
+    }
+
+    fn run(&self, context: &ScenarioContext) -> Result<(), ScenarioError> {
+        let config = context
+            .client_controller_config
+            .clone()
+            .ok_or(ScenarioError::MissingComposeInfrastructure)?;
+        bench(context, config.clone()).map_err(|error| scenario_error(&config, &error))
+    }
+
+    fn validate(&self, _context: &ScenarioContext) -> Result<Vec<String>, ScenarioError> {
+        Ok(Vec::new())
+    }
+
+    fn cleanup(&self, _context: &ScenarioContext) -> Result<(), ScenarioError> {
+        Ok(())
+    }
+}
 
 fn knob<T: std::str::FromStr>(key: &str, default: T) -> anyhow::Result<T>
 where
@@ -89,7 +126,7 @@ async fn delayed_pipe(
     let _ = writer.await;
 }
 
-async fn start_proxy(upstream_port: u16, one_way: Duration) -> anyhow::Result<DelayProxy> {
+async fn start_proxy(upstream: (String, u16), one_way: Duration) -> anyhow::Result<DelayProxy> {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let port = listener.local_addr()?.port();
     let open = Arc::new(AtomicU64::new(0));
@@ -104,15 +141,15 @@ async fn start_proxy(upstream_port: u16, one_way: Duration) -> anyhow::Result<De
     );
     let task = tokio::spawn(async move {
         while let Ok((client, _)) = listener.accept().await {
-            let (open, peak, accepted, round_trips) = (
+            let (open, peak, accepted, round_trips, upstream) = (
                 task_open.clone(),
                 task_peak.clone(),
                 task_accepted.clone(),
                 task_round_trips.clone(),
+                upstream.clone(),
             );
             tokio::spawn(async move {
-                let Ok(server) = tokio::net::TcpStream::connect(("127.0.0.1", upstream_port)).await
-                else {
+                let Ok(server) = tokio::net::TcpStream::connect(upstream).await else {
                     return;
                 };
                 let _ = (client.set_nodelay(true), server.set_nodelay(true));
@@ -144,18 +181,32 @@ async fn start_proxy(upstream_port: u16, one_way: Duration) -> anyhow::Result<De
     })
 }
 
-fn postgres_container(stack: &DisposableStack) -> anyhow::Result<String> {
+/// The host and explicit port a service URL points at.
+fn upstream(url: &url::Url) -> anyhow::Result<(String, u16)> {
+    Ok((
+        url.host_str()
+            .context("service URL has no host")?
+            .to_string(),
+        url.port().context("service URL has no explicit port")?,
+    ))
+}
+
+/// Points `url` at a loopback proxy on `port`, keeping its credentials and path.
+fn redirect_to_proxy(url: &mut url::Url, port: u16) -> anyhow::Result<()> {
+    url.set_host(Some("127.0.0.1"))?;
+    url.set_port(Some(port))
+        .map_err(|()| anyhow::anyhow!("service URL cannot carry a port"))
+}
+
+fn postgres_container(project: &str) -> anyhow::Result<String> {
     let output = Command::new("docker")
         .args([
             "ps",
             "-q",
             "--filter",
-            &format!(
-                "label=com.docker.compose.project={}",
-                stack.compose.project_name()
-            ),
+            &format!("label=com.docker.compose.project={project}"),
             "--filter",
-            "label=com.docker.compose.service=postgres",
+            &format!("label=com.docker.compose.service={POSTGRES_SERVICE_NAME}"),
         ])
         .output()?;
     let id = String::from_utf8(output.stdout)?.trim().to_string();
@@ -186,16 +237,6 @@ fn parse_mib(value: &str) -> Option<f64> {
     Some(number * scale)
 }
 
-#[test]
-fn parse_mib_reads_docker_binary_units_and_rejects_others() {
-    assert_eq!(parse_mib("78.45MiB"), Some(78.45));
-    assert_eq!(parse_mib(" 2GiB "), Some(2048.0));
-    assert_eq!(parse_mib("512KiB"), Some(0.5));
-    assert_eq!(parse_mib("1048576B"), Some(1.0));
-    assert_eq!(parse_mib("12kB"), None);
-    assert_eq!(parse_mib("12"), None);
-}
-
 /// Runs a CLI child to completion while sampling its RSS and the PostgreSQL container.
 fn run_measured(
     command: Command,
@@ -208,7 +249,7 @@ fn run_measured(
     let stats_stop = stop.clone();
     let container = pg_container.to_string();
     // `docker stats` blocks for about a second per sample, so it runs beside the RSS loop.
-    let docker = std::thread::spawn(move || {
+    let docker = thread::spawn(move || {
         let (mut cpu, mut memory) = (0.0_f64, 0.0_f64);
         while !stats_stop.load(Ordering::Relaxed) {
             let Ok(output) = Command::new("docker")
@@ -236,62 +277,31 @@ fn run_measured(
         (cpu, memory)
     });
 
-    let started = std::time::Instant::now();
-    let result = run_child_sampled(command, timeout, stdout, stderr);
-    let elapsed = started.elapsed();
-    stop.store(true, Ordering::Relaxed);
-    let (peak_pg_cpu_percent, peak_pg_memory_mib) = docker
-        .join()
-        .map_err(|_| anyhow::anyhow!("docker stats sampler panicked"))?;
-    let (output, peak_rss) = result?;
-    Ok((
-        output,
-        elapsed,
-        Samples {
-            peak_rss,
-            peak_pg_cpu_percent,
-            peak_pg_memory_mib,
-        },
-    ))
-}
-
-fn run_child_sampled(
-    mut command: Command,
-    timeout: Duration,
-    stdout: &Path,
-    stderr: &Path,
-) -> anyhow::Result<(Output, u64)> {
-    command.stdout(std::fs::File::create(stdout)?);
-    command.stderr(std::fs::File::create(stderr)?);
-    let mut child = OwnedCli(command.spawn()?);
-    let pid = sysinfo::Pid::from_u32(child.0.id());
     let mut system = sysinfo::System::new();
     let mut peak_rss = 0;
-    let started = std::time::Instant::now();
-    let status = loop {
+    let started = Instant::now();
+    let result = run_child_bounded(command, timeout, stdout, stderr, |pid| {
+        let pid = sysinfo::Pid::from_u32(pid);
         system.refresh_processes_specifics(
             sysinfo::ProcessesToUpdate::Some(&[pid]),
             true,
             sysinfo::ProcessRefreshKind::nothing().with_memory(),
         );
         peak_rss = peak_rss.max(system.process(pid).map_or(0, sysinfo::Process::memory));
-        if let Some(status) = child.0.try_wait()? {
-            break status;
-        }
-        anyhow::ensure!(
-            started.elapsed() < timeout,
-            "janitor CLI exceeded {timeout:?}; artifacts at {}",
-            stdout.display()
-        );
-        std::thread::sleep(Duration::from_millis(100));
-    };
+    });
+    let elapsed = started.elapsed();
+    stop.store(true, Ordering::Relaxed);
+    let (peak_pg_cpu_percent, peak_pg_memory_mib) = docker
+        .join()
+        .map_err(|_| anyhow::anyhow!("docker stats sampler panicked"))?;
     Ok((
-        Output {
-            status,
-            stdout: std::fs::read(stdout)?,
-            stderr: std::fs::read(stderr)?,
+        result?,
+        elapsed,
+        Samples {
+            peak_rss,
+            peak_pg_cpu_percent,
+            peak_pg_memory_mib,
         },
-        peak_rss,
     ))
 }
 
@@ -314,12 +324,12 @@ async fn foreground_load(
     let mut id = first_id;
     while !stop.load(Ordering::Relaxed) {
         ticker.tick().await;
-        let started = std::time::Instant::now();
+        let started = Instant::now();
         writer
             .write(&bench_key(&prefix, id, id), b"foreground".to_vec())
             .await?;
         s3_ms.push(u64::try_from(started.elapsed().as_millis())?);
-        let started = std::time::Instant::now();
+        let started = Instant::now();
         client
             .execute(
                 "INSERT INTO snapshot_current_references (vol, ino, object_id) VALUES ($1, $2, $2)",
@@ -342,9 +352,7 @@ fn percentile(values: &[u64], percent: usize) -> Option<u64> {
         .copied()
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "SFS-979 benchmark; requires Docker and a release CLI (see docs/perf/sfs-979-janitor-benchmark.md)"]
-async fn live_cli_janitor_benchmark() -> anyhow::Result<()> {
+fn bench(context: &ScenarioContext, config: ClientControllerConfig) -> anyhow::Result<()> {
     let objects: u64 = knob("STUDIOFS_JANITOR_BENCH_OBJECTS", 1_000)?;
     anyhow::ensure!(
         objects > 0,
@@ -373,93 +381,80 @@ async fn live_cli_janitor_benchmark() -> anyhow::Result<()> {
         .to_string(),
     )?;
 
-    let stack = DisposableStack::start().await?;
+    let pg_container = postgres_container(&compose_control_from_manifest(context)?.project_name)?;
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()?;
+
+    // Volume init, and every janitor run, reach both services through the delaying proxies.
+    let mut proxied = config.clone();
+    let mut pg_url = url::Url::parse(&config.meta_dsn)?;
+    let mut s3_url = url::Url::parse(&config.s3.endpoint)?;
+    let pg_proxy = runtime.block_on(start_proxy(
+        upstream(&pg_url)?,
+        Duration::from_millis(pg_latency_ms / 2),
+    ))?;
+    let s3_proxy = runtime.block_on(start_proxy(
+        upstream(&s3_url)?,
+        Duration::from_millis(s3_latency_ms / 2),
+    ))?;
+    redirect_to_proxy(&mut pg_url, pg_proxy.port)?;
+    redirect_to_proxy(&mut s3_url, s3_proxy.port)?;
+    proxied.meta_dsn = pg_url.to_string();
+    proxied.s3.endpoint = s3_url.as_str().trim_end_matches('/').to_string();
+    let volume = JanitorVolume::bootstrap(proxied)?;
     let base = object_id(0)?;
-    let prefix = format!("sfsbench/{base:016x}/objects/");
-    let pg_port: u16 = stack
-        .postgres_url
-        .split("port=")
-        .nth(1)
-        .and_then(|rest| rest.split_whitespace().next()?.parse().ok())
-        .ok_or_else(|| anyhow::anyhow!("PostgreSQL port missing from DSN"))?;
-    let s3_port: u16 = stack
-        .endpoint
-        .rsplit(':')
-        .next()
-        .and_then(|port| port.parse().ok())
-        .ok_or_else(|| anyhow::anyhow!("S3 port missing from endpoint"))?;
+    let prefix = volume.prefix.clone();
 
     // Seed the bucket directly; seeding is not part of the measured window.
-    let seed_started = std::time::Instant::now();
-    let writer = stack.writer()?;
-    let mut writes = tokio::task::JoinSet::new();
-    for index in 0..objects {
-        if writes.len() >= 64 {
-            writes.join_next().await.expect("pending write")??;
+    let seed_started = Instant::now();
+    let writer = s3_writer(&config)?;
+    runtime.block_on(async {
+        let mut writes = tokio::task::JoinSet::new();
+        for index in 0..objects {
+            if writes.len() >= 64 {
+                writes.join_next().await.context("pending write")???;
+            }
+            let (writer, key) = (writer.clone(), bench_key(&prefix, base + index, index));
+            writes.spawn(async move {
+                writer
+                    .write(&key, b"janitor benchmark".to_vec())
+                    .await
+                    .map(drop)
+            });
         }
-        let (writer, key) = (writer.clone(), bench_key(&prefix, base + index, index));
-        writes.spawn(async move {
-            writer
-                .write(&key, b"janitor benchmark".to_vec())
-                .await
-                .map(drop)
-        });
-    }
-    while let Some(write) = writes.join_next().await {
-        write??;
-    }
-    let last_key = bench_key(&prefix, base + objects - 1, objects - 1);
-    // The container clock can run ahead of the host; future-dated objects are skipped.
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    while writer
-        .stat(&last_key)
-        .await?
-        .last_modified()
-        .map(std::time::SystemTime::from)
-        .is_none_or(|modified| modified > std::time::SystemTime::now())
-    {
-        anyhow::ensure!(
-            std::time::Instant::now() < deadline,
-            "seeded objects stayed future-dated"
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+        while let Some(write) = writes.join_next().await {
+            write??;
+        }
+        let last_key = bench_key(&prefix, base + objects - 1, objects - 1);
+        wait_until_s3_keys_are_past(&writer, &[last_key]).await
+    })?;
     let seed_ms = seed_started.elapsed().as_millis();
 
-    let pg_proxy = start_proxy(pg_port, Duration::from_millis(pg_latency_ms / 2)).await?;
-    let s3_proxy = start_proxy(s3_port, Duration::from_millis(s3_latency_ms / 2)).await?;
-    let proxied_pg = format!(
-        "host=127.0.0.1 port={} user=studiofs password=studiofs dbname=studiofs",
-        pg_proxy.port
+    let volume_id = volume.volume_id;
+    let (base_sql, objects_sql, orphan_sql) = (
+        i64::try_from(base)?,
+        i64::try_from(objects)?,
+        i64::try_from(orphan_percent)?,
     );
-    let proxied_s3 = format!("http://127.0.0.1:{}", s3_proxy.port);
-    let s3 = LiveS3Config {
-        endpoint: &proxied_s3,
-        bucket: &stack.bucket,
-        access_key: ACCESS_KEY,
-        secret_key: SECRET_KEY,
-        region: REGION,
-        prefix: &prefix,
-    };
-    let client_root = stack.root.join("benchmark");
-    let (volume_id, _, _) = create_live_postgres_janitor_fixture(
-        &proxied_pg,
-        &s3,
-        &client_root.join("meta/janitor-live"),
-        base,
-    )
-    .await?;
-    let (client, task) = connection(&stack).await?;
-    let live_refs = client
-        .execute(
-            "INSERT INTO snapshot_current_references (vol, ino, object_id) SELECT $1, i + 1, $2 + i FROM generate_series(0::bigint, $3::bigint - 1) AS i WHERE i * 37 % 100 >= $4::bigint",
-            &[&volume_id, &i64::try_from(base)?, &i64::try_from(objects)?, &i64::try_from(orphan_percent)?],
-        )
-        .await?;
-    client.execute("ANALYZE", &[]).await?;
-    task.abort();
+    let live_refs = with_pg(&config, "seed live references", |client| async move {
+        let inserted = client
+            .execute(
+                "INSERT INTO snapshot_current_references (vol, ino, object_id) SELECT $1, i + 1, $2 + i FROM generate_series(0::bigint, $3::bigint - 1) AS i WHERE i * 37 % 100 >= $4::bigint",
+                &[&volume_id, &base_sql, &objects_sql, &orphan_sql],
+            )
+            .await
+            .map_err(io::Error::other)?;
+        client
+            .execute("ANALYZE", &[])
+            .await
+            .map_err(io::Error::other)?;
+        Ok(inserted)
+    })?;
 
-    let pg_container = postgres_container(&stack)?;
+    // ponytail: the limits outlive this scenario on the run's shared PostgreSQL container;
+    // the scenario is opt-in and documented to run alone.
     let update = Command::new("docker")
         .args([
             "update",
@@ -480,9 +475,9 @@ async fn live_cli_janitor_benchmark() -> anyhow::Result<()> {
 
     let stop_foreground = Arc::new(AtomicBool::new(false));
     let foreground = (foreground_ms > 0).then(|| {
-        tokio::spawn(foreground_load(
-            stack.writer().expect("writer"),
-            stack.postgres_url.clone(),
+        runtime.spawn(foreground_load(
+            writer.clone(),
+            config.meta_dsn.clone(),
             prefix.clone(),
             volume_id,
             base + objects + 1_000,
@@ -491,7 +486,7 @@ async fn live_cli_janitor_benchmark() -> anyhow::Result<()> {
         ))
     });
 
-    // Fixture setup also went through the proxy; count only the janitor runs.
+    // Volume init also went through the proxy; count only the janitor runs.
     let pg_round_trips_before = pg_proxy.round_trips.load(Ordering::Relaxed);
     let mut runs = Vec::new();
     let mut complete = false;
@@ -501,14 +496,14 @@ async fn live_cli_janitor_benchmark() -> anyhow::Result<()> {
     for run in 0..max_runs {
         let mut args = vec![
             "janitor".to_string(),
-            "janitor-live".to_string(),
+            config.volume_name.clone(),
             "--skip-newer-minutes".to_string(),
             "0".to_string(),
             "--max-deletes".to_string(),
             max_deletes.to_string(),
         ];
         let command = match &baseline {
-            Some(binary) => DisposableStack::command_for(binary, &args, &client_root),
+            Some(binary) => volume.command(binary, &args),
             None => {
                 args.extend([
                     "--output".into(),
@@ -519,22 +514,23 @@ async fn live_cli_janitor_benchmark() -> anyhow::Result<()> {
                 if run == 0 {
                     args.push("--full-scan".into());
                 }
-                stack.command(&args, &client_root)?
+                volume.command(&config.studiofs_bin, &args)
             }
         };
-        let stdout = stack.artifact_root.join(format!("bench-{run}.stdout"));
-        let stderr = stack.artifact_root.join(format!("bench-{run}.stderr"));
+        let stdout = context.scenario_dir.join(format!("bench-{run}.stdout.log"));
+        let stderr = context.scenario_dir.join(format!("bench-{run}.stderr.log"));
         let run_round_trips = pg_proxy.round_trips.load(Ordering::Relaxed);
-        let (output, elapsed, samples) = tokio::task::block_in_place(|| {
-            run_measured(command, timeout, &stdout, &stderr, &pg_container)
-        })?;
+        let (output, elapsed, samples) =
+            run_measured(command, timeout, &stdout, &stderr, &pg_container)?;
+        volume.redact_logs(&stdout, &stderr)?;
         total_ms += elapsed.as_millis();
         peak_rss = peak_rss.max(samples.peak_rss);
         peak_cpu = peak_cpu.max(samples.peak_pg_cpu_percent);
         peak_memory = peak_memory.max(samples.peak_pg_memory_mib);
         let cycle = if baseline.is_none() {
-            parse_events(&output)?
-                .into_iter()
+            std::str::from_utf8(&output.stdout)?
+                .lines()
+                .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
                 .find(|event| event["event"] == "cycle")
         } else {
             None
@@ -545,7 +541,7 @@ async fn live_cli_janitor_benchmark() -> anyhow::Result<()> {
                 .and_then(|cycle| cycle["first_candidate_ms"].as_u64())
                 .map(|ms| u128::from(ms) + total_ms - elapsed.as_millis());
         }
-        runs.push(serde_json::json!({
+        runs.push(json!({
             "run": run,
             "exit_code": output.status.code(),
             "wall_ms": elapsed.as_millis(),
@@ -569,21 +565,19 @@ async fn live_cli_janitor_benchmark() -> anyhow::Result<()> {
             output.status.code() == Some(2),
             "janitor run {run} failed with {:?}; artifacts at {}",
             output.status.code(),
-            stack.artifact_root.display()
+            context.scenario_dir.display()
         );
     }
 
     stop_foreground.store(true, Ordering::Relaxed);
     let (fg_s3, fg_pg, fg_ids) = match foreground {
-        Some(task) => task.await??,
+        Some(task) => runtime.block_on(task)??,
         None => Default::default(),
     };
 
     // Zero data loss: every referenced object (seeded or foreground) must still be listed.
-    let remaining: HashSet<String> = writer
-        .list_with(&prefix)
-        .recursive(true)
-        .await?
+    let remaining: HashSet<String> = runtime
+        .block_on(async { writer.list_with(&prefix).recursive(true).await })?
         .into_iter()
         .map(|entry| entry.path().to_string())
         .collect();
@@ -603,7 +597,7 @@ async fn live_cli_janitor_benchmark() -> anyhow::Result<()> {
         .count();
     let deleted = orphans - orphans_remaining;
 
-    let report = serde_json::json!({
+    let report = json!({
         "label": label,
         "objects": objects,
         "orphan_percent": orphan_percent,
@@ -641,10 +635,8 @@ async fn live_cli_janitor_benchmark() -> anyhow::Result<()> {
         "s3_connections_opened": s3_proxy.accepted.load(Ordering::Relaxed),
         "run_details": runs,
     });
-    let dir = studiofs_test_support::workspace_root().join("target/janitor-benchmark");
-    std::fs::create_dir_all(&dir)?;
-    std::fs::write(
-        dir.join(format!(
+    fs::write(
+        context.scenario_dir.join(format!(
             "live-{label}-{objects}-o{orphan_percent}-pg{pg_latency_ms}ms-rps{rps}.json"
         )),
         serde_json::to_vec_pretty(&report)?,
@@ -663,4 +655,27 @@ async fn live_cli_janitor_benchmark() -> anyhow::Result<()> {
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_mib_reads_docker_binary_units_and_rejects_others() {
+        assert_eq!(parse_mib("78.45MiB"), Some(78.45));
+        assert_eq!(parse_mib(" 2GiB "), Some(2048.0));
+        assert_eq!(parse_mib("512KiB"), Some(0.5));
+        assert_eq!(parse_mib("1048576B"), Some(1.0));
+        assert_eq!(parse_mib("12kB"), None);
+        assert_eq!(parse_mib("12"), None);
+    }
+
+    #[test]
+    fn redirect_to_proxy_keeps_credentials_and_reports_upstream() {
+        let mut dsn = url::Url::parse("postgres://user:pass@localhost:5432").unwrap();
+        assert_eq!(upstream(&dsn).unwrap(), ("localhost".to_string(), 5432));
+        redirect_to_proxy(&mut dsn, 4000).unwrap();
+        assert_eq!(dsn.as_str(), "postgres://user:pass@127.0.0.1:4000");
+    }
 }

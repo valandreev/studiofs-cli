@@ -507,7 +507,7 @@ fn run_janitor_reclaim(
     Ok(cycle)
 }
 
-fn with_pg<F, Fut, T>(
+pub(in crate::scenario) fn with_pg<F, Fut, T>(
     config: &ClientControllerConfig,
     op_name: &str,
     work: F,
@@ -540,7 +540,7 @@ where
     })
 }
 
-fn load_volume_id_and_prefix(
+pub(in crate::scenario) fn load_volume_id_and_prefix(
     config: &ClientControllerConfig,
 ) -> Result<(i64, String), ScenarioError> {
     with_pg(config, "load volume and prefix", |client| {

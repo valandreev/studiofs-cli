@@ -1,4 +1,4 @@
-//! Process termination, snapshot capture and resumption on the shared disposable stack.
+//! Process termination, snapshot capture and resumption against the live test services.
 
 use super::*;
 
@@ -57,9 +57,9 @@ async fn wait_for_cli(child: &mut OwnedCli) -> anyhow::Result<std::process::Exit
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires Docker; creates isolated PostgreSQL and RustFS containers"]
+#[ignore = "requires local STUDIOFS_TEST_PG_DSN and a live STUDIOFS_S3_* bucket"]
 async fn live_cli_disposable_kill_restart_and_signal_drain() -> anyhow::Result<()> {
-    let stack = DisposableStack::start().await?;
+    let stack = LiveStack::start()?;
     // Windows hard termination is covered here; console Ctrl+C needs a console process group.
     let modes: &[bool] = if cfg!(unix) { &[false, true] } else { &[false] };
     for &graceful in modes {
@@ -191,12 +191,12 @@ async fn live_cli_disposable_kill_restart_and_signal_drain() -> anyhow::Result<(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires Docker; creates isolated PostgreSQL and RustFS containers"]
+#[ignore = "requires local STUDIOFS_TEST_PG_DSN and a live STUDIOFS_S3_* bucket"]
 async fn live_cli_disposable_concurrent_snapshot_cuts_wait_for_janitor() -> anyhow::Result<()> {
     use sha2::{Digest, Sha256};
     use studiofs_meta::snapshot::{SnapshotOrigin, SnapshotRetention};
 
-    let stack = DisposableStack::start().await?;
+    let stack = LiveStack::start()?;
     let orphan = object_id(0)?;
     let pinned = orphan + 1;
     let prefix = format!("sfs978-snapshot/{orphan:016x}/objects/");
@@ -322,10 +322,10 @@ async fn live_cli_disposable_concurrent_snapshot_cuts_wait_for_janitor() -> anyh
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires Docker; creates isolated PostgreSQL and RustFS containers"]
+#[ignore = "requires local STUDIOFS_TEST_PG_DSN and a live STUDIOFS_S3_* bucket"]
 async fn live_cli_disposable_scan_budget_resumes_checkpoint_across_processes() -> anyhow::Result<()>
 {
-    let stack = DisposableStack::start().await?;
+    let stack = LiveStack::start()?;
     let base = object_id(0)?;
     let prefix = format!("sfs978-resume/{base:016x}/objects/");
     let client_root = stack.root.join("resume");
