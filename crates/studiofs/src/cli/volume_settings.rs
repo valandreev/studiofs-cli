@@ -2,7 +2,7 @@
 
 use anyhow::{Context, bail};
 use std::time::Duration;
-use studiofs_meta::trash::VolumeSettings;
+use studiofs_meta::trash::{CompressionPolicy, VolumeSettings};
 
 const SETTINGS_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -12,6 +12,8 @@ pub(super) enum SettingsUpdate {
     TrashDays(u32),
     /// Compare-and-set the logical quota against the revision just read.
     LogicalQuota(Option<u64>),
+    /// Compare-and-set the compression policy against the revision just read.
+    Compression(CompressionPolicy),
 }
 
 impl SettingsUpdate {
@@ -19,13 +21,16 @@ impl SettingsUpdate {
         match self {
             Self::TrashDays(_) => "cli-trash-days",
             Self::LogicalQuota(_) => "cli-quota",
+            Self::Compression(_) => "cli-compression",
         }
     }
 
     fn missing_result_context(&self) -> &'static str {
         match self {
             Self::TrashDays(_) => "unconditional settings update returned no result",
-            Self::LogicalQuota(_) => "volume settings changed concurrently; retry the command",
+            Self::LogicalQuota(_) | Self::Compression(_) => {
+                "volume settings changed concurrently; retry the command"
+            }
         }
     }
 
@@ -50,6 +55,17 @@ impl SettingsUpdate {
                     volume,
                     Some(current.revision),
                     bytes,
+                    client_id,
+                    now_ms,
+                )
+                .await?
+            }
+            Self::Compression(policy) => {
+                studiofs_meta::pg_engine::set_shared_compression(
+                    client,
+                    volume,
+                    Some(current.revision),
+                    policy,
                     client_id,
                     now_ms,
                 )

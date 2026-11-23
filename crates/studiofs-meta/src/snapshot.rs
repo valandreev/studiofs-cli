@@ -289,7 +289,8 @@ pub(crate) struct ServingCheckpoint {
     /// Appended in format version 2; peers that created an alias may still
     /// publish events naming it after this checkpoint's cut.
     pub(crate) directory_aliases: Vec<(u64, u64)>,
-    /// Shared mutable settings, appended in checkpoint format version 3.
+    /// Shared mutable settings, appended in checkpoint format version 3
+    /// (with compression appended in format version 4).
     pub(crate) volume_settings: crate::trash::VolumeSettings,
 }
 
@@ -306,7 +307,7 @@ struct ServingCheckpointV1 {
 
 impl ServingCheckpoint {
     /// The persisted checkpoint format version.
-    pub(crate) const FORMAT_VERSION: i16 = 3;
+    pub(crate) const FORMAT_VERSION: i16 = 4;
     /// The serving-state schema version.
     pub(crate) const SCHEMA_VERSION: i16 = 1;
 
@@ -315,10 +316,11 @@ impl ServingCheckpoint {
         (1..=Self::FORMAT_VERSION).contains(&version)
     }
 
-    /// Decodes either format version.
+    /// Decodes format versions 1 through 4.
     ///
-    /// Both layouts share the version 1 prefix. Only an empty remainder means
-    /// version 1; a present version 2 alias suffix must decode completely.
+    /// Format 1 holds the core serving tables, format 2 appends directory
+    /// aliases, format 3 appends volume settings without compression, and
+    /// format 4 appends the compression policy.
     pub(crate) fn decode(bytes: &[u8]) -> Result<Self, postcard::Error> {
         let (v1, suffix) = postcard::take_from_bytes::<ServingCheckpointV1>(bytes)?;
         let (directory_aliases, suffix) = if suffix.is_empty() {
@@ -329,7 +331,24 @@ impl ServingCheckpoint {
         let volume_settings = if suffix.is_empty() {
             crate::trash::VolumeSettings::default()
         } else {
-            postcard::from_bytes(suffix)?
+            let ((revision, trash, logical_quota_bytes), suffix) =
+                postcard::take_from_bytes::<(u64, crate::trash::TrashPolicy, Option<u64>)>(suffix)?;
+            let compression = if suffix.is_empty() {
+                crate::trash::CompressionPolicy::off()
+            } else {
+                let (compression, remainder) =
+                    postcard::take_from_bytes::<crate::trash::CompressionPolicy>(suffix)?;
+                if !remainder.is_empty() {
+                    return Err(postcard::Error::DeserializeBadEncoding);
+                }
+                compression
+            };
+            crate::trash::VolumeSettings {
+                revision,
+                trash,
+                logical_quota_bytes,
+                compression,
+            }
         };
         Ok(Self {
             inodes: v1.inodes,
@@ -1093,7 +1112,8 @@ mod tests {
         assert!(ServingCheckpoint::supports_format_version(1));
         assert!(ServingCheckpoint::supports_format_version(2));
         assert!(ServingCheckpoint::supports_format_version(3));
-        assert!(!ServingCheckpoint::supports_format_version(4));
+        assert!(ServingCheckpoint::supports_format_version(4));
+        assert!(!ServingCheckpoint::supports_format_version(5));
     }
     use super::*;
     use chrono::{NaiveDate, TimeZone, Utc};
@@ -1471,5 +1491,67 @@ mod tests {
         assert!(!rendered.contains("snapshot-access-sentinel"));
         assert!(!rendered.contains("snapshot-secret-sentinel"));
         assert!(rendered.contains("capture snapshot"));
+    }
+
+    #[test]
+    fn serving_checkpoint_decodes_v3_as_compression_off_and_roundtrips_v4() {
+        use crate::trash::{CompressionPolicy, TrashPolicy, VolumeSettings};
+
+        assert_eq!(ServingCheckpoint::FORMAT_VERSION, 4);
+        for version in 1..=4 {
+            assert!(ServingCheckpoint::supports_format_version(version));
+        }
+        assert!(!ServingCheckpoint::supports_format_version(0));
+        assert!(!ServingCheckpoint::supports_format_version(5));
+
+        let mut trash = TrashPolicy::default();
+        trash.set_days(7);
+
+        // Build a v3 fixture: v1 fields + directory_aliases + 3-field VolumeSettings (no compression).
+        let v3_bytes = postcard::to_stdvec(&(
+            Vec::<(u64, Vec<u8>)>::new(),
+            Vec::<(Vec<u8>, Vec<u8>)>::new(),
+            Vec::<(u64, Vec<u8>)>::new(),
+            Vec::<(u64, Vec<u8>)>::new(),
+            Vec::<(Vec<u8>, Vec<u8>)>::new(),
+            Vec::<(Vec<u8>, u8)>::new(),
+            vec![(10_u64, 2_u64)],
+            (5_u64, trash, Some(4096_u64)),
+        ))
+        .unwrap();
+        let decoded_v3 = ServingCheckpoint::decode(&v3_bytes).unwrap();
+        assert_eq!(decoded_v3.directory_aliases, vec![(10, 2)]);
+        assert_eq!(
+            decoded_v3.volume_settings,
+            VolumeSettings {
+                revision: 5,
+                trash,
+                logical_quota_bytes: Some(4096),
+                compression: CompressionPolicy::off(),
+            }
+        );
+
+        // v4 checkpoint round-trips compression policy.
+        let v4 = ServingCheckpoint {
+            directory_aliases: vec![(10, 2)],
+            volume_settings: VolumeSettings {
+                revision: 6,
+                trash,
+                logical_quota_bytes: Some(4096),
+                compression: CompressionPolicy::zstd(9).unwrap(),
+            },
+            ..Default::default()
+        };
+        let mut v4_bytes = postcard::to_stdvec(&v4).unwrap();
+        assert_eq!(ServingCheckpoint::decode(&v4_bytes).unwrap(), v4);
+
+        // Trailing bytes after v4 payload are rejected.
+        v4_bytes.push(0);
+        assert!(ServingCheckpoint::decode(&v4_bytes).is_err());
+
+        // Invalid compression level in v4 payload is rejected.
+        let mut bad_v4 = v3_bytes;
+        bad_v4.extend(postcard::to_stdvec(&(1_u8, 20_u8)).unwrap());
+        assert!(ServingCheckpoint::decode(&bad_v4).is_err());
     }
 }

@@ -1749,6 +1749,67 @@ fn test_pg_volume_settings_authoritative_cas_converges_two_clients() {
 
 #[test]
 #[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
+fn test_pg_compression_policy_cas_checkpoint_and_replication() {
+    use crate::trash::{CompressionPolicy, MetaVolumeSettings};
+
+    let dsn = pg_dsn().expect("STUDIOFS_TEST_PG_DSN is required; no silent skip");
+    let dir = studiofs_test_support::workspace_target_tempdir("pg-compression-settings-");
+    let volume = PgTestVolume::new(&dsn, "pg-compression-settings");
+    let first_path = dir.path().join("first.redb");
+    let second_path = dir.path().join("second.redb");
+    seed_local(&first_path, &volume.format_info());
+    seed_local(&second_path, &volume.format_info());
+    let first = PgMetaEngine::open(&first_path).unwrap();
+    let second = PgMetaEngine::open(&second_path).unwrap();
+
+    // New unseeded volume reads as compression = off.
+    assert_eq!(
+        first.volume_settings().unwrap().compression,
+        CompressionPolicy::off()
+    );
+
+    // Client 1 sets zstd:9 at revision 0 -> revision 1; client 2's stale CAS is rejected.
+    let zstd9 = CompressionPolicy::zstd(9).unwrap();
+    let updated = first
+        .compare_and_set_compression(0, zstd9)
+        .unwrap()
+        .unwrap();
+    assert_eq!(updated.revision, 1);
+    assert_eq!(updated.compression, zstd9);
+    assert!(
+        second
+            .compare_and_set_compression(0, CompressionPolicy::zstd_default())
+            .unwrap()
+            .is_none()
+    );
+
+    // Replication delivers the tag-21 event to client 2's local redb view.
+    second.sync_metadata().unwrap();
+    assert_eq!(second.volume_settings().unwrap(), updated);
+
+    // v4 checkpoint preserves the compression policy for a freshly bootstrapped client.
+    first.write_checkpoint_with_lease().unwrap();
+    let third_path = dir.path().join("third.redb");
+    seed_local(&third_path, &volume.format_info());
+    let third = PgMetaEngine::open(&third_path).unwrap();
+    third.sync_metadata().unwrap();
+    assert_eq!(third.volume_settings().unwrap(), updated);
+
+    // Switching back to off replicates to all peers.
+    let disabled = second
+        .compare_and_set_compression(updated.revision, CompressionPolicy::off())
+        .unwrap()
+        .unwrap();
+    assert_eq!(disabled.revision, 2);
+    assert_eq!(disabled.compression, CompressionPolicy::off());
+    first.sync_metadata().unwrap();
+    third.sync_metadata().unwrap();
+    assert_eq!(first.volume_settings().unwrap(), disabled);
+    assert_eq!(third.volume_settings().unwrap(), disabled);
+}
+
+#[test]
+#[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
 fn test_pg_umeta_updates_requested_fields_atomically_and_refreshes_existing_cache() {
     use crate::engine::MetaEngine;
     let dsn = pg_dsn().expect("STUDIOFS_TEST_PG_DSN is required; no silent skip");

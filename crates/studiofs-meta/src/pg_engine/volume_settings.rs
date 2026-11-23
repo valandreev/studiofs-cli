@@ -153,6 +153,83 @@ impl MetaVolumeSettings for PgMetaEngine {
         }
         Ok(accepted)
     }
+
+    fn compare_and_set_compression(
+        &self,
+        expected_revision: u64,
+        compression: crate::trash::CompressionPolicy,
+    ) -> MetaResult<Option<VolumeSettings>> {
+        let pool = self.command_pool.clone();
+        let timeout = self.command_timeout;
+        let volume = self.volume_id;
+        let client_id = self.current_client_id()?;
+        let now_ms = PgMetaEngine::now_millis();
+        let accepted = self.run_async(async move {
+            Self::with_postgres_client_timeout(
+                pool,
+                timeout,
+                "update volume compression",
+                move |client| {
+                    Box::pin(async move {
+                        set_shared_compression(
+                            client,
+                            volume,
+                            Some(expected_revision),
+                            compression,
+                            &client_id,
+                            now_ms,
+                        )
+                        .await
+                    })
+                },
+            )
+            .await
+        })?;
+        if let Some(settings) = accepted {
+            let events = [MetaEvent::SetVolumeSettings { settings }];
+            self.local.apply_replica_events_to_base(&events)?;
+            self.local.apply_replica_serving_state(&events)?;
+        }
+        Ok(accepted)
+    }
+}
+
+/// Update the shared compression policy and publish its settings revision atomically.
+pub async fn set_shared_compression(
+    client: &mut tokio_postgres::Client,
+    volume: i64,
+    expected_revision: Option<u64>,
+    compression: crate::trash::CompressionPolicy,
+    client_id: &str,
+    now_ms: i64,
+) -> MetaResult<Option<VolumeSettings>> {
+    update_volume_settings(
+        client,
+        volume,
+        expected_revision,
+        client_id,
+        now_ms,
+        |settings| settings.compression = compression,
+    )
+    .await
+}
+
+/// Apply the initial shared settings for a newly initialized volume in one transaction.
+pub async fn set_shared_initial_volume_settings(
+    client: &mut tokio_postgres::Client,
+    volume: i64,
+    compression: crate::trash::CompressionPolicy,
+    trash_days: u32,
+    client_id: &str,
+    now_ms: i64,
+) -> MetaResult<Option<VolumeSettings>> {
+    update_volume_settings(client, volume, Some(0), client_id, now_ms, |settings| {
+        settings.compression = compression;
+        if trash_days > 0 {
+            settings.trash.set_days(trash_days);
+        }
+    })
+    .await
 }
 
 /// Update the shared logical byte limit and publish its settings revision atomically.

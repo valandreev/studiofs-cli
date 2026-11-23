@@ -617,32 +617,40 @@ fn run(request: InitRunRequest) -> anyhow::Result<()> {
         &format_info_bytes,
     )?;
     drop(engine);
-    if trash_days > 0 {
-        // Same ordered shared path as `studiofs trash-days`; peers replay its event.
-        rt.block_on(with_postgres_client(&postgres_dsn, |mut client| async move {
-            let now_ms = i64::try_from(
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)?
-                    .as_millis(),
-            )?;
-            let client_id = format!("cli-init-{}", Uuid::new_v4());
-            studiofs_meta::pg_engine::set_shared_trash_days(
-                &mut client,
-                postgres_volume_id,
-                Some(0),
-                trash_days,
-                &client_id,
-                now_ms,
-            )
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("new volume settings changed concurrently"))?;
-            Ok(())
-        }))
-        .map_err(|error| {
+    // Same ordered shared path as `studiofs compression` / `studiofs trash-days`;
+    // new volumes default to `zstd:3` compression, and peers replay this event.
+    let default_compression = studiofs_meta::trash::CompressionPolicy::zstd_default();
+    rt.block_on(with_postgres_client(&postgres_dsn, |mut client| async move {
+        let now_ms = i64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_millis(),
+        )?;
+        let client_id = format!("cli-init-{}", Uuid::new_v4());
+        studiofs_meta::pg_engine::set_shared_initial_volume_settings(
+            &mut client,
+            postgres_volume_id,
+            default_compression,
+            trash_days,
+            &client_id,
+            now_ms,
+        )
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("new volume settings changed concurrently"))?;
+        Ok(())
+    }))
+    .map_err(|error| {
+        if trash_days > 0 {
             anyhow::anyhow!(
-                "Volume was created with trash disabled; setting trash days failed ({error}). Retry with `studiofs trash-days {name} {trash_days}`."
+                "Volume was created with default settings; setting compression ({default_compression}) and trash days failed ({error}). Retry with `studiofs compression {name} {default_compression}` and `studiofs trash-days {name} {trash_days}`."
             )
-        })?;
+        } else {
+            anyhow::anyhow!(
+                "Volume was created with compression disabled; setting compression ({default_compression}) failed ({error}). Retry with `studiofs compression {name} {default_compression}`."
+            )
+        }
+    })?;
+    if trash_days > 0 {
         println!("✓ Trash keeps native Move to Trash entries for {trash_days} day(s).");
     }
 
