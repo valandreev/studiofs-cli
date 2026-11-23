@@ -334,9 +334,10 @@ fn invalid_endpoint(message: impl Into<String>) -> DataError {
     DataError::InvalidEndpoint(message.into())
 }
 
-/// Process-wide admission for object crypto: one permit per CPU thread that
-/// may run SFEC frame work at once, shared by every `DataStore`.
-static CRYPTO_ADMISSION: LazyLock<Arc<Semaphore>> = LazyLock::new(|| {
+/// Process-wide admission for object crypto and compression: one permit per
+/// CPU thread that may run SFEC frame or zstd chunk work at once, shared by
+/// every `DataStore`.
+pub(crate) static CRYPTO_ADMISSION: LazyLock<Arc<Semaphore>> = LazyLock::new(|| {
     let cpus = std::thread::available_parallelism().map_or(1, usize::from);
     Arc::new(Semaphore::new(cpus))
 });
@@ -346,14 +347,14 @@ fn crypto_worker_hint(len: usize) -> usize {
     (len / crypto::DEFAULT_ENCRYPTION_FRAME_SIZE).max(1)
 }
 
-/// Run object crypto on the blocking pool once admitted.
+/// Run object crypto or compression on the blocking pool once admitted.
 ///
 /// Waits for one CPU permit, then opportunistically takes up to
 /// `max_workers - 1` more without waiting; `operation` gets the number of
 /// threads it may use. Permits move into the blocking task, so they are held
-/// until the crypto work finishes even if the caller is cancelled, and a caller
+/// until the work finishes even if the caller is cancelled, and a caller
 /// cancelled while still waiting holds nothing.
-async fn run_crypto_blocking<T: Send + 'static>(
+pub(crate) async fn run_crypto_blocking<T: Send + 'static>(
     admission: &Arc<Semaphore>,
     max_workers: usize,
     operation: impl FnOnce(usize) -> DataResult<T> + Send + 'static,
