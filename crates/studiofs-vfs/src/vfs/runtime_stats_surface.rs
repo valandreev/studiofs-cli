@@ -1272,35 +1272,25 @@ impl super::VfsUploadStats {
     /// Add compression counters and effective policy/ratio gauges to object I/O stats.
     /// Shared by the mounted text surface and diagnostics-backed performance reporting.
     pub fn insert_compression_metrics(&self, section: &mut RuntimeStatsSection) {
-        let upload = self;
-
         for (name, unit, value) in [
             (
                 "logical_bytes_uploaded",
                 "bytes",
-                upload.logical_bytes_uploaded,
+                self.logical_bytes_uploaded,
             ),
-            (
-                "stored_bytes_uploaded",
-                "bytes",
-                upload.stored_bytes_uploaded,
-            ),
-            (
-                "v3_fragments_uploaded",
-                "count",
-                upload.v3_fragments_uploaded,
-            ),
+            ("stored_bytes_uploaded", "bytes", self.stored_bytes_uploaded),
+            ("v3_fragments_uploaded", "count", self.v3_fragments_uploaded),
             (
                 "raw_probe_fragments_uploaded",
                 "count",
-                upload.raw_probe_fragments_uploaded,
+                self.raw_probe_fragments_uploaded,
             ),
             (
                 "raw_threshold_fragments_uploaded",
                 "count",
-                upload.raw_threshold_fragments_uploaded,
+                self.raw_threshold_fragments_uploaded,
             ),
-            ("decompression", "ns", upload.decompression_nanos),
+            ("decompression", "ns", self.decompression_nanos),
         ] {
             insert_counter(section, name, unit, value);
         }
@@ -1308,9 +1298,9 @@ impl super::VfsUploadStats {
             section,
             "compression_policy_known",
             "bool",
-            u64::from(upload.compression_policy.is_some()),
+            u64::from(self.compression_policy.is_some()),
         );
-        if let Some(policy) = &upload.compression_policy {
+        if let Some(policy) = &self.compression_policy {
             insert_gauge(
                 section,
                 "compression_enabled",
@@ -1324,7 +1314,7 @@ impl super::VfsUploadStats {
             };
             insert_gauge(section, "compression_level", "level", level);
         }
-        if let Some(ratio) = upload.compression_stored_logical_ratio {
+        if let Some(ratio) = self.compression_stored_logical_ratio {
             insert_gauge(
                 section,
                 "compression_stored_logical_ratio",

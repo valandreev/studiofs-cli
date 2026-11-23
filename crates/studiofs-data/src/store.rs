@@ -537,6 +537,24 @@ pub struct CompressionStats {
     pub decompression_nanos: u64,
 }
 
+impl CompressionStats {
+    fn record_upload(&mut self, outcome: FragmentUploadOutcome, logical: u64, stored: u64) {
+        self.logical_bytes_uploaded = self.logical_bytes_uploaded.saturating_add(logical);
+        self.stored_bytes_uploaded = self.stored_bytes_uploaded.saturating_add(stored);
+        let counter = match outcome {
+            FragmentUploadOutcome::V3 => &mut self.v3_fragments_uploaded,
+            FragmentUploadOutcome::Raw(StoreRawReason::ProbeSkipped) => {
+                &mut self.raw_probe_fragments_uploaded
+            }
+            FragmentUploadOutcome::Raw(StoreRawReason::FinalThreshold) => {
+                &mut self.raw_threshold_fragments_uploaded
+            }
+            FragmentUploadOutcome::Raw(StoreRawReason::PolicyOff) => return,
+        };
+        *counter = counter.saturating_add(1);
+    }
+}
+
 type CompressionPolicyReader = Arc<dyn Fn() -> DataResult<CompressionPolicy> + Send + Sync>;
 
 /// DataStore — manages payload-object I/O to S3-compatible storage.
@@ -1115,30 +1133,14 @@ impl DataStore {
         );
         self.op.write(key, encrypted).await?;
         if let Some(outcome) = outcome {
-            let mut stats = self
-                .compression_stats
+            self.compression_stats
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            stats.logical_bytes_uploaded = stats
-                .logical_bytes_uploaded
-                .saturating_add(logical_len as u64);
-            stats.stored_bytes_uploaded = stats
-                .stored_bytes_uploaded
-                .saturating_add(plaintext_len.saturating_sub(ObjectHeader::SIZE) as u64);
-            match outcome {
-                FragmentUploadOutcome::V3 => {
-                    stats.v3_fragments_uploaded = stats.v3_fragments_uploaded.saturating_add(1)
-                }
-                FragmentUploadOutcome::Raw(StoreRawReason::ProbeSkipped) => {
-                    stats.raw_probe_fragments_uploaded =
-                        stats.raw_probe_fragments_uploaded.saturating_add(1)
-                }
-                FragmentUploadOutcome::Raw(StoreRawReason::FinalThreshold) => {
-                    stats.raw_threshold_fragments_uploaded =
-                        stats.raw_threshold_fragments_uploaded.saturating_add(1)
-                }
-                FragmentUploadOutcome::Raw(StoreRawReason::PolicyOff) => {}
-            }
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .record_upload(
+                    outcome,
+                    logical_len as u64,
+                    plaintext_len.saturating_sub(ObjectHeader::SIZE) as u64,
+                );
         }
         Ok(RemoteObjectWriteStats {
             plaintext_bytes: plaintext_len as u64,
@@ -1637,7 +1639,8 @@ fn seal_stfs_buffer_blocking(
         logical_len,
         stfs_sha256,
         payload_xxh64,
-        compression_outcome: Some(FragmentUploadOutcome::V3),
+        // Only `prepare_payload_with_policy` knows the outcome; v2 seals share this path.
+        compression_outcome: None,
     })
 }
 
