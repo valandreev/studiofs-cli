@@ -1,7 +1,7 @@
 //! Criterion benchmarks for STFS v3 Zstd compression and entropy probe (SFS-1089).
 
 use bytes::Bytes;
-use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group};
 use std::hint::black_box;
 use studiofs_data::compression::{EncodedFragment, compress_fragment_blocking};
 use studiofs_data::crypto::{DEFAULT_ENCRYPTION_FRAME_SIZE, ObjectCipher, VolumeMasterKey};
@@ -86,4 +86,13 @@ fn bench_random_4mib_probe_vs_off(c: &mut Criterion) {
 }
 
 criterion_group!(benches, bench_random_4mib_probe_vs_off);
-criterion_main!(benches);
+fn main() {
+    // `cargo test --all-targets -- --test-threads=1` forwards libtest flags that
+    // Criterion's CLI rejects; skip instead of failing the whole test run.
+    if std::env::args().any(|arg| arg.starts_with("--test-threads")) {
+        eprintln!("compression bench: skipped under libtest --test-threads; run `cargo bench`");
+        return;
+    }
+    benches();
+    Criterion::default().configure_from_args().final_summary();
+}
