@@ -71,6 +71,16 @@ impl MetaVolumeSettings for RedbMetaEngine {
             settings.logical_quota_bytes = bytes
         })
     }
+
+    fn compare_and_set_compression(
+        &self,
+        expected_revision: u64,
+        compression: crate::trash::CompressionPolicy,
+    ) -> MetaResult<Option<VolumeSettings>> {
+        self.update_settings(expected_revision, |settings| {
+            settings.compression = compression
+        })
+    }
 }
 
 impl RedbMetaEngine {
@@ -331,5 +341,75 @@ mod tests {
         assert_eq!(reopened.volume_settings().unwrap(), disabled);
         assert_eq!(disabled.trash.existing_entry_days(), 7);
         assert!(!disabled.trash.enabled());
+    }
+
+    #[test]
+    fn compression_settings_cas_replay_conflict_and_checkpoint_roundtrip() {
+        use crate::trash::CompressionPolicy;
+
+        let temp = studiofs_test_support::workspace_target_tempdir("compression-settings-");
+        let source = RedbMetaEngine::open(temp.path().join("source.redb")).unwrap();
+        assert_eq!(
+            source.volume_settings().unwrap().compression,
+            CompressionPolicy::off()
+        );
+        let zstd9 = CompressionPolicy::zstd(9).unwrap();
+        let accepted = source
+            .compare_and_set_compression(0, zstd9)
+            .unwrap()
+            .unwrap();
+        assert_eq!(accepted.revision, 1);
+        assert_eq!(accepted.compression, zstd9);
+        assert_eq!(
+            source
+                .compare_and_set_compression(0, CompressionPolicy::off())
+                .unwrap(),
+            None
+        );
+
+        let events = source.read_events_range(0, u64::MAX).unwrap();
+        assert_eq!(
+            events,
+            vec![crate::MetaEvent::SetVolumeSettings { settings: accepted }]
+        );
+
+        let replica = RedbMetaEngine::open(temp.path().join("replica.redb")).unwrap();
+        replica.apply_replica_events_to_base(&events).unwrap();
+        replica.apply_replica_serving_state(&events).unwrap();
+        assert_eq!(replica.volume_settings().unwrap(), accepted);
+
+        // Equal revision with different compression is rejected; older revision is ignored.
+        let mut conflict = accepted;
+        conflict.compression = CompressionPolicy::zstd_default();
+        assert!(
+            replica
+                .apply_replica_serving_state(&[crate::MetaEvent::SetVolumeSettings {
+                    settings: conflict,
+                }])
+                .is_err()
+        );
+        replica
+            .apply_replica_serving_state(&[crate::MetaEvent::SetVolumeSettings {
+                settings: VolumeSettings::default(),
+            }])
+            .unwrap();
+        assert_eq!(replica.volume_settings().unwrap(), accepted);
+
+        // Higher revision replaces compression.
+        let mut higher = accepted;
+        higher.revision = 2;
+        higher.compression = CompressionPolicy::off();
+        replica
+            .apply_replica_serving_state(&[crate::MetaEvent::SetVolumeSettings {
+                settings: higher,
+            }])
+            .unwrap();
+        assert_eq!(replica.volume_settings().unwrap(), higher);
+
+        // Remote snapshot exports base state, which keeps the replicated compression.
+        let snapshot = replica.export_remote_snapshot().unwrap();
+        let bootstrapped = RedbMetaEngine::open(temp.path().join("bootstrap.redb")).unwrap();
+        bootstrapped.import_remote_snapshot(&snapshot).unwrap();
+        assert_eq!(bootstrapped.volume_settings().unwrap(), accepted);
     }
 }

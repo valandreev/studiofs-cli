@@ -56,6 +56,13 @@ impl<M: ?Sized + MetaEngine> crate::trash::MetaVolumeSettings for ReadOnlyMetaEn
     ) -> MetaResult<Option<crate::trash::VolumeSettings>> {
         Err(read_only_error(ROOT_INO))
     }
+    fn compare_and_set_compression(
+        &self,
+        _expected_revision: u64,
+        _compression: crate::trash::CompressionPolicy,
+    ) -> MetaResult<Option<crate::trash::VolumeSettings>> {
+        Err(read_only_error(ROOT_INO))
+    }
 }
 
 impl<M: ?Sized + MetaEngine> crate::trash::MetaRetainedStore for ReadOnlyMetaEngine<M> {

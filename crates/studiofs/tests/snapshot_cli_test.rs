@@ -378,6 +378,212 @@ fn trash_days_cli_updates_shared_setting_and_client_converges() {
 }
 
 #[test]
+#[ignore = "requires PostgreSQL test service; isolated compression command, no S3"]
+fn compression_cli_updates_shared_setting_handles_cas_conflict_and_converges() {
+    use studiofs_meta::trash::{CompressionPolicy, VolumeSettings};
+
+    let raw_dsn = configured_test_pg_dsn().expect("configured PostgreSQL test service");
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let dsn = runtime
+        .block_on(ensure_studiofs_database(&raw_dsn))
+        .unwrap()
+        .metadata_dsn;
+    let (mut client, connection) = runtime
+        .block_on(tokio_postgres::connect(&dsn, tokio_postgres::NoTls))
+        .unwrap();
+    let connection_task = runtime.spawn(connection);
+    runtime
+        .block_on(studiofs_meta::pg_engine::schema::ensure_studiofs_pg_schema(
+            &client,
+        ))
+        .unwrap();
+    let name = format!("compression-cli-{}", Uuid::new_v4().simple());
+    let _cleanup = PgVolumeCleanup {
+        dsn: dsn.clone(),
+        names: vec![name.clone()],
+    };
+    let (id, uuid) = runtime.block_on(insert_pg_volume(&client, &name));
+    let root = studiofs_test_support::workspace_target_tempdir("compression-cli-");
+    let (checkpoint, bytes) = create_local_volume_metadata(root.path(), &name, &dsn, id, &uuid);
+    runtime.block_on(seed_pg_metadata_state(&client, id, &checkpoint, &bytes));
+    let run = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_studiofs"))
+            .arg("compression")
+            .arg(&name)
+            .args(args)
+            .env("STUDIOFS_CLIENT_ROOT", root.path())
+            .stdin(Stdio::null())
+            .output()
+            .unwrap()
+    };
+    let shared_settings = |client: &tokio_postgres::Client| {
+        let bytes: Option<Vec<u8>> = runtime
+            .block_on(client.query_one(
+                "SELECT volume_settings FROM metadata_state WHERE vol=$1",
+                &[&id],
+            ))
+            .unwrap()
+            .get(0);
+        bytes.map(|bytes| serde_json::from_slice::<VolumeSettings>(&bytes).unwrap())
+    };
+
+    // Absent volume_settings reads as off.
+    let shown = run(&[]);
+    assert!(shown.status.success(), "{}", output_text(&shown));
+    assert!(output_text(&shown).contains("compression is off."));
+
+    // Invalid policies are rejected without touching PostgreSQL.
+    for invalid in ["zstd:0", "zstd:20", "lz4", "zstd:", "zstd:-1"] {
+        assert!(!run(&[invalid]).status.success(), "{invalid} must fail");
+    }
+    assert_eq!(
+        shared_settings(&client),
+        None,
+        "invalid input must not write"
+    );
+
+    // `zstd` -> zstd:3, `zstd:9` -> zstd:9, `off` -> off.
+    let default_zstd = run(&["zstd"]);
+    assert!(
+        default_zstd.status.success(),
+        "{}",
+        output_text(&default_zstd)
+    );
+    assert!(output_text(&default_zstd).contains("compression is zstd:3."));
+
+    let level9 = run(&["zstd:9"]);
+    assert!(level9.status.success(), "{}", output_text(&level9));
+    assert!(output_text(&level9).contains("compression is zstd:9."));
+
+    let off = run(&["off"]);
+    assert!(off.status.success(), "{}", output_text(&off));
+    assert!(output_text(&off).contains("compression is off."));
+    assert!(!output_text(&off).contains(&dsn));
+
+    let shared = shared_settings(&client).unwrap();
+    assert_eq!(shared.revision, 3);
+    assert_eq!(shared.compression, CompressionPolicy::off());
+
+    // Deterministic concurrent CAS conflict: hold the metadata_state row lock while the CLI
+    // reads revision 3 and waits on SELECT ... FOR UPDATE, then advance revision to 4 and commit.
+    let (observer, observer_conn) = runtime
+        .block_on(tokio_postgres::connect(&dsn, tokio_postgres::NoTls))
+        .unwrap();
+    let observer_task = runtime.spawn(observer_conn);
+    let cli_output = runtime.block_on(async {
+        let tx = client.transaction().await.unwrap();
+        let holder_pid: i32 = tx
+            .query_one("SELECT pg_backend_pid()", &[])
+            .await
+            .unwrap()
+            .get(0);
+        tx.query_one(
+            "SELECT 1 FROM metadata_state WHERE vol=$1 FOR UPDATE",
+            &[&id],
+        )
+        .await
+        .unwrap();
+
+        let child = Command::new(env!("CARGO_BIN_EXE_studiofs"))
+            .arg("compression")
+            .arg(&name)
+            .arg("zstd:12")
+            .env("STUDIOFS_CLIENT_ROOT", root.path())
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+
+        // Wait until the CLI's FOR UPDATE query is blocked on our transaction lock.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let mut blocked = false;
+        while std::time::Instant::now() < deadline {
+            let waiting: i64 = observer
+                .query_one(
+                    "SELECT count(*) FROM pg_stat_activity \
+                     WHERE $1 = ANY(pg_blocking_pids(pid)) \
+                       AND query LIKE '%FOR UPDATE%' \
+                       AND query LIKE '%metadata_state%'",
+                    &[&holder_pid],
+                )
+                .await
+                .unwrap()
+                .get(0);
+            if waiting > 0 {
+                blocked = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            blocked,
+            "CLI compression command did not block on metadata_state FOR UPDATE in time"
+        );
+
+        let mut concurrent = shared;
+        concurrent.revision += 1;
+        concurrent.compression = CompressionPolicy::zstd(5).unwrap();
+        let concurrent_bytes = serde_json::to_vec(&concurrent).unwrap();
+        tx.execute(
+            "UPDATE metadata_state SET volume_settings=$2 WHERE vol=$1",
+            &[&id, &concurrent_bytes],
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+
+        child.wait_with_output().unwrap()
+    });
+    drop(observer);
+    let _ = runtime.block_on(observer_task);
+
+    assert!(
+        !cli_output.status.success(),
+        "concurrent CAS conflict must fail: {}",
+        output_text(&cli_output)
+    );
+    assert!(
+        output_text(&cli_output).contains("volume settings changed concurrently"),
+        "{}",
+        output_text(&cli_output)
+    );
+    let after_conflict = shared_settings(&client).unwrap();
+    assert_eq!(after_conflict.revision, 4);
+    assert_eq!(
+        after_conflict.compression,
+        CompressionPolicy::zstd(5).unwrap()
+    );
+
+    // Apply a final clean CLI update and verify a client's redb view converges via replication.
+    let final_set = run(&["zstd:7"]);
+    assert!(final_set.status.success(), "{}", output_text(&final_set));
+    let expected = shared_settings(&client).unwrap();
+    assert_eq!(expected.revision, 5);
+    assert_eq!(expected.compression, CompressionPolicy::zstd(7).unwrap());
+
+    let path = root
+        .path()
+        .join("meta")
+        .join(&name)
+        .join(format!("{name}.db"));
+    let engine = studiofs_meta::open_meta_engine_with_options(
+        &path,
+        studiofs_meta::MetaOpenOptions {
+            background_poll: false,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    engine.sync_metadata().unwrap();
+    let local = engine.retained_store().unwrap().volume_settings().unwrap();
+    assert_eq!(local, expected);
+    drop(engine);
+    drop(client);
+    let _ = runtime.block_on(connection_task);
+}
+
+#[test]
 #[ignore = "requires PostgreSQL test service via STUDIOFS_TEST_PG_DSN; does not use S3"]
 fn snapshot_cli_scopes_catalog_and_policy_to_the_named_volume() {
     let raw_dsn = configured_test_pg_dsn()

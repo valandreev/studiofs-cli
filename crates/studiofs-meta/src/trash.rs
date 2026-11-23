@@ -92,6 +92,118 @@ impl TryFrom<TrashPolicyFields> for TrashPolicy {
     }
 }
 
+/// Minimum supported Zstd compression level.
+pub const MIN_ZSTD_COMPRESSION_LEVEL: u8 = 1;
+/// Default Zstd compression level for new volumes and bare `zstd` policy input.
+pub const DEFAULT_ZSTD_COMPRESSION_LEVEL: u8 = 3;
+/// Maximum supported Zstd compression level.
+pub const MAX_ZSTD_COMPRESSION_LEVEL: u8 = 19;
+
+/// Shared remote payload compression mode.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CompressionMode {
+    /// Store remote payload fragments uncompressed (STFS v2).
+    #[default]
+    Off,
+    /// Compress remote payload fragments adaptively with Zstd (STFS v3).
+    Zstd,
+}
+
+/// Shared remote payload compression policy, stored in [`VolumeSettings`].
+///
+/// Missing fields in older JSON records decode as [`CompressionPolicy::off`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "CompressionPolicyFields")]
+pub struct CompressionPolicy {
+    mode: CompressionMode,
+    level: u8,
+}
+
+#[derive(Deserialize)]
+struct CompressionPolicyFields {
+    mode: CompressionMode,
+    #[serde(default = "default_zstd_compression_level")]
+    level: u8,
+}
+
+const fn default_zstd_compression_level() -> u8 {
+    DEFAULT_ZSTD_COMPRESSION_LEVEL
+}
+
+impl Default for CompressionPolicy {
+    fn default() -> Self {
+        Self::off()
+    }
+}
+
+impl CompressionPolicy {
+    /// Disabled compression policy (`mode = off`).
+    pub const fn off() -> Self {
+        Self {
+            mode: CompressionMode::Off,
+            level: DEFAULT_ZSTD_COMPRESSION_LEVEL,
+        }
+    }
+
+    /// Default compression policy for newly initialized volumes (`zstd:3`).
+    pub const fn zstd_default() -> Self {
+        Self {
+            mode: CompressionMode::Zstd,
+            level: DEFAULT_ZSTD_COMPRESSION_LEVEL,
+        }
+    }
+
+    /// Construct a validated Zstd compression policy with `level` in `1..=19`.
+    pub const fn zstd(level: u8) -> Result<Self, &'static str> {
+        if level < MIN_ZSTD_COMPRESSION_LEVEL || level > MAX_ZSTD_COMPRESSION_LEVEL {
+            return Err("compression level must be between 1 and 19");
+        }
+        Ok(Self {
+            mode: CompressionMode::Zstd,
+            level,
+        })
+    }
+
+    /// Active compression mode.
+    pub const fn mode(self) -> CompressionMode {
+        self.mode
+    }
+
+    /// Configured Zstd level in `1..=19`.
+    pub const fn level(self) -> u8 {
+        self.level
+    }
+
+    /// Whether remote payload compression is enabled.
+    pub const fn is_enabled(self) -> bool {
+        matches!(self.mode, CompressionMode::Zstd)
+    }
+}
+
+impl TryFrom<CompressionPolicyFields> for CompressionPolicy {
+    type Error = &'static str;
+
+    fn try_from(fields: CompressionPolicyFields) -> Result<Self, Self::Error> {
+        let zstd = Self::zstd(fields.level)?;
+        // `off` has one canonical value, so a stray level cannot cause a
+        // false equal-revision conflict or a needless tag-21 event.
+        Ok(match fields.mode {
+            CompressionMode::Off => Self::off(),
+            CompressionMode::Zstd => zstd,
+        })
+    }
+}
+
+impl std::fmt::Display for CompressionPolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.mode {
+            CompressionMode::Off => f.write_str("off"),
+            CompressionMode::Zstd => write!(f, "zstd:{}", self.level),
+        }
+    }
+}
+
 /// Mutable shared volume settings, separate from immutable storage identity.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 pub struct VolumeSettings {
@@ -103,6 +215,9 @@ pub struct VolumeSettings {
     /// Optional logical capacity limit; `None` means unlimited.
     #[serde(default)]
     pub logical_quota_bytes: Option<u64>,
+    /// Shared remote payload compression policy.
+    #[serde(default)]
+    pub compression: CompressionPolicy,
 }
 
 impl Serialize for VolumeSettings {
@@ -115,16 +230,17 @@ impl Serialize for VolumeSettings {
         } else {
             "revision"
         };
-        let mut state = serializer.serialize_struct("VolumeSettings", 3)?;
+        let mut state = serializer.serialize_struct("VolumeSettings", 4)?;
         state.serialize_field(revision_key, &self.revision)?;
         state.serialize_field("trash", &self.trash)?;
         state.serialize_field("logical_quota_bytes", &self.logical_quota_bytes)?;
+        state.serialize_field("compression", &self.compression)?;
         state.end()
     }
 }
 
 impl VolumeSettings {
-    /// Replica ordering of tag-19 settings: a higher revision replaces `self`,
+    /// Replica ordering of volume settings: a higher revision replaces `self`,
     /// an equal revision must be identical, and an older one is ignored.
     pub fn is_superseded_by(&self, next: &Self) -> crate::MetaResult<bool> {
         if next.revision == self.revision && next != self {
@@ -154,6 +270,13 @@ pub trait MetaVolumeSettings: Send + Sync {
         &self,
         expected_revision: u64,
         bytes: Option<u64>,
+    ) -> crate::MetaResult<Option<VolumeSettings>>;
+
+    /// Atomically update the compression policy if the serving revision still matches.
+    fn compare_and_set_compression(
+        &self,
+        expected_revision: u64,
+        compression: CompressionPolicy,
     ) -> crate::MetaResult<Option<VolumeSettings>>;
 }
 
@@ -357,5 +480,89 @@ mod tests {
         let recovered: TrashPolicy = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(recovered, policy);
         assert!(recovered.is_expired(0, 7 * 86_400));
+    }
+
+    #[test]
+    fn compression_policy_serde_roundtrip_and_bounds() {
+        use super::{CompressionMode, CompressionPolicy, VolumeSettings};
+
+        for (policy, expected_display) in [
+            (CompressionPolicy::off(), "off"),
+            (CompressionPolicy::zstd(1).unwrap(), "zstd:1"),
+            (CompressionPolicy::zstd_default(), "zstd:3"),
+            (CompressionPolicy::zstd(19).unwrap(), "zstd:19"),
+        ] {
+            assert_eq!(policy.to_string(), expected_display);
+            let json = serde_json::to_vec(&policy).unwrap();
+            let decoded: CompressionPolicy = serde_json::from_slice(&json).unwrap();
+            assert_eq!(decoded, policy);
+        }
+
+        assert!(CompressionPolicy::zstd(0).is_err());
+        assert!(CompressionPolicy::zstd(20).is_err());
+        assert!(CompressionPolicy::zstd(u8::MAX).is_err());
+
+        for invalid in [
+            r#"{"mode":"zstd","level":0}"#,
+            r#"{"mode":"zstd","level":20}"#,
+            r#"{"mode":"off","level":0}"#,
+            r#"{"mode":"off","level":20}"#,
+            r#"{"mode":"lz4","level":3}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<CompressionPolicy>(invalid).is_err(),
+                "{invalid} must be rejected"
+            );
+        }
+
+        // `off` is canonical: a stray in-range level is not a distinct policy.
+        let off_level9: CompressionPolicy =
+            serde_json::from_str(r#"{"mode":"off","level":9}"#).unwrap();
+        assert_eq!(off_level9, CompressionPolicy::off());
+
+        // Existing volume JSON without `compression` decodes as `off`.
+        let legacy_no_quota: VolumeSettings =
+            serde_json::from_str(r#"{"revision":4,"trash":{"days":7,"last_positive_days":7}}"#)
+                .unwrap();
+        assert_eq!(legacy_no_quota.revision, 4);
+        assert_eq!(legacy_no_quota.compression, CompressionPolicy::off());
+        assert_eq!(legacy_no_quota.compression.mode(), CompressionMode::Off);
+
+        let legacy_with_quota: VolumeSettings = serde_json::from_str(
+            r#"{"quota_v1_revision":5,"trash":{"days":0,"last_positive_days":0},"logical_quota_bytes":1024}"#,
+        )
+        .unwrap();
+        assert_eq!(legacy_with_quota.revision, 5);
+        assert_eq!(legacy_with_quota.logical_quota_bytes, Some(1024));
+        assert_eq!(legacy_with_quota.compression, CompressionPolicy::off());
+
+        // Full VolumeSettings round-trips compression alongside trash and quota.
+        let mut settings = VolumeSettings {
+            revision: 6,
+            logical_quota_bytes: Some(4096),
+            compression: CompressionPolicy::zstd(9).unwrap(),
+            ..Default::default()
+        };
+        settings.trash.set_days(14);
+        let bytes = serde_json::to_vec(&settings).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<VolumeSettings>(&bytes).unwrap(),
+            settings
+        );
+
+        // Revision ordering: higher replaces, equal with different compression fails, older ignored.
+        let mut higher = settings;
+        higher.revision = 7;
+        higher.compression = CompressionPolicy::off();
+        assert!(settings.is_superseded_by(&higher).unwrap());
+
+        let mut conflict = settings;
+        conflict.compression = CompressionPolicy::zstd(12).unwrap();
+        assert!(settings.is_superseded_by(&conflict).is_err());
+
+        let mut older = settings;
+        older.revision = 5;
+        older.compression = CompressionPolicy::off();
+        assert!(!settings.is_superseded_by(&older).unwrap());
     }
 }

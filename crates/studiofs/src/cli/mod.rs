@@ -7,6 +7,7 @@ pub(crate) const WRITE_PATH_OBSERVABILITY_FILE: &str = "write_path_observability
 pub mod bench;
 pub(crate) mod benchmark_engine;
 pub mod cache_layout;
+pub mod compression;
 pub mod destroy;
 pub mod discovery;
 pub mod dump_load;
@@ -167,6 +168,8 @@ enum Commands {
     TrashDays(trash::TrashDaysArgs),
     /// Show or change the shared logical byte quota
     Quota(quota::QuotaArgs),
+    /// Show or change the shared remote payload compression policy
+    Compression(compression::CompressionArgs),
     /// Update mutable shared S3 volume settings
     Umeta(umeta::UmetaArgs),
     Discover(discovery::DiscoverArgs),
@@ -196,6 +199,7 @@ impl Commands {
             Self::Upgrade(args) => args.dispatch(),
             Self::TrashDays(args) => args.dispatch(),
             Self::Quota(args) => args.dispatch(),
+            Self::Compression(args) => args.dispatch(),
             Self::Umeta(args) => args.dispatch(),
             Self::Discover(args) => args.dispatch(),
             Self::Mount(args) => args.dispatch_with_auto_tray(),

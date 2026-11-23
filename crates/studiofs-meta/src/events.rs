@@ -24,6 +24,7 @@ const TAG_REMOVE_PENDING_DELETION: u8 = 15;
 const TAG_REMOVE_LOCAL_ENTRY: u8 = 18;
 const TAG_SET_VOLUME_SETTINGS: u8 = 19;
 const TAG_SET_VOLUME_SETTINGS_V2: u8 = 20;
+const TAG_SET_VOLUME_SETTINGS_V3: u8 = 21;
 
 // These tag values are part of the persisted format: append new values, never
 // reorder or reuse an existing value.
@@ -223,10 +224,15 @@ impl MetaEvent {
 
     fn wire_tag(&self) -> u8 {
         match self {
-            Self::SetVolumeSettings { settings } if settings.logical_quota_bytes.is_none() => {
-                TAG_SET_VOLUME_SETTINGS
+            Self::SetVolumeSettings { settings }
+                if settings.compression != crate::trash::CompressionPolicy::off() =>
+            {
+                TAG_SET_VOLUME_SETTINGS_V3
             }
-            Self::SetVolumeSettings { .. } => TAG_SET_VOLUME_SETTINGS_V2,
+            Self::SetVolumeSettings { settings } if settings.logical_quota_bytes.is_some() => {
+                TAG_SET_VOLUME_SETTINGS_V2
+            }
+            Self::SetVolumeSettings { .. } => TAG_SET_VOLUME_SETTINGS,
             Self::SetAttr { .. } => TAG_SET_ATTR,
             Self::RemoveAttr { .. } => TAG_REMOVE_ATTR,
             Self::AddEntry { .. } => TAG_ADD_ENTRY,
@@ -292,6 +298,16 @@ pub fn encode_event(event: &MetaEvent) -> MetaResult<Vec<u8>> {
     match event {
         MetaEvent::SetVolumeSettings { settings } if tag == TAG_SET_VOLUME_SETTINGS => {
             encode_event_envelope(tag, &(settings.revision, settings.trash))
+        }
+        MetaEvent::SetVolumeSettings { settings } if tag == TAG_SET_VOLUME_SETTINGS_V2 => {
+            encode_event_envelope(
+                tag,
+                &(
+                    settings.revision,
+                    settings.trash,
+                    settings.logical_quota_bytes,
+                ),
+            )
         }
         MetaEvent::SetVolumeSettings { settings } => encode_event_envelope(tag, settings),
         MetaEvent::SetAttr { attr } => encode_event_envelope(tag, attr),
@@ -369,9 +385,10 @@ pub(crate) fn decode_event_with_type(event_type: &str, bytes: &[u8]) -> MetaResu
         MetaError::Serialization(format!("unknown PostgreSQL MetaEvent type `{event_type}`"))
     })?;
     let (tag, payload) = decode_event_wire_parts(bytes)?;
-    if tag != expected_tag
-        && !(tag == TAG_SET_VOLUME_SETTINGS && expected_tag == TAG_SET_VOLUME_SETTINGS_V2)
-    {
+    let tag_matches = tag == expected_tag
+        || (expected_tag == TAG_SET_VOLUME_SETTINGS_V3
+            && matches!(tag, TAG_SET_VOLUME_SETTINGS | TAG_SET_VOLUME_SETTINGS_V2));
+    if !tag_matches {
         return Err(MetaError::Serialization(format!(
             "PostgreSQL MetaEvent type `{event_type}` does not match decoded wire tag {tag}"
         )));
@@ -381,7 +398,7 @@ pub(crate) fn decode_event_with_type(event_type: &str, bytes: &[u8]) -> MetaResu
 
 fn wire_tag_for_kind(kind: &str) -> Option<u8> {
     match kind {
-        "set_volume_settings" => Some(TAG_SET_VOLUME_SETTINGS_V2),
+        "set_volume_settings" => Some(TAG_SET_VOLUME_SETTINGS_V3),
         "set_attr" => Some(TAG_SET_ATTR),
         "remove_attr" => Some(TAG_REMOVE_ATTR),
         "add_entry" => Some(TAG_ADD_ENTRY),
@@ -483,10 +500,22 @@ fn decode_tagged_event(tag: u8, payload: &[u8]) -> MetaResult<MetaEvent> {
                     revision,
                     trash,
                     logical_quota_bytes: None,
+                    compression: crate::trash::CompressionPolicy::off(),
                 },
             })
         }
-        TAG_SET_VOLUME_SETTINGS_V2 => Ok(MetaEvent::SetVolumeSettings {
+        TAG_SET_VOLUME_SETTINGS_V2 => {
+            let (revision, trash, logical_quota_bytes) = decode_event_payload(tag, payload)?;
+            Ok(MetaEvent::SetVolumeSettings {
+                settings: crate::trash::VolumeSettings {
+                    revision,
+                    trash,
+                    logical_quota_bytes,
+                    compression: crate::trash::CompressionPolicy::off(),
+                },
+            })
+        }
+        TAG_SET_VOLUME_SETTINGS_V3 => Ok(MetaEvent::SetVolumeSettings {
             settings: decode_event_payload(tag, payload)?,
         }),
         TAG_SET_ATTR => Ok(MetaEvent::SetAttr {
@@ -652,6 +681,81 @@ mod tests {
             decode_event_with_type("set_volume_settings", &encoded).unwrap(),
             event
         );
+    }
+
+    #[test]
+    fn compression_settings_tag19_tag20_default_off_and_tag21_roundtrips() {
+        use crate::trash::{CompressionPolicy, TrashPolicy, VolumeSettings};
+
+        let mut trash = TrashPolicy::default();
+        trash.set_days(7);
+
+        // Tag 19 fixture (2-field layout) decodes with compression = off.
+        let tag19_bytes = encode_event_envelope(TAG_SET_VOLUME_SETTINGS, &(1_u64, trash)).unwrap();
+        assert_eq!(tag19_bytes[8], 19);
+        assert_eq!(
+            decode_event_with_type("set_volume_settings", &tag19_bytes).unwrap(),
+            MetaEvent::SetVolumeSettings {
+                settings: VolumeSettings {
+                    revision: 1,
+                    trash,
+                    logical_quota_bytes: None,
+                    compression: CompressionPolicy::off(),
+                },
+            }
+        );
+
+        // Tag 20 fixture (3-field layout) decodes with compression = off and
+        // encode_event keeps the 3-field layout unchanged when compression is off.
+        let tag20_bytes =
+            encode_event_envelope(TAG_SET_VOLUME_SETTINGS_V2, &(2_u64, trash, Some(8192_u64)))
+                .unwrap();
+        assert_eq!(tag20_bytes[8], 20);
+        let tag20_event = MetaEvent::SetVolumeSettings {
+            settings: VolumeSettings {
+                revision: 2,
+                trash,
+                logical_quota_bytes: Some(8192),
+                compression: CompressionPolicy::off(),
+            },
+        };
+        assert_eq!(encode_event(&tag20_event).unwrap(), tag20_bytes);
+        assert_eq!(
+            decode_event_with_type("set_volume_settings", &tag20_bytes).unwrap(),
+            tag20_event
+        );
+
+        // Tag 21 event round-trips the compression policy.
+        let tag21_event = MetaEvent::SetVolumeSettings {
+            settings: VolumeSettings {
+                revision: 3,
+                trash,
+                logical_quota_bytes: Some(8192),
+                compression: CompressionPolicy::zstd(9).unwrap(),
+            },
+        };
+        let tag21_bytes = encode_event(&tag21_event).unwrap();
+        assert_eq!(tag21_bytes[8], 21);
+        assert_eq!(decode_event(&tag21_bytes).unwrap(), tag21_event);
+        assert_eq!(
+            decode_event_with_type("set_volume_settings", &tag21_bytes).unwrap(),
+            tag21_event
+        );
+
+        // Invalid compression level in tag 21 is rejected.
+        for bad_level in [0_u8, 20_u8] {
+            let invalid = postcard::to_stdvec(&(
+                *b"SFS-EVT",
+                1_u8,
+                TAG_SET_VOLUME_SETTINGS_V3,
+                (3_u64, trash, Some(8192_u64), (1_u8, bad_level)),
+            ))
+            .unwrap();
+            assert!(matches!(
+                decode_event(&invalid),
+                Err(MetaError::Serialization(_))
+            ));
+        }
     }
 
     use crate::types::{
