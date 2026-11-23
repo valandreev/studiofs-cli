@@ -1027,6 +1027,56 @@ where
     E: std::fmt::Display,
 {
     let data: Buffer = data.into();
+    let seek_table = parse_complete_v3_seek_table(&data)?;
+    let header = *seek_table.header();
+    let codec = seek_table.codec();
+
+    let mut out = vec![0u8; seek_table.original_size()];
+    for entry in seek_table.entries() {
+        let mut chunk_buf = data.slice(entry.plaintext_range());
+        let dst = &mut out[entry.logical_range()];
+        if entry.is_raw {
+            chunk_buf.copy_to_slice(dst);
+        } else {
+            let stored = if Buffer::count(&chunk_buf) == 1 {
+                chunk_buf.current()
+            } else {
+                chunk_buf.to_bytes()
+            };
+            let written = decompress_chunk(codec, stored.as_ref(), dst).map_err(|err| {
+                ObjectError::ChunkDecompression {
+                    chunk_index: entry.index,
+                    message: err.to_string(),
+                }
+            })?;
+            if written != entry.original_len {
+                return Err(ObjectError::ChunkDecompression {
+                    chunk_index: entry.index,
+                    message: format!(
+                        "decompressed length {written} != derived chunk length {}",
+                        entry.original_len
+                    ),
+                });
+            }
+        }
+    }
+
+    let computed_checksum = xxh64(&out, 0);
+    if computed_checksum != header.checksum {
+        return Err(ObjectError::ChecksumMismatch {
+            expected: header.checksum,
+            computed: computed_checksum,
+        });
+    }
+
+    Ok((Bytes::from(out), computed_checksum))
+}
+
+/// Parse and validate the header and seek table of a complete STFS v3 object.
+///
+/// Checks header, codec, chunk geometry, seek table, and that the stored payload
+/// length equals `compressed_size`, so every entry's ranges are in bounds of `data`.
+pub(crate) fn parse_complete_v3_seek_table(data: &Buffer) -> Result<V3SeekTable, ObjectError> {
     if data.len() < ObjectHeader::SIZE {
         return Err(
             io::Error::new(io::ErrorKind::UnexpectedEof, "file too short for header").into(),
@@ -1061,45 +1111,7 @@ where
         });
     }
 
-    let mut out = vec![0u8; seek_table.original_size()];
-    for entry in seek_table.entries() {
-        let mut chunk_buf = data.slice(entry.plaintext_range());
-        let dst = &mut out[entry.logical_range()];
-        if entry.is_raw {
-            chunk_buf.copy_to_slice(dst);
-        } else {
-            let stored = if Buffer::count(&chunk_buf) == 1 {
-                chunk_buf.current()
-            } else {
-                chunk_buf.to_bytes()
-            };
-            let written = decompress_chunk(meta.codec, stored.as_ref(), dst).map_err(|err| {
-                ObjectError::ChunkDecompression {
-                    chunk_index: entry.index,
-                    message: err.to_string(),
-                }
-            })?;
-            if written != entry.original_len {
-                return Err(ObjectError::ChunkDecompression {
-                    chunk_index: entry.index,
-                    message: format!(
-                        "decompressed length {written} != derived chunk length {}",
-                        entry.original_len
-                    ),
-                });
-            }
-        }
-    }
-
-    let computed_checksum = xxh64(&out, 0);
-    if computed_checksum != header.checksum {
-        return Err(ObjectError::ChecksumMismatch {
-            expected: header.checksum,
-            computed: computed_checksum,
-        });
-    }
-
-    Ok((Bytes::from(out), computed_checksum))
+    Ok(seek_table)
 }
 
 // =============================================================================

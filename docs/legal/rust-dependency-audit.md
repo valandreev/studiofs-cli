@@ -1,5 +1,31 @@
 # Rust dependency license audit for v0.2.0
 
+## SFS-1089 zstd chunk compressor renewal, 2026-11-23
+
+The chunk compressor adds `zstd 0.14.4`, `zstd-safe 8.3.0` and
+`zstd-sys 2.1.3+zstd.1.5.7` as normal dependencies of `studiofs-data`.
+The crate manifests declare `BSD-3-Clause` (wrappers) and
+`BSD-3-Clause AND BSD-2-Clause` (`zstd-sys`); all three archives ship their
+`LICENSE` files. `zstd-sys` statically links the bundled libzstd 1.5.7 C
+sources, which upstream dual-licenses as BSD-3-Clause or GPL-2.0-only
+(`zstd/LICENSE`, `zstd/COPYING`); select BSD-3-Clause. The native component
+is listed in the [platform policy](platform-distribution.md).
+
+The compression benchmark adds the development-only `criterion 0.8.2` graph:
+`criterion-plot 0.8.2`, `tinytemplate 1.2.1`, `cast 0.3.0`, `half 2.7.1`,
+`page_size 0.6.0`, `anes 0.1.6` (select MIT for these `MIT OR Apache-2.0`
+crates), `alloca 0.4.0`, `oorandom 11.1.5` (MIT), and `ciborium`,
+`ciborium-io`, `ciborium-ll 0.2.2` (Apache-2.0). None of them are in the
+product dependency scopes. The `anes 0.1.6` archive ships no license file;
+`supplemental-licenses/anes-0.1.6/` holds the verbatim upstream texts from
+the crate's `.cargo_vcs_info.json` commit.
+
+The refreshed inventory covers 668 lock entries (656 registry packages and
+12 workspace packages). The product dependency scopes contain 339 Windows,
+380 Linux, and 373 macOS packages. The LF-normalized lockfile SHA-256 is
+`3bcb15088d93847411d82e227b3bb56b1ff8c233e9eef95ce48ffd7803a18692`.
+Strict (`--release`) notice generation reports zero unresolved entries.
+
 ## RUSTSEC-2026-0592 url renewal, 2026-11-22
 
 The reviewed inventory is renewed for `url 2.5.8 -> 2.5.9` and its

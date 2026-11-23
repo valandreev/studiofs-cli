@@ -32,9 +32,15 @@ hkdf = "0.12"
 sha2 = "0.10"
 uuid.workspace = true
 zeroize.workspace = true
+zstd.workspace = true
 
 [dev-dependencies]
+criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
 dotenvy.workspace = true
 aws-sdk-s3 = { version = "1", default-features = false, features = ["http-1x", "rt-tokio"] }
 aws-smithy-http-client = { version = "1", features = ["rustls-aws-lc"] }
+
+[[bench]]
+name = "compression"
+harness = false

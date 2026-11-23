@@ -4,6 +4,7 @@
 //! Handles reading/writing StudioFS payload objects to S3-compatible storage via OpenDAL.
 //! Logical payloads are stored as fixed-size cloud fragments where needed.
 
+pub mod compression;
 pub mod crypto;
 pub mod envelope;
 /// OpenDAL-backed object listing and mutation used by the standalone janitor.

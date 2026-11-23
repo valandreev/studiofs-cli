@@ -4,7 +4,7 @@
   "inputs": {
     "lockfile": {
       "path": "Cargo.lock",
-      "sha256": "c5440699a6ad6ea64b03fa99c3c4a941e3b44a6e566718c8780cea98b1eef8b8",
+      "sha256": "3bcb15088d93847411d82e227b3bb56b1ff8c233e9eef95ce48ffd7803a18692",
       "sha256_input": "LF-normalized bytes"
     },
     "metadata_snapshot": {
@@ -15,22 +15,22 @@
     "windows-x86_64": {
       "triple": "x86_64-pc-windows-msvc",
       "selection_source": "cargo tree -e normal,build package set and features; roles propagated through target-filtered metadata restricted to that set",
-      "package_count": 334
+      "package_count": 339
     },
     "linux-x86_64": {
       "triple": "x86_64-unknown-linux-gnu",
       "selection_source": "cargo tree -e normal,build package set and features; roles propagated through target-filtered metadata restricted to that set",
-      "package_count": 375
+      "package_count": 380
     },
     "macos-aarch64": {
       "triple": "aarch64-apple-darwin",
       "selection_source": "cargo tree -e normal,build package set and features; roles propagated through target-filtered metadata restricted to that set",
-      "package_count": 368
+      "package_count": 373
     }
   },
   "package_counts": {
-    "lock_rows": 653,
-    "registry_third_party": 641,
+    "lock_rows": 668,
+    "registry_third_party": 656,
     "workspace": 12
   },
   "packages": [
@@ -742,6 +742,63 @@
       }
     },
     {
+      "name": "alloca",
+      "version": "0.4.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "checksum": "e5a7d05ea6aea7e9e64d25b9156ba2fee3fdd659e34e41063cd2fc7cd020d7f4",
+      "package_kind": "third-party",
+      "license_expression": "MIT",
+      "license_expression_id": "spdx:e5dcffe836b6ec8a",
+      "repository": "https://github.com/playXE/alloca-rs",
+      "manifest": {
+        "path": "registry:registry+https://github.com/rust-lang/crates.io-index#alloca@0.4.0/Cargo.toml",
+        "sha256": "e77ade4f61db4a028745fedd7ace5f38b168189c7684d2422797d1172d3a40ae"
+      },
+      "license_evidence": [
+        {
+          "path": "Cargo.toml",
+          "sha256": "e77ade4f61db4a028745fedd7ace5f38b168189c7684d2422797d1172d3a40ae",
+          "archive_member_sha256": "e77ade4f61db4a028745fedd7ace5f38b168189c7684d2422797d1172d3a40ae",
+          "archive_member_status": "verified"
+        },
+        {
+          "path": "LICENSE",
+          "sha256": "9bfb5d3c11a688a99a8284b2487a55356ca1bfc288a2860fe806d655b84af036",
+          "archive_member_sha256": "9bfb5d3c11a688a99a8284b2487a55356ca1bfc288a2860fe806d655b84af036",
+          "archive_member_status": "verified"
+        }
+      ],
+      "cargo_cache_checksum_evidence": {
+        "kind": "crate-archive",
+        "path": "registry/cache/crates-io/alloca-0.4.0.crate",
+        "sha256": "e5a7d05ea6aea7e9e64d25b9156ba2fee3fdd659e34e41063cd2fc7cd020d7f4"
+      },
+      "source_integrity_status": "verified",
+      "license_evidence_status": "present",
+      "distribution_obligation_profile": "spdx:e5dcffe836b6ec8a",
+      "distribution_obligation_profile_reference": "docs/legal/rust-dependency-audit.md#distribution-profiles",
+      "target_scope_classification": "outside-selected-studiofs-targets",
+      "nonproduction_scope_hints": [
+        "has-target-conditioned-edge"
+      ],
+      "resolved_incoming_dependency_edges": [
+        {
+          "from": {
+            "name": "criterion",
+            "version": "0.8.2",
+            "source": "registry+https://github.com/rust-lang/crates.io-index"
+          },
+          "dependency_kinds": [
+            {
+              "kind": "normal",
+              "target": "cfg(any(windows, unix))"
+            }
+          ]
+        }
+      ],
+      "targets": {}
+    },
+    {
       "name": "allocator-api2",
       "version": "0.2.21",
       "source": "registry+https://github.com/rust-lang/crates.io-index",
@@ -1009,6 +1066,55 @@
             {
               "kind": "normal",
               "target": "cfg(target_os = \"android\")"
+            }
+          ]
+        }
+      ],
+      "targets": {}
+    },
+    {
+      "name": "anes",
+      "version": "0.1.6",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "checksum": "4b46cbb362ab8752921c97e041f5e366ee6297bd428a31275b9fcf1e380f7299",
+      "package_kind": "third-party",
+      "license_expression": "MIT OR Apache-2.0",
+      "license_expression_id": "spdx:db11fec9946737df",
+      "repository": "https://github.com/zrzka/anes-rs",
+      "manifest": {
+        "path": "registry:registry+https://github.com/rust-lang/crates.io-index#anes@0.1.6/Cargo.toml",
+        "sha256": "42baf88fbaa6a98da7fd05e7e5359d5519616c07f3792cd6d706f813081df19b"
+      },
+      "license_evidence": [
+        {
+          "path": "Cargo.toml",
+          "sha256": "42baf88fbaa6a98da7fd05e7e5359d5519616c07f3792cd6d706f813081df19b",
+          "archive_member_sha256": "42baf88fbaa6a98da7fd05e7e5359d5519616c07f3792cd6d706f813081df19b",
+          "archive_member_status": "verified"
+        }
+      ],
+      "cargo_cache_checksum_evidence": {
+        "kind": "crate-archive",
+        "path": "registry/cache/crates-io/anes-0.1.6.crate",
+        "sha256": "4b46cbb362ab8752921c97e041f5e366ee6297bd428a31275b9fcf1e380f7299"
+      },
+      "source_integrity_status": "verified",
+      "license_evidence_status": "missing",
+      "distribution_obligation_profile": "spdx:db11fec9946737df",
+      "distribution_obligation_profile_reference": "docs/legal/rust-dependency-audit.md#distribution-profiles",
+      "target_scope_classification": "outside-selected-studiofs-targets",
+      "nonproduction_scope_hints": [],
+      "resolved_incoming_dependency_edges": [
+        {
+          "from": {
+            "name": "criterion",
+            "version": "0.8.2",
+            "source": "registry+https://github.com/rust-lang/crates.io-index"
+          },
+          "dependency_kinds": [
+            {
+              "kind": "normal",
+              "target": null
             }
           ]
         }
@@ -8245,6 +8351,80 @@
       "targets": {}
     },
     {
+      "name": "cast",
+      "version": "0.3.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "checksum": "37b2a672a2cb129a2e41c10b1224bb368f9f37a2b16b612598138befd7b37eb5",
+      "package_kind": "third-party",
+      "license_expression": "MIT OR Apache-2.0",
+      "license_expression_id": "spdx:db11fec9946737df",
+      "repository": "https://github.com/japaric/cast.rs",
+      "manifest": {
+        "path": "registry:registry+https://github.com/rust-lang/crates.io-index#cast@0.3.0/Cargo.toml",
+        "sha256": "fce66320ad4fa962c38c22656375a2db2666d39d2e7010736cedf98abe95db71"
+      },
+      "license_evidence": [
+        {
+          "path": "Cargo.toml",
+          "sha256": "fce66320ad4fa962c38c22656375a2db2666d39d2e7010736cedf98abe95db71",
+          "archive_member_sha256": "fce66320ad4fa962c38c22656375a2db2666d39d2e7010736cedf98abe95db71",
+          "archive_member_status": "verified"
+        },
+        {
+          "path": "LICENSE-APACHE",
+          "sha256": "a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2",
+          "archive_member_sha256": "a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2",
+          "archive_member_status": "verified"
+        },
+        {
+          "path": "LICENSE-MIT",
+          "sha256": "005b3f9b4687364514bbaea2a25e96d54ce6a59277d157386e8259cbcae8e095",
+          "archive_member_sha256": "005b3f9b4687364514bbaea2a25e96d54ce6a59277d157386e8259cbcae8e095",
+          "archive_member_status": "verified"
+        }
+      ],
+      "cargo_cache_checksum_evidence": {
+        "kind": "crate-archive",
+        "path": "registry/cache/crates-io/cast-0.3.0.crate",
+        "sha256": "37b2a672a2cb129a2e41c10b1224bb368f9f37a2b16b612598138befd7b37eb5"
+      },
+      "source_integrity_status": "verified",
+      "license_evidence_status": "present",
+      "distribution_obligation_profile": "spdx:db11fec9946737df",
+      "distribution_obligation_profile_reference": "docs/legal/rust-dependency-audit.md#distribution-profiles",
+      "target_scope_classification": "outside-selected-studiofs-targets",
+      "nonproduction_scope_hints": [],
+      "resolved_incoming_dependency_edges": [
+        {
+          "from": {
+            "name": "criterion",
+            "version": "0.8.2",
+            "source": "registry+https://github.com/rust-lang/crates.io-index"
+          },
+          "dependency_kinds": [
+            {
+              "kind": "normal",
+              "target": null
+            }
+          ]
+        },
+        {
+          "from": {
+            "name": "criterion-plot",
+            "version": "0.8.2",
+            "source": "registry+https://github.com/rust-lang/crates.io-index"
+          },
+          "dependency_kinds": [
+            {
+              "kind": "normal",
+              "target": null
+            }
+          ]
+        }
+      ],
+      "targets": {}
+    },
+    {
       "name": "cc",
       "version": "1.2.56",
       "source": "registry+https://github.com/rust-lang/crates.io-index",
@@ -8317,6 +8497,19 @@
             {
               "kind": "build",
               "target": "cfg(target_os = \"macos\")"
+            }
+          ]
+        },
+        {
+          "from": {
+            "name": "alloca",
+            "version": "0.4.0",
+            "source": "registry+https://github.com/rust-lang/crates.io-index"
+          },
+          "dependency_kinds": [
+            {
+              "kind": "build",
+              "target": null
             }
           ]
         },
@@ -8426,6 +8619,19 @@
         },
         {
           "from": {
+            "name": "zstd-sys",
+            "version": "2.1.3+zstd.1.5.7",
+            "source": "registry+https://github.com/rust-lang/crates.io-index"
+          },
+          "dependency_kinds": [
+            {
+              "kind": "build",
+              "target": null
+            }
+          ]
+        },
+        {
+          "from": {
             "name": "cmake",
             "version": "0.1.57",
             "source": "registry+https://github.com/rust-lang/crates.io-index"
@@ -8443,19 +8649,25 @@
           "roles": [
             "host-build"
           ],
-          "enabled_features": []
+          "enabled_features": [
+            "parallel"
+          ]
         },
         "linux-x86_64": {
           "roles": [
             "host-build"
           ],
-          "enabled_features": []
+          "enabled_features": [
+            "parallel"
+          ]
         },
         "macos-aarch64": {
           "roles": [
             "host-build"
           ],
-          "enabled_features": []
+          "enabled_features": [
+            "parallel"
+          ]
         }
       }
     },
@@ -8773,6 +8985,19 @@
           "from": {
             "name": "getrandom",
             "version": "0.4.1",
+            "source": "registry+https://github.com/rust-lang/crates.io-index"
+          },
+          "dependency_kinds": [
+            {
+              "kind": "normal",
+              "target": null
+            }
+          ]
+        },
+        {
+          "from": {
+            "name": "half",
+            "version": "2.7.1",
             "source": "registry+https://github.com/rust-lang/crates.io-index"
           },
           "dependency_kinds": [
@@ -9713,6 +9938,184 @@
       }
     },
     {
+      "name": "ciborium",
+      "version": "0.2.2",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "checksum": "42e69ffd6f0917f5c029256a24d0161db17cea3997d185db0d35926308770f0e",
+      "package_kind": "third-party",
+      "license_expression": "Apache-2.0",
+      "license_expression_id": "spdx:2af71558e438db0b",
+      "repository": "https://github.com/enarx/ciborium",
+      "manifest": {
+        "path": "registry:registry+https://github.com/rust-lang/crates.io-index#ciborium@0.2.2/Cargo.toml",
+        "sha256": "b7511734761d1d08e1ab4f7db03f3856a7ec513b018e8c4184157a30869a0520"
+      },
+      "license_evidence": [
+        {
+          "path": "Cargo.toml",
+          "sha256": "b7511734761d1d08e1ab4f7db03f3856a7ec513b018e8c4184157a30869a0520",
+          "archive_member_sha256": "b7511734761d1d08e1ab4f7db03f3856a7ec513b018e8c4184157a30869a0520",
+          "archive_member_status": "verified"
+        },
+        {
+          "path": "LICENSE",
+          "sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4",
+          "archive_member_sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4",
+          "archive_member_status": "verified"
+        }
+      ],
+      "cargo_cache_checksum_evidence": {
+        "kind": "crate-archive",
+        "path": "registry/cache/crates-io/ciborium-0.2.2.crate",
+        "sha256": "42e69ffd6f0917f5c029256a24d0161db17cea3997d185db0d35926308770f0e"
+      },
+      "source_integrity_status": "verified",
+      "license_evidence_status": "present",
+      "distribution_obligation_profile": "spdx:2af71558e438db0b",
+      "distribution_obligation_profile_reference": "docs/legal/rust-dependency-audit.md#distribution-profiles",
+      "target_scope_classification": "outside-selected-studiofs-targets",
+      "nonproduction_scope_hints": [],
+      "resolved_incoming_dependency_edges": [
+        {
+          "from": {
+            "name": "criterion",
+            "version": "0.8.2",
+            "source": "registry+https://github.com/rust-lang/crates.io-index"
+          },
+          "dependency_kinds": [
+            {
+              "kind": "normal",
+              "target": null
+            }
+          ]
+        }
+      ],
+      "targets": {}
+    },
+    {
+      "name": "ciborium-io",
+      "version": "0.2.2",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "checksum": "05afea1e0a06c9be33d539b876f1ce3692f4afea2cb41f740e7743225ed1c757",
+      "package_kind": "third-party",
+      "license_expression": "Apache-2.0",
+      "license_expression_id": "spdx:2af71558e438db0b",
+      "repository": "https://github.com/enarx/ciborium",
+      "manifest": {
+        "path": "registry:registry+https://github.com/rust-lang/crates.io-index#ciborium-io@0.2.2/Cargo.toml",
+        "sha256": "abeba525640ec9d3c21a2505d26a94be52680803baa2c0c3e6a46d0d11a7e534"
+      },
+      "license_evidence": [
+        {
+          "path": "Cargo.toml",
+          "sha256": "abeba525640ec9d3c21a2505d26a94be52680803baa2c0c3e6a46d0d11a7e534",
+          "archive_member_sha256": "abeba525640ec9d3c21a2505d26a94be52680803baa2c0c3e6a46d0d11a7e534",
+          "archive_member_status": "verified"
+        },
+        {
+          "path": "LICENSE",
+          "sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4",
+          "archive_member_sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4",
+          "archive_member_status": "verified"
+        }
+      ],
+      "cargo_cache_checksum_evidence": {
+        "kind": "crate-archive",
+        "path": "registry/cache/crates-io/ciborium-io-0.2.2.crate",
+        "sha256": "05afea1e0a06c9be33d539b876f1ce3692f4afea2cb41f740e7743225ed1c757"
+      },
+      "source_integrity_status": "verified",
+      "license_evidence_status": "present",
+      "distribution_obligation_profile": "spdx:2af71558e438db0b",
+      "distribution_obligation_profile_reference": "docs/legal/rust-dependency-audit.md#distribution-profiles",
+      "target_scope_classification": "outside-selected-studiofs-targets",
+      "nonproduction_scope_hints": [],
+      "resolved_incoming_dependency_edges": [
+        {
+          "from": {
+            "name": "ciborium",
+            "version": "0.2.2",
+            "source": "registry+https://github.com/rust-lang/crates.io-index"
+          },
+          "dependency_kinds": [
+            {
+              "kind": "normal",
+              "target": null
+            }
+          ]
+        },
+        {
+          "from": {
+            "name": "ciborium-ll",
+            "version": "0.2.2",
+            "source": "registry+https://github.com/rust-lang/crates.io-index"
+          },
+          "dependency_kinds": [
+            {
+              "kind": "normal",
+              "target": null
+            }
+          ]
+        }
+      ],
+      "targets": {}
+    },
+    {
+      "name": "ciborium-ll",
+      "version": "0.2.2",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "checksum": "57663b653d948a338bfb3eeba9bb2fd5fcfaecb9e199e87e1eda4d9e8b240fd9",
+      "package_kind": "third-party",
+      "license_expression": "Apache-2.0",
+      "license_expression_id": "spdx:2af71558e438db0b",
+      "repository": "https://github.com/enarx/ciborium",
+      "manifest": {
+        "path": "registry:registry+https://github.com/rust-lang/crates.io-index#ciborium-ll@0.2.2/Cargo.toml",
+        "sha256": "ca45cd09db5f1b8fae6f7f37eb569977ea9e75c9cc19da960b6386e5301438a9"
+      },
+      "license_evidence": [
+        {
+          "path": "Cargo.toml",
+          "sha256": "ca45cd09db5f1b8fae6f7f37eb569977ea9e75c9cc19da960b6386e5301438a9",
+          "archive_member_sha256": "ca45cd09db5f1b8fae6f7f37eb569977ea9e75c9cc19da960b6386e5301438a9",
+          "archive_member_status": "verified"
+        },
+        {
+          "path": "LICENSE",
+          "sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4",
+          "archive_member_sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4",
+          "archive_member_status": "verified"
+        }
+      ],
+      "cargo_cache_checksum_evidence": {
+        "kind": "crate-archive",
+        "path": "registry/cache/crates-io/ciborium-ll-0.2.2.crate",
+        "sha256": "57663b653d948a338bfb3eeba9bb2fd5fcfaecb9e199e87e1eda4d9e8b240fd9"
+      },
+      "source_integrity_status": "verified",
+      "license_evidence_status": "present",
+      "distribution_obligation_profile": "spdx:2af71558e438db0b",
+      "distribution_obligation_profile_reference": "docs/legal/rust-dependency-audit.md#distribution-profiles",
+      "target_scope_classification": "outside-selected-studiofs-targets",
+      "nonproduction_scope_hints": [],
+      "resolved_incoming_dependency_edges": [
+        {
+          "from": {
+            "name": "ciborium",
+            "version": "0.2.2",
+            "source": "registry+https://github.com/rust-lang/crates.io-index"
+          },
+          "dependency_kinds": [
+            {
+              "kind": "normal",
+              "target": null
+            }
+          ]
+        }
+      ],
+      "targets": {}
+    },
+    {
       "name": "cipher",
       "version": "0.4.4",
       "source": "registry+https://github.com/rust-lang/crates.io-index",
@@ -9934,6 +10337,19 @@
       "target_scope_classification": "selected-for-studiofs-target",
       "nonproduction_scope_hints": [],
       "resolved_incoming_dependency_edges": [
+        {
+          "from": {
+            "name": "criterion",
+            "version": "0.8.2",
+            "source": "registry+https://github.com/rust-lang/crates.io-index"
+          },
+          "dependency_kinds": [
+            {
+              "kind": "normal",
+              "target": null
+            }
+          ]
+        },
         {
           "from": {
             "name": "studiofs",
@@ -12274,6 +12690,131 @@
       }
     },
     {
+      "name": "criterion",
+      "version": "0.8.2",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "checksum": "950046b2aa2492f9a536f5f4f9a3de7b9e2476e575e05bd6c333371add4d98f3",
+      "package_kind": "third-party",
+      "license_expression": "Apache-2.0 OR MIT",
+      "license_expression_id": "spdx:12c4662dfa8e784a",
+      "repository": "https://github.com/criterion-rs/criterion.rs",
+      "manifest": {
+        "path": "registry:registry+https://github.com/rust-lang/crates.io-index#criterion@0.8.2/Cargo.toml",
+        "sha256": "058e4ce4a339af60716255c0d662c3efe6efac9da0905371c7f3ff3019822352"
+      },
+      "license_evidence": [
+        {
+          "path": "Cargo.toml",
+          "sha256": "058e4ce4a339af60716255c0d662c3efe6efac9da0905371c7f3ff3019822352",
+          "archive_member_sha256": "058e4ce4a339af60716255c0d662c3efe6efac9da0905371c7f3ff3019822352",
+          "archive_member_status": "verified"
+        },
+        {
+          "path": "LICENSE-APACHE",
+          "sha256": "a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2",
+          "archive_member_sha256": "a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2",
+          "archive_member_status": "verified"
+        },
+        {
+          "path": "LICENSE-MIT",
+          "sha256": "4594f18866be94a3ce309ed8f94d92699f5b87739b76e1216addca75f5253fa7",
+          "archive_member_sha256": "4594f18866be94a3ce309ed8f94d92699f5b87739b76e1216addca75f5253fa7",
+          "archive_member_status": "verified"
+        }
+      ],
+      "cargo_cache_checksum_evidence": {
+        "kind": "crate-archive",
+        "path": "registry/cache/crates-io/criterion-0.8.2.crate",
+        "sha256": "950046b2aa2492f9a536f5f4f9a3de7b9e2476e575e05bd6c333371add4d98f3"
+      },
+      "source_integrity_status": "verified",
+      "license_evidence_status": "present",
+      "distribution_obligation_profile": "spdx:12c4662dfa8e784a",
+      "distribution_obligation_profile_reference": "docs/legal/rust-dependency-audit.md#distribution-profiles",
+      "target_scope_classification": "outside-selected-studiofs-targets",
+      "nonproduction_scope_hints": [
+        "has-workspace-or-dependency-dev-edge"
+      ],
+      "resolved_incoming_dependency_edges": [
+        {
+          "from": {
+            "name": "studiofs-data",
+            "version": "0.2.4",
+            "source": null,
+            "workspace_path": "crates/studiofs-data"
+          },
+          "dependency_kinds": [
+            {
+              "kind": "dev",
+              "target": null
+            }
+          ]
+        }
+      ],
+      "targets": {}
+    },
+    {
+      "name": "criterion-plot",
+      "version": "0.8.2",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "checksum": "d8d80a2f4f5b554395e47b5d8305bc3d27813bacb73493eb1001e8f76dae29ea",
+      "package_kind": "third-party",
+      "license_expression": "Apache-2.0 OR MIT",
+      "license_expression_id": "spdx:12c4662dfa8e784a",
+      "repository": "https://github.com/criterion-rs/criterion.rs",
+      "manifest": {
+        "path": "registry:registry+https://github.com/rust-lang/crates.io-index#criterion-plot@0.8.2/Cargo.toml",
+        "sha256": "ebfb2a8e125b318042ac3ecc8b3d44594a944beedf228dbaf2effc1c2ec643a8"
+      },
+      "license_evidence": [
+        {
+          "path": "Cargo.toml",
+          "sha256": "ebfb2a8e125b318042ac3ecc8b3d44594a944beedf228dbaf2effc1c2ec643a8",
+          "archive_member_sha256": "ebfb2a8e125b318042ac3ecc8b3d44594a944beedf228dbaf2effc1c2ec643a8",
+          "archive_member_status": "verified"
+        },
+        {
+          "path": "LICENSE-APACHE",
+          "sha256": "a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2",
+          "archive_member_sha256": "a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2",
+          "archive_member_status": "verified"
+        },
+        {
+          "path": "LICENSE-MIT",
+          "sha256": "4594f18866be94a3ce309ed8f94d92699f5b87739b76e1216addca75f5253fa7",
+          "archive_member_sha256": "4594f18866be94a3ce309ed8f94d92699f5b87739b76e1216addca75f5253fa7",
+          "archive_member_status": "verified"
+        }
+      ],
+      "cargo_cache_checksum_evidence": {
+        "kind": "crate-archive",
+        "path": "registry/cache/crates-io/criterion-plot-0.8.2.crate",
+        "sha256": "d8d80a2f4f5b554395e47b5d8305bc3d27813bacb73493eb1001e8f76dae29ea"
+      },
+      "source_integrity_status": "verified",
+      "license_evidence_status": "present",
+      "distribution_obligation_profile": "spdx:12c4662dfa8e784a",
+      "distribution_obligation_profile_reference": "docs/legal/rust-dependency-audit.md#distribution-profiles",
+      "target_scope_classification": "outside-selected-studiofs-targets",
+      "nonproduction_scope_hints": [],
+      "resolved_incoming_dependency_edges": [
+        {
+          "from": {
+            "name": "criterion",
+            "version": "0.8.2",
+            "source": "registry+https://github.com/rust-lang/crates.io-index"
+          },
+          "dependency_kinds": [
+            {
+              "kind": "normal",
+              "target": null
+            }
+          ]
+        }
+      ],
+      "targets": {}
+    },
+    {
       "name": "critical-section",
       "version": "1.2.0",
       "source": "registry+https://github.com/rust-lang/crates.io-index",
@@ -12692,8 +13233,23 @@
       "distribution_obligation_profile": "spdx:e5dcffe836b6ec8a",
       "distribution_obligation_profile_reference": "docs/legal/rust-dependency-audit.md#distribution-profiles",
       "target_scope_classification": "selected-for-studiofs-target",
-      "nonproduction_scope_hints": [],
+      "nonproduction_scope_hints": [
+        "has-target-conditioned-edge"
+      ],
       "resolved_incoming_dependency_edges": [
+        {
+          "from": {
+            "name": "half",
+            "version": "2.7.1",
+            "source": "registry+https://github.com/rust-lang/crates.io-index"
+          },
+          "dependency_kinds": [
+            {
+              "kind": "normal",
+              "target": "cfg(target_arch = \"spirv\")"
+            }
+          ]
+        },
         {
           "from": {
             "name": "tiny-keccak",
@@ -19616,6 +20172,7 @@
       "targets": {
         "windows-x86_64": {
           "roles": [
+            "host-build",
             "runtime"
           ],
           "enabled_features": [
@@ -20264,6 +20821,67 @@
           "from": {
             "name": "hyper",
             "version": "1.8.1",
+            "source": "registry+https://github.com/rust-lang/crates.io-index"
+          },
+          "dependency_kinds": [
+            {
+              "kind": "normal",
+              "target": null
+            }
+          ]
+        }
+      ],
+      "targets": {}
+    },
+    {
+      "name": "half",
+      "version": "2.7.1",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "checksum": "6ea2d84b969582b4b1864a92dc5d27cd2b77b622a8d79306834f1be5ba20d84b",
+      "package_kind": "third-party",
+      "license_expression": "MIT OR Apache-2.0",
+      "license_expression_id": "spdx:db11fec9946737df",
+      "repository": "https://github.com/VoidStarKat/half-rs",
+      "manifest": {
+        "path": "registry:registry+https://github.com/rust-lang/crates.io-index#half@2.7.1/Cargo.toml",
+        "sha256": "cb0325b14b6e12ea7c027da7084877327b91368efc7a3c9cfac1c19c0fd4061d"
+      },
+      "license_evidence": [
+        {
+          "path": "Cargo.toml",
+          "sha256": "cb0325b14b6e12ea7c027da7084877327b91368efc7a3c9cfac1c19c0fd4061d",
+          "archive_member_sha256": "cb0325b14b6e12ea7c027da7084877327b91368efc7a3c9cfac1c19c0fd4061d",
+          "archive_member_status": "verified"
+        },
+        {
+          "path": "LICENSE-APACHE",
+          "sha256": "a6cba85bc92e0cff7a450b1d873c0eaa2e9fc96bf472df0247a26bec77bf3ff9",
+          "archive_member_sha256": "a6cba85bc92e0cff7a450b1d873c0eaa2e9fc96bf472df0247a26bec77bf3ff9",
+          "archive_member_status": "verified"
+        },
+        {
+          "path": "LICENSE-MIT",
+          "sha256": "508a77d2e7b51d98adeed32648ad124b7b30241a8e70b2e72c99f92d8e5874d1",
+          "archive_member_sha256": "508a77d2e7b51d98adeed32648ad124b7b30241a8e70b2e72c99f92d8e5874d1",
+          "archive_member_status": "verified"
+        }
+      ],
+      "cargo_cache_checksum_evidence": {
+        "kind": "crate-archive",
+        "path": "registry/cache/crates-io/half-2.7.1.crate",
+        "sha256": "6ea2d84b969582b4b1864a92dc5d27cd2b77b622a8d79306834f1be5ba20d84b"
+      },
+      "source_integrity_status": "verified",
+      "license_evidence_status": "present",
+      "distribution_obligation_profile": "spdx:db11fec9946737df",
+      "distribution_obligation_profile_reference": "docs/legal/rust-dependency-audit.md#distribution-profiles",
+      "target_scope_classification": "outside-selected-studiofs-targets",
+      "nonproduction_scope_hints": [],
+      "resolved_incoming_dependency_edges": [
+        {
+          "from": {
+            "name": "ciborium-ll",
+            "version": "0.2.2",
             "source": "registry+https://github.com/rust-lang/crates.io-index"
           },
           "dependency_kinds": [
@@ -24633,6 +25251,32 @@
         },
         {
           "from": {
+            "name": "criterion",
+            "version": "0.8.2",
+            "source": "registry+https://github.com/rust-lang/crates.io-index"
+          },
+          "dependency_kinds": [
+            {
+              "kind": "normal",
+              "target": null
+            }
+          ]
+        },
+        {
+          "from": {
+            "name": "criterion-plot",
+            "version": "0.8.2",
+            "source": "registry+https://github.com/rust-lang/crates.io-index"
+          },
+          "dependency_kinds": [
+            {
+              "kind": "normal",
+              "target": null
+            }
+          ]
+        },
+        {
+          "from": {
             "name": "prost-derive",
             "version": "0.14.3",
             "source": "registry+https://github.com/rust-lang/crates.io-index"
@@ -25583,7 +26227,7 @@
       "license_evidence_status": "present",
       "distribution_obligation_profile": "spdx:db11fec9946737df",
       "distribution_obligation_profile_reference": "docs/legal/rust-dependency-audit.md#distribution-profiles",
-      "target_scope_classification": "outside-selected-studiofs-targets",
+      "target_scope_classification": "selected-for-studiofs-target",
       "nonproduction_scope_hints": [],
       "resolved_incoming_dependency_edges": [
         {
@@ -25600,7 +26244,26 @@
           ]
         }
       ],
-      "targets": {}
+      "targets": {
+        "windows-x86_64": {
+          "roles": [
+            "host-build"
+          ],
+          "enabled_features": []
+        },
+        "linux-x86_64": {
+          "roles": [
+            "host-build"
+          ],
+          "enabled_features": []
+        },
+        "macos-aarch64": {
+          "roles": [
+            "host-build"
+          ],
+          "enabled_features": []
+        }
+      }
     },
     {
       "name": "js-sys",
@@ -26649,6 +27312,19 @@
           "from": {
             "name": "memmap2",
             "version": "0.9.10",
+            "source": "registry+https://github.com/rust-lang/crates.io-index"
+          },
+          "dependency_kinds": [
+            {
+              "kind": "normal",
+              "target": "cfg(unix)"
+            }
+          ]
+        },
+        {
+          "from": {
+            "name": "page_size",
+            "version": "0.6.0",
             "source": "registry+https://github.com/rust-lang/crates.io-index"
           },
           "dependency_kinds": [
@@ -31487,6 +32163,19 @@
         },
         {
           "from": {
+            "name": "criterion",
+            "version": "0.8.2",
+            "source": "registry+https://github.com/rust-lang/crates.io-index"
+          },
+          "dependency_kinds": [
+            {
+              "kind": "normal",
+              "target": null
+            }
+          ]
+        },
+        {
+          "from": {
             "name": "image",
             "version": "0.25.10",
             "source": "registry+https://github.com/rust-lang/crates.io-index"
@@ -35739,6 +36428,61 @@
       }
     },
     {
+      "name": "oorandom",
+      "version": "11.1.5",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "checksum": "d6790f58c7ff633d8771f42965289203411a5e5c68388703c06e14f24770b41e",
+      "package_kind": "third-party",
+      "license_expression": "MIT",
+      "license_expression_id": "spdx:e5dcffe836b6ec8a",
+      "repository": "https://hg.sr.ht/~icefox/oorandom",
+      "manifest": {
+        "path": "registry:registry+https://github.com/rust-lang/crates.io-index#oorandom@11.1.5/Cargo.toml",
+        "sha256": "c2d20a6c59f36e8ce5912d434a19dd4946f1599ce36556d4879e2043c7dd1d14"
+      },
+      "license_evidence": [
+        {
+          "path": "Cargo.toml",
+          "sha256": "c2d20a6c59f36e8ce5912d434a19dd4946f1599ce36556d4879e2043c7dd1d14",
+          "archive_member_sha256": "c2d20a6c59f36e8ce5912d434a19dd4946f1599ce36556d4879e2043c7dd1d14",
+          "archive_member_status": "verified"
+        },
+        {
+          "path": "LICENSE-MIT",
+          "sha256": "e3f96201e81ea40ed151ec06694dd5b1d9e6b94a74f47a1c45779c4b8a293888",
+          "archive_member_sha256": "e3f96201e81ea40ed151ec06694dd5b1d9e6b94a74f47a1c45779c4b8a293888",
+          "archive_member_status": "verified"
+        }
+      ],
+      "cargo_cache_checksum_evidence": {
+        "kind": "crate-archive",
+        "path": "registry/cache/crates-io/oorandom-11.1.5.crate",
+        "sha256": "d6790f58c7ff633d8771f42965289203411a5e5c68388703c06e14f24770b41e"
+      },
+      "source_integrity_status": "verified",
+      "license_evidence_status": "present",
+      "distribution_obligation_profile": "spdx:e5dcffe836b6ec8a",
+      "distribution_obligation_profile_reference": "docs/legal/rust-dependency-audit.md#distribution-profiles",
+      "target_scope_classification": "outside-selected-studiofs-targets",
+      "nonproduction_scope_hints": [],
+      "resolved_incoming_dependency_edges": [
+        {
+          "from": {
+            "name": "criterion",
+            "version": "0.8.2",
+            "source": "registry+https://github.com/rust-lang/crates.io-index"
+          },
+          "dependency_kinds": [
+            {
+              "kind": "normal",
+              "target": null
+            }
+          ]
+        }
+      ],
+      "targets": {}
+    },
+    {
       "name": "opaque-debug",
       "version": "0.3.1",
       "source": "registry+https://github.com/rust-lang/crates.io-index",
@@ -36379,6 +37123,67 @@
           "from": {
             "name": "ab_glyph",
             "version": "0.2.32",
+            "source": "registry+https://github.com/rust-lang/crates.io-index"
+          },
+          "dependency_kinds": [
+            {
+              "kind": "normal",
+              "target": null
+            }
+          ]
+        }
+      ],
+      "targets": {}
+    },
+    {
+      "name": "page_size",
+      "version": "0.6.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "checksum": "30d5b2194ed13191c1999ae0704b7839fb18384fa22e49b57eeaa97d79ce40da",
+      "package_kind": "third-party",
+      "license_expression": "MIT/Apache-2.0",
+      "license_expression_id": "spdx:ec5c82d846feaa2a",
+      "repository": "https://github.com/Elzair/page_size_rs",
+      "manifest": {
+        "path": "registry:registry+https://github.com/rust-lang/crates.io-index#page_size@0.6.0/Cargo.toml",
+        "sha256": "353701175f61ca094b2053c31127ba9e36195a1bdd10596a331a57a70c2fc918"
+      },
+      "license_evidence": [
+        {
+          "path": "Cargo.toml",
+          "sha256": "353701175f61ca094b2053c31127ba9e36195a1bdd10596a331a57a70c2fc918",
+          "archive_member_sha256": "353701175f61ca094b2053c31127ba9e36195a1bdd10596a331a57a70c2fc918",
+          "archive_member_status": "verified"
+        },
+        {
+          "path": "LICENSE-APACHE",
+          "sha256": "769f80b5bcb42ed0af4e4d2fd74e1ac9bf843cb80c5a29219d1ef3544428a6bb",
+          "archive_member_sha256": "769f80b5bcb42ed0af4e4d2fd74e1ac9bf843cb80c5a29219d1ef3544428a6bb",
+          "archive_member_status": "verified"
+        },
+        {
+          "path": "LICENSE-MIT",
+          "sha256": "14435fbcd271e2783f721b57b7bf4f6502c1379249a4300e0e5bb774686c2d90",
+          "archive_member_sha256": "14435fbcd271e2783f721b57b7bf4f6502c1379249a4300e0e5bb774686c2d90",
+          "archive_member_status": "verified"
+        }
+      ],
+      "cargo_cache_checksum_evidence": {
+        "kind": "crate-archive",
+        "path": "registry/cache/crates-io/page_size-0.6.0.crate",
+        "sha256": "30d5b2194ed13191c1999ae0704b7839fb18384fa22e49b57eeaa97d79ce40da"
+      },
+      "source_integrity_status": "verified",
+      "license_evidence_status": "present",
+      "distribution_obligation_profile": "spdx:ec5c82d846feaa2a",
+      "distribution_obligation_profile_reference": "docs/legal/rust-dependency-audit.md#distribution-profiles",
+      "target_scope_classification": "outside-selected-studiofs-targets",
+      "nonproduction_scope_hints": [],
+      "resolved_incoming_dependency_edges": [
+        {
+          "from": {
+            "name": "criterion",
+            "version": "0.8.2",
             "source": "registry+https://github.com/rust-lang/crates.io-index"
           },
           "dependency_kinds": [
@@ -38418,7 +39223,7 @@
       "license_evidence_status": "present",
       "distribution_obligation_profile": "spdx:db11fec9946737df",
       "distribution_obligation_profile_reference": "docs/legal/rust-dependency-audit.md#distribution-profiles",
-      "target_scope_classification": "outside-selected-studiofs-targets",
+      "target_scope_classification": "selected-for-studiofs-target",
       "nonproduction_scope_hints": [
         "has-build-edge",
         "has-target-conditioned-edge"
@@ -38476,9 +39281,41 @@
               "target": null
             }
           ]
+        },
+        {
+          "from": {
+            "name": "zstd-sys",
+            "version": "2.1.3+zstd.1.5.7",
+            "source": "registry+https://github.com/rust-lang/crates.io-index"
+          },
+          "dependency_kinds": [
+            {
+              "kind": "build",
+              "target": null
+            }
+          ]
         }
       ],
-      "targets": {}
+      "targets": {
+        "windows-x86_64": {
+          "roles": [
+            "host-build"
+          ],
+          "enabled_features": []
+        },
+        "linux-x86_64": {
+          "roles": [
+            "host-build"
+          ],
+          "enabled_features": []
+        },
+        "macos-aarch64": {
+          "roles": [
+            "host-build"
+          ],
+          "enabled_features": []
+        }
+      }
     },
     {
       "name": "plain",
@@ -43352,6 +44189,19 @@
               "target": null
             }
           ]
+        },
+        {
+          "from": {
+            "name": "criterion",
+            "version": "0.8.2",
+            "source": "registry+https://github.com/rust-lang/crates.io-index"
+          },
+          "dependency_kinds": [
+            {
+              "kind": "normal",
+              "target": null
+            }
+          ]
         }
       ],
       "targets": {
@@ -46498,6 +47348,32 @@
         },
         {
           "from": {
+            "name": "ciborium",
+            "version": "0.2.2",
+            "source": "registry+https://github.com/rust-lang/crates.io-index"
+          },
+          "dependency_kinds": [
+            {
+              "kind": "normal",
+              "target": null
+            }
+          ]
+        },
+        {
+          "from": {
+            "name": "criterion",
+            "version": "0.8.2",
+            "source": "registry+https://github.com/rust-lang/crates.io-index"
+          },
+          "dependency_kinds": [
+            {
+              "kind": "normal",
+              "target": null
+            }
+          ]
+        },
+        {
+          "from": {
             "name": "enumflags2",
             "version": "0.7.12",
             "source": "registry+https://github.com/rust-lang/crates.io-index"
@@ -46766,6 +47642,19 @@
             "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs-vfs"
+          },
+          "dependency_kinds": [
+            {
+              "kind": "normal",
+              "target": null
+            }
+          ]
+        },
+        {
+          "from": {
+            "name": "tinytemplate",
+            "version": "1.2.1",
+            "source": "registry+https://github.com/rust-lang/crates.io-index"
           },
           "dependency_kinds": [
             {
@@ -47409,6 +48298,19 @@
         },
         {
           "from": {
+            "name": "criterion",
+            "version": "0.8.2",
+            "source": "registry+https://github.com/rust-lang/crates.io-index"
+          },
+          "dependency_kinds": [
+            {
+              "kind": "normal",
+              "target": null
+            }
+          ]
+        },
+        {
+          "from": {
             "name": "opendal",
             "version": "0.55.0",
             "source": "registry+https://github.com/rust-lang/crates.io-index"
@@ -47508,6 +48410,19 @@
             "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs-vfs"
+          },
+          "dependency_kinds": [
+            {
+              "kind": "normal",
+              "target": null
+            }
+          ]
+        },
+        {
+          "from": {
+            "name": "tinytemplate",
+            "version": "1.2.1",
+            "source": "registry+https://github.com/rust-lang/crates.io-index"
           },
           "dependency_kinds": [
             {
@@ -50389,12 +51304,12 @@
       "repository": null,
       "manifest": {
         "path": "crates/studiofs-data/Cargo.toml",
-        "sha256": "7df3f6707f782aa5831ebbf65cc224458cb52ef0192c9b5a2b809f8fbed4776e"
+        "sha256": "75055042a6d56591b6f1d1317337c1ad1c19a394b287890ce720983670f915a4"
       },
       "license_evidence": [
         {
           "path": "Cargo.toml",
-          "sha256": "7df3f6707f782aa5831ebbf65cc224458cb52ef0192c9b5a2b809f8fbed4776e"
+          "sha256": "75055042a6d56591b6f1d1317337c1ad1c19a394b287890ce720983670f915a4"
         }
       ],
       "cargo_cache_checksum_evidence": null,
@@ -54172,6 +55087,67 @@
           ]
         }
       }
+    },
+    {
+      "name": "tinytemplate",
+      "version": "1.2.1",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "checksum": "be4d6b5f19ff7664e8c98d03e2139cb510db9b0a60b55f8e8709b689d939b6bc",
+      "package_kind": "third-party",
+      "license_expression": "Apache-2.0 OR MIT",
+      "license_expression_id": "spdx:12c4662dfa8e784a",
+      "repository": "https://github.com/bheisler/TinyTemplate",
+      "manifest": {
+        "path": "registry:registry+https://github.com/rust-lang/crates.io-index#tinytemplate@1.2.1/Cargo.toml",
+        "sha256": "f5e4758f59eb8cebd7cfb8553d2158223f24fc4716327e2a1de3a8726b8bc441"
+      },
+      "license_evidence": [
+        {
+          "path": "Cargo.toml",
+          "sha256": "f5e4758f59eb8cebd7cfb8553d2158223f24fc4716327e2a1de3a8726b8bc441",
+          "archive_member_sha256": "f5e4758f59eb8cebd7cfb8553d2158223f24fc4716327e2a1de3a8726b8bc441",
+          "archive_member_status": "verified"
+        },
+        {
+          "path": "LICENSE-APACHE",
+          "sha256": "a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2",
+          "archive_member_sha256": "a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2",
+          "archive_member_status": "verified"
+        },
+        {
+          "path": "LICENSE-MIT",
+          "sha256": "b6d10b8851a36aa6ec9612a186e56c2fcea0ad7db7b90c3dda1d16ae27c0077e",
+          "archive_member_sha256": "b6d10b8851a36aa6ec9612a186e56c2fcea0ad7db7b90c3dda1d16ae27c0077e",
+          "archive_member_status": "verified"
+        }
+      ],
+      "cargo_cache_checksum_evidence": {
+        "kind": "crate-archive",
+        "path": "registry/cache/crates-io/tinytemplate-1.2.1.crate",
+        "sha256": "be4d6b5f19ff7664e8c98d03e2139cb510db9b0a60b55f8e8709b689d939b6bc"
+      },
+      "source_integrity_status": "verified",
+      "license_evidence_status": "present",
+      "distribution_obligation_profile": "spdx:12c4662dfa8e784a",
+      "distribution_obligation_profile_reference": "docs/legal/rust-dependency-audit.md#distribution-profiles",
+      "target_scope_classification": "outside-selected-studiofs-targets",
+      "nonproduction_scope_hints": [],
+      "resolved_incoming_dependency_edges": [
+        {
+          "from": {
+            "name": "criterion",
+            "version": "0.8.2",
+            "source": "registry+https://github.com/rust-lang/crates.io-index"
+          },
+          "dependency_kinds": [
+            {
+              "kind": "normal",
+              "target": null
+            }
+          ]
+        }
+      ],
+      "targets": {}
     },
     {
       "name": "tinyvec",
@@ -59449,6 +60425,19 @@
               "target": null
             }
           ]
+        },
+        {
+          "from": {
+            "name": "criterion",
+            "version": "0.8.2",
+            "source": "registry+https://github.com/rust-lang/crates.io-index"
+          },
+          "dependency_kinds": [
+            {
+              "kind": "normal",
+              "target": null
+            }
+          ]
         }
       ],
       "targets": {}
@@ -62036,6 +63025,19 @@
         },
         {
           "from": {
+            "name": "page_size",
+            "version": "0.6.0",
+            "source": "registry+https://github.com/rust-lang/crates.io-index"
+          },
+          "dependency_kinds": [
+            {
+              "kind": "normal",
+              "target": "cfg(windows)"
+            }
+          ]
+        },
+        {
+          "from": {
             "name": "ntapi",
             "version": "0.4.3",
             "source": "registry+https://github.com/rust-lang/crates.io-index"
@@ -64048,84 +65050,6 @@
               "target": "cfg(target_os = \"windows\")"
             }
           ]
-        },
-        {
-          "from": {
-            "name": "errno",
-            "version": "0.3.14",
-            "source": "registry+https://github.com/rust-lang/crates.io-index"
-          },
-          "dependency_kinds": [
-            {
-              "kind": "normal",
-              "target": "cfg(windows)"
-            }
-          ]
-        },
-        {
-          "from": {
-            "name": "jiff",
-            "version": "0.2.20",
-            "source": "registry+https://github.com/rust-lang/crates.io-index"
-          },
-          "dependency_kinds": [
-            {
-              "kind": "normal",
-              "target": "cfg(windows)"
-            }
-          ]
-        },
-        {
-          "from": {
-            "name": "quinn-udp",
-            "version": "0.5.16",
-            "source": "registry+https://github.com/rust-lang/crates.io-index"
-          },
-          "dependency_kinds": [
-            {
-              "kind": "normal",
-              "target": "cfg(windows)"
-            }
-          ]
-        },
-        {
-          "from": {
-            "name": "rustix",
-            "version": "1.1.3",
-            "source": "registry+https://github.com/rust-lang/crates.io-index"
-          },
-          "dependency_kinds": [
-            {
-              "kind": "normal",
-              "target": "cfg(windows)"
-            }
-          ]
-        },
-        {
-          "from": {
-            "name": "tempfile",
-            "version": "3.25.0",
-            "source": "registry+https://github.com/rust-lang/crates.io-index"
-          },
-          "dependency_kinds": [
-            {
-              "kind": "normal",
-              "target": "cfg(windows)"
-            }
-          ]
-        },
-        {
-          "from": {
-            "name": "winapi-util",
-            "version": "0.1.11",
-            "source": "registry+https://github.com/rust-lang/crates.io-index"
-          },
-          "dependency_kinds": [
-            {
-              "kind": "normal",
-              "target": "cfg(windows)"
-            }
-          ]
         }
       ],
       "targets": {
@@ -64144,8 +65068,6 @@
             "Win32_Graphics_Gdi",
             "Win32_Media",
             "Win32_Security",
-            "Win32_Storage",
-            "Win32_Storage_FileSystem",
             "Win32_System",
             "Win32_System_Com",
             "Win32_System_Com_StructuredStorage",
@@ -64154,7 +65076,6 @@
             "Win32_System_SystemInformation",
             "Win32_System_SystemServices",
             "Win32_System_Threading",
-            "Win32_System_Time",
             "Win32_System_WindowsProgramming",
             "Win32_UI",
             "Win32_UI_Accessibility",
@@ -64222,32 +65143,6 @@
       "resolved_incoming_dependency_edges": [
         {
           "from": {
-            "name": "dirs-sys",
-            "version": "0.5.0",
-            "source": "registry+https://github.com/rust-lang/crates.io-index"
-          },
-          "dependency_kinds": [
-            {
-              "kind": "normal",
-              "target": "cfg(windows)"
-            }
-          ]
-        },
-        {
-          "from": {
-            "name": "nu-ansi-term",
-            "version": "0.50.3",
-            "source": "registry+https://github.com/rust-lang/crates.io-index"
-          },
-          "dependency_kinds": [
-            {
-              "kind": "normal",
-              "target": "cfg(windows)"
-            }
-          ]
-        },
-        {
-          "from": {
             "name": "rustix",
             "version": "0.38.44",
             "source": "registry+https://github.com/rust-lang/crates.io-index"
@@ -64281,19 +65176,14 @@
           "enabled_features": [
             "Win32",
             "Win32_Foundation",
-            "Win32_Globalization",
             "Win32_Security",
             "Win32_Storage",
             "Win32_Storage_FileSystem",
             "Win32_System",
-            "Win32_System_Com",
-            "Win32_System_Console",
             "Win32_System_Diagnostics",
             "Win32_System_Diagnostics_Debug",
             "Win32_System_Registry",
             "Win32_System_Time",
-            "Win32_UI",
-            "Win32_UI_Shell",
             "default"
           ]
         }
@@ -64439,8 +65329,47 @@
         },
         {
           "from": {
+            "name": "dirs-sys",
+            "version": "0.5.0",
+            "source": "registry+https://github.com/rust-lang/crates.io-index"
+          },
+          "dependency_kinds": [
+            {
+              "kind": "normal",
+              "target": "cfg(windows)"
+            }
+          ]
+        },
+        {
+          "from": {
+            "name": "errno",
+            "version": "0.3.14",
+            "source": "registry+https://github.com/rust-lang/crates.io-index"
+          },
+          "dependency_kinds": [
+            {
+              "kind": "normal",
+              "target": "cfg(windows)"
+            }
+          ]
+        },
+        {
+          "from": {
             "name": "home",
             "version": "0.5.12",
+            "source": "registry+https://github.com/rust-lang/crates.io-index"
+          },
+          "dependency_kinds": [
+            {
+              "kind": "normal",
+              "target": "cfg(windows)"
+            }
+          ]
+        },
+        {
+          "from": {
+            "name": "jiff",
+            "version": "0.2.20",
             "source": "registry+https://github.com/rust-lang/crates.io-index"
           },
           "dependency_kinds": [
@@ -64465,6 +65394,19 @@
         },
         {
           "from": {
+            "name": "nu-ansi-term",
+            "version": "0.50.3",
+            "source": "registry+https://github.com/rust-lang/crates.io-index"
+          },
+          "dependency_kinds": [
+            {
+              "kind": "normal",
+              "target": "cfg(windows)"
+            }
+          ]
+        },
+        {
+          "from": {
             "name": "polling",
             "version": "3.11.0",
             "source": "registry+https://github.com/rust-lang/crates.io-index"
@@ -64478,8 +65420,47 @@
         },
         {
           "from": {
+            "name": "quinn-udp",
+            "version": "0.5.16",
+            "source": "registry+https://github.com/rust-lang/crates.io-index"
+          },
+          "dependency_kinds": [
+            {
+              "kind": "normal",
+              "target": "cfg(windows)"
+            }
+          ]
+        },
+        {
+          "from": {
+            "name": "rustix",
+            "version": "1.1.3",
+            "source": "registry+https://github.com/rust-lang/crates.io-index"
+          },
+          "dependency_kinds": [
+            {
+              "kind": "normal",
+              "target": "cfg(windows)"
+            }
+          ]
+        },
+        {
+          "from": {
             "name": "socket2",
             "version": "0.6.5",
+            "source": "registry+https://github.com/rust-lang/crates.io-index"
+          },
+          "dependency_kinds": [
+            {
+              "kind": "normal",
+              "target": "cfg(windows)"
+            }
+          ]
+        },
+        {
+          "from": {
+            "name": "tempfile",
+            "version": "3.25.0",
             "source": "registry+https://github.com/rust-lang/crates.io-index"
           },
           "dependency_kinds": [
@@ -64506,6 +65487,19 @@
           "from": {
             "name": "uds_windows",
             "version": "1.2.1",
+            "source": "registry+https://github.com/rust-lang/crates.io-index"
+          },
+          "dependency_kinds": [
+            {
+              "kind": "normal",
+              "target": "cfg(windows)"
+            }
+          ]
+        },
+        {
+          "from": {
+            "name": "winapi-util",
+            "version": "0.1.11",
             "source": "registry+https://github.com/rust-lang/crates.io-index"
           },
           "dependency_kinds": [
@@ -64572,6 +65566,7 @@
             "Win32_System_Pipes",
             "Win32_System_SystemServices",
             "Win32_System_Threading",
+            "Win32_System_Time",
             "Win32_System_WindowsProgramming",
             "Win32_UI",
             "Win32_UI_Accessibility",
@@ -67361,6 +68356,19 @@
         },
         {
           "from": {
+            "name": "half",
+            "version": "2.7.1",
+            "source": "registry+https://github.com/rust-lang/crates.io-index"
+          },
+          "dependency_kinds": [
+            {
+              "kind": "normal",
+              "target": null
+            }
+          ]
+        },
+        {
+          "from": {
             "name": "macho-unwind-info",
             "version": "0.5.0",
             "source": "registry+https://github.com/rust-lang/crates.io-index"
@@ -67486,6 +68494,10 @@
             "source": "registry+https://github.com/rust-lang/crates.io-index"
           },
           "dependency_kinds": [
+            {
+              "kind": "normal",
+              "target": null
+            },
             {
               "kind": "normal",
               "target": "cfg(any())"
@@ -68436,6 +69448,268 @@
             "runtime"
           ],
           "enabled_features": []
+        }
+      }
+    },
+    {
+      "name": "zstd",
+      "version": "0.14.4",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "checksum": "ad5020ab8f27bfc0024ad0a07aed6bf022a16208f479686fbed4fdd0c85eb0b3",
+      "package_kind": "third-party",
+      "license_expression": "BSD-3-Clause",
+      "license_expression_id": "spdx:118dbcd2d5c9f9b2",
+      "repository": "https://github.com/gyscos/zstd-rs",
+      "manifest": {
+        "path": "registry:registry+https://github.com/rust-lang/crates.io-index#zstd@0.14.4/Cargo.toml",
+        "sha256": "8dd17f1ba072fb0d12cc2f688b87cbbd3e66445a0c7cf16a6f43aeb20367f500"
+      },
+      "license_evidence": [
+        {
+          "path": "Cargo.toml",
+          "sha256": "8dd17f1ba072fb0d12cc2f688b87cbbd3e66445a0c7cf16a6f43aeb20367f500",
+          "archive_member_sha256": "8dd17f1ba072fb0d12cc2f688b87cbbd3e66445a0c7cf16a6f43aeb20367f500",
+          "archive_member_status": "verified"
+        },
+        {
+          "path": "LICENSE",
+          "sha256": "ce4868c8e4ebe47a7d4b3c93dbf6b802033e5ae2fa7638098173f80836daac60",
+          "archive_member_sha256": "ce4868c8e4ebe47a7d4b3c93dbf6b802033e5ae2fa7638098173f80836daac60",
+          "archive_member_status": "verified"
+        }
+      ],
+      "cargo_cache_checksum_evidence": {
+        "kind": "crate-archive",
+        "path": "registry/cache/crates-io/zstd-0.14.4.crate",
+        "sha256": "ad5020ab8f27bfc0024ad0a07aed6bf022a16208f479686fbed4fdd0c85eb0b3"
+      },
+      "source_integrity_status": "verified",
+      "license_evidence_status": "present",
+      "distribution_obligation_profile": "spdx:118dbcd2d5c9f9b2",
+      "distribution_obligation_profile_reference": "docs/legal/rust-dependency-audit.md#distribution-profiles",
+      "target_scope_classification": "selected-for-studiofs-target",
+      "nonproduction_scope_hints": [],
+      "resolved_incoming_dependency_edges": [
+        {
+          "from": {
+            "name": "studiofs-data",
+            "version": "0.2.4",
+            "source": null,
+            "workspace_path": "crates/studiofs-data"
+          },
+          "dependency_kinds": [
+            {
+              "kind": "normal",
+              "target": null
+            }
+          ]
+        }
+      ],
+      "targets": {
+        "windows-x86_64": {
+          "roles": [
+            "runtime"
+          ],
+          "enabled_features": []
+        },
+        "linux-x86_64": {
+          "roles": [
+            "runtime"
+          ],
+          "enabled_features": []
+        },
+        "macos-aarch64": {
+          "roles": [
+            "runtime"
+          ],
+          "enabled_features": []
+        }
+      }
+    },
+    {
+      "name": "zstd-safe",
+      "version": "8.3.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "checksum": "5a9ea9cc2576c2fcc104e9cec04f46e3ede564f4fbc206831e4ef7e859a4140d",
+      "package_kind": "third-party",
+      "license_expression": "BSD-3-Clause",
+      "license_expression_id": "spdx:118dbcd2d5c9f9b2",
+      "repository": "https://github.com/gyscos/zstd-rs",
+      "manifest": {
+        "path": "registry:registry+https://github.com/rust-lang/crates.io-index#zstd-safe@8.3.0/Cargo.toml",
+        "sha256": "ca8308442bc352bc329daed4c90dd6a88b27b0a271afecbcb1d4bf0bb3964850"
+      },
+      "license_evidence": [
+        {
+          "path": "Cargo.toml",
+          "sha256": "ca8308442bc352bc329daed4c90dd6a88b27b0a271afecbcb1d4bf0bb3964850",
+          "archive_member_sha256": "ca8308442bc352bc329daed4c90dd6a88b27b0a271afecbcb1d4bf0bb3964850",
+          "archive_member_status": "verified"
+        },
+        {
+          "path": "LICENSE",
+          "sha256": "ce4868c8e4ebe47a7d4b3c93dbf6b802033e5ae2fa7638098173f80836daac60",
+          "archive_member_sha256": "ce4868c8e4ebe47a7d4b3c93dbf6b802033e5ae2fa7638098173f80836daac60",
+          "archive_member_status": "verified"
+        }
+      ],
+      "cargo_cache_checksum_evidence": {
+        "kind": "crate-archive",
+        "path": "registry/cache/crates-io/zstd-safe-8.3.0.crate",
+        "sha256": "5a9ea9cc2576c2fcc104e9cec04f46e3ede564f4fbc206831e4ef7e859a4140d"
+      },
+      "source_integrity_status": "verified",
+      "license_evidence_status": "present",
+      "distribution_obligation_profile": "spdx:118dbcd2d5c9f9b2",
+      "distribution_obligation_profile_reference": "docs/legal/rust-dependency-audit.md#distribution-profiles",
+      "target_scope_classification": "selected-for-studiofs-target",
+      "nonproduction_scope_hints": [],
+      "resolved_incoming_dependency_edges": [
+        {
+          "from": {
+            "name": "zstd",
+            "version": "0.14.4",
+            "source": "registry+https://github.com/rust-lang/crates.io-index"
+          },
+          "dependency_kinds": [
+            {
+              "kind": "normal",
+              "target": null
+            }
+          ]
+        }
+      ],
+      "targets": {
+        "windows-x86_64": {
+          "roles": [
+            "runtime"
+          ],
+          "enabled_features": [
+            "alloc",
+            "std"
+          ]
+        },
+        "linux-x86_64": {
+          "roles": [
+            "runtime"
+          ],
+          "enabled_features": [
+            "alloc",
+            "std"
+          ]
+        },
+        "macos-aarch64": {
+          "roles": [
+            "runtime"
+          ],
+          "enabled_features": [
+            "alloc",
+            "std"
+          ]
+        }
+      }
+    },
+    {
+      "name": "zstd-sys",
+      "version": "2.1.3+zstd.1.5.7",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "checksum": "f729a06d0257428fd9d997ac8db7e1407bd0262ab016b085b36bc52957c0052d",
+      "package_kind": "third-party",
+      "license_expression": "BSD-3-Clause AND BSD-2-Clause",
+      "license_expression_id": "spdx:83e3be5d1f780b09",
+      "repository": "https://github.com/gyscos/zstd-rs",
+      "manifest": {
+        "path": "registry:registry+https://github.com/rust-lang/crates.io-index#zstd-sys@2.1.3+zstd.1.5.7/Cargo.toml",
+        "sha256": "f59b3e33fa8fa78a3c500d0bf7c8fbd09861bdd3aea9f35910544d59499c24ce"
+      },
+      "license_evidence": [
+        {
+          "path": "Cargo.toml",
+          "sha256": "f59b3e33fa8fa78a3c500d0bf7c8fbd09861bdd3aea9f35910544d59499c24ce",
+          "archive_member_sha256": "f59b3e33fa8fa78a3c500d0bf7c8fbd09861bdd3aea9f35910544d59499c24ce",
+          "archive_member_status": "verified"
+        },
+        {
+          "path": "LICENSE",
+          "sha256": "ce4868c8e4ebe47a7d4b3c93dbf6b802033e5ae2fa7638098173f80836daac60",
+          "archive_member_sha256": "ce4868c8e4ebe47a7d4b3c93dbf6b802033e5ae2fa7638098173f80836daac60",
+          "archive_member_status": "verified"
+        },
+        {
+          "path": "LICENSE.BSD-2-Clause",
+          "sha256": "982cd76c8a6b5c597aa999be672c4f16b953eb6d074fe29c0a931d7aae2c8fc2",
+          "archive_member_sha256": "982cd76c8a6b5c597aa999be672c4f16b953eb6d074fe29c0a931d7aae2c8fc2",
+          "archive_member_status": "verified"
+        },
+        {
+          "path": "LICENSE.BSD-3-Clause",
+          "sha256": "bf7017a73a95ea63bf3716b13ec2bcd79c92942356e3408c6fb66332bad6d977",
+          "archive_member_sha256": "bf7017a73a95ea63bf3716b13ec2bcd79c92942356e3408c6fb66332bad6d977",
+          "archive_member_status": "verified"
+        },
+        {
+          "path": "zstd/COPYING",
+          "sha256": "f9c375a1be4a41f7b70301dd83c91cb89e41567478859b77eef375a52d782505",
+          "archive_member_sha256": "f9c375a1be4a41f7b70301dd83c91cb89e41567478859b77eef375a52d782505",
+          "archive_member_status": "verified"
+        },
+        {
+          "path": "zstd/LICENSE",
+          "sha256": "7055266497633c9025b777c78eb7235af13922117480ed5c674677adc381c9d8",
+          "archive_member_sha256": "7055266497633c9025b777c78eb7235af13922117480ed5c674677adc381c9d8",
+          "archive_member_status": "verified"
+        }
+      ],
+      "cargo_cache_checksum_evidence": {
+        "kind": "crate-archive",
+        "path": "registry/cache/crates-io/zstd-sys-2.1.3+zstd.1.5.7.crate",
+        "sha256": "f729a06d0257428fd9d997ac8db7e1407bd0262ab016b085b36bc52957c0052d"
+      },
+      "source_integrity_status": "verified",
+      "license_evidence_status": "present",
+      "distribution_obligation_profile": "spdx:83e3be5d1f780b09",
+      "distribution_obligation_profile_reference": "docs/legal/rust-dependency-audit.md#distribution-profiles",
+      "target_scope_classification": "selected-for-studiofs-target",
+      "nonproduction_scope_hints": [],
+      "resolved_incoming_dependency_edges": [
+        {
+          "from": {
+            "name": "zstd-safe",
+            "version": "8.3.0",
+            "source": "registry+https://github.com/rust-lang/crates.io-index"
+          },
+          "dependency_kinds": [
+            {
+              "kind": "normal",
+              "target": null
+            }
+          ]
+        }
+      ],
+      "targets": {
+        "windows-x86_64": {
+          "roles": [
+            "runtime"
+          ],
+          "enabled_features": [
+            "std"
+          ]
+        },
+        "linux-x86_64": {
+          "roles": [
+            "runtime"
+          ],
+          "enabled_features": [
+            "std"
+          ]
+        },
+        "macos-aarch64": {
+          "roles": [
+            "runtime"
+          ],
+          "enabled_features": [
+            "std"
+          ]
         }
       }
     },
