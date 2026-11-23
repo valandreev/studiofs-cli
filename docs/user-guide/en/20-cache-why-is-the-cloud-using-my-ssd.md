@@ -29,7 +29,7 @@ For the cache, choose a fast local NVMe SSD with enough free space and a filesys
 Here is an example of options for **the next mount** on Linux:
 
 ```bash
-studiofs mount studio /mnt/studio --cache-dir /srv/studiofs-cache --cache-size 50GB
+studiofs mount studio /mnt/StudioFS --cache-dir /srv/studiofs-cache --cache-size 50GB
 ```
 
 Here, `studio` is an example volume name, and you need to replace both paths with your own. On Windows, the cache path might look like `D:\StudioFS-cache`; on macOS, `/Users/yourname/StudioFS-cache`.

@@ -34,9 +34,15 @@ sudo dnf install -y fuse3 fuse3-libs
 
 If a package cannot be found, first check repository availability and your system version. Do not replace FUSE3 with the older FUSE2: StudioFS uses version 3.
 
-## Desktop indicator in 0.2.1
+## System tray icon (version 0.2.1)
 
-The Linux tray uses KSNI/StatusNotifierItem over your session D-Bus; GTK3, GLib, libxdo and AppIndicator libraries are no longer StudioFS prerequisites. A compatible desktop host, such as KDE Plasma, displays the icon. On GNOME, enable an AppIndicator/KStatusNotifierItem extension; tooltips may not be displayed. If the watcher starts later or restarts on the same bus, the backend registers again. Without a compatible host or session bus, mounting continues without the tray. A tray helper blocked in D-Bus is terminated after a two-second shutdown grace period; the mount result is preserved. An absent icon does not confirm that synchronization has finished. Older 0.2.0 binaries retain their GTK/AppIndicator requirements.
+Starting with version 0.2.1, the StudioFS icon in the Linux tray uses the KSNI/StatusNotifierItem standard over your session D-Bus. GTK3, GLib, libxdo and AppIndicator libraries are no longer required for it.
+
+* **Where the icon appears.** In compatible desktop environments, such as KDE Plasma. On GNOME, enable an AppIndicator/KStatusNotifierItem extension; tooltips may not be displayed there.
+* If the tray service starts later or restarts, StudioFS registers the icon again.
+* Without a compatible desktop environment or session bus, the volume mounts and works without a tray icon.
+* If the tray helper gets stuck in D-Bus, it is forcibly stopped after two seconds; the mounted volume keeps working.
+* An absent icon does not mean that synchronization has finished. Older 0.2.0 builds still require GTK and AppIndicator.
 
 ## Checking FUSE3
 

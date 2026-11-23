@@ -26,7 +26,7 @@ studiofs discover <disk-name> --meta "<your-postgres-connection>"
 Angle brackets mark the places for your values; do not type them literally. For example, the command might look like this:
 
 ```bash
-studiofs discover myvolume --meta "postgres://studiofs:YOUR_PASSWORD@100.101.102.103:5432"
+studiofs discover myvolume --meta "postgresql://studiofs:YOUR_PASSWORD@100.101.102.103:5432/studiofs"
 ```
 
 Replace the user, password, address, and port with your own. The address here is an example: use your server's VPN address or private hostname.

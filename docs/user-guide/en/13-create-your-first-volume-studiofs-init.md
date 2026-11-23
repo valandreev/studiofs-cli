@@ -23,7 +23,7 @@ First, you can check the available options in your installed version:
 studiofs init --help
 ```
 
-Below is a **template**: replace all uppercase values with your own. The example host names are placeholders, not real services. The command is shown on one line so you can adapt it for Bash, PowerShell, or another shell without different line continuation characters:
+Below is a **template**: replace all uppercase values with your own. The command is shown on one line so you can adapt it for Bash, PowerShell, or another shell without different line continuation characters:
 
 ```text
 studiofs init studio-projects --endpoint 'https://S3_API_HOST:PORT' --bucket 'YOUR_PRIVATE_BUCKET' --region 'YOUR_S3_REGION' --access-key 'YOUR_ACCESS_KEY_ID' --secret-key 'YOUR_SECRET_ACCESS_KEY' --meta 'postgresql://YOUR_PG_USER:YOUR_URL_ENCODED_PASSWORD@PRIVATE_PG_HOST:5432/studiofs?sslmode=require'

@@ -43,7 +43,7 @@ Use the help for your **installed version**: available options can differ betwee
 studiofs perf Z: --interval 1000 --count 10 --json-lines > perf.jsonl
 ```
 
-On macOS or Linux, replace `Z:` with your path, such as `/mnt/studio`. The interval is in milliseconds; `--count 10` limits collection to ten interval samples. The `perf.jsonl` file will be created in the current directory. Choose a local folder outside the StudioFS drive so writing the report does not add load to the volume being measured.
+On macOS or Linux, replace `Z:` with your path, such as `/mnt/StudioFS/myvolume`. The interval is in milliseconds; `--count 10` limits collection to ten measurements. The `perf.jsonl` file will be created in the current directory, so run the command from a local folder outside the StudioFS drive; this way writing the report does not add load to the volume you are measuring.
 
 Start collection in a second terminal and repeat a safe action that triggers the problem. Note when you started the action. `perf` shows counters, rates, and latencies; it does not replace an error log. If the mount is no longer working, the command may be unable to retrieve statistics—include its message in the report.
 
@@ -69,17 +69,17 @@ A few minutes of logs before and after the event are usually enough for a report
 The default log level is `info`. The global `--log-level` option accepts `trace`, `debug`, `info`, `warn`, or `error`. For a short reproduction, you can start a mount with `debug` logging:
 
 ```bash
-studiofs --log-level debug mount myvolume /mnt/studio
+studiofs --log-level debug mount myvolume /mnt/StudioFS
 ```
 
-On Windows, use your drive letter, such as `Z:`, instead of `/mnt/studio`. Do this after cleanly unmounting the previous mount, when it is safe for your work; [chapter 17](17-unplug-safely-studiofs-umount.md) explains the procedure. Do not restart a failing client just to get more detailed logs before preserving the evidence already available.
+On Windows, use your drive letter, such as `Z:`, instead of `/mnt/StudioFS`. Do this after cleanly unmounting the previous mount, when it is safe for your work; [chapter 17](17-unplug-safely-studiofs-umount.md) explains the procedure. Do not restart a failing client just to get more detailed logs before preserving the evidence already available.
 
 The option applies to the process you start. Running `studiofs --log-level debug status myvolume` does not change logging for an existing mount process.
 
 In an open terminal, you can save both output streams to a local file:
 
 ```bash
-studiofs --log-level debug mount myvolume /mnt/studio > mount-debug.log 2>&1
+studiofs --log-level debug mount myvolume /mnt/StudioFS > mount-debug.log 2>&1
 ```
 
 The command occupies the terminal while the mount is running, and messages go to the file. For a background launch, add `-d`: then look for the daily log in the `logs` directory rather than relying on terminal redirection.

@@ -44,7 +44,7 @@ For the cache directory and size, explicit `mount` options take priority over sa
 On macOS and Linux, you can also save a default mount point:
 
 ```bash
-studiofs settings --mount-point /mnt/studio
+studiofs settings --mount-point /mnt/StudioFS
 ```
 
 ## Disk cache and memory are different resources
@@ -94,7 +94,7 @@ studiofs perf Z: --interval 1000 --count 10
 On macOS or Linux, pass the actual path of the mounted volume:
 
 ```bash
-studiofs perf /mnt/studio/projectfs --interval 1000 --count 10
+studiofs perf /mnt/StudioFS/projectfs --interval 1000 --count 10
 ```
 
 The interval is in milliseconds; this produces ten interval samples roughly one second apart. Without `--count`, the view continues until you interrupt it with `Ctrl+C`; that stops observation, rather than unmounting the drive.

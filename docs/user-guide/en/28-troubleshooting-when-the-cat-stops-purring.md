@@ -70,7 +70,7 @@ If the library cannot be found during the build, check the FUSE3 development pac
 **Timeout**, **connection refused**, a DNS error, and **password authentication failed** mean different things.
 
 1. Check that Tailscale or NetBird is connected and the server is reachable on the private network. A VPN status of “connected” does not guarantee that access rules allow PostgreSQL connections.
-2. Compare the address and port with the server configuration. Check the firewall, VPN ACLs, and PostgreSQL itself, following [chapters 7](07-postgresql-the-brain-behind-the-files.md) and [8](08-tailscale-netbird-a-private-path-to-postgresql.md).
+2. Compare the address and port with the server configuration. Check the firewall, VPN ACLs, and PostgreSQL itself, (see chapters [07](07-postgresql-the-brain-behind-the-files.md) and [08](08-tailscale-netbird-a-private-path-to-postgresql.md)).
 3. If the network works, check the username, password, database name, and server authentication rules. Do not expose a public PostgreSQL port as a way to “fix the VPN.”
 
 If you have the `psql` client, you can test an actual connection from the workstation. Replace the address and username with your own; enter the password at the prompt:
@@ -89,7 +89,7 @@ If cached files are readable but a new large file is not, check access to **S3**
 
 Check the endpoint, bucket, region, and whether the keys are still valid. Look in the logs for DNS, TLS, timeout, or `AccessDenied` errors. Also check storage health, quotas, and any proxy in front of it. S3 can fail even when the VPN connection to PostgreSQL works: these are separate access paths.
 
-Do not disable certificate verification or switch from HTTPS to HTTP at random. If the server address has changed, confirm the new address with the administrator. See [chapter 6](06-s3-a-home-for-your-files.md) for more on configuration.
+Do not disable certificate verification or switch from HTTPS to HTTP at random. If the server address has changed, confirm the new address with the administrator. See [chapter 06](06-s3-a-home-for-your-files.md) for more on configuration.
 
 A `Permission denied` error may also concern permissions on the file itself. Check the user and the `--principal` option if your team uses ACLs. Bucket permissions do not override permissions within the volume.
 

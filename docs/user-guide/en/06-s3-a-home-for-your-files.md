@@ -1,4 +1,4 @@
-# 06. S3: a home for our files
+# 06. S3: A Home for Your Files
 > **Work in progress**
 
 In the previous section, we decided where our data will live: on our own server or in a cloud provider’s storage. Now it is time to prepare a place for it.
