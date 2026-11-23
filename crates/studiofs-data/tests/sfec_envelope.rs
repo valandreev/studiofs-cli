@@ -210,6 +210,8 @@ fn sfec_parser_rejects_frame_count_and_object_length_overflow() {
 
 #[test]
 fn sfec_parser_rejects_large_valid_frame_count_without_linear_scan() {
+    let frame_size = DEFAULT_SFEC_FRAME_SIZE as u32;
+    let plaintext_len = u64::from(u32::MAX) * u64::from(frame_size);
     let mut header = Vec::new();
     header.extend_from_slice(b"SFEC");
     header.extend_from_slice(&1u16.to_le_bytes());
@@ -217,8 +219,8 @@ fn sfec_parser_rejects_large_valid_frame_count_without_linear_scan() {
     header.extend_from_slice(&1u16.to_le_bytes());
     header.extend_from_slice(&0u16.to_le_bytes());
     header.extend_from_slice(&1u32.to_le_bytes());
-    header.extend_from_slice(&(u32::MAX as u64).to_le_bytes());
-    header.extend_from_slice(&1u32.to_le_bytes());
+    header.extend_from_slice(&plaintext_len.to_le_bytes());
+    header.extend_from_slice(&frame_size.to_le_bytes());
     header.extend_from_slice(&u32::MAX.to_le_bytes());
     header.extend_from_slice(&0u16.to_le_bytes());
     header.extend_from_slice(&0u16.to_le_bytes());

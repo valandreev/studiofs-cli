@@ -1259,7 +1259,13 @@ impl DataStore {
         run_crypto_blocking(&CRYPTO_ADMISSION, max_workers, move |workers| {
             crypto
                 .cipher
-                .encrypt_object(plaintext, &key, crypto.key_id, workers)
+                .encrypt_object(
+                    plaintext,
+                    &key,
+                    crypto.key_id,
+                    crypto::DEFAULT_ENCRYPTION_FRAME_SIZE as u32,
+                    workers,
+                )
                 .map_err(DataError::from)
         })
         .await

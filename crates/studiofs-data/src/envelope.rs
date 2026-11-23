@@ -17,6 +17,9 @@ pub const SFEC_VERSION: u16 = 1;
 /// Default plaintext frame size for encrypted remote objects.
 pub const DEFAULT_SFEC_FRAME_SIZE: usize = 1024 * 1024;
 
+/// Plaintext frame size for compressed (STFS v3) encrypted objects (ADR 0015).
+pub const SMALL_SFEC_FRAME_SIZE: usize = 64 * 1024;
+
 /// XChaCha20-Poly1305 authentication tag length appended to each frame.
 pub const SFEC_FRAME_TAG_LEN: usize = 16;
 
@@ -460,9 +463,6 @@ fn validate_fixed_shape(
     if flags & !SUPPORTED_SFEC_FLAGS != 0 {
         return Err(SfecError::UnsupportedFlags(flags));
     }
-    if frame_size == 0 {
-        return Err(SfecError::InvalidFrameSize(frame_size));
-    }
     let expected = expected_frame_count(plaintext_len, frame_size)?;
     if expected != frame_count {
         return Err(SfecError::FrameCountOverflow);
@@ -577,7 +577,9 @@ fn validate_variable_len(field: &'static str, len: usize) -> Result<(), SfecErro
 }
 
 fn expected_frame_count(plaintext_len: u64, frame_size: u32) -> Result<u32, SfecError> {
-    if frame_size == 0 {
+    if frame_size as usize != SMALL_SFEC_FRAME_SIZE
+        && frame_size as usize != DEFAULT_SFEC_FRAME_SIZE
+    {
         return Err(SfecError::InvalidFrameSize(frame_size));
     }
     if plaintext_len == 0 {
@@ -601,12 +603,16 @@ fn validate_ciphertext_len(header: &SfecHeader, actual_len: usize) -> Result<(),
 mod tests {
     use super::*;
 
+    const FRAME: u64 = SMALL_SFEC_FRAME_SIZE as u64;
+    const STRIDE: u64 = FRAME + SFEC_FRAME_TAG_LEN as u64;
+    const PLAINTEXT_LEN: u64 = 2 * FRAME + 3;
+
     fn header() -> SfecHeader {
         SfecHeader::new(
             SfecAlgorithm::XChaCha20Poly1305V1,
             7,
             19,
-            8,
+            DEFAULT_SFEC_FRAME_SIZE,
             Bytes::from_static(b"wrapnonce"),
             Bytes::from_static(b"nonce-prefix-123"),
             Bytes::from_static(b"wrapped-dek-material"),
@@ -656,15 +662,23 @@ mod tests {
 
     #[test]
     fn prefix_layout_maps_ranges_without_the_full_header() {
-        // Fixture: 9 + 16 + 20 variable bytes => header 85; frame stride 8 + 16 = 24.
         let encoded = header_for_layout().serialized_header().unwrap();
         assert_eq!(encoded.len(), 85);
         let layout = SfecHeaderLayout::from_prefix(&encoded[..SFEC_HEADER_FIXED_LEN]).unwrap();
         assert_eq!(layout.header_len(), 85);
-        assert_eq!(layout.ciphertext_range(1..3), Ok(85..109));
-        assert_eq!(layout.ciphertext_range(8..10), Ok(109..133));
-        assert_eq!(layout.ciphertext_range(15..19), Ok(109..152));
-        assert_eq!(layout.ciphertext_range(7..10), Ok(85..133));
+        assert_eq!(layout.ciphertext_range(1..3), Ok(85..85 + STRIDE));
+        assert_eq!(
+            layout.ciphertext_range(FRAME..FRAME + 2),
+            Ok(85 + STRIDE..85 + 2 * STRIDE)
+        );
+        assert_eq!(
+            layout.ciphertext_range(2 * FRAME - 1..PLAINTEXT_LEN),
+            Ok(85 + STRIDE..85 + 2 * STRIDE + 19)
+        );
+        assert_eq!(
+            layout.ciphertext_range(FRAME - 1..FRAME + 2),
+            Ok(85..85 + 2 * STRIDE)
+        );
         assert_eq!(layout.ciphertext_range(0..0), Err(SfecError::InvalidRange));
     }
 
@@ -672,8 +686,8 @@ mod tests {
         SfecHeader::new(
             SfecAlgorithm::XChaCha20Poly1305V1,
             7,
-            19,
-            8,
+            PLAINTEXT_LEN,
+            FRAME as usize,
             Bytes::from_static(b"wrapnonce"),
             Bytes::from_static(b"nonce-prefix-123"),
             Bytes::from_static(b"wrapped-dek-material"),
@@ -683,39 +697,34 @@ mod tests {
 
     #[test]
     fn ciphertext_range_includes_header_and_only_covering_frames() {
-        let header = SfecHeader::new(
-            SfecAlgorithm::XChaCha20Poly1305V1,
-            7,
-            19,
-            8,
-            Bytes::from_static(b"wrapnonce"),
-            Bytes::from_static(b"nonce-prefix-123"),
-            Bytes::from_static(b"wrapped-dek-material"),
-        )
-        .unwrap();
+        let header = header_for_layout();
         let header_len = header.serialized_header().unwrap().len() as u64;
-        let stride = 8 + SFEC_FRAME_TAG_LEN as u64;
 
         assert_eq!(
             header.ciphertext_range(1..3).unwrap(),
-            header_len..header_len + stride
+            header_len..header_len + STRIDE
         );
         assert_eq!(
-            header.ciphertext_range(8..10).unwrap(),
-            header_len + stride..header_len + 2 * stride
+            header.ciphertext_range(FRAME..FRAME + 2).unwrap(),
+            header_len + STRIDE..header_len + 2 * STRIDE
         );
         assert_eq!(
-            header.ciphertext_range(15..19).unwrap(),
-            header_len + stride..header_len + 2 * stride + 19
+            header
+                .ciphertext_range(2 * FRAME - 1..PLAINTEXT_LEN)
+                .unwrap(),
+            header_len + STRIDE..header_len + 2 * STRIDE + 19
         );
         assert_eq!(
-            header.ciphertext_range(7..10).unwrap(),
-            header_len..header_len + 2 * stride
+            header.ciphertext_range(FRAME - 1..FRAME + 2).unwrap(),
+            header_len..header_len + 2 * STRIDE
         );
-        assert_eq!(header.ciphertext_range(0..19).unwrap().start, header_len);
+        assert_eq!(
+            header.ciphertext_range(0..PLAINTEXT_LEN).unwrap().start,
+            header_len
+        );
         assert_eq!(header.ciphertext_range(0..0), Err(SfecError::InvalidRange));
         assert_eq!(
-            header.ciphertext_range(18..20),
+            header.ciphertext_range(PLAINTEXT_LEN - 1..PLAINTEXT_LEN + 1),
             Err(SfecError::InvalidRange)
         );
     }
