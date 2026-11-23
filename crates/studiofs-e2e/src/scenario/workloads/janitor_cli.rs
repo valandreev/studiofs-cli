@@ -3,6 +3,7 @@
 //! Each scenario initializes its own volume with one `janitor` client, seeds payload
 //! objects directly in S3, and drives the CLI as a separate process.
 
+use std::io::{Read, Seek};
 use std::process::{Command, Output, Stdio};
 
 use opendal::Operator;
@@ -94,20 +95,8 @@ impl JanitorVolume {
         timeout: Duration,
     ) -> anyhow::Result<Output> {
         let command = self.command(&self.config.studiofs_bin, args);
-        let stdout = dir.join(format!("{label}.stdout.log"));
-        let stderr = dir.join(format!("{label}.stderr.log"));
-        let output = run_child_bounded(command, timeout, &stdout, &stderr, |_| {})?;
-        self.redact_logs(&stdout, &stderr)?;
-        Ok(output)
-    }
-
-    /// Rewrites captured CLI output without DSN or S3 credentials.
-    fn redact_logs(&self, stdout: &Path, stderr: &Path) -> io::Result<()> {
-        for path in [stdout, stderr] {
-            let text = fs::read_to_string(path)?;
-            fs::write(path, redact_diagnostics(&self.config, &text))?;
-        }
-        Ok(())
+        run_child_bounded(&self.config, command, timeout, dir, label, |_| {})
+            .map(|(output, _)| output)
     }
 
     /// Queues `object_id` as an already eligible deletion candidate.
@@ -141,36 +130,59 @@ impl Drop for OwnedCli {
     }
 }
 
-/// Runs `command` with output in `stdout`/`stderr`, calling `sample` with the child
-/// pid on every poll, and kills it once `timeout` elapses.
+/// Spools child output to temporary files and publishes redacted logs after reaping.
 fn run_child_bounded(
+    config: &ClientControllerConfig,
     mut command: Command,
     timeout: Duration,
-    stdout: &Path,
-    stderr: &Path,
+    dir: &Path,
+    label: &str,
     mut sample: impl FnMut(u32),
-) -> anyhow::Result<Output> {
-    command.stdout(fs::File::create(stdout)?);
-    command.stderr(fs::File::create(stderr)?);
-    let mut child = OwnedCli(command.spawn()?);
+) -> anyhow::Result<(Output, Duration)> {
+    let stdout = tempfile::tempfile_in(dir)?;
+    let stderr = tempfile::tempfile_in(dir)?;
+    command.stdout(stdout.try_clone()?);
+    command.stderr(stderr.try_clone()?);
     let started = Instant::now();
+    let mut child = OwnedCli(command.spawn()?);
     let status = loop {
         sample(child.0.id());
         if let Some(status) = child.0.try_wait()? {
-            break status;
+            break Some(status);
         }
-        anyhow::ensure!(
-            started.elapsed() < timeout,
-            "janitor CLI exceeded {timeout:?}; output at {}",
-            stdout.display()
-        );
+        if started.elapsed() >= timeout {
+            break None;
+        }
         thread::sleep(Duration::from_millis(50));
     };
-    Ok(Output {
-        status,
-        stdout: fs::read(stdout)?,
-        stderr: fs::read(stderr)?,
-    })
+    let elapsed = started.elapsed();
+    drop(child);
+    let read_log = |mut file: fs::File, stream: &str| -> io::Result<Vec<u8>> {
+        let mut bytes = Vec::new();
+        file.rewind()?;
+        file.read_to_end(&mut bytes)?;
+        fs::write(
+            dir.join(format!("{label}.{stream}.log")),
+            redact_diagnostics(config, &String::from_utf8_lossy(&bytes)),
+        )?;
+        Ok(bytes)
+    };
+    let stdout = read_log(stdout, "stdout")?;
+    let stderr = read_log(stderr, "stderr")?;
+    let status = status.ok_or_else(|| {
+        anyhow::anyhow!(
+            "janitor CLI exceeded {timeout:?}; output at {}",
+            dir.display()
+        )
+    })?;
+    Ok((
+        Output {
+            status,
+            stdout,
+            stderr,
+        },
+        elapsed,
+    ))
 }
 
 fn s3_writer(config: &ClientControllerConfig) -> anyhow::Result<Operator> {
@@ -232,4 +244,47 @@ async fn wait_until_s3_keys_are_past(writer: &Operator, keys: &[String]) -> anyh
 /// Converts a scenario failure into a redacted `ScenarioError`.
 fn scenario_error(config: &ClientControllerConfig, error: &anyhow::Error) -> ScenarioError {
     io::Error::other(redact_diagnostics(config, &format!("{error:#}"))).into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn timed_out_janitor_publishes_only_redacted_diagnostics() -> anyhow::Result<()> {
+        const SECRET: &str = "test-janitor-secret";
+        if std::env::var("STUDIOFS_DAEMON_LOG_STEM").as_deref() == Ok("studiofs-janitor-cli") {
+            eprintln!("fixture error: {SECRET}");
+            loop {
+                thread::park();
+            }
+        }
+
+        let dir = studiofs_test_support::workspace_target_tempdir("janitor-timeout-");
+        let mut config = super::super::tests::_test_config(dir.path());
+        config.studiofs_bin = std::env::current_exe()?;
+        config.s3.secret_key = SECRET.into();
+        let volume = JanitorVolume {
+            config,
+            client_root: dir.path().to_path_buf(),
+            volume_id: 0,
+            prefix: String::new(),
+        };
+        let error = volume
+            .run(
+                dir.path(),
+                "timeout",
+                &[
+                    "timed_out_janitor_publishes_only_redacted_diagnostics".into(),
+                    "--nocapture".into(),
+                ],
+                Duration::from_secs(3),
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("exceeded"));
+        let stderr = fs::read_to_string(dir.path().join("timeout.stderr.log"))?;
+        assert!(stderr.contains("fixture error: <redacted-secret-key>"));
+        assert!(!stderr.contains(SECRET));
+        Ok(())
+    }
 }

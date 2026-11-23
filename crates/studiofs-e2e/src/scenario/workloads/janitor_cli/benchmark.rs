@@ -81,6 +81,7 @@ fn bench_key(prefix: &str, id: u64, index: u64) -> String {
 /// burst counts once.
 struct DelayProxy {
     port: u16,
+    measuring: Arc<AtomicBool>,
     peak_open: Arc<AtomicU64>,
     accepted: Arc<AtomicU64>,
     round_trips: Arc<AtomicU64>,
@@ -129,6 +130,8 @@ async fn delayed_pipe(
 async fn start_proxy(upstream: (String, u16), one_way: Duration) -> anyhow::Result<DelayProxy> {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let port = listener.local_addr()?.port();
+    let measuring = Arc::new(AtomicBool::new(false));
+    let task_measuring = measuring.clone();
     let open = Arc::new(AtomicU64::new(0));
     let peak_open = Arc::new(AtomicU64::new(0));
     let accepted = Arc::new(AtomicU64::new(0));
@@ -141,6 +144,7 @@ async fn start_proxy(upstream: (String, u16), one_way: Duration) -> anyhow::Resu
     );
     let task = tokio::spawn(async move {
         while let Ok((client, _)) = listener.accept().await {
+            let measure = task_measuring.load(Ordering::Relaxed);
             let (open, peak, accepted, round_trips, upstream) = (
                 task_open.clone(),
                 task_peak.clone(),
@@ -153,8 +157,10 @@ async fn start_proxy(upstream: (String, u16), one_way: Duration) -> anyhow::Resu
                     return;
                 };
                 let _ = (client.set_nodelay(true), server.set_nodelay(true));
-                accepted.fetch_add(1, Ordering::Relaxed);
-                peak.fetch_max(open.fetch_add(1, Ordering::Relaxed) + 1, Ordering::Relaxed);
+                if measure {
+                    accepted.fetch_add(1, Ordering::Relaxed);
+                    peak.fetch_max(open.fetch_add(1, Ordering::Relaxed) + 1, Ordering::Relaxed);
+                }
                 let (client_read, client_write) = client.into_split();
                 let (server_read, server_write) = server.into_split();
                 let awaiting_reply = AtomicBool::new(false);
@@ -163,17 +169,20 @@ async fn start_proxy(upstream: (String, u16), one_way: Duration) -> anyhow::Resu
                         awaiting_reply.store(true, Ordering::Relaxed);
                     }),
                     delayed_pipe(server_read, client_write, one_way, || {
-                        if awaiting_reply.swap(false, Ordering::Relaxed) {
+                        if measure && awaiting_reply.swap(false, Ordering::Relaxed) {
                             round_trips.fetch_add(1, Ordering::Relaxed);
                         }
                     }),
                 );
-                open.fetch_sub(1, Ordering::Relaxed);
+                if measure {
+                    open.fetch_sub(1, Ordering::Relaxed);
+                }
             });
         }
     });
     Ok(DelayProxy {
         port,
+        measuring,
         peak_open,
         accepted,
         round_trips,
@@ -239,10 +248,11 @@ fn parse_mib(value: &str) -> Option<f64> {
 
 /// Runs a CLI child to completion while sampling its RSS and the PostgreSQL container.
 fn run_measured(
+    config: &ClientControllerConfig,
     command: Command,
     timeout: Duration,
-    stdout: &Path,
-    stderr: &Path,
+    dir: &Path,
+    label: &str,
     pg_container: &str,
 ) -> anyhow::Result<(Output, Duration, Samples)> {
     let stop = Arc::new(AtomicBool::new(false));
@@ -279,8 +289,7 @@ fn run_measured(
 
     let mut system = sysinfo::System::new();
     let mut peak_rss = 0;
-    let started = Instant::now();
-    let result = run_child_bounded(command, timeout, stdout, stderr, |pid| {
+    let result = run_child_bounded(config, command, timeout, dir, label, |pid| {
         let pid = sysinfo::Pid::from_u32(pid);
         system.refresh_processes_specifics(
             sysinfo::ProcessesToUpdate::Some(&[pid]),
@@ -289,13 +298,13 @@ fn run_measured(
         );
         peak_rss = peak_rss.max(system.process(pid).map_or(0, sysinfo::Process::memory));
     });
-    let elapsed = started.elapsed();
     stop.store(true, Ordering::Relaxed);
     let (peak_pg_cpu_percent, peak_pg_memory_mib) = docker
         .join()
         .map_err(|_| anyhow::anyhow!("docker stats sampler panicked"))?;
+    let (output, elapsed) = result?;
     Ok((
-        result?,
+        output,
         elapsed,
         Samples {
             peak_rss,
@@ -486,8 +495,9 @@ fn bench(context: &ScenarioContext, config: ClientControllerConfig) -> anyhow::R
         ))
     });
 
-    // Volume init also went through the proxy; count only the janitor runs.
-    let pg_round_trips_before = pg_proxy.round_trips.load(Ordering::Relaxed);
+    // Proxied init and fsck exercise both services before the measured janitor runs.
+    pg_proxy.measuring.store(true, Ordering::Relaxed);
+    s3_proxy.measuring.store(true, Ordering::Relaxed);
     let mut runs = Vec::new();
     let mut complete = false;
     let (mut total_ms, mut peak_rss, mut peak_cpu, mut peak_memory) =
@@ -517,12 +527,15 @@ fn bench(context: &ScenarioContext, config: ClientControllerConfig) -> anyhow::R
                 volume.command(&config.studiofs_bin, &args)
             }
         };
-        let stdout = context.scenario_dir.join(format!("bench-{run}.stdout.log"));
-        let stderr = context.scenario_dir.join(format!("bench-{run}.stderr.log"));
         let run_round_trips = pg_proxy.round_trips.load(Ordering::Relaxed);
-        let (output, elapsed, samples) =
-            run_measured(command, timeout, &stdout, &stderr, &pg_container)?;
-        volume.redact_logs(&stdout, &stderr)?;
+        let (output, elapsed, samples) = run_measured(
+            &volume.config,
+            command,
+            timeout,
+            &context.scenario_dir,
+            &format!("bench-{run}"),
+            &pg_container,
+        )?;
         total_ms += elapsed.as_millis();
         peak_rss = peak_rss.max(samples.peak_rss);
         peak_cpu = peak_cpu.max(samples.peak_pg_cpu_percent);
@@ -630,7 +643,7 @@ fn bench(context: &ScenarioContext, config: ClientControllerConfig) -> anyhow::R
         "peak_pg_memory_mib": peak_memory,
         "peak_pg_connections": pg_proxy.peak_open.load(Ordering::Relaxed),
         "pg_connections_opened": pg_proxy.accepted.load(Ordering::Relaxed),
-        "pg_round_trips": pg_proxy.round_trips.load(Ordering::Relaxed) - pg_round_trips_before,
+        "pg_round_trips": pg_proxy.round_trips.load(Ordering::Relaxed),
         "peak_s3_connections": s3_proxy.peak_open.load(Ordering::Relaxed),
         "s3_connections_opened": s3_proxy.accepted.load(Ordering::Relaxed),
         "run_details": runs,

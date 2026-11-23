@@ -5098,6 +5098,7 @@ dependencies = [
  "studiofs-vfs",
  "syn 2.0.116",
  "sysinfo",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tokio-postgres",
