@@ -1177,7 +1177,7 @@ impl DataStore {
         let header_len = layout.header_len();
         let plaintext_len = layout.plaintext_len();
         if plaintext_len < ObjectHeader::SIZE as u64
-            || plaintext_len > crate::object::CLOUD_FRAGMENT_SIZE as u64 + ObjectHeader::SIZE as u64
+            || plaintext_len > crate::object::MAX_REGULAR_OBJECT_PLAINTEXT_LEN as u64
         {
             return Err(crypto::CryptoError::from(SfecError::InvalidRange).into());
         }
@@ -1201,17 +1201,20 @@ impl DataStore {
         let head_range = layout
             .ciphertext_range(0..first_end)
             .map_err(crypto::CryptoError::from)?;
-        // Round 2: the tail and frame 0 are contiguous; a target directly after
-        // frame 0 is merged into the same read.
-        let merge_target = target_range
-            .as_ref()
-            .is_some_and(|target| target.start == head_range.end);
+        // Round 2: the tail and frame 0 are contiguous; with large frames a target
+        // directly after frame 0 is merged into the same read. 64 KiB framing (v3)
+        // defers the target until the authenticated seek table gives stored offsets.
+        let deferred_target = layout.frame_size() == SMALL_SFEC_FRAME_SIZE as u32;
+        let merge_target = !deferred_target
+            && target_range
+                .as_ref()
+                .is_some_and(|target| target.start == head_range.end);
         let round2_end = match (&target_range, merge_target) {
             (Some(target), true) => target.end,
             _ => head_range.end,
         };
         let (round2, separate_target) = match &target_range {
-            Some(target) if !merge_target => {
+            Some(target) if !merge_target && !deferred_target => {
                 let (round2, target_bytes) = futures::try_join!(
                     self.op
                         .read_with(key)
@@ -1236,7 +1239,8 @@ impl DataStore {
         let header_bytes =
             Bytes::from([fixed.as_ref(), round2.slice(..tail_len).to_bytes().as_ref()].concat());
         // Authoritative strict parse of the header bytes read above.
-        SfecHeader::parse(header_bytes.clone()).map_err(crypto::CryptoError::from)?;
+        let sfec_header =
+            SfecHeader::parse(header_bytes.clone()).map_err(crypto::CryptoError::from)?;
         let local = |offset: u64| {
             usize::try_from(offset - SFEC_HEADER_FIXED_LEN as u64).map_err(|_| invalid_range())
         };
@@ -1246,6 +1250,26 @@ impl DataStore {
             .decrypt_payload_range(key, header_bytes.clone(), first_ciphertext, 0..first_end)
             .await?;
         let object_header = ObjectHeader::from_bytes(&first)?;
+        if object_header.version == crate::object::VERSION_V3 {
+            // Stored offsets are authoritative only after the seek table in frame 0 authenticates.
+            // For canonical 64 KiB v3 framing no target bytes have been fetched speculatively.
+            if let Some(ref read) = separate_target {
+                encrypted_bytes += read.len() as u64;
+            }
+            return self
+                .read_v3_payload_range(
+                    key,
+                    range,
+                    sfec_header,
+                    header_bytes,
+                    first,
+                    encrypted_bytes,
+                )
+                .await;
+        }
+        if payload_len > crate::object::CLOUD_FRAGMENT_SIZE as u64 {
+            return Err(crypto::CryptoError::from(SfecError::InvalidRange).into());
+        }
         let payload_len = usize::try_from(payload_len).map_err(|_| invalid_range())?;
         validate_object_payload_size(&object_header, payload_len)?;
 
@@ -1258,7 +1282,11 @@ impl DataStore {
             let ciphertext = if merge_target {
                 round2.slice(local(target.start)?..local(target.end)?.min(round2.len()))
             } else {
-                let read = separate_target.ok_or_else(invalid_range)?;
+                let read = match separate_target {
+                    Some(read) => read,
+                    None if deferred_target => self.op.read_with(key).range(target.clone()).await?,
+                    None => return Err(invalid_range()),
+                };
                 encrypted_bytes += read.len() as u64;
                 read
             };
@@ -1274,6 +1302,52 @@ impl DataStore {
                 Bytes::from(payload)
             }
         };
+        let stats = RemoteObjectReadStats {
+            encrypted_bytes,
+            plaintext_bytes: payload.len() as u64,
+        };
+        Ok((payload, stats))
+    }
+
+    async fn read_v3_payload_range(
+        &self,
+        key: &str,
+        range: Range<u64>,
+        layout: SfecHeader,
+        header_bytes: Bytes,
+        first: Bytes,
+        mut encrypted_bytes: u64,
+    ) -> DataResult<(Bytes, RemoteObjectReadStats)> {
+        let table = crate::object::V3SeekTable::parse_from_plaintext(&first)?;
+        if ObjectHeader::SIZE as u64 + table.compressed_size() as u64 != layout.plaintext_len() {
+            return Err(crate::object::ObjectError::InvalidV3Format(
+                "stored object length does not match SFEC plaintext length".into(),
+            )
+            .into());
+        }
+        let mapping = table.map_range(range);
+        let mut stored = Vec::new();
+        if let Some(needed) = &mapping.plaintext_range {
+            let first_end = first.len() as u64;
+            if needed.start < first_end {
+                stored.extend_from_slice(
+                    &first[needed.start as usize..needed.end.min(first_end) as usize],
+                );
+            }
+            if needed.end > first_end {
+                let remaining = needed.start.max(first_end)..needed.end;
+                let ciphertext_range = layout
+                    .ciphertext_range(remaining.clone())
+                    .map_err(crypto::CryptoError::from)?;
+                let ciphertext = self.op.read_with(key).range(ciphertext_range).await?;
+                encrypted_bytes += ciphertext.len() as u64;
+                let plaintext = self
+                    .decrypt_payload_range(key, header_bytes, ciphertext, remaining)
+                    .await?;
+                stored.extend_from_slice(&plaintext);
+            }
+        }
+        let payload = crate::compression::decompress_v3_range(mapping, Bytes::from(stored)).await?;
         let stats = RemoteObjectReadStats {
             encrypted_bytes,
             plaintext_bytes: payload.len() as u64,
@@ -1960,6 +2034,222 @@ mod tests {
         assert!(!err.is_retryable());
         assert!(consumed.load(Ordering::SeqCst) <= sealed_max.len() + 17);
         assert!(consumed.load(Ordering::SeqCst) < trailing.len());
+    }
+
+    #[tokio::test]
+    async fn payload_range_v3_reads_only_selected_chunks_with_three_requests() {
+        use crate::object::{CLOUD_FRAGMENT_SIZE, DEFAULT_V3_CHUNK_SIZE};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let reads = Arc::new(AtomicUsize::new(0));
+        let raw = Operator::new(Memory::default())
+            .unwrap()
+            .layer(ReadCounterLayer(reads.clone()))
+            .finish();
+        let store =
+            DataStore::with_operator_for_test(&encrypted_test_config(), raw.clone()).unwrap();
+        let key = "unit-volume/objects/v3-range";
+        // Half of every chunk repeats, giving compression while retaining multiple SFEC frames.
+        let mut seed = 17u64;
+        let mut data = vec![0; CLOUD_FRAGMENT_SIZE];
+        for chunk in data.chunks_mut(DEFAULT_V3_CHUNK_SIZE) {
+            for byte in &mut chunk[..DEFAULT_V3_CHUNK_SIZE / 2] {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                *byte = seed as u8;
+            }
+        }
+        // Keep the initial probe compressible and force one mixed raw chunk.
+        data[..DEFAULT_V3_CHUNK_SIZE].fill(42);
+        for byte in &mut data[16 * DEFAULT_V3_CHUNK_SIZE..17 * DEFAULT_V3_CHUNK_SIZE] {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            *byte = seed as u8;
+        }
+        let payload = Bytes::from(data);
+        let prepared = store
+            .prepare_payload_with_policy(key, payload.clone(), CompressionPolicy::zstd_default())
+            .await
+            .unwrap();
+        store.put_prepared_by_key(key, prepared).await.unwrap();
+        let original = raw.read(key).await.unwrap().to_bytes();
+        let envelope = crate::envelope::SfecEnvelope::parse(original.clone()).unwrap();
+        let header_len = envelope.header_bytes().len();
+        let stfs = store.get_by_key(key).await.unwrap().to_bytes();
+        let table = crate::object::V3SeekTable::parse_from_plaintext(&stfs).unwrap();
+        assert!(table.entries().iter().any(|entry| entry.is_raw));
+        assert!(table.entries().iter().any(|entry| !entry.is_raw));
+        let full_len = original.len() as u64;
+        for start in [
+            0,
+            CLOUD_FRAGMENT_SIZE / 2,
+            CLOUD_FRAGMENT_SIZE - 4096,
+            DEFAULT_V3_CHUNK_SIZE - 2048,
+            // Compressed chunk 15 into raw chunk 16: zstd decode and raw slice in one read.
+            16 * DEFAULT_V3_CHUNK_SIZE - 2048,
+        ] {
+            reads.store(0, Ordering::SeqCst);
+            let (bytes, stats) = store
+                .get_payload_range_by_key_with_stats(key, start as u64..start as u64 + 4096)
+                .await
+                .unwrap();
+            assert_eq!(bytes, payload.slice(start..start + 4096));
+            assert_eq!(stats.plaintext_bytes, 4096);
+            assert!(stats.encrypted_bytes < full_len);
+            let mapping = table.map_range(start as u64..start as u64 + 4096);
+            let needed = mapping.plaintext_range.unwrap();
+            let frame = SMALL_SFEC_FRAME_SIZE as u64;
+            let first_target = (needed.start / frame).max(1);
+            let end_frame = needed.end.div_ceil(frame);
+            let mut expected = header_len as u64 + frame + 16;
+            for index in first_target..end_frame {
+                expected += (stfs.len() as u64 - index * frame).min(frame) + 16;
+            }
+            assert_eq!(stats.encrypted_bytes, expected, "offset {start}");
+            assert_eq!(
+                reads.load(Ordering::SeqCst),
+                if end_frame > first_target { 3 } else { 2 }
+            );
+        }
+        // Frame 0 contains the seek table; frame 16 covers the distant raw chunk.
+        for offset in [
+            header_len + ObjectHeader::SIZE,
+            header_len + 16 * (SMALL_SFEC_FRAME_SIZE + 16),
+        ] {
+            let mut tampered = original.to_vec();
+            tampered[offset] ^= 1;
+            raw.write(key, tampered).await.unwrap();
+            let err = store
+                .get_payload_range_by_key_with_stats(
+                    key,
+                    (CLOUD_FRAGMENT_SIZE / 2) as u64..(CLOUD_FRAGMENT_SIZE / 2 + 4096) as u64,
+                )
+                .await
+                .unwrap_err();
+            assert!(matches!(
+                err,
+                DataError::Crypto(crypto::CryptoError::AuthenticationFailed)
+            ));
+        }
+        // A distant ciphertext frame does not affect a range held entirely in frame 0.
+        let mut tampered = original.to_vec();
+        tampered[header_len + 16 * (SMALL_SFEC_FRAME_SIZE + 16)] ^= 1;
+        raw.write(key, tampered).await.unwrap();
+        assert_eq!(
+            store
+                .get_payload_range_by_key_with_stats(key, 0..4096)
+                .await
+                .unwrap()
+                .0,
+            payload.slice(..4096)
+        );
+
+        // Recompute a structurally valid prefix after swapping 64 KiB for 1 MiB.
+        let mut tampered = original.to_vec();
+        tampered[26..30].copy_from_slice(&(DEFAULT_SFEC_FRAME_SIZE as u32).to_le_bytes());
+        let count = stfs.len().div_ceil(DEFAULT_SFEC_FRAME_SIZE) as u32;
+        tampered[30..34].copy_from_slice(&count.to_le_bytes());
+        raw.write(key, tampered).await.unwrap();
+        assert!(matches!(
+            store
+                .get_payload_range_by_key_with_stats(key, 0..4096)
+                .await,
+            Err(DataError::Crypto(crypto::CryptoError::AuthenticationFailed))
+        ));
+
+        // The whole table is validated even when requesting just the first chunk.
+        let mut malformed = stfs.to_vec();
+        malformed[ObjectHeader::SIZE + 31 * 4..ObjectHeader::SIZE + 32 * 4].fill(0);
+        let prepared = store
+            .seal_stfs_object(
+                key,
+                Bytes::from(malformed).into(),
+                payload.len(),
+                SMALL_SFEC_FRAME_SIZE,
+            )
+            .await
+            .unwrap();
+        store.put_prepared_by_key(key, prepared).await.unwrap();
+        assert!(matches!(
+            store
+                .get_payload_range_by_key_with_stats(key, 0..4096)
+                .await,
+            Err(DataError::Object(
+                crate::object::ObjectError::InvalidV3Format(_)
+            ))
+        ));
+    }
+
+    #[tokio::test]
+    async fn payload_range_v3_accepts_maximum_geometry_and_keeps_v2_fragment_bound() {
+        use crate::object::{
+            CLOUD_FRAGMENT_SIZE, CompressionCodec, MIN_V3_CHUNK_LOG2, ObjectFlags, V3EncodedChunk,
+            create_v3_object_buffer,
+        };
+        let raw = Operator::new(Memory::default()).unwrap().finish();
+        let store = DataStore::with_operator_for_test(&encrypted_test_config(), raw).unwrap();
+        let key = "unit-volume/objects/v3-range-maximum";
+        let payload = Bytes::from(vec![21; CLOUD_FRAGMENT_SIZE]);
+        let chunks = (0..payload.len())
+            .step_by(1 << MIN_V3_CHUNK_LOG2)
+            .map(|start| {
+                V3EncodedChunk::Raw(payload.slice(start..start + (1 << MIN_V3_CHUNK_LOG2)))
+            })
+            .collect();
+        // Partial reads deliberately do not check this whole-payload checksum.
+        let object = create_v3_object_buffer(
+            payload.len() as u32,
+            0,
+            CompressionCodec::Zstd,
+            MIN_V3_CHUNK_LOG2,
+            ObjectFlags::empty(),
+            chunks,
+        )
+        .unwrap();
+        assert_eq!(
+            object.len(),
+            crate::object::MAX_REGULAR_OBJECT_PLAINTEXT_LEN
+        );
+        let prepared = store
+            .seal_stfs_object(key, object, payload.len(), SMALL_SFEC_FRAME_SIZE)
+            .await
+            .unwrap();
+        store.put_prepared_by_key(key, prepared).await.unwrap();
+        for range in [
+            0..4096,
+            CLOUD_FRAGMENT_SIZE as u64 - 2048..CLOUD_FRAGMENT_SIZE as u64 + 2048,
+        ] {
+            let (bytes, stats) = store
+                .get_payload_range_by_key_with_stats(key, range.clone())
+                .await
+                .unwrap();
+            assert_eq!(
+                bytes,
+                payload.slice(range.start as usize..(range.end as usize).min(payload.len()))
+            );
+            assert_eq!(stats.plaintext_bytes, bytes.len() as u64);
+        }
+        let (bytes, stats) = store
+            .get_payload_range_by_key_with_stats(
+                key,
+                CLOUD_FRAGMENT_SIZE as u64..CLOUD_FRAGMENT_SIZE as u64 + 4096,
+            )
+            .await
+            .unwrap();
+        assert!(bytes.is_empty());
+        assert_eq!(stats.plaintext_bytes, 0);
+
+        let oversized_v2 =
+            create_object_buffer(Bytes::from(vec![0; CLOUD_FRAGMENT_SIZE + 1])).unwrap();
+        store.put_by_key(key, oversized_v2).await.unwrap();
+        assert!(matches!(
+            store
+                .get_payload_range_by_key_with_stats(key, 0..4096)
+                .await,
+            Err(DataError::Crypto(_))
+        ));
     }
 
     #[tokio::test]

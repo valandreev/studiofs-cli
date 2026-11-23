@@ -215,6 +215,44 @@ pub(crate) async fn decompress_v3_object_with_admission(
     .await
 }
 
+/// Decode only authenticated chunks selected by a validated seek-table mapping.
+/// `stored` starts at the mapping's first stored chunk; partial reads do not verify XXH64.
+pub(crate) async fn decompress_v3_range(
+    mapping: crate::object::V3RangeMapping,
+    stored: Bytes,
+) -> DataResult<Bytes> {
+    if mapping.chunks.is_empty() {
+        return Ok(Bytes::new());
+    }
+    run_crypto_blocking(&CRYPTO_ADMISSION, 1, move |_| {
+        let mut out = Vec::with_capacity(mapping.clamped_logical_range.len());
+        let mut offset = 0;
+        let mut decompressor = None;
+        for chunk in mapping.chunks {
+            let entry = chunk.entry;
+            let bytes = stored
+                .get(offset..offset + entry.stored_len)
+                .ok_or_else(|| {
+                    ObjectError::InvalidV3Format("truncated selected chunk bytes".into())
+                })?;
+            if entry.is_raw {
+                out.extend_from_slice(&bytes[chunk.slice_in_chunk]);
+            } else {
+                let dctx = match decompressor.as_mut() {
+                    Some(dctx) => dctx,
+                    None => decompressor.insert(Decompressor::new().map_err(ObjectError::from)?),
+                };
+                let mut decoded = vec![0; entry.original_len];
+                decompress_zstd_chunk_with(dctx, bytes, &mut decoded, entry.index)?;
+                out.extend_from_slice(&decoded[chunk.slice_in_chunk]);
+            }
+            offset += entry.stored_len;
+        }
+        Ok(Bytes::from(out))
+    })
+    .await
+}
+
 /// Decompress one Zstd chunk into `dst`, sized to exactly its derived original length.
 ///
 /// Rejects frames that inflate past `dst.len()` without allocating beyond `dst`,
