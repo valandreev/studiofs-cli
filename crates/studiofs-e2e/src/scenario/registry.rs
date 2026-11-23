@@ -3,6 +3,7 @@
 use std::sync::OnceLock;
 
 use super::types::{Scenario, ScenarioDefinition};
+use super::workloads::compression::MountedCompression;
 use super::workloads::scratch_auto_promote::{SCRATCH_AUTO_PROMOTE, ScratchAutoPromote};
 use super::workloads::scratch_demote::{SCRATCH_DEMOTE, ScratchDemote};
 use super::workloads::scratch_e2e::{
@@ -74,6 +75,7 @@ pub fn available_scenarios() -> &'static [ScenarioDefinition] {
             ScratchOrphanRestore.definition(),
             ScratchDemote.definition(),
             ScratchAppleDouble.definition(),
+            MountedCompression.definition(),
         ]
     })
 }
@@ -81,6 +83,7 @@ pub fn available_scenarios() -> &'static [ScenarioDefinition] {
 /// Resolves a scenario name to a concrete scenario implementation.
 pub(crate) fn resolve_scenario(name: &str) -> Option<Box<dyn Scenario>> {
     match name {
+        "mounted-compression" => Some(Box::new(MountedCompression)),
         "mounted-recoverable-trash-two-client" => Some(Box::new(RecoverableTrash)),
         "mounted-logical-quota" => Some(Box::new(LogicalQuota)),
         "mounted-cache-scrub" => Some(Box::new(MountedCacheScrub)),

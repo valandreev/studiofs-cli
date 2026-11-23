@@ -1,7 +1,6 @@
 //! Scenario registry and lifecycle hooks for mounted E2E runs.
 
-use std::fs;
-use std::fs::OpenOptions;
+use std::fs::{self, OpenOptions};
 use std::io::{self, Read as _, Seek as _, SeekFrom, Write as _};
 use std::path::{Path, PathBuf};
 #[cfg(not(test))]
@@ -247,6 +246,7 @@ mod actions;
 mod advanced_mounted;
 mod assertions;
 mod cache_scrub;
+pub(super) mod compression;
 mod concurrent_mkdir;
 mod faults;
 mod logical_quota;

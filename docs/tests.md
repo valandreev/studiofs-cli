@@ -57,6 +57,40 @@ cargo test -p studiofs --test architecture_vocabulary_test active_docs_drop_supe
 3. Selected live S3 and combined S3/PostgreSQL regressions, run automatically in Linux CI.
 4. Other ignored integration tests that need RustFS/S3, mounted filesystems, or multiple processes.
 
+### Mounted adaptive compression
+
+The registered `mounted-compression` scenario writes 2 MiB USDA-like text,
+repetitive float scanlines, and deterministic high-entropy bytes with volume
+policy `zstd:3`. It waits for observable safe publication, authenticates remote
+SFEC envelopes, and checks STFS v3 plus 64 KiB encryption frames and at least
+50% storage savings for compressible fixtures. Entropy must remain STFS v2.
+Independent empty-cache peers perform seeded cold ranges of 4, 16, 64, and
+256 KiB before a separate complete-file readback. Per-file GET/decode counters
+substantiate each cold read; complete-cache insertion counters are also retained.
+Cold describes the state before the read, and permits the reader to cache a
+complete object while serving it.
+The sizes describe mounted requests; this scenario does not require a particular
+S3 range-transfer strategy or measure bandwidth.
+After switching to `off`, distinct new data must be v2 and a fresh peer must
+still read all old v3 and new v2 bytes.
+
+Rebuild the native product and runner, then run only this scenario:
+
+```bash
+cargo build -p studiofs -p studiofs-e2e
+cargo run -p studiofs-e2e -- run mounted-compression --studiofs-bin target/debug/studiofs --platform linux-fuse --run-id compression-linux --retain always
+```
+
+Use `macos-fuse` on a macOS host with macFUSE for the second acceptance platform.
+Native `windows-winfsp` with `target/debug/studiofs.exe` is a separate gate.
+All require working S3/PostgreSQL services and the platform's native driver.
+Retain `compression.json`, per-object evidence, cold-start records, per-file
+read hashes/ranges, runtime snapshots, and runner logs under the run sandbox.
+This is correctness acceptance without a performance threshold. The manual
+Linux full gate also selects it; focused helper/runner tests do not establish
+mounted acceptance. See [the execution plan](plans/sfs-1094-mounted-compression.md)
+for focused checks and evidence requirements.
+
 ### SFS-864 upload deletion dispatch
 
 Run the focused uploader tests and the release-mode bounded-work checks:
