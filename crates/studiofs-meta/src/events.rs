@@ -224,9 +224,7 @@ impl MetaEvent {
 
     fn wire_tag(&self) -> u8 {
         match self {
-            Self::SetVolumeSettings { settings }
-                if settings.compression != crate::trash::CompressionPolicy::off() =>
-            {
+            Self::SetVolumeSettings { settings } if settings.compression.is_enabled() => {
                 TAG_SET_VOLUME_SETTINGS_V3
             }
             Self::SetVolumeSettings { settings } if settings.logical_quota_bytes.is_some() => {
