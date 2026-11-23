@@ -10,8 +10,8 @@
 
 use crate::object::{
     CLOUD_FRAGMENT_SIZE, CompressionCodec, DEFAULT_V3_CHUNK_LOG2, DEFAULT_V3_CHUNK_SIZE,
-    ObjectError, ObjectFlags, V3EncodedChunk, V3SeekTable, create_v3_object_buffer,
-    parse_complete_v3_seek_table,
+    ObjectError, ObjectFlags, ObjectHeader, V3EncodedChunk, V3SeekTable, VERSION_V3,
+    create_v3_object_buffer, parse_complete_v3_seek_table, read_object_with_checksum,
 };
 use crate::store::{CRYPTO_ADMISSION, DataError, DataResult, run_crypto_blocking};
 use bytes::{Buf, Bytes};
@@ -125,6 +125,46 @@ pub(crate) async fn compress_fragment_with_admission(
         compress_fragment_blocking(payload, policy, workers).map_err(DataError::from)
     })
     .await
+}
+
+/// Decode and verify a complete STFS object (v2 or v3) into its original
+/// uncompressed payload bytes.
+///
+/// Dispatches STFS v2 to direct checksum verification and STFS v3 to parallel
+/// chunk decompression on `CRYPTO_ADMISSION`.
+pub async fn decode_object(data: impl Into<Buffer>) -> DataResult<Bytes> {
+    decode_object_with_checksum(data)
+        .await
+        .map(|(payload, _)| payload)
+}
+
+/// Decode and verify a complete STFS object (v2 or v3) into its original
+/// uncompressed payload bytes and verified XXH64 checksum.
+///
+/// STFS v2 objects are validated and checksummed directly. STFS v3 objects
+/// validate header, codec, and seek-table geometry before admitting parallel
+/// chunk decompression onto `CRYPTO_ADMISSION` and verifying XXH64 over the
+/// reconstructed payload.
+pub async fn decode_object_with_checksum(data: impl Into<Buffer>) -> DataResult<(Bytes, u64)> {
+    let data: Buffer = data.into();
+    if data.len() < ObjectHeader::SIZE {
+        return Err(ObjectError::from(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "file too short for header",
+        ))
+        .into());
+    }
+
+    let mut header_buf = data.slice(..ObjectHeader::SIZE);
+    let mut header_bytes = [0u8; ObjectHeader::SIZE];
+    header_buf.copy_to_slice(&mut header_bytes);
+    let header = ObjectHeader::from_bytes(&header_bytes)?;
+
+    if header.version == VERSION_V3 {
+        decompress_v3_object_with_checksum(data).await
+    } else {
+        read_object_with_checksum(data).map_err(DataError::from)
+    }
 }
 
 /// Decode and verify a complete STFS v3 object into its original plaintext payload.
@@ -889,5 +929,90 @@ mod tests {
         drop(held);
         let (decoded, _) = decompress_fut.await.unwrap();
         assert_eq!(decoded, input);
+    }
+
+    const STFS_V3_BASELINE_FIXTURE: &[u8] = include_bytes!("../tests/fixtures/stfs-v3-mixed.bin");
+
+    #[tokio::test]
+    async fn decode_object_handles_v2_v3_fixture_generated_and_typed_errors() {
+        // 1. STFS v2 still decodes unchanged.
+        let v2_payload = Bytes::from_static(b"plain v2 payload bytes");
+        let v2_buf = crate::object::create_object_buffer(v2_payload.clone()).unwrap();
+        let (decoded_v2, checksum_v2) = decode_object_with_checksum(v2_buf).await.unwrap();
+        assert_eq!(decoded_v2, v2_payload);
+        assert_eq!(checksum_v2, xxh64(v2_payload.as_ref(), 0));
+
+        // 2. Pinned STFS v3 baseline fixture decodes and verifies XXH64.
+        let mut expected_fixture = vec![0x42u8; DEFAULT_V3_CHUNK_SIZE];
+        expected_fixture.extend_from_slice(b"v3 raw tail chunk");
+        let (decoded_fixture, checksum_fixture) =
+            decode_object_with_checksum(Bytes::from_static(STFS_V3_BASELINE_FIXTURE))
+                .await
+                .unwrap();
+        assert_eq!(decoded_fixture.as_ref(), expected_fixture.as_slice());
+        assert_eq!(checksum_fixture, xxh64(&expected_fixture, 0));
+
+        // 3. Encoder-generated STFS v3 object decodes and verifies XXH64.
+        let generated_input = compressible_text(DEFAULT_V3_CHUNK_SIZE * 2 + 123);
+        let encoded = compress_fragment(generated_input.clone(), CompressionPolicy::zstd_default())
+            .await
+            .unwrap();
+        let EncodedFragment::V3(v3_buf) = encoded.fragment else {
+            panic!("expected v3");
+        };
+        let v3_bytes = v3_buf.to_bytes();
+        let (decoded_gen, checksum_gen) =
+            decode_object_with_checksum(v3_bytes.clone()).await.unwrap();
+        assert_eq!(decoded_gen, generated_input);
+        assert_eq!(checksum_gen, xxh64(generated_input.as_ref(), 0));
+
+        // 4. Unknown codec is a typed ObjectError::UnsupportedCodec.
+        let mut bad_codec = v3_bytes.to_vec();
+        bad_codec[24] = 99;
+        let err = decode_object_with_checksum(Bytes::from(bad_codec))
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            DataError::Object(ObjectError::UnsupportedCodec(99))
+        ));
+
+        // 5. Invalid chunk geometry is a typed ObjectError::InvalidV3Format.
+        let mut bad_geom = v3_bytes.to_vec();
+        bad_geom[25] = 5; // chunk_log2 below MIN_V3_CHUNK_LOG2
+        let err = decode_object_with_checksum(Bytes::from(bad_geom))
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            DataError::Object(ObjectError::InvalidV3Format(_))
+        ));
+
+        // 6. Oversized declared original_size is rejected before allocation.
+        let oversized_header = ObjectHeader {
+            magic: *crate::object::MAGIC,
+            version: VERSION_V3,
+            flags: ObjectFlags::empty(),
+            original_size: u32::MAX,
+            compressed_size: 4,
+            checksum: 0,
+            reserved: [
+                CompressionCodec::Zstd.to_byte(),
+                DEFAULT_V3_CHUNK_LOG2,
+                1,
+                0,
+                0,
+                0,
+            ],
+        };
+        let mut oversized_obj = oversized_header.to_bytes().to_vec();
+        oversized_obj.extend_from_slice(&[0u8; 4]);
+        let err = decode_object_with_checksum(Bytes::from(oversized_obj))
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            DataError::Object(ObjectError::ObjectTooLarge(sz)) if sz == u64::from(u32::MAX)
+        ));
     }
 }

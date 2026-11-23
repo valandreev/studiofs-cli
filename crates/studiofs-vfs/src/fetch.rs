@@ -24,9 +24,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use studiofs_cache::CachedStore;
-use studiofs_data::object::{
-    CLOUD_FRAGMENT_SIZE, read_object_with_checksum, validate_cloud_fragment_layout,
-};
+use studiofs_data::compression::decode_object_with_checksum;
+use studiofs_data::object::{CLOUD_FRAGMENT_SIZE, validate_cloud_fragment_layout};
 use studiofs_data::store::{DataError, DataStore};
 use tokio::sync::broadcast;
 use tokio::task;
@@ -1205,11 +1204,20 @@ impl FetchScheduler {
                     let result = if payload_range.is_some() {
                         (compressed.to_bytes(), None)
                     } else {
-                        // Decode STFS object payload.
+                        // Decode STFS object payload (v2 or v3).
                         let decode_start = Instant::now();
-                        let decoded = read_object_with_checksum(compressed);
+                        let decoded = decode_object_with_checksum(compressed).await;
                         self.record_object_decode(decode_start.elapsed());
-                        let (payload, xxh64) = decoded?;
+                        let (payload, xxh64) = match decoded {
+                            Ok(pair) => pair,
+                            Err(DataError::Object(err)) => return Err(FetchError::Decode(err)),
+                            Err(err) => {
+                                return Err(FetchError::Exhausted {
+                                    attempts: attempts_made,
+                                    source: err,
+                                });
+                            }
+                        };
                         (payload, Some(xxh64))
                     };
                     return Ok(result);
@@ -1636,6 +1644,7 @@ mod tests {
     use studiofs_data::envelope::SFEC_MAGIC;
     use studiofs_data::object::{
         MAGIC as STFS_MAGIC, create_object_buffer, format_object_fragment_key,
+        read_object_with_checksum,
     };
     use studiofs_data::store::{DataStoreConfig, DataStoreCryptoConfig};
     use studiofs_meta::schema::{CURRENT_FORMAT_VERSION, FormatInfo, MetadataConfig};
@@ -2460,5 +2469,277 @@ mod tests {
             "default cold sequential prefetch should be able to fill the configured 8-worker pipeline, got {} permits",
             permits.len()
         );
+    }
+
+    const STFS_V3_BASELINE_FIXTURE: &[u8] =
+        include_bytes!("../../studiofs-data/tests/fixtures/stfs-v3-mixed.bin");
+
+    async fn put_sealed_stfs_object(
+        config: &DataStoreConfig,
+        raw: &Operator,
+        key: &str,
+        stfs_bytes: Bytes,
+        frame_size: u32,
+    ) -> Bytes {
+        let cipher = studiofs_data::crypto::ObjectCipher::new(
+            &studiofs_data::crypto::VolumeMasterKey::from_bytes(
+                config.crypto.encryption.volume_master_key,
+            ),
+            &config.volume_uuid,
+        )
+        .expect("build test ObjectCipher");
+        let sealed = cipher
+            .encrypt_object(
+                stfs_bytes,
+                key,
+                config.crypto.encryption.active_key_id,
+                frame_size,
+                1,
+            )
+            .expect("seal STFS object")
+            .to_bytes();
+        assert!(sealed.starts_with(SFEC_MAGIC));
+        raw.write(key, sealed.clone())
+            .await
+            .expect("write sealed STFS object");
+        sealed
+    }
+
+    #[tokio::test]
+    async fn foreground_singleflight_and_prefetch_decode_v3_and_cache_plaintext() {
+        use studiofs_data::compression::{EncodedFragment, compress_fragment};
+        use studiofs_data::envelope::SMALL_SFEC_FRAME_SIZE;
+        use studiofs_data::object::DEFAULT_V3_CHUNK_SIZE;
+        use studiofs_meta::trash::CompressionPolicy;
+
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+        let (scheduler, raw, cached_store, config) =
+            make_encrypted_fetch_scheduler(&tmp, "v3-full-fetch");
+
+        // 1. Pinned STFS v3 baseline fixture sealed with 64 KiB SFEC frames (foreground + singleflight).
+        let fixture_id = 0x7001;
+        let fixture_key = fragment_key(&config, fixture_id, 0);
+        let mut expected_fixture = vec![0x42u8; DEFAULT_V3_CHUNK_SIZE];
+        expected_fixture.extend_from_slice(b"v3 raw tail chunk");
+        let expected_fixture = Bytes::from(expected_fixture);
+        let (_, expected_fixture_xxh64) =
+            read_object_with_checksum(create_object_buffer(expected_fixture.clone()).unwrap())
+                .unwrap();
+        let sealed_fixture = put_sealed_stfs_object(
+            &config,
+            &raw,
+            &fixture_key,
+            Bytes::from_static(STFS_V3_BASELINE_FIXTURE),
+            SMALL_SFEC_FRAME_SIZE as u32,
+        )
+        .await;
+
+        let (r1, r2) = tokio::join!(
+            scheduler.fetch_block(fixture_id, std::slice::from_ref(&fixture_key)),
+            scheduler.fetch_block(fixture_id, std::slice::from_ref(&fixture_key)),
+        );
+        assert_eq!(r1.expect("first v3 fetch"), expected_fixture);
+        assert_eq!(r2.expect("second v3 fetch"), expected_fixture);
+        let cached_fixture = cached_store
+            .get(fixture_id)
+            .expect("v3 fixture should populate plaintext cache");
+        assert_eq!(cached_fixture, expected_fixture);
+        assert_ne!(cached_fixture.as_ref(), STFS_V3_BASELINE_FIXTURE);
+        assert_ne!(cached_fixture.as_ref(), sealed_fixture.as_ref());
+
+        // 2. Encoder-generated STFS v3 object fetched via prefetch path caches uncompressed plaintext.
+        let gen_id = 0x7002;
+        let gen_key = fragment_key(&config, gen_id, 0);
+        let expected_gen = Bytes::from(
+            b"def Xform \"shot_020_camera\" { double3 translate = (4.0, 5.0, 6.0) }\n".repeat(4096),
+        );
+        let (_, expected_gen_xxh64) =
+            read_object_with_checksum(create_object_buffer(expected_gen.clone()).unwrap()).unwrap();
+        let compressed = compress_fragment(expected_gen.clone(), CompressionPolicy::zstd_default())
+            .await
+            .expect("compress v3 fragment");
+        let EncodedFragment::V3(v3_buf) = compressed.fragment else {
+            panic!("expected v3 encoded fragment");
+        };
+        let v3_bytes = v3_buf.to_bytes();
+        put_sealed_stfs_object(
+            &config,
+            &raw,
+            &gen_key,
+            v3_bytes.clone(),
+            SMALL_SFEC_FRAME_SIZE as u32,
+        )
+        .await;
+
+        let prefetched = scheduler
+            .fetch_block_prefetch(gen_id, std::slice::from_ref(&gen_key))
+            .await
+            .expect("prefetch should decode v3 object");
+        assert_eq!(prefetched, expected_gen);
+        let cached_gen = cached_store
+            .get(gen_id)
+            .expect("prefetch should cache uncompressed plaintext");
+        assert_eq!(cached_gen, expected_gen);
+        assert_ne!(cached_gen.as_ref(), v3_bytes.as_ref());
+
+        // Verify original uncompressed XXH64 was recorded in the cache index.
+        drop(scheduler);
+        drop(cached_store);
+        let layout =
+            studiofs_cache::LocalPayloadLayout::from_cache_root(tmp.path().join("fetch-cache"));
+        let index = studiofs_cache::runtime::CacheIndex::open(layout.redb_index_path).unwrap();
+        assert_eq!(
+            index.get_entry(fixture_id).unwrap().unwrap().xxh64,
+            Some(expected_fixture_xxh64)
+        );
+        assert_eq!(
+            index.get_entry(gen_id).unwrap().unwrap().xxh64,
+            Some(expected_gen_xxh64)
+        );
+    }
+
+    #[tokio::test]
+    async fn v3_forged_checksum_and_typed_decode_errors_are_distinct_from_transport() {
+        use studiofs_data::compression::{EncodedFragment, compress_fragment};
+        use studiofs_data::envelope::SMALL_SFEC_FRAME_SIZE;
+        use studiofs_data::object::{
+            CompressionCodec, DEFAULT_V3_CHUNK_LOG2, ObjectError, ObjectFlags, ObjectHeader,
+            VERSION_V3,
+        };
+        use studiofs_meta::trash::CompressionPolicy;
+
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+        let (scheduler, raw, cached_store, config) =
+            make_encrypted_fetch_scheduler(&tmp, "v3-errors");
+
+        let payload = Bytes::from(
+            b"def Xform \"forged_test\" { double3 scale = (1.0, 1.0, 1.0) }\n".repeat(4096),
+        );
+        let compressed = compress_fragment(payload, CompressionPolicy::zstd_default())
+            .await
+            .expect("compress v3");
+        let EncodedFragment::V3(v3_buf) = compressed.fragment else {
+            panic!("expected v3");
+        };
+        let valid_v3 = v3_buf.to_bytes();
+
+        // 1. Forged with test key: SFEC frames authenticate, decompressed payload fails XXH64.
+        let mut bad_checksum = valid_v3.to_vec();
+        bad_checksum[16] ^= 0x01;
+        let id_checksum = 0x7101;
+        let key_checksum = fragment_key(&config, id_checksum, 0);
+        put_sealed_stfs_object(
+            &config,
+            &raw,
+            &key_checksum,
+            Bytes::from(bad_checksum),
+            SMALL_SFEC_FRAME_SIZE as u32,
+        )
+        .await;
+        let err = scheduler
+            .fetch_block(id_checksum, std::slice::from_ref(&key_checksum))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                FetchError::Decode(ObjectError::ChecksumMismatch { .. })
+            ),
+            "forged checksum mismatch must stay typed corruption, got {err:?}"
+        );
+        assert!(cached_store.get(id_checksum).is_none());
+        assert_eq!(scheduler.metrics.retries.load(Ordering::Relaxed), 0);
+
+        // 2. Unknown codec stays typed FetchError::Decode(ObjectError::UnsupportedCodec(_)).
+        let mut bad_codec = valid_v3.to_vec();
+        bad_codec[24] = 77;
+        let id_codec = 0x7102;
+        let key_codec = fragment_key(&config, id_codec, 0);
+        put_sealed_stfs_object(
+            &config,
+            &raw,
+            &key_codec,
+            Bytes::from(bad_codec),
+            SMALL_SFEC_FRAME_SIZE as u32,
+        )
+        .await;
+        let err = scheduler
+            .fetch_block(id_codec, std::slice::from_ref(&key_codec))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, FetchError::Decode(ObjectError::UnsupportedCodec(77))),
+            "unknown codec must be typed UnsupportedCodec, got {err:?}"
+        );
+        assert!(cached_store.get(id_codec).is_none());
+        assert_eq!(scheduler.metrics.retries.load(Ordering::Relaxed), 0);
+
+        // 3. Invalid chunk geometry stays typed FetchError::Decode(ObjectError::InvalidV3Format(_)).
+        let mut bad_geom = valid_v3.to_vec();
+        bad_geom[25] = 4;
+        let id_geom = 0x7103;
+        let key_geom = fragment_key(&config, id_geom, 0);
+        put_sealed_stfs_object(
+            &config,
+            &raw,
+            &key_geom,
+            Bytes::from(bad_geom),
+            SMALL_SFEC_FRAME_SIZE as u32,
+        )
+        .await;
+        let err = scheduler
+            .fetch_block(id_geom, std::slice::from_ref(&key_geom))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, FetchError::Decode(ObjectError::InvalidV3Format(_))),
+            "bad chunk geometry must be typed InvalidV3Format, got {err:?}"
+        );
+        assert!(cached_store.get(id_geom).is_none());
+        assert_eq!(scheduler.metrics.retries.load(Ordering::Relaxed), 0);
+
+        // 4. Oversized declared original_size in authenticated v3 header is rejected before allocation.
+        let oversized_header = ObjectHeader {
+            magic: *STFS_MAGIC,
+            version: VERSION_V3,
+            flags: ObjectFlags::empty(),
+            original_size: (CLOUD_FRAGMENT_SIZE + 1) as u32,
+            compressed_size: 4,
+            checksum: 0,
+            reserved: [
+                CompressionCodec::Zstd.to_byte(),
+                DEFAULT_V3_CHUNK_LOG2,
+                1,
+                0,
+                0,
+                0,
+            ],
+        };
+        let mut oversized = oversized_header.to_bytes().to_vec();
+        oversized.extend_from_slice(&[0u8; 4]);
+        let id_oversized = 0x7104;
+        let key_oversized = fragment_key(&config, id_oversized, 0);
+        put_sealed_stfs_object(
+            &config,
+            &raw,
+            &key_oversized,
+            Bytes::from(oversized),
+            SMALL_SFEC_FRAME_SIZE as u32,
+        )
+        .await;
+        let err = scheduler
+            .fetch_block(id_oversized, std::slice::from_ref(&key_oversized))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                FetchError::Decode(ObjectError::ObjectTooLarge(sz))
+                    if sz == (CLOUD_FRAGMENT_SIZE + 1) as u64
+            ),
+            "oversized v3 original_size must be rejected as ObjectTooLarge, got {err:?}"
+        );
+        assert!(cached_store.get(id_oversized).is_none());
+        assert_eq!(scheduler.metrics.retries.load(Ordering::Relaxed), 0);
     }
 }

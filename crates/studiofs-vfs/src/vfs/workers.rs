@@ -4201,6 +4201,83 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn prove_reconciliation_claim_accepts_v3_object_with_64k_sfec_frames() {
+        use opendal::{Operator, services::Memory};
+        use studiofs_data::compression::{EncodedFragment, compress_fragment};
+        use studiofs_data::crypto::{ObjectCipher, VolumeMasterKey};
+        use studiofs_data::envelope::SMALL_SFEC_FRAME_SIZE;
+        use studiofs_data::store::{DataStore, DataStoreConfig, DataStoreCryptoConfig};
+        use studiofs_meta::EncryptionConfig;
+        use studiofs_meta::snapshot_ports::{
+            UploadedFragmentLedgerEntry, UploadedFragmentReconciliationClaim,
+            UploadedFragmentReconciliationOutcome,
+        };
+        use studiofs_meta::trash::CompressionPolicy;
+
+        let config = DataStoreConfig {
+            endpoint: "memory://".to_owned(),
+            bucket: "reconcile-tests".to_owned(),
+            access_key: "access".to_owned(),
+            secret_key: "secret".to_owned(),
+            rotating_credentials: None,
+            region: "us-east-1".to_owned(),
+            volume_name: "reconcile".to_owned(),
+            data_prefix: "reconcile/objects/".to_owned(),
+            volume_uuid: "reconcile-v3-uuid".to_owned(),
+            crypto: DataStoreCryptoConfig::from(EncryptionConfig::new([0x55; 32])),
+        };
+        let raw = Operator::new(Memory::default()).unwrap().finish();
+        let data_store = DataStore::with_operator_for_test(&config, raw.clone()).unwrap();
+
+        let plaintext = Bytes::from(
+            b"reconciliation-v3-payload-0123456789-abcdefghijklmnopqrstuvwxyz\n".repeat(4096),
+        );
+        let compressed = compress_fragment(plaintext, CompressionPolicy::zstd_default())
+            .await
+            .unwrap();
+        let EncodedFragment::V3(v3_buf) = compressed.fragment else {
+            panic!("expected v3 encoded fragment");
+        };
+        let v3_bytes = v3_buf.to_bytes();
+        let expected_sha256: [u8; 32] = Sha256::digest(&v3_bytes).into();
+        let key = "reconcile/objects/0009/0000000000000009/0".to_owned();
+
+        let cipher = ObjectCipher::new(
+            &VolumeMasterKey::from_bytes(config.crypto.encryption.volume_master_key),
+            &config.volume_uuid,
+        )
+        .unwrap();
+        let sealed = cipher
+            .encrypt_object(
+                v3_bytes.clone(),
+                &key,
+                config.crypto.encryption.active_key_id,
+                SMALL_SFEC_FRAME_SIZE as u32,
+                1,
+            )
+            .unwrap();
+        raw.write(&key, sealed).await.unwrap();
+
+        let claim = UploadedFragmentReconciliationClaim {
+            entry: UploadedFragmentLedgerEntry {
+                volume_id: 1,
+                object_id: 9,
+                fragment_index: 0,
+                object_key: key,
+                expected_byte_length: v3_bytes.len() as u64,
+                expected_sha256,
+            },
+            fencing_token: 1,
+        };
+        let shutdown = CancellationToken::new();
+        let (_, outcome) = prove_reconciliation_claim(&data_store, &shutdown, 1, claim).await;
+        assert_eq!(
+            outcome,
+            UploadedFragmentReconciliationOutcome::RemoteConfirmed
+        );
+    }
+
+    #[tokio::test]
     async fn janitor_deletion_queue_bounds_parallelism_and_caps_only_successes() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         use tokio::sync::{mpsc, oneshot};

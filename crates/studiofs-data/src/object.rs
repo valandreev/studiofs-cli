@@ -53,6 +53,16 @@ pub const DEFAULT_BLOCK_SIZE: u32 = 4 * 1024 * 1024;
 pub const CLOUD_FRAGMENT_SIZE: usize = 4 * 1024 * 1024;
 /// Number of cloud fragments per logical block.
 pub const CLOUD_FRAGMENT_COUNT: usize = 1;
+/// Maximum seek table byte length for a valid STFS v3 fragment
+/// (`(CLOUD_FRAGMENT_SIZE >> MIN_V3_CHUNK_LOG2) * 4`).
+pub const MAX_V3_SEEK_TABLE_LEN: usize =
+    (CLOUD_FRAGMENT_SIZE >> MIN_V3_CHUNK_LOG2) * std::mem::size_of::<u32>();
+/// Maximum STFS plaintext byte length for a regular fragment object (v2 or v3).
+///
+/// Accounts for the 30-byte STFS header, up to `CLOUD_FRAGMENT_SIZE` payload bytes,
+/// and the largest valid v3 seek table.
+pub const MAX_REGULAR_OBJECT_PLAINTEXT_LEN: usize =
+    ObjectHeader::SIZE + MAX_V3_SEEK_TABLE_LEN + CLOUD_FRAGMENT_SIZE;
 /// Compile-time invariant: one logical block must map exactly to fixed cloud fragments.
 const _: [(); DEFAULT_BLOCK_SIZE as usize] = [(); CLOUD_FRAGMENT_SIZE * CLOUD_FRAGMENT_COUNT];
 /// Compile-time invariant: the largest v3 chunk size equals one cloud fragment.
