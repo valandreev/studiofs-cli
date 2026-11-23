@@ -241,6 +241,7 @@ but no packaging change. SFS-853 owns generating the full notice file.
 | `ring` 0.17.14 | BoringSSL-derived C/assembly | all | Apache-2.0 AND ISC |
 | `tikv-jemalloc-sys` 0.6.1 | jemalloc 5.3 (C), via `pyroscope` | Linux, macOS | crate MIT/Apache-2.0; jemalloc BSD-2-Clause |
 | `winfsp-sys` 0.12.1 | WinFsp import library | Windows | GPLv3 (WinFsp) |
+| `zstd-sys` 2.1.3 | libzstd 1.5.7 (C) | all | BSD-3-Clause (selected from upstream BSD-3-Clause OR GPL-2.0-only) |
 
 ## Required notices
 

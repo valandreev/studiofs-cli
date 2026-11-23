@@ -1,0 +1,8 @@
+Repository: https://github.com/zrzka/anes-rs
+Commit: 378ac7461ecac29fde9e10df7b08359d1315a9ad
+Crate source path in repository: (repository root; crate is anes/)
+Upstream license file paths:
+  LICENSE-MIT
+  LICENSE-APACHE
+Cargo.toml license expression: MIT OR Apache-2.0
+Texts were fetched verbatim from the upstream repository at the commit above (.cargo_vcs_info.json sha1).
