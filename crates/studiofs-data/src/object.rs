@@ -344,16 +344,6 @@ impl ObjectHeader {
         self.flags.contains(ObjectFlags::LEGACY_LZ4_COMPRESSED) || self.version == VERSION_V3
     }
 
-    /// Check if object uses the STFS v3 compressed format.
-    pub fn is_v3(&self) -> bool {
-        self.version == VERSION_V3
-    }
-
-    /// Parse and validate STFS v3 header metadata from the 6 reserved bytes.
-    pub fn v3_meta(&self) -> Result<V3HeaderMeta, ObjectError> {
-        V3HeaderMeta::parse(self)
-    }
-
     /// Check if object has footer.
     pub fn has_footer(&self) -> bool {
         self.flags.contains(ObjectFlags::HAS_FOOTER)
@@ -428,7 +418,8 @@ pub use create_object_buffer_with as create_object_buffer_with_flags;
 ///
 /// # Errors
 /// Returns [`ObjectError::Io`] for a truncated header, [`ObjectError::InvalidMagic`]
-/// or [`ObjectError::UnsupportedVersion`] for an invalid header, and
+/// or [`ObjectError::UnsupportedVersion`] for an invalid header (including STFS v3,
+/// which must be decoded with [`read_v3_object`]), and
 /// [`ObjectError::LegacyCompressionUnsupported`] for legacy compression.
 /// Uncompressed payloads return [`ObjectError::SizeMismatch`] for inconsistent
 /// sizes, [`ObjectError::ObjectTooLarge`] for consistent sizes above the limit,
@@ -629,11 +620,6 @@ impl V3HeaderMeta {
     pub const fn seek_table_len(self) -> usize {
         (self.chunk_count as usize) * std::mem::size_of::<u32>()
     }
-
-    /// Byte offset where chunk payloads start inside the STFS plaintext.
-    pub const fn chunk_data_offset(self) -> usize {
-        ObjectHeader::SIZE + self.seek_table_len()
-    }
 }
 
 fn validate_v3_chunk_log2(chunk_log2: u8) -> Result<(), ObjectError> {
@@ -658,6 +644,28 @@ pub fn expected_v3_chunk_count(original_size: u32, chunk_log2: u8) -> Result<u16
     u16::try_from(count).map_err(|_| {
         ObjectError::InvalidV3Format(format!("derived chunk count {count} exceeds u16::MAX"))
     })
+}
+
+/// Shared encoder/decoder rule: a raw chunk stores exactly its derived length, and a
+/// compressed chunk must shrink (ADR 0015: a chunk that does not shrink is stored raw).
+fn validate_v3_stored_len(
+    idx: usize,
+    is_raw: bool,
+    stored_len: usize,
+    original_len: usize,
+) -> Result<(), ObjectError> {
+    if is_raw {
+        if stored_len != original_len {
+            return Err(ObjectError::InvalidV3Format(format!(
+                "raw chunk {idx} stored length {stored_len} != derived original length {original_len}"
+            )));
+        }
+    } else if stored_len == 0 || stored_len >= original_len {
+        return Err(ObjectError::InvalidV3Format(format!(
+            "compressed chunk {idx} stored length {stored_len} outside 1..{original_len}"
+        )));
+    }
+    Ok(())
 }
 
 /// Derive the uncompressed byte length of chunk `index` within a v3 fragment.
@@ -688,11 +696,6 @@ impl V3ChunkEntry {
     /// Stored byte range inside the STFS plaintext.
     pub const fn plaintext_range(self) -> Range<usize> {
         self.plaintext_offset..(self.plaintext_offset + self.stored_len)
-    }
-
-    /// Stored byte range inside the STFS plaintext as `Range<u64>`.
-    pub const fn plaintext_range_u64(self) -> Range<u64> {
-        (self.plaintext_offset as u64)..((self.plaintext_offset + self.stored_len) as u64)
     }
 
     /// Logical byte range inside the original uncompressed payload.
@@ -762,7 +765,6 @@ impl V3SeekTable {
         let chunk_count = usize::from(meta.chunk_count);
 
         let mut entries = Vec::with_capacity(chunk_count);
-        let mut stored_total: usize = seek_table_len;
         let mut plaintext_offset: usize = ObjectHeader::SIZE + seek_table_len;
 
         for idx in 0..chunk_count {
@@ -778,21 +780,7 @@ impl V3SeekTable {
             let original_len = derived_v3_chunk_original_len(original_size, chunk_size, idx);
             let logical_offset = idx * chunk_size;
 
-            if is_raw {
-                if stored_len != original_len {
-                    return Err(ObjectError::InvalidV3Format(format!(
-                        "raw chunk {idx} stored length {stored_len} != derived original length {original_len}"
-                    )));
-                }
-            } else if stored_len == 0 || stored_len > original_len {
-                return Err(ObjectError::InvalidV3Format(format!(
-                    "compressed chunk {idx} stored length {stored_len} outside 1..={original_len}"
-                )));
-            }
-
-            stored_total = stored_total.checked_add(stored_len).ok_or_else(|| {
-                ObjectError::InvalidV3Format("seek table stored length overflow".into())
-            })?;
+            validate_v3_stored_len(idx, is_raw, stored_len, original_len)?;
 
             entries.push(V3ChunkEntry {
                 index: idx,
@@ -808,6 +796,7 @@ impl V3SeekTable {
             })?;
         }
 
+        let stored_total = plaintext_offset - ObjectHeader::SIZE;
         if stored_total != header.compressed_size as usize {
             return Err(ObjectError::InvalidV3Format(format!(
                 "seek table total ({stored_total}) != header compressed_size ({})",
@@ -860,11 +849,6 @@ impl V3SeekTable {
     /// Return the validated chunk entries in ascending order.
     pub fn entries(&self) -> &[V3ChunkEntry] {
         &self.entries
-    }
-
-    /// Return one validated chunk entry by index.
-    pub fn entry(&self, index: usize) -> Option<&V3ChunkEntry> {
-        self.entries.get(index)
     }
 
     /// Map a logical payload byte range to the covering chunk indices and their
@@ -924,30 +908,6 @@ pub enum V3EncodedChunk {
     Compressed(Bytes),
 }
 
-impl V3EncodedChunk {
-    /// Returns `true` when this chunk is stored raw.
-    pub const fn is_raw(&self) -> bool {
-        matches!(self, Self::Raw(_))
-    }
-
-    /// Returns the stored payload bytes for this chunk.
-    pub const fn bytes(&self) -> &Bytes {
-        match self {
-            Self::Raw(bytes) | Self::Compressed(bytes) => bytes,
-        }
-    }
-
-    /// Returns the stored byte length of this chunk.
-    pub fn len(&self) -> usize {
-        self.bytes().len()
-    }
-
-    /// Returns `true` when the stored chunk is empty.
-    pub fn is_empty(&self) -> bool {
-        self.bytes().is_empty()
-    }
-}
-
 /// Create a complete STFS v3 object buffer (header + seek table + chunk payloads)
 /// without copying chunk payload bytes.
 ///
@@ -993,25 +953,10 @@ pub fn create_v3_object_buffer(
     for (idx, chunk) in chunks.into_iter().enumerate() {
         let original_len = derived_v3_chunk_original_len(original_size_usize, chunk_size, idx);
         let (is_raw, payload) = match chunk {
-            V3EncodedChunk::Raw(bytes) => {
-                if bytes.len() != original_len {
-                    return Err(ObjectError::InvalidV3Format(format!(
-                        "raw chunk {idx} length {} != derived original length {original_len}",
-                        bytes.len()
-                    )));
-                }
-                (true, bytes)
-            }
-            V3EncodedChunk::Compressed(bytes) => {
-                if bytes.is_empty() || bytes.len() > original_len {
-                    return Err(ObjectError::InvalidV3Format(format!(
-                        "compressed chunk {idx} length {} outside 1..={original_len}",
-                        bytes.len()
-                    )));
-                }
-                (false, bytes)
-            }
+            V3EncodedChunk::Raw(bytes) => (true, bytes),
+            V3EncodedChunk::Compressed(bytes) => (false, bytes),
         };
+        validate_v3_stored_len(idx, is_raw, payload.len(), original_len)?;
 
         let stored_len_u32 = u32::try_from(payload.len()).map_err(|_| {
             ObjectError::InvalidV3Format(format!("chunk {idx} length exceeds u32::MAX"))
@@ -1684,7 +1629,8 @@ mod tests {
     /// representation of any uniform slice of length >= 2.
     fn mock_compress_uniform(chunk: &[u8]) -> Option<Bytes> {
         let first = *chunk.first()?;
-        if chunk.len() >= 2 && chunk.iter().all(|&b| b == first) {
+        // The 2-byte encoding must shrink the chunk, otherwise it is stored raw.
+        if chunk.len() > 2 && chunk.iter().all(|&b| b == first) {
             Some(Bytes::copy_from_slice(&[0xAA, first]))
         } else {
             None
@@ -1749,7 +1695,7 @@ mod tests {
 
         let seek = V3SeekTable::parse_from_plaintext(&raw_bytes).unwrap();
         assert_eq!(seek.header().version, VERSION_V3);
-        assert!(seek.header().is_v3());
+        assert_eq!(seek.header().version, VERSION_V3);
         assert!(seek.header().is_compressed());
         assert_eq!(seek.codec(), CompressionCodec::Zstd);
         assert_eq!(seek.chunk_size(), chunk_size);
@@ -1964,6 +1910,18 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, ObjectError::ObjectTooLarge(_)));
+
+        // Encoder rejects a compressed chunk that does not shrink (stored_len == original_len).
+        let err = create_v3_object_buffer(
+            10,
+            0,
+            CompressionCodec::Zstd,
+            chunk_log2,
+            ObjectFlags::empty(),
+            vec![V3EncodedChunk::Compressed(Bytes::from(vec![1u8; 10]))],
+        )
+        .unwrap_err();
+        assert!(matches!(err, ObjectError::InvalidV3Format(_)));
 
         // Encoder rejects oversized compressed chunk (stored_len > original_len).
         let err = create_v3_object_buffer(
@@ -2273,7 +2231,8 @@ mod tests {
                         compressed_size += c_orig;
                         (c_orig as u32) | V3_SEEK_ENTRY_RAW_FLAG
                     } else {
-                        let stored = 1 + rng.gen_range(c_orig);
+                        // Compressed chunks must shrink: stored in 1..c_orig.
+                        let stored = 1 + rng.gen_range(c_orig - 1);
                         compressed_size += stored;
                         stored as u32
                     };
@@ -2351,7 +2310,8 @@ mod tests {
                         assert_eq!(abs_start, cursor, "gap or overlap in logical coverage");
                         cursor = abs_end;
 
-                        let pt = slice.entry.plaintext_range_u64();
+                        let pt = slice.entry.plaintext_range();
+                        let pt = pt.start as u64..pt.end as u64;
                         if expected_pt_start.is_some() {
                             assert_eq!(
                                 pt.start, expected_pt_end,
