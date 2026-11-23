@@ -355,11 +355,16 @@ impl DataStoreSnapshotPayloadReader {
                             error,
                         )
                     })?;
-                let fragment = decode_object(object).await.map_err(|_| {
-                    SnapshotPortError::permanent(
+                let fragment = decode_object(object).await.map_err(|error| match error {
+                    DataError::Object(_) => SnapshotPortError::permanent(
                         "payload_object",
                         "snapshot payload object is invalid",
-                    )
+                    ),
+                    // e.g. a cancelled decode worker at shutdown is not object corruption
+                    other => DataStoreSnapshotArtifactStore::map_data_error(
+                        "decode snapshot payload",
+                        other,
+                    ),
                 })?;
                 Ok::<_, SnapshotPortError>((fragment_index, fragment))
             },
