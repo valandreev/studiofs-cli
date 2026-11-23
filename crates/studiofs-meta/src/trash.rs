@@ -185,12 +185,12 @@ impl TryFrom<CompressionPolicyFields> for CompressionPolicy {
     type Error = &'static str;
 
     fn try_from(fields: CompressionPolicyFields) -> Result<Self, Self::Error> {
-        if !(MIN_ZSTD_COMPRESSION_LEVEL..=MAX_ZSTD_COMPRESSION_LEVEL).contains(&fields.level) {
-            return Err("compression level must be between 1 and 19");
-        }
-        Ok(Self {
-            mode: fields.mode,
-            level: fields.level,
+        let zstd = Self::zstd(fields.level)?;
+        // `off` has one canonical value, so a stray level cannot cause a
+        // false equal-revision conflict or a needless tag-21 event.
+        Ok(match fields.mode {
+            CompressionMode::Off => Self::off(),
+            CompressionMode::Zstd => zstd,
         })
     }
 }
@@ -514,6 +514,11 @@ mod tests {
                 "{invalid} must be rejected"
             );
         }
+
+        // `off` is canonical: a stray in-range level is not a distinct policy.
+        let off_level9: CompressionPolicy =
+            serde_json::from_str(r#"{"mode":"off","level":9}"#).unwrap();
+        assert_eq!(off_level9, CompressionPolicy::off());
 
         // Existing volume JSON without `compression` decodes as `off`.
         let legacy_no_quota: VolumeSettings =

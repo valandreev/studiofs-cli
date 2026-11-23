@@ -472,6 +472,11 @@ fn compression_cli_updates_shared_setting_handles_cas_conflict_and_converges() {
     let observer_task = runtime.spawn(observer_conn);
     let cli_output = runtime.block_on(async {
         let tx = client.transaction().await.unwrap();
+        let holder_pid: i32 = tx
+            .query_one("SELECT pg_backend_pid()", &[])
+            .await
+            .unwrap()
+            .get(0);
         tx.query_one(
             "SELECT 1 FROM metadata_state WHERE vol=$1 FOR UPDATE",
             &[&id],
@@ -497,11 +502,10 @@ fn compression_cli_updates_shared_setting_handles_cas_conflict_and_converges() {
             let waiting: i64 = observer
                 .query_one(
                     "SELECT count(*) FROM pg_stat_activity \
-                     WHERE datname = current_database() \
-                       AND wait_event_type = 'Lock' \
+                     WHERE $1 = ANY(pg_blocking_pids(pid)) \
                        AND query LIKE '%FOR UPDATE%' \
                        AND query LIKE '%metadata_state%'",
-                    &[],
+                    &[&holder_pid],
                 )
                 .await
                 .unwrap()

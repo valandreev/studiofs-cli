@@ -406,7 +406,7 @@ mod tests {
             .unwrap();
         assert_eq!(replica.volume_settings().unwrap(), higher);
 
-        // Remote snapshot (v4 checkpoint) preserves compression from base state.
+        // Remote snapshot exports base state, which keeps the replicated compression.
         let snapshot = replica.export_remote_snapshot().unwrap();
         let bootstrapped = RedbMetaEngine::open(temp.path().join("bootstrap.redb")).unwrap();
         bootstrapped.import_remote_snapshot(&snapshot).unwrap();
