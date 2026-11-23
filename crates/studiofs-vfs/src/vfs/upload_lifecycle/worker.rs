@@ -2144,9 +2144,6 @@ impl RemoteUploadPort for VfsRemoteUploadPort {
                     prepared_keys.push(key);
                     prepared_fragments.push(prepared);
                 }
-                Err((_, _, crate::upload::UploadError::Cancelled)) => {
-                    return UploadPutOutcome::Cancelled;
-                }
                 Err((fragment_index, key, error)) => {
                     return UploadPutOutcome::Failed(VfsError::Other(format!(
                         "fragment upload preparation failed (idx={fragment_index}, key={key}): {error}"
