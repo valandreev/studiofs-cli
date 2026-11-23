@@ -10,8 +10,8 @@
 
 use crate::object::{
     CLOUD_FRAGMENT_SIZE, CompressionCodec, DEFAULT_V3_CHUNK_LOG2, DEFAULT_V3_CHUNK_SIZE,
-    ObjectError, ObjectFlags, ObjectHeader, V3EncodedChunk, V3HeaderMeta, V3SeekTable,
-    create_v3_object_buffer,
+    ObjectError, ObjectFlags, V3EncodedChunk, V3SeekTable, create_v3_object_buffer,
+    parse_complete_v3_seek_table,
 };
 use crate::store::{CRYPTO_ADMISSION, DataError, DataResult, run_crypto_blocking};
 use bytes::{Buf, Bytes};
@@ -115,20 +115,9 @@ pub(crate) async fn compress_fragment_with_admission(
     payload: Bytes,
     policy: CompressionPolicy,
 ) -> DataResult<FragmentCompressionOutput> {
-    if payload.len() > CLOUD_FRAGMENT_SIZE {
-        return Err(ObjectError::ObjectTooLarge(payload.len() as u64).into());
-    }
-    if !policy.is_enabled() {
-        return Ok(FragmentCompressionOutput::raw(
-            payload,
-            StoreRawReason::PolicyOff,
-        ));
-    }
-    if payload.is_empty() {
-        return Ok(FragmentCompressionOutput::raw(
-            payload,
-            StoreRawReason::ProbeSkipped,
-        ));
+    // Decide trivial cases before taking admission permits.
+    if let Some(output) = precheck_fragment(&payload, policy)? {
+        return Ok(output);
     }
 
     let max_workers = payload.len().div_ceil(DEFAULT_V3_CHUNK_SIZE).max(1);
@@ -186,23 +175,10 @@ pub(crate) async fn decompress_v3_object_with_admission(
     .await
 }
 
-/// Decompress one Zstd chunk into a caller-provided buffer of exactly its derived
-/// original length.
+/// Decompress one Zstd chunk into `dst`, sized to exactly its derived original length.
 ///
 /// Rejects frames that inflate past `dst.len()` without allocating beyond `dst`,
 /// as well as frames that produce fewer than `dst.len()` bytes.
-pub fn decompress_zstd_chunk(
-    compressed: &[u8],
-    dst: &mut [u8],
-    chunk_index: usize,
-) -> Result<(), ObjectError> {
-    let mut decompressor = Decompressor::new().map_err(|err| ObjectError::ChunkDecompression {
-        chunk_index,
-        message: format!("failed to initialize zstd decompressor: {err}"),
-    })?;
-    decompress_zstd_chunk_with(&mut decompressor, compressed, dst, chunk_index)
-}
-
 fn decompress_zstd_chunk_with(
     decompressor: &mut Decompressor<'_>,
     compressed: &[u8],
@@ -236,20 +212,8 @@ pub fn compress_fragment_blocking(
     policy: CompressionPolicy,
     workers: usize,
 ) -> Result<FragmentCompressionOutput, ObjectError> {
-    if payload.len() > CLOUD_FRAGMENT_SIZE {
-        return Err(ObjectError::ObjectTooLarge(payload.len() as u64));
-    }
-    if !policy.is_enabled() {
-        return Ok(FragmentCompressionOutput::raw(
-            payload,
-            StoreRawReason::PolicyOff,
-        ));
-    }
-    if payload.is_empty() {
-        return Ok(FragmentCompressionOutput::raw(
-            payload,
-            StoreRawReason::ProbeSkipped,
-        ));
+    if let Some(output) = precheck_fragment(&payload, policy)? {
+        return Ok(output);
     }
 
     let probe_len = payload.len().min(PROBE_BYTES);
@@ -298,6 +262,27 @@ pub fn compress_fragment_blocking(
         stored_bytes: compressed_size,
         probe_skipped: false,
     })
+}
+
+/// Rejects oversized input and resolves `off` policy / empty input without compressing.
+fn precheck_fragment(
+    payload: &Bytes,
+    policy: CompressionPolicy,
+) -> Result<Option<FragmentCompressionOutput>, ObjectError> {
+    if payload.len() > CLOUD_FRAGMENT_SIZE {
+        return Err(ObjectError::ObjectTooLarge(payload.len() as u64));
+    }
+    let reason = if !policy.is_enabled() {
+        StoreRawReason::PolicyOff
+    } else if payload.is_empty() {
+        StoreRawReason::ProbeSkipped
+    } else {
+        return Ok(None);
+    };
+    Ok(Some(FragmentCompressionOutput::raw(
+        payload.clone(),
+        reason,
+    )))
 }
 
 fn new_chunk_compressor(level: i32) -> Result<Compressor<'static>, ObjectError> {
@@ -377,24 +362,7 @@ fn compress_chunks_parallel(
         }
         Ok(())
     };
-
-    if workers == 1 {
-        run()?;
-    } else {
-        thread::scope(|scope| -> Result<(), ObjectError> {
-            let handles: Vec<_> = (1..workers)
-                .filter_map(|_| thread::Builder::new().spawn_scoped(scope, run).ok())
-                .collect();
-            let mut result = run();
-            for handle in handles {
-                let joined = handle
-                    .join()
-                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
-                result = result.and(joined);
-            }
-            result
-        })?;
-    }
+    run_on_workers(workers, run)?;
 
     slots
         .into_iter()
@@ -432,42 +400,31 @@ fn compress_one_chunk(
     }
 }
 
-fn parse_complete_v3_seek_table(data: &Buffer) -> Result<V3SeekTable, ObjectError> {
-    if data.len() < ObjectHeader::SIZE {
-        return Err(
-            io::Error::new(io::ErrorKind::UnexpectedEof, "file too short for header").into(),
-        );
+/// Run `run` on the calling thread plus `workers - 1` scoped threads and join all.
+///
+/// Each worker pulls from a shared queue inside `run`; the first error wins and
+/// worker panics are propagated.
+fn run_on_workers<R>(workers: usize, run: R) -> Result<(), ObjectError>
+where
+    R: Fn() -> Result<(), ObjectError> + Sync,
+{
+    if workers <= 1 {
+        return run();
     }
-
-    let mut header_buf = data.slice(..ObjectHeader::SIZE);
-    let mut header_bytes = [0u8; ObjectHeader::SIZE];
-    header_buf.copy_to_slice(&mut header_bytes);
-    let header = ObjectHeader::from_bytes(&header_bytes)?;
-    let meta = V3HeaderMeta::parse(&header)?;
-
-    let payload = data.slice(ObjectHeader::SIZE..);
-    let seek_table_len = meta.seek_table_len();
-    if payload.len() < seek_table_len {
-        return Err(ObjectError::InvalidV3Format(format!(
-            "truncated seek table: need {seek_table_len} bytes, got {}",
-            payload.len()
-        )));
-    }
-
-    let mut seek_table_bytes = vec![0u8; seek_table_len];
-    let mut seek_table_buf = payload.slice(..seek_table_len);
-    seek_table_buf.copy_to_slice(&mut seek_table_bytes);
-    let seek_table = V3SeekTable::parse_with_header(header, &seek_table_bytes)?;
-
-    if payload.len() != header.compressed_size as usize {
-        return Err(ObjectError::SizeMismatch {
-            original_size: header.original_size,
-            compressed_size: header.compressed_size,
-            actual_size: payload.len(),
-        });
-    }
-
-    Ok(seek_table)
+    thread::scope(|scope| {
+        // A thread that fails to spawn only reduces parallelism; the queue still drains.
+        let handles: Vec<_> = (1..workers)
+            .filter_map(|_| thread::Builder::new().spawn_scoped(scope, &run).ok())
+            .collect();
+        let mut result = run();
+        for handle in handles {
+            let joined = handle
+                .join()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+            result = result.and(joined);
+        }
+        result
+    })
 }
 
 fn decompress_v3_parsed(
@@ -527,24 +484,7 @@ fn decompress_v3_parsed(
         }
         Ok(())
     };
-
-    if workers == 1 {
-        run()?;
-    } else {
-        thread::scope(|scope| -> Result<(), ObjectError> {
-            let handles: Vec<_> = (1..workers)
-                .filter_map(|_| thread::Builder::new().spawn_scoped(scope, run).ok())
-                .collect();
-            let mut result = run();
-            for handle in handles {
-                let joined = handle
-                    .join()
-                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
-                result = result.and(joined);
-            }
-            result
-        })?;
-    }
+    run_on_workers(workers, run)?;
 
     let computed_checksum = xxh64(&out, 0);
     let expected_checksum = seek_table.header().checksum;
