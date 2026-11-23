@@ -2,7 +2,7 @@
 
 [English](../en/README.md) · [Про документацію](../README.md)
 
-**Хочете почати якнайшвидше?** [Швидкий старт](quick-start.md) — від порожнього сервера до спільних дисків команди на одній сторінці.
+**Хочете почати якнайшвидше?** [Швидкий старт](quick-start.md) — увесь шлях від порожнього сервера до спільних дисків команди на одній сторінці.
 
 ## Знайомство зі StudioFS
 
@@ -14,7 +14,7 @@
 ## Підготовка інфраструктури
 
 - [05. Обираємо конфігурацію](05-choose-your-setup.md)
-- [06. S3 — дім для наших файлів](06-s3-a-home-for-your-files.md)
+- [06. S3 — дім для ваших файлів](06-s3-a-home-for-your-files.md)
 - [07. PostgreSQL — мозок, який пам’ятає, де лежать файли](07-postgresql-the-brain-behind-the-files.md)
 - [08. Tailscale — приватний шлях до PostgreSQL](08-tailscale-netbird-a-private-path-to-postgresql.md)
 - [09. Перевіряємо інфраструктуру](09-check-your-infrastructure.md)
@@ -35,11 +35,11 @@
 
 ## Щоденна робота
 
-- [18. Для чого підходить StudioFS і де потрібна обережність](18-studiofs-workloads.md)
+- [18. Для чого підходить StudioFS і де варто бути обережними](18-studiofs-workloads.md)
 - [19. Синхронізація, поганий Wi-Fi та інші несподіванки](19-sync-bad-wi-fi-and-other-surprises.md)
 - [20. Кеш: чому хмара використовує мій SSD?](20-cache-why-is-the-cloud-using-my-ssd.md)
 - [21. Двоє людей, один файл: співпраця та конфлікти](21-two-people-one-file-collaboration-and-conflicts.md)
-- [22. Налаштування, стан і активність](22-settings-status-and-activity.md)
+- [22. Налаштування, стан та активність](22-settings-status-and-activity.md)
 - [31. Локальний scratch-шар та `.studiofsignore`](31-scratch-layer-and-studiofsignore.md)
 
 ## Безпека та обслуговування
