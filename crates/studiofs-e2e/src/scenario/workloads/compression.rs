@@ -320,20 +320,22 @@ fn verify_peer(
             },
         )?;
         let per_file_after = peer.runtime_snapshot("client-b")?;
-        let gets_before = metric(&per_file_before, "gets")?;
-        let gets_after = metric(&per_file_after, "gets")?;
-        let decode_before = metric(&per_file_before, "decode")?;
-        let decode_after = metric(&per_file_after, "decode")?;
+        let counters = ColdReadCounters {
+            mount_gets: metric(&before, "gets")?,
+            gets_before: metric(&per_file_before, "gets")?,
+            gets_after: metric(&per_file_after, "gets")?,
+            mount_decode: metric(&before, "decode")?,
+            decode_before: metric(&per_file_before, "decode")?,
+            decode_after: metric(&per_file_after, "decode")?,
+        };
+        let (gets_before, gets_after) = (counters.gets_before, counters.gets_after);
+        let (decode_before, decode_after) = (counters.decode_before, counters.decode_after);
         let puts_before = metric(&per_file_before, "puts")?;
         let puts_after = metric(&per_file_after, "puts")?;
-        if gets_after <= gets_before
-            || (name != "entropy.bin" && name != "after-off.usda" && decode_after <= decode_before)
-        {
-            return Err(io::Error::other(format!(
-                "{name}: cold read did not fetch/decode its remote payload"
-            ))
-            .into());
-        }
+        let compressed = name != "entropy.bin" && name != "after-off.usda";
+        let fetched_before_read = cold_read_fetch_source(index, compressed, &counters)
+            .map_err(|reason| io::Error::other(format!("{name}: {reason}")))?;
+        evidence["fetched_before_read"] = json!(fetched_before_read);
         evidence["s3_gets_before"] = json!(gets_before);
         evidence["s3_gets_after"] = json!(gets_after);
         evidence["decompression_nanos_before"] = json!(decode_before);
@@ -352,6 +354,48 @@ fn verify_peer(
     let evidence = json!({"fresh_cache": true, "reads": reads, "s3_gets_before": gets_before, "s3_gets_after": gets_after});
     save(context, &format!("{label}-reads.json"), &evidence)?;
     Ok(evidence)
+}
+
+/// Fetch/decode counters around one cold peer read, plus their values at mount.
+struct ColdReadCounters {
+    mount_gets: u64,
+    gets_before: u64,
+    gets_after: u64,
+    mount_decode: u64,
+    decode_before: u64,
+    decode_after: u64,
+}
+
+/// Proves that the `index`-th fixture read by a cold peer came from its remote payload.
+///
+/// The peer starts with absent metadata and an empty cache, and each fixture is a
+/// distinct remote object. Normally the read's own window shows the S3 GET (and, for
+/// compressed fixtures, the decode). Another opener on the fresh mount, such as macOS
+/// Finder enumerating the new volume, can open a later fixture first; the VFS eager open
+/// prefetch then fetches that object during an earlier window and the read is served
+/// from the local payload. That fetch is accepted only when the GETs issued since mount
+/// already cover every fixture read so far plus this one, and a compressed fixture's
+/// decode advanced since mount. Returns whether the fetch preceded the read window.
+fn cold_read_fetch_source(
+    index: usize,
+    compressed: bool,
+    counters: &ColdReadCounters,
+) -> Result<bool, String> {
+    if counters.gets_after > counters.gets_before {
+        if compressed && counters.decode_after <= counters.decode_before {
+            return Err("cold read fetched but did not decode its remote payload".into());
+        }
+        return Ok(false);
+    }
+    let fetched_since_mount = counters.gets_before.saturating_sub(counters.mount_gets);
+    let covers_this_read = usize::try_from(fetched_since_mount).is_ok_and(|n| n > index);
+    if !covers_this_read || (compressed && counters.decode_before <= counters.mount_decode) {
+        return Err(format!(
+            "cold read did not fetch/decode its remote payload \
+             ({fetched_since_mount} GETs since mount before fixture read {index})"
+        ));
+    }
+    Ok(true)
 }
 
 fn metric(snapshot: &serde_json::Value, name: &str) -> io::Result<u64> {
@@ -461,6 +505,44 @@ mod tests {
                 assert!(encoded.probe_skipped);
             }
         }
+    }
+
+    fn counters(mount: (u64, u64), before: (u64, u64), after: (u64, u64)) -> ColdReadCounters {
+        ColdReadCounters {
+            mount_gets: mount.0,
+            gets_before: before.0,
+            gets_after: after.0,
+            mount_decode: mount.1,
+            decode_before: before.1,
+            decode_after: after.1,
+        }
+    }
+
+    #[test]
+    fn cold_read_accepts_fetch_in_own_window() {
+        let window = counters((0, 0), (1, 10), (2, 20));
+        assert_eq!(cold_read_fetch_source(1, true, &window), Ok(false));
+        let uncompressed = counters((0, 0), (1, 10), (2, 10));
+        assert_eq!(cold_read_fetch_source(1, false, &uncompressed), Ok(false));
+        assert!(cold_read_fetch_source(1, true, &uncompressed).is_err());
+    }
+
+    #[test]
+    fn cold_read_accepts_earlier_prefetch_only_when_gets_cover_it() {
+        // Failure evidence from run 20261124T222616Z-ae4a22: after-off.usda (read 3)
+        // was prefetched while scanlines.float32 was being read.
+        let prefetched = counters((0, 0), (4, 690_626), (4, 690_626));
+        assert_eq!(cold_read_fetch_source(3, false, &prefetched), Ok(true));
+        // A compressed prefetched fixture also needs decode progress since mount.
+        assert_eq!(cold_read_fetch_source(3, true, &prefetched), Ok(true));
+        let no_decode = counters((0, 0), (4, 0), (4, 0));
+        assert!(cold_read_fetch_source(3, true, &no_decode).is_err());
+        // Three GETs cannot cover four distinct cold objects.
+        let uncovered = counters((0, 0), (3, 10), (3, 10));
+        assert!(cold_read_fetch_source(3, false, &uncovered).is_err());
+        // GETs from before this mount's reads never count.
+        let stale = counters((4, 0), (4, 10), (4, 10));
+        assert!(cold_read_fetch_source(0, false, &stale).is_err());
     }
 
     #[test]
