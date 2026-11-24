@@ -97,23 +97,25 @@ pub(in crate::scenario) fn run_lww_reconnect_operations(
     // 0012: the later AddEntry binds the name). If client-d overwrites
     // client-a's displaced inode before it sees client-b's create, its bytes
     // leave the name, so the live clients converge on client-b's payload.
-    let converged = wait_for_lww_converged_payload(
+    // required_op propagates the error with `?`, so the empty fallback is never read.
+    let (converged, converged_payload) = match wait_for_lww_converged_payload(
         &[clients[0].clone(), clients[1].clone(), clients[3].clone()],
         &path,
         [client_d_payload.as_slice(), client_b_payload.as_slice()],
         Instant::now() + LWW_RECONNECT_CONVERGENCE_TIMEOUT,
         "lww reconnect client-d",
-    );
-    let converged_payload = converged.as_ref().ok().map(|payload| payload.to_vec());
+    ) {
+        Ok(payload) => (Ok(()), payload),
+        Err(error) => (Err(error), &[][..]),
+    };
     operations.push(required_op(
         started,
         6,
         &clients[0],
         "client_d_peer_visible",
         &path,
-        converged.map(|_| ()),
+        converged,
     )?);
-    let converged_payload = converged_payload.unwrap_or_default();
     operations.push(required_op(
         started,
         7,
@@ -132,7 +134,7 @@ pub(in crate::scenario) fn run_lww_reconnect_operations(
         &path,
         wait_for_mounted_initial_payloads_until(
             std::slice::from_ref(&clients[2]),
-            &[(path.as_str(), converged_payload.as_slice())],
+            &[(path.as_str(), converged_payload)],
             Instant::now() + LWW_RECONNECT_CONVERGENCE_TIMEOUT,
             MOUNTED_WRITE_READBACK_POLL_INTERVAL,
             "lww reconnect client-c catch-up",
@@ -235,7 +237,9 @@ fn wait_for_lww_converged_payload<'a>(
                 ),
             )));
         }
-        thread::sleep(MOUNTED_WRITE_READBACK_POLL_INTERVAL.min(deadline - now));
+        thread::sleep(
+            MOUNTED_WRITE_READBACK_POLL_INTERVAL.min(deadline.saturating_duration_since(now)),
+        );
     }
 }
 

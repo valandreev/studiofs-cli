@@ -848,7 +848,7 @@ fn evidence_view_filters_by_scope_object_identity_and_marker_span() {
     };
     let lease_manager = ControllerLeaseManager::default();
     let lease = lease_manager
-        .acquire("tester".to_string(), None)
+        .acquire("tester".to_string(), Some(DIAGNOSTICS_TEST_LEASE_TTL_MS))
         .expect("acquire lease");
     let service = test_session_service(&source, &lease_manager, Some(&store), None);
     let view = service
@@ -926,7 +926,7 @@ fn evidence_view_clamps_requested_budget_and_reports_truncation() {
     };
     let lease_manager = ControllerLeaseManager::default();
     let lease = lease_manager
-        .acquire("tester".to_string(), None)
+        .acquire("tester".to_string(), Some(DIAGNOSTICS_TEST_LEASE_TTL_MS))
         .expect("acquire lease");
     let service = test_session_service(&source, &lease_manager, Some(&store), None);
     let view = service
@@ -1029,7 +1029,7 @@ fn evidence_view_derives_blocking_intervals_and_hotspots_from_profile_artifacts(
 
     let lease_manager = ControllerLeaseManager::default();
     let lease = lease_manager
-        .acquire("tester".to_string(), None)
+        .acquire("tester".to_string(), Some(DIAGNOSTICS_TEST_LEASE_TTL_MS))
         .expect("acquire lease");
     let source = static_source();
     let service = test_session_service(&source, &lease_manager, Some(&store), None);
@@ -1080,7 +1080,7 @@ fn evidence_view_returns_empty_collections_for_empty_slices() {
     let (_case, run) = test_case_and_run(&store);
     let lease_manager = ControllerLeaseManager::default();
     let lease = lease_manager
-        .acquire("tester".to_string(), None)
+        .acquire("tester".to_string(), Some(DIAGNOSTICS_TEST_LEASE_TTL_MS))
         .expect("acquire lease");
     let source = static_source();
     let service = test_session_service(&source, &lease_manager, Some(&store), None);
@@ -1156,7 +1156,7 @@ fn evidence_view_surfaces_profile_artifact_load_errors() {
 
     let lease_manager = ControllerLeaseManager::default();
     let lease = lease_manager
-        .acquire("tester".to_string(), None)
+        .acquire("tester".to_string(), Some(DIAGNOSTICS_TEST_LEASE_TTL_MS))
         .expect("acquire lease");
     let source = static_source();
     let service = test_session_service(&source, &lease_manager, Some(&store), None);
@@ -1272,7 +1272,7 @@ fn materialize_report_persists_reloadable_run_artifact_with_findings() {
 
     let lease_manager = ControllerLeaseManager::default();
     let lease = lease_manager
-        .acquire("tester".to_string(), None)
+        .acquire("tester".to_string(), Some(DIAGNOSTICS_TEST_LEASE_TTL_MS))
         .expect("acquire lease");
     let service = test_session_service(&source, &lease_manager, Some(&store), None);
     let report = service
@@ -1383,7 +1383,7 @@ fn materialize_report_records_truncation_metadata_for_condensed_sections() {
 
     let lease_manager = ControllerLeaseManager::default();
     let lease = lease_manager
-        .acquire("tester".to_string(), None)
+        .acquire("tester".to_string(), Some(DIAGNOSTICS_TEST_LEASE_TTL_MS))
         .expect("acquire lease");
     let service = test_session_service(&source, &lease_manager, Some(&store), None);
     let report = service
@@ -1516,7 +1516,7 @@ fn materialize_report_reuses_single_runtime_snapshot_for_report_and_view() {
     };
     let lease_manager = ControllerLeaseManager::default();
     let lease = lease_manager
-        .acquire("tester".to_string(), None)
+        .acquire("tester".to_string(), Some(DIAGNOSTICS_TEST_LEASE_TTL_MS))
         .expect("acquire lease");
     let service = test_session_service(&source, &lease_manager, Some(&store), None);
     let report = service
@@ -2870,7 +2870,7 @@ fn compare_run_span_matches_markers_and_persists_delta_summary() {
 
     let lease_manager = ControllerLeaseManager::default();
     let lease = lease_manager
-        .acquire("tester".to_string(), None)
+        .acquire("tester".to_string(), Some(DIAGNOSTICS_TEST_LEASE_TTL_MS))
         .expect("acquire lease");
 
     let response = execute_request(
@@ -3001,7 +3001,7 @@ fn compare_run_span_rejects_ambiguous_marker_titles() {
 
     let lease_manager = ControllerLeaseManager::default();
     let lease = lease_manager
-        .acquire("tester".to_string(), None)
+        .acquire("tester".to_string(), Some(DIAGNOSTICS_TEST_LEASE_TTL_MS))
         .expect("acquire lease");
 
     let response = execute_request(
@@ -3044,7 +3044,7 @@ fn hypothesis_status_updates_remain_traceable_to_comparison_evidence() {
 
     let lease_manager = ControllerLeaseManager::default();
     let lease = lease_manager
-        .acquire("tester".to_string(), None)
+        .acquire("tester".to_string(), Some(DIAGNOSTICS_TEST_LEASE_TTL_MS))
         .expect("acquire lease");
 
     let create_response = execute_request(
