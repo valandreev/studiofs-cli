@@ -959,6 +959,22 @@ impl Scenario for ScratchAppleDouble {
             // No `.studiofsignore` file is written: `._*` is a built-in scratch rule.
             let _ = wait_until_sync_safe(controller, "client-a")?;
             let _ = wait_until_sync_safe(controller, "client-b")?;
+
+            // The tracked base file is created before its sidecar. On macOS, xnu
+            // `vn_create` removes a pre-existing `._<name>` when `<name>` is newly
+            // created on a volume without native xattr support (the same kernel
+            // cleanup happens on FAT/SMB), so a sidecar written first never
+            // survives the base create. Real AppleDouble sidecars follow their base.
+            let shot_payload = b"tracked shot payload\n";
+            write_mounted_file_with_readback(
+                a.join("shot.exr"),
+                shot_payload,
+                "write tracked shot.exr",
+                true,
+            )?;
+            expect_bytes(&b.join("shot.exr"), shot_payload)?;
+            let _ = wait_until_sync_safe(controller, "client-a")?;
+            let _ = wait_until_sync_safe(controller, "client-b")?;
             let events_before = query_event_log_count(config)?;
             let s3_before = count_s3_objects(config)?;
 
@@ -982,15 +998,7 @@ impl Scenario for ScratchAppleDouble {
                 .into());
             }
 
-            // Tracked companion file publishes normally; sidecar stays invisible to peer.
-            let shot_payload = b"tracked shot payload\n";
-            write_mounted_file_with_readback(
-                a.join("shot.exr"),
-                shot_payload,
-                "write tracked shot.exr",
-                true,
-            )?;
-            expect_bytes(&b.join("shot.exr"), shot_payload)?;
+            // The sidecar stays invisible to the peer while the tracked base is visible.
             wait_for_mounted_paths_absent_until(
                 std::slice::from_ref(&observer),
                 &["._shot.exr"],
@@ -998,6 +1006,7 @@ impl Scenario for ScratchAppleDouble {
                 POLL,
                 "._* sidecar stays hidden from peer",
             )?;
+            expect_bytes(&b.join("shot.exr"), shot_payload)?;
 
             // Sidecar bytes survive unmount and remount on the creating client.
             controller.unmount("client-a")?;
