@@ -93,20 +93,27 @@ pub(in crate::scenario) fn run_lww_reconnect_operations(
             .map_err(scenario_error_to_io)
         },
     ))?);
+    // client-b may create its own winner.txt before it sees client-a's (ADR
+    // 0012: the later AddEntry binds the name). If client-d overwrites
+    // client-a's displaced inode before it sees client-b's create, its bytes
+    // leave the name, so the live clients converge on client-b's payload.
+    let converged = wait_for_lww_converged_payload(
+        &[clients[0].clone(), clients[1].clone(), clients[3].clone()],
+        &path,
+        [client_d_payload.as_slice(), client_b_payload.as_slice()],
+        Instant::now() + LWW_RECONNECT_CONVERGENCE_TIMEOUT,
+        "lww reconnect client-d",
+    );
+    let converged_payload = converged.as_ref().ok().map(|payload| payload.to_vec());
     operations.push(required_op(
         started,
         6,
         &clients[0],
         "client_d_peer_visible",
         &path,
-        wait_for_mounted_initial_payloads_until(
-            std::slice::from_ref(&clients[0]),
-            &[(path.as_str(), client_d_payload.as_slice())],
-            Instant::now() + LWW_RECONNECT_CONVERGENCE_TIMEOUT,
-            MOUNTED_WRITE_READBACK_POLL_INTERVAL,
-            "lww reconnect client-d",
-        ),
+        converged.map(|_| ()),
     )?);
+    let converged_payload = converged_payload.unwrap_or_default();
     operations.push(required_op(
         started,
         7,
@@ -125,7 +132,7 @@ pub(in crate::scenario) fn run_lww_reconnect_operations(
         &path,
         wait_for_mounted_initial_payloads_until(
             std::slice::from_ref(&clients[2]),
-            &[(path.as_str(), client_d_payload.as_slice())],
+            &[(path.as_str(), converged_payload.as_slice())],
             Instant::now() + LWW_RECONNECT_CONVERGENCE_TIMEOUT,
             MOUNTED_WRITE_READBACK_POLL_INTERVAL,
             "lww reconnect client-c catch-up",
@@ -191,6 +198,45 @@ pub(in crate::scenario) fn run_lww_reconnect_operations(
     };
     write_lww_oracle(context, &oracle)?;
     Ok((operations, oracle))
+}
+
+/// Waits until every client reads the same candidate payload at `path` and
+/// returns that candidate.
+fn wait_for_lww_converged_payload<'a>(
+    clients: &[ClientSpec],
+    path: &str,
+    candidates: [&'a [u8]; 2],
+    deadline: Instant,
+    label: &str,
+) -> Result<&'a [u8], ScenarioError> {
+    let probe_limiter = MountedProbeLimiter::new(MOUNTED_VALIDATION_MAX_ACTIVE_PROBES);
+    loop {
+        let mut last_missing = Vec::new();
+        for candidate in candidates {
+            let missing = missing_mounted_initial_payloads_with_probe(
+                clients,
+                &[(path, candidate)],
+                &probe_limiter,
+                MOUNTED_VALIDATION_PROBE_TIMEOUT,
+                mounted_initial_payload_probe,
+            );
+            if missing.is_empty() {
+                return Ok(candidate);
+            }
+            last_missing.extend(missing);
+        }
+        let now = Instant::now();
+        if probe_limiter.is_poisoned() || now >= deadline {
+            return Err(ScenarioError::Io(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!(
+                    "{label} did not converge before timeout; missing: {}",
+                    last_missing.join(", ")
+                ),
+            )));
+        }
+        thread::sleep(MOUNTED_WRITE_READBACK_POLL_INTERVAL.min(deadline - now));
+    }
 }
 
 pub(in crate::scenario) fn run_open_handle_operations(
