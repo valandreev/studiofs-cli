@@ -1876,8 +1876,7 @@ mod tests {
         runtime.block_on(async {
             let worker = tokio::spawn(Arc::clone(&vfs).background_ignore_rules());
             vfs.wait_for_ignore_rules_bootstrap().await;
-            let ino = write_rule_file(&vfs, ROOT_INO, b"*.bak
-").await;
+            let ino = write_rule_file(&vfs, ROOT_INO, b"*.bak\n").await;
             wait_for_class(&vfs, &mut changes, b"keep.bak", ScratchClass::Scratch).await;
 
             // WinFSP: the user handle closes (Cleanup) but the OS cache defers
@@ -1885,8 +1884,7 @@ mod tests {
             let fh = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
             vfs.setattr_with_handle(Some(fh), ino, SetattrArgs::size_only(0))
                 .unwrap();
-            vfs.write_fh(fh, ino, 0, b"*.tmp
-").await.unwrap();
+            vfs.write_fh(fh, ino, 0, b"*.tmp\n").await.unwrap();
             vfs.flush_fh(fh).await.unwrap();
             vfs.note_writer_handle_cleanup(ino, fh);
             wait_for_class(&vfs, &mut changes, b"keep.tmp", ScratchClass::Scratch).await;
