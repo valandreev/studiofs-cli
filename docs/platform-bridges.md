@@ -395,6 +395,10 @@ WinFSP callback barrier semantics:
   cached file data. Set `STUDIOFS_WINFSP_FLUSH_AND_PURGE_ON_CLEANUP=1` only for
   targeted stale-cache investigations.
 - Non-delete `cleanup` callback handling in StudioFS is observational only; for real file handles it records that the callback happened, but any remaining writer state is deferred to a later explicit `flush` or the last-handle `close` / `release_fh()` path.
+  One exception: a writer handle on a `.studiofsignore` file stops deferring the
+  rule reload at `cleanup`, because Windows can hold back the matching `close`
+  while the cache manager still references the file object. Unflushed local
+  dirty state on the rule file still defers the reload.
 - `fh == 0` contexts, such as directories, do not have a `release_fh()` fallback; they stay observational unless an explicit `flush` callback makes local state visible.
 - `close` is the release-path hook for WinFSP. It admits remaining local writer
   state for the last handle to the same volatile worker, without waiting for

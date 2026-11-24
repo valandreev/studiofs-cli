@@ -495,7 +495,12 @@ fn should_disable_winfsp_file_cache(
     open_flags.allows_write() || truncates_on_open || requested_uncached
 }
 
-fn read_ahead_owner_for_winfsp_handle() -> ReadAheadOwner {
+fn read_ahead_owner_for_winfsp_handle(granted_access: FILE_ACCESS_RIGHTS) -> ReadAheadOwner {
+    // Attribute/DELETE-only opens (stat, rename, unlink) never read data; an
+    // eager payload fetch there would silently make the file locally cached.
+    if (granted_access & FILE_READ_DATA_ACCESS) == 0 {
+        return ReadAheadOwner::Kernel;
+    }
     // WinFSP's cache-manager caches the exposed mount, while the VFS still
     // owns the separate local payload cache. Keep VFS prefetch enabled even
     // for cacheable read-only handles so a cold local payload is warmed before
@@ -1503,6 +1508,7 @@ impl StudioFsContext {
             create_options,
             file_attributes,
             open_flags: open_flags_from_access(granted_access, create_options),
+            read_ahead_owner: read_ahead_owner_for_winfsp_handle(granted_access),
             write_local_sync_policy: write_local_sync_policy_from_create_parameters(
                 create_options,
                 file_attributes,
@@ -1579,7 +1585,7 @@ impl StudioFsContext {
                     plan.open_flags,
                     false,
                     plan.write_local_sync_policy,
-                    read_ahead_owner_for_winfsp_handle(),
+                    plan.read_ahead_owner,
                 )?,
             );
             if truncates_on_open
@@ -2028,7 +2034,7 @@ impl FileSystemContext for StudioFsContext {
                 open_flags,
                 false,
                 write_local_sync_policy,
-                read_ahead_owner_for_winfsp_handle(),
+                read_ahead_owner_for_winfsp_handle(granted_access),
             )?,
         );
         if trunc
@@ -3666,6 +3672,32 @@ mod tests {
             vfs.read_ahead_owner(handle.fh),
             Some(ReadAheadOwner::Vfs),
             "WinFSP cacheable read-only handles still need VFS prefetch for the local payload cache"
+        );
+
+        <StudioFsContext as FileSystemContext>::close(&ctx, handle);
+    }
+
+    #[test]
+    fn attribute_only_open_skips_vfs_eager_prefetch() {
+        let (_tmp, vfs, ctx, _queue) = make_test_context("attribute-only-no-prefetch");
+        vfs.create(ROOT_INO, b"stat-only.txt", 0, 0, 0o644)
+            .expect("create file");
+
+        let file_name = U16CString::from_str(r"\stat-only.txt").expect("u16 path");
+        let mut file_info = empty_open_file_info();
+        // Rename/stat opens carry DELETE or READ_ATTRIBUTES without FILE_READ_DATA.
+        let handle = <StudioFsContext as FileSystemContext>::open(
+            &ctx,
+            file_name.as_ucstr(),
+            0,
+            0x0001_0000 | FILE_READ_ATTRIBUTES_ACCESS | SYNCHRONIZE_ACCESS,
+            &mut file_info,
+        )
+        .expect("open existing file for attributes");
+
+        assert_eq!(
+            vfs.read_ahead_owner(handle.fh),
+            Some(ReadAheadOwner::Kernel)
         );
 
         <StudioFsContext as FileSystemContext>::close(&ctx, handle);

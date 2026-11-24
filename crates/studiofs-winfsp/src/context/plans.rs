@@ -1,5 +1,5 @@
 use studiofs_meta::Ino;
-use studiofs_vfs::{LocalSyncPolicy, OpenFlags};
+use studiofs_vfs::{LocalSyncPolicy, OpenFlags, ReadAheadOwner};
 
 use super::CreateCallbackKind;
 
@@ -9,6 +9,7 @@ pub(super) struct CreateCallbackPlan {
     pub(super) create_options: u32,
     pub(super) file_attributes: u32,
     pub(super) open_flags: OpenFlags,
+    pub(super) read_ahead_owner: ReadAheadOwner,
     pub(super) write_local_sync_policy: LocalSyncPolicy,
     pub(super) kind: CreateCallbackKind,
 }
