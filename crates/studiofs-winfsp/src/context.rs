@@ -498,7 +498,7 @@ fn should_disable_winfsp_file_cache(
 fn read_ahead_owner_for_winfsp_handle(granted_access: FILE_ACCESS_RIGHTS) -> ReadAheadOwner {
     // Attribute/DELETE-only opens (stat, rename, unlink) never read data; an
     // eager payload fetch there would silently make the file locally cached.
-    if granted_access & FILE_READ_DATA_ACCESS == 0 {
+    if (granted_access & FILE_READ_DATA_ACCESS) == 0 {
         return ReadAheadOwner::Kernel;
     }
     // WinFSP's cache-manager caches the exposed mount, while the VFS still

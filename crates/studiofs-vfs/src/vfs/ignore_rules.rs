@@ -293,11 +293,15 @@ impl IgnoreRules {
         if !self.watched.lock().files.contains(&ino) {
             return;
         }
-        self.cleaned_up_writers
+        let inserted = self
+            .cleaned_up_writers
             .lock()
             .entry(ino)
             .or_default()
             .insert(fh);
+        if !inserted {
+            return;
+        }
         self.bump_write_activity_epoch();
         self.refresh.notify_one();
     }
@@ -672,6 +676,10 @@ impl StudioVfs {
     pub fn note_writer_handle_cleanup(&self, ino: Ino, fh: u64) {
         if self.handle_table.is_valid_writer_for_inode(fh, ino) {
             self.ignore_rules.note_writer_cleanup(ino, fh);
+            // A release between the check and the insert already ran its forget.
+            if !self.handle_table.is_valid_writer_for_inode(fh, ino) {
+                self.ignore_rules.forget_cleaned_up_writer(ino, fh);
+            }
         }
     }
 
@@ -1891,6 +1899,18 @@ mod tests {
             assert_eq!(
                 vfs.classify_scratch_path(b"keep.bak", false),
                 ScratchClass::Tracked
+            );
+            let epoch = vfs
+                .ignore_rules
+                .write_activity_epoch
+                .load(Ordering::Acquire);
+            vfs.note_writer_handle_cleanup(ino, fh);
+            assert_eq!(
+                vfs.ignore_rules
+                    .write_activity_epoch
+                    .load(Ordering::Acquire),
+                epoch,
+                "a duplicate Cleanup must not force another refresh pass"
             );
 
             vfs.release_fh(fh).await.unwrap();

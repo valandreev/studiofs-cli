@@ -480,9 +480,14 @@ async fn seed_large_history_fixture_async(
         })?;
 
     insert_fixture_events(&transaction, volume_id, &events).await?;
+    let existing_payload_bytes = u64::try_from(existing_payload_bytes).map_err(|_| {
+        ScenarioError::Io(io::Error::other(format!(
+            "large-history PostgreSQL fixture found negative total_event_payload_bytes {existing_payload_bytes}"
+        )))
+    })?;
     let total_payload_bytes = checkpoint_payload_bytes
         .checked_add(event_payload_bytes)
-        .and_then(|total| total.checked_add(u64::try_from(existing_payload_bytes).ok()?))
+        .and_then(|total| total.checked_add(existing_payload_bytes))
         .ok_or_else(|| {
             ScenarioError::Io(io::Error::other(
                 "large-history PostgreSQL fixture total payload size overflow",
