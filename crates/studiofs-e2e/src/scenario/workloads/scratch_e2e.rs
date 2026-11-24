@@ -1199,6 +1199,7 @@ fn wait_for_rules_active_single_client(
     volume_name: &str,
 ) -> Result<u32, ScenarioError> {
     let deadline = Instant::now() + WAIT;
+    let mut last_listing = String::new();
     for attempt in 1.. {
         let probe = format!("probe-single-{attempt}.tmp");
         write_mounted_file_with_readback(mount.join(&probe), b"p\n", "single rule probe", true)?;
@@ -1215,12 +1216,19 @@ fn wait_for_rules_active_single_client(
         if output.stdout.contains(&probe) {
             return Ok(attempt);
         }
+        last_listing = format!(
+            "probe={probe} stdout={:?} stderr={:?}",
+            output.stdout, output.stderr
+        );
         if Instant::now() >= deadline {
             break;
         }
         thread::sleep(POLL);
     }
-    Err(io::Error::other(format!("{client_name}: ignore rules never became active")).into())
+    Err(io::Error::other(format!(
+        "{client_name}: ignore rules never became active; last scratch list: {last_listing}"
+    ))
+    .into())
 }
 
 fn write_synced_mounted_file(
@@ -1231,7 +1239,11 @@ fn write_synced_mounted_file(
     let path_owned = path.to_path_buf();
     let bytes = payload.to_vec();
     run_bounded_mounted_io(label, WAIT, move || {
-        let mut file = fs::File::create(&path_owned)?;
+        // WinFSP FlushFileBuffers is volatile writeback; write-through is the
+        // local durability barrier a forced kill must not cross.
+        let mut options = mounted_write_barrier_open_options();
+        options.create(true).truncate(true);
+        let mut file = options.open(&path_owned)?;
         file.write_all(&bytes)?;
         file.sync_all()?;
         Ok(())

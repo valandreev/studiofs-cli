@@ -79,6 +79,9 @@ pub(super) struct IgnoreRules {
     dir_rename_epoch: AtomicU64,
     write_activity_epoch: AtomicU64,
     opening_trunc_writers: parking_lot::Mutex<HashMap<Ino, u32>>,
+    /// Rule-file writer handles whose user handle was closed (WinFSP
+    /// `Cleanup`) but whose final `Close` is still deferred by the OS cache.
+    cleaned_up_writers: parking_lot::Mutex<HashMap<Ino, HashSet<u64>>>,
     dir_rule_cache: parking_lot::Mutex<LruCache<Ino, CachedDirRules>>,
     sources: RuleSources,
     refresh: Notify,
@@ -164,6 +167,7 @@ impl IgnoreRules {
             dir_rename_epoch: AtomicU64::new(0),
             write_activity_epoch: AtomicU64::new(0),
             opening_trunc_writers: parking_lot::Mutex::default(),
+            cleaned_up_writers: parking_lot::Mutex::default(),
             dir_rule_cache: parking_lot::Mutex::new(LruCache::new(
                 NonZeroUsize::new(DIR_RULE_CACHE_CAPACITY).expect("non-zero dir rule cache cap"),
             )),
@@ -280,6 +284,41 @@ impl IgnoreRules {
             ino,
             notify_on_drop: true,
         }
+    }
+
+    /// Treat a writer whose user handle closed as closed for rule reloads.
+    /// WinFSP delivers `Close` only once the OS cache drops its file-object
+    /// reference, which can be arbitrarily late after `Cleanup`.
+    fn note_writer_cleanup(&self, ino: Ino, fh: u64) {
+        if !self.watched.lock().files.contains(&ino) {
+            return;
+        }
+        self.cleaned_up_writers
+            .lock()
+            .entry(ino)
+            .or_default()
+            .insert(fh);
+        self.bump_write_activity_epoch();
+        self.refresh.notify_one();
+    }
+
+    pub(super) fn forget_cleaned_up_writer(&self, ino: Ino, fh: u64) {
+        let mut cleaned = self.cleaned_up_writers.lock();
+        if let Some(handles) = cleaned.get_mut(&ino) {
+            handles.remove(&fh);
+            if handles.is_empty() {
+                cleaned.remove(&ino);
+            }
+        }
+    }
+
+    fn cleaned_up_writer_count(&self, ino: Ino) -> u32 {
+        self.cleaned_up_writers
+            .lock()
+            .get(&ino)
+            .map_or(0, |handles| {
+                u32::try_from(handles.len()).unwrap_or(u32::MAX)
+            })
     }
 
     fn has_opening_trunc_writer(&self, ino: Ino) -> bool {
@@ -623,9 +662,17 @@ impl StudioVfs {
     /// handle, an in-flight `open(..., trunc=true)`, or unflushed local dirty
     /// state from a handle that is still closing.
     fn is_ignore_rule_inode_open_for_writing(&self, ino: Ino) -> bool {
-        self.handle_table.write_open_count(ino) > 0
+        self.handle_table.write_open_count(ino) > self.ignore_rules.cleaned_up_writer_count(ino)
             || self.ignore_rules.has_opening_trunc_writer(ino)
             || self.inode_has_pending_local_state(ino)
+    }
+
+    /// Record a platform `Cleanup` (user handle closed) for writer `fh`; its
+    /// deferred `Close` no longer holds back a `.studiofsignore` reload.
+    pub fn note_writer_handle_cleanup(&self, ino: Ino, fh: u64) {
+        if self.handle_table.is_valid_writer_for_inode(fh, ino) {
+            self.ignore_rules.note_writer_cleanup(ino, fh);
+        }
     }
 
     /// Wait for the initial prefetch pass before exposing the mount.
@@ -1820,6 +1867,44 @@ mod tests {
     /// keeps the last compiled rule set across truncate, write, and flush, and
     /// loads the new content only after the last write handle closes (even if a
     /// read-only handle remains open).
+    #[test]
+    fn ignore_rules_reload_after_writer_cleanup_without_close() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("ignore-rules-cleanup-");
+        let (runtime, vfs, _) =
+            super::super::tests::make_unstarted_test_vfs(&tmp, "ignore-rules-cleanup");
+        let mut changes = vfs.subscribe_ignore_rules_changes();
+        runtime.block_on(async {
+            let worker = tokio::spawn(Arc::clone(&vfs).background_ignore_rules());
+            vfs.wait_for_ignore_rules_bootstrap().await;
+            let ino = write_rule_file(&vfs, ROOT_INO, b"*.bak
+").await;
+            wait_for_class(&vfs, &mut changes, b"keep.bak", ScratchClass::Scratch).await;
+
+            // WinFSP: the user handle closes (Cleanup) but the OS cache defers
+            // Close, so the writer stays in the handle table.
+            let fh = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
+            vfs.setattr_with_handle(Some(fh), ino, SetattrArgs::size_only(0))
+                .unwrap();
+            vfs.write_fh(fh, ino, 0, b"*.tmp
+").await.unwrap();
+            vfs.flush_fh(fh).await.unwrap();
+            vfs.note_writer_handle_cleanup(ino, fh);
+            wait_for_class(&vfs, &mut changes, b"keep.tmp", ScratchClass::Scratch).await;
+            assert_eq!(
+                vfs.classify_scratch_path(b"keep.bak", false),
+                ScratchClass::Tracked
+            );
+
+            vfs.release_fh(fh).await.unwrap();
+            assert!(vfs.ignore_rules.cleaned_up_writers.lock().is_empty());
+            vfs.state.shutdown.background_shutdown_token.cancel();
+            tokio::time::timeout(Duration::from_secs(5), worker)
+                .await
+                .expect("rule worker joined")
+                .unwrap();
+        });
+    }
+
     #[test]
     fn ignore_rules_keep_last_compiled_rules_while_open_for_writing() {
         let tmp = studiofs_test_support::workspace_target_tempdir("ignore-rules-open-write-");

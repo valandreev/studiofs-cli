@@ -121,6 +121,9 @@ impl<'a> WinfspHandleDrainFacade<'a> {
 
     pub(super) fn cleanup_non_delete(&self, ino: Ino, fh: u64) {
         self.context.vfs.note_winfsp_cleanup_callback();
+        if fh != 0 {
+            self.context.vfs.note_writer_handle_cleanup(ino, fh);
+        }
         if fh != 0 && self.context.vfs.inode_has_local_dirty_state(ino) {
             self.context
                 .callback_barrier_state

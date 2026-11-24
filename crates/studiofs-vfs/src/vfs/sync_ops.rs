@@ -797,6 +797,8 @@ impl StudioVfs {
             debug!("release_fh: unknown fh={}", fh);
             return None;
         };
+        self.ignore_rules
+            .forget_cleaned_up_writer(open_file.ino, fh);
         if open_file.flags.allows_write() && remaining_write == 0 {
             // The close snapshot skips the tracker while a writer remains.
             // Recheck because a writer may reopen before this lock is acquired;
