@@ -288,7 +288,7 @@ impl MountedProbeLimiter {
         }
     }
 
-    fn is_poisoned(&self) -> bool {
+    pub(in crate::scenario) fn is_poisoned(&self) -> bool {
         self.poisoned.load(Ordering::Acquire)
     }
 
