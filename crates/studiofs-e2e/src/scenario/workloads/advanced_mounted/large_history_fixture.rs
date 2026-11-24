@@ -417,7 +417,8 @@ async fn seed_large_history_fixture_async(
     let volume_id: i64 = volume_row.get(0);
     let state_row = transaction
         .query_one(
-            "SELECT version, checkpoint_version FROM metadata_state WHERE vol = $1 FOR UPDATE",
+            "SELECT version, checkpoint_version, total_event_payload_bytes, volume_settings
+             FROM metadata_state WHERE vol = $1 FOR UPDATE",
             &[&volume_id],
         )
         .await
@@ -428,15 +429,20 @@ async fn seed_large_history_fixture_async(
         })?;
     let metadata_version: i64 = state_row.get(0);
     let checkpoint_version: i64 = state_row.get(1);
-    if metadata_version != 0 || checkpoint_version != 0 {
+    let existing_payload_bytes: i64 = state_row.get(2);
+    let volume_settings: Option<Vec<u8>> = state_row.get(3);
+    // `studiofs init` publishes the initial volume settings as an ordered
+    // event; the fixture checkpoint supersedes it and carries the settings.
+    if metadata_version >= FIXTURE_CHECKPOINT_VERSION || checkpoint_version != 0 {
         return Err(ScenarioError::Io(io::Error::other(
             "large-history PostgreSQL fixture requires an empty metadata history",
         )));
     }
     let existing_event_count: i64 = transaction
         .query_one(
-            "SELECT COUNT(*) FROM event_log WHERE vol = $1",
-            &[&volume_id],
+            "SELECT COUNT(*) FROM event_log
+             WHERE vol = $1 AND (event_type <> 'set_volume_settings' OR batch_version > $2)",
+            &[&volume_id, &metadata_version],
         )
         .await
         .map_err(|_| {
@@ -452,7 +458,8 @@ async fn seed_large_history_fixture_async(
     }
 
     let (checkpoint_events, events, file_count) = build_fixture_events(fixture_root)?;
-    let checkpoint_bytes = build_serving_checkpoint(&checkpoint_events, scenario_dir)?;
+    let checkpoint_bytes =
+        build_serving_checkpoint(&checkpoint_events, volume_settings, scenario_dir)?;
     let checkpoint_payload_bytes = encoded_payload_bytes(&checkpoint_events)?;
     let event_payload_bytes = events.iter().try_fold(0_u64, |total, event| {
         total
@@ -475,6 +482,7 @@ async fn seed_large_history_fixture_async(
     insert_fixture_events(&transaction, volume_id, &events).await?;
     let total_payload_bytes = checkpoint_payload_bytes
         .checked_add(event_payload_bytes)
+        .and_then(|total| total.checked_add(u64::try_from(existing_payload_bytes).ok()?))
         .ok_or_else(|| {
             ScenarioError::Io(io::Error::other(
                 "large-history PostgreSQL fixture total payload size overflow",
@@ -503,7 +511,7 @@ async fn seed_large_history_fixture_async(
                  checkpoint_generation = checkpoint_generation + 1,
                  checkpoint_updated_at = now(),
                  updated_at = now()
-             WHERE vol = $1 AND version = 0 AND checkpoint_version = 0",
+             WHERE vol = $1 AND version = $8 AND checkpoint_version = 0",
             &[
                 &volume_id,
                 &remote_head_version,
@@ -512,6 +520,7 @@ async fn seed_large_history_fixture_async(
                 &checkpoint_payload_bytes_i64,
                 &checkpoint_bytes,
                 &sha256(&checkpoint_bytes),
+                &metadata_version,
             ],
         )
         .await
@@ -782,9 +791,14 @@ fn build_moving_head_events(first_batch_version: i64) -> Result<Vec<FixtureEvent
 
 fn build_serving_checkpoint(
     checkpoint_events: &[MetaEvent],
+    volume_settings: Option<Vec<u8>>,
     scenario_dir: &Path,
 ) -> Result<Vec<u8>, ScenarioError> {
-    let snapshot = serving_snapshot_from_events(checkpoint_events)?;
+    let mut snapshot = serving_snapshot_from_events(checkpoint_events)?;
+    // Same JSON as `metadata_state.volume_settings`; the export reads this key.
+    snapshot
+        .settings
+        .extend(volume_settings.map(|settings| ("base_volume_settings".to_string(), settings)));
     let path = scenario_dir.join("large-history-fixture-checkpoint.redb");
     let result = (|| {
         let engine = RedbMetaEngine::open(&path).map_err(|_| {
@@ -1019,6 +1033,32 @@ mod tests {
             expected_last_batch
         );
         assert!(events.iter().all(|event| event.event_type == "set_attr"));
+    }
+
+    #[test]
+    fn fixture_checkpoint_carries_initial_volume_settings() {
+        use studiofs_meta::trash::{CompressionPolicy, MetaVolumeSettings as _, VolumeSettings};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (checkpoint_events, _, _) =
+            build_fixture_events("fixture-root").expect("fixture events");
+        let settings = VolumeSettings {
+            revision: 1,
+            compression: CompressionPolicy::zstd_default(),
+            ..VolumeSettings::default()
+        };
+        let checkpoint = build_serving_checkpoint(
+            &checkpoint_events,
+            Some(serde_json::to_vec(&settings).expect("settings json")),
+            dir.path(),
+        )
+        .expect("checkpoint");
+
+        let engine = RedbMetaEngine::open(dir.path().join("cold.redb")).expect("engine");
+        engine
+            .import_serving_checkpoint_bytes(&checkpoint)
+            .expect("import checkpoint");
+        assert_eq!(engine.volume_settings().expect("settings"), settings);
     }
 
     fn child_ino(events: &[MetaEvent], parent: u64, name: &str) -> u64 {
