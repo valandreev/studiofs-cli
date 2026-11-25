@@ -145,13 +145,36 @@ that declares support for 0.2.5 (the compiled test successor of
   (`crates/studiofs-meta/src/pg_engine/schema.rs:922`). The marker insert is the
   last statement and never moves backwards
   (`crates/studiofs-meta/src/pg_engine/schema.rs:912`).
-- Reader strictness: mount startup runs `validate_postgres_schema`
-  (`crates/studiofs-meta/src/pg_engine.rs:1280`) against one global list of
-  required tables (`crates/studiofs-meta/src/pg_engine.rs:1314`) and columns.
-  A missing table tells the operator to destroy and re-init
-  (`crates/studiofs-meta/src/pg_engine.rs:1365`). Extra tables are ignored.
-  The Janitor requires `payload_gc` to equal exactly 2 and its guard triggers
-  to be enabled (`crates/studiofs-meta/src/pg_engine/janitor.rs:430`).
+- Reader strictness (SFS-1006): mount startup runs `validate_postgres_schema`
+  (`crates/studiofs-meta/src/pg_engine/startup_schema.rs`) per component, not
+  against one global list of tables. `MOUNT_COMPONENTS` names the components
+  a mount uses and the objects it touches:
+  - `core`: the bootstrap, replay, publication, checkpoint and file-lock
+    tables, `trash_entry_authority` and `trash_publication_receipts` for
+    retained-entry publication and recovery, `snapshot_catalog` and
+    `snapshot_source_checkpoints` (event log prune floor), and the
+    `metadata_state` checkpoint, prune and `write_requirement` columns.
+  - `payload_gc`: the payload upload and reachability ledger that publication
+    writes.
+
+  Each component's `studiofs_schema_components` row must exist and be at least
+  its `min_supported`. A newer version or an unknown component is additive for
+  a mount and is accepted. A missing object refuses the mount as
+  `schema_component_outdated` naming the object, even under a newer version.
+  If an object is missing and its recorded component is newer than the
+  running binary, use a binary that supports that version or newer when
+  running `studiofs upgrade --repair-schema`.
+  A missing registry or row refuses the mount as `schema_component_missing`. These
+  refusals reuse the `compat::ReasonCode` codes and actions and are permanent
+  `Storage` errors. Only an unreachable PostgreSQL or a bounded timeout falls
+  back to local-first startup; a rejected probe statement fails startup.
+  Optional-feature tables are not checked at mount: snapshot creation jobs and
+  leases, cleanup and mount leases, policies, artifacts and attempts, and
+  Janitor sweep checkpoints. A missing one fails only that feature's
+  statements. Snapshot ports still report this as a redacted retryable
+  backend error. The Janitor requires `payload_gc` to equal exactly 2 and its
+  guard triggers to be enabled
+  (`crates/studiofs-meta/src/pg_engine/janitor.rs:430`).
 - Writers: DDL runs only from CLI commands: `init`
   (`crates/studiofs/src/cli/init.rs:322`, `crates/studiofs/src/cli/init.rs:420`),
   `load`
@@ -513,7 +536,7 @@ successor can fence it safely. "Current state" is what `main` does today.
 | Unknown checkpoint formats fail closed with a typed reason. | Missing typed reason: snapshot sources fail closed, but one untyped `snapshot source checkpoint is invalid` covers unknown format, checksum mismatch and schema mismatch (`crates/studiofs-meta/src/pg_engine/snapshot_control.rs:360`). The serving checkpoint has no format field of its own and relies on `metadata_format_version`. | [SFS-1011](https://linear.app/valandreev/issue/SFS-1011) |
 | Unknown payload object formats fail closed with a typed reason. | Present: `UnsupportedVersion` and `UnsupportedCodec` (`crates/studiofs-data/src/object.rs:325`, `crates/studiofs-data/src/object.rs:160`); SFEC version and flags are strict. | [SFS-1009](https://linear.app/valandreev/issue/SFS-1009) (write gating) |
 | Unknown local formats fail closed with a typed reason. | Partial: payload index format is typed (`crates/studiofs-cache/src/payload_index.rs:1299`), entry encoding is `Corruption` (`crates/studiofs-cache/src/payload_index.rs:1790`); redb has no own identity. | [SFS-1012](https://linear.app/valandreev/issue/SFS-1012), [SFS-1003](https://linear.app/valandreev/issue/SFS-1003) |
-| Additive PG objects are tolerated when declared capabilities allow it. | Partial: extra tables are ignored by `validate_postgres_schema`, but the required list is global and not capability-scoped (`crates/studiofs-meta/src/pg_engine.rs:1314`). DDL from `init`/`load`/`upgrade` goes through the SFS-1005 migration registry, which refuses newer or unknown components before any DDL. | [SFS-1006](https://linear.app/valandreev/issue/SFS-1006) |
+| Additive PG objects are tolerated when declared capabilities allow it. | Present for mount startup: `validate_postgres_schema` checks only the components and objects used by the mount (`crates/studiofs-meta/src/pg_engine/startup_schema.rs`). DDL from `init`/`load`/`upgrade` goes through the SFS-1005 migration registry, which refuses newer or unknown components before any DDL. | [SFS-1006](https://linear.app/valandreev/issue/SFS-1006) |
 | Policy epoch is revalidated after reconnect. | Partial: the format and write-requirement predicates are re-evaluated in every publication transaction; the policy epoch exists (`volume_protocol.policy_epoch`, SFS-1007) but no client caches or compares it yet. | [SFS-1015](https://linear.app/valandreev/issue/SFS-1015), [SFS-1007](https://linear.app/valandreev/issue/SFS-1007) |
 | Unknown `MetadataBackend` variant or unknown `FormatInfo` field fails closed with typed `UpgradeRequired`. | Present (SFS-1003): `decode_format_info` returns `MetaError::UpgradeRequired` naming the field or variant, including nested configs, and the bootstrap descriptor keeps it instead of reporting an invalid checkpoint. | [SFS-1003](https://linear.app/valandreev/issue/SFS-1003) |
 | 0.2.x volumes adopt the baseline by `studiofs upgrade` to format 7. | Missing: upgrade handles 5→6 only (`crates/studiofs-meta/src/pg_engine/format_upgrade.rs:35`). | [SFS-1132](https://linear.app/valandreev/issue/SFS-1132) |

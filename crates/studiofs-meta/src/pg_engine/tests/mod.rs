@@ -27,6 +27,7 @@ mod snapshot_control;
 mod snapshot_policy;
 mod snapshot_reachability;
 mod snapshot_replay;
+mod startup_schema;
 mod volume_protocol;
 
 fn pg_err(e: tokio_postgres::Error) -> String {
