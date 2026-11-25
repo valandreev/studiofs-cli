@@ -94,6 +94,17 @@ pub const POSTGRES_CORE_SCHEMA: VersionIdentity = VersionIdentity {
     min_supported: 1,
 };
 
+/// Per-volume write requirement (`metadata_state.write_requirement`, SFS-1007).
+/// Publication succeeds only while the volume's value is at most `current`, in
+/// the same UPDATE that bumps the volume version; Activate of a write
+/// capability raises the volume's value to fence older writers without
+/// touching the read gate.
+pub const SHARED_WRITE_REQUIREMENT: VersionIdentity = VersionIdentity {
+    name: "shared write requirement",
+    current: 1,
+    min_supported: 1,
+};
+
 /// Local redb metadata layout, recorded in the redb `SETTINGS_TABLE["format"]`
 /// header. Both checks use `FormatInfo.format_version` until SFS-1012 adds a
 /// dedicated local layout marker, so their supported ranges must agree.
@@ -139,6 +150,7 @@ pub const IDENTITIES: &[VersionIdentity] = &[
     SERVING_CHECKPOINT_FORMAT,
     SERVING_CHECKPOINT_SCHEMA,
     POSTGRES_CORE_SCHEMA,
+    SHARED_WRITE_REQUIREMENT,
 ];
 
 /// Machine-readable report of this binary's identities, printed by

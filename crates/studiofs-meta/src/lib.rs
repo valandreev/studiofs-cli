@@ -47,6 +47,8 @@ pub mod trash;
 pub mod types;
 /// Typed version identities of the persisted boundaries.
 pub mod version;
+/// Per-volume protocol policy and feature activation state (SFS-1007).
+pub mod volume_protocol;
 
 /// Test-only successor change registry (SFS-1131).
 #[cfg(feature = "test-successor")]

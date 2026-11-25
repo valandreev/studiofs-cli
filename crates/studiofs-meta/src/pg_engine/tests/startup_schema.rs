@@ -189,21 +189,25 @@ fn startup_schema_distinguishes_additive_optional_absent_and_incompatible_schema
     );
     drop(engine);
 
-    // A required column is gone: incompatible even though core is newer.
-    sql("ALTER TABLE metadata_state DROP COLUMN checkpoint_sha256");
-    let message = refusal(&dsn, vol);
-    assert!(
-        message.contains(
-            "schema_component_outdated (PostgreSQL core schema 99 lacks metadata_state.checkpoint_sha256)"
-        ),
-        "{message}"
-    );
+    // Missing required columns refuse startup even though core is newer.
+    for column in ["checkpoint_sha256", "write_requirement"] {
+        sql(&format!(
+            "ALTER TABLE metadata_state RENAME COLUMN {column} TO hidden_{column}"
+        ));
+        let message = refusal(&dsn, vol);
+        sql(&format!(
+            "ALTER TABLE metadata_state RENAME COLUMN hidden_{column} TO {column}"
+        ));
+        assert!(
+            message.contains(&format!(
+                "schema_component_outdated (PostgreSQL core schema 99 lacks metadata_state.{column})"
+            )),
+            "{message}"
+        );
+    }
 
     // A required component that is older than this binary reads.
-    sql(
-        "ALTER TABLE metadata_state ADD COLUMN checkpoint_sha256 BYTEA;
-         UPDATE studiofs_schema_components SET version = 1 WHERE component = 'payload_gc'",
-    );
+    sql("UPDATE studiofs_schema_components SET version = 1 WHERE component = 'payload_gc'");
     let message = refusal(&dsn, vol);
     assert!(
         message.contains("schema_component_outdated (PostgreSQL payload GC schema 1, needs 2)")

@@ -901,6 +901,30 @@ pub const fn studiofs_pg_schema_sql() -> &'static str {
             INCLUDE (next_attempt_at)
             WHERE acknowledged_at IS NULL;
 
+        -- Per-volume protocol policy (SFS-1007). Publication checks
+        -- `write_requirement` in its version-bump UPDATE; Activate raises it
+        -- together with the policy epoch, and never touches the
+        -- `metadata_format_version` read gate. Provisioning and explicit
+        -- format adoption write policy rows for individual volumes.
+        ALTER TABLE metadata_state
+            ADD COLUMN IF NOT EXISTS write_requirement SMALLINT NOT NULL DEFAULT 1
+                CHECK (write_requirement >= 1);
+        CREATE TABLE IF NOT EXISTS volume_protocol (
+            vol BIGINT PRIMARY KEY REFERENCES volumes(vol) ON DELETE CASCADE,
+            policy_epoch BIGINT NOT NULL CHECK (policy_epoch >= 1),
+            requirements JSONB NOT NULL,
+            updated_by TEXT NOT NULL,
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        );
+        CREATE TABLE IF NOT EXISTS volume_protocol_history (
+            vol BIGINT NOT NULL REFERENCES volumes(vol) ON DELETE CASCADE,
+            policy_epoch BIGINT NOT NULL CHECK (policy_epoch >= 1),
+            write_requirement SMALLINT NOT NULL CHECK (write_requirement >= 1),
+            requirements JSONB NOT NULL,
+            changed_by TEXT NOT NULL,
+            changed_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+            PRIMARY KEY (vol, policy_epoch)
+        );
         CREATE TABLE IF NOT EXISTS studiofs_schema_components (
             component TEXT PRIMARY KEY,
             version INTEGER NOT NULL CHECK (version > 0),
@@ -960,6 +984,15 @@ pub async fn ensure_studiofs_pg_schema_committed(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn schema_declares_policy_tables_without_adopting_volumes() {
+        let sql = studiofs_pg_schema_sql();
+        for table in ["volume_protocol", "volume_protocol_history"] {
+            assert!(sql.contains(&format!("CREATE TABLE IF NOT EXISTS {table} (")));
+            assert!(!sql.contains(&format!("INSERT INTO {table} ")));
+        }
+    }
 
     #[test]
     fn payload_gc_version_marker_is_the_last_statement_and_never_downgrades() {

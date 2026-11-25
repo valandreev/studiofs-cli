@@ -36,7 +36,7 @@ identity it touches.
 |---|---|---|
 | Client release | binary version, not persisted | SFS-1003 |
 | Shared metadata schema (backend schema components) | `studiofs_schema_components`, only `payload_gc` | SFS-1005 |
-| Volume protocol (what writers must speak) | shared `metadata_format_version` | SFS-1003, SFS-1007 |
+| Volume protocol (what writers must speak) | `volume_protocol` policy record plus `metadata_state.write_requirement` (SFS-1007) | SFS-1003, SFS-1007 |
 | Local metadata (redb layout) | shared format number | SFS-1003, SFS-1012 |
 | Event codec | wire version 1 plus append-only tags | SFS-1009 |
 | Checkpoint | serving checkpoint format 4, schema 1 | SFS-1011 |
@@ -113,9 +113,22 @@ older one that the binary cannot open maps into `NeedsMigration`.
 ### Per-volume policy and policy epoch
 
 Each volume has one policy record in the shared backend holding the three
-required sets and a policy epoch, a counter that increases on every change
-(SFS-1007). Changing the record is the Activate step of an
-Expand–Migrate–Activate–Contract cutover (SFS-1017):
+required sets, the serving checkpoint format and state schema, the activation
+state of every feature (`available`, `compatible`, `required`, `retired`),
+and a policy epoch that increases on every change
+(SFS-1007, `crates/studiofs-meta/src/volume_protocol.rs`).
+`init` and `load` write the baseline policy when provisioning a volume.
+The PostgreSQL schema baseline creates the policy tables. SFS-1132 writes the
+baseline policy for a selected format 5 or 6 volume during explicit adoption.
+A policy change moves a feature one lifecycle step. A `required` feature
+returns only to `compatible`, and `retired` is terminal. The acting binary
+must declare any newly required capability and support any newly selected
+checkpoint format and schema. Adding a write capability raises the write
+requirement. Lowering it requires the actor to declare all remaining write
+capabilities. Returning to the baseline write requirement also requires
+baseline writers to support those capabilities. Every change records the
+new policy in the same transaction as its audit row. Changing the record
+is the Activate step of an Expand–Migrate–Activate–Contract cutover (SFS-1017):
 
 1. Expand adds optional schema objects and capabilities. Older binaries keep
    working.

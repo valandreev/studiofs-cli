@@ -391,6 +391,17 @@ cargo test -p studiofs init_pg_schema_provisions_volume_encryption_metadata -- -
 cargo test -p studiofs init_repairs_existing_schema_before_volume_guard -- --ignored --nocapture
 ```
 
+### SFS-1007 Volume Protocol Policy
+
+Run the policy unit tests, then select the two live policy cases with a local
+`STUDIOFS_TEST_PG_DSN`. They cover initial provisioning, the publication fence,
+audit rollback, and a writer that waits on another policy update.
+
+```bash
+cargo test -p studiofs-meta --lib volume_protocol
+cargo test -p studiofs-meta --lib pg_engine::tests::volume_protocol:: -- --ignored
+```
+
 ### SFS-36 Snapshot Source Replay Regressions
 
 These focused PostgreSQL tests require `STUDIOFS_TEST_PG_DSN` with a local

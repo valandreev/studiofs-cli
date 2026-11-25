@@ -48,6 +48,7 @@ const MOUNT_COMPONENTS: [MountComponent; 2] = [
         ],
         columns: &[
             ("metadata_state", "metadata_format_version"),
+            ("metadata_state", "write_requirement"),
             ("metadata_state", "total_event_payload_bytes"),
             ("metadata_state", "checkpoint_total_event_bytes"),
             ("metadata_state", "checkpoint_sha256"),
@@ -330,6 +331,11 @@ mod tests {
             objects
                 .iter()
                 .any(|object| object == "metadata_state.event_log_pruned_rows")
+        );
+        assert!(
+            objects
+                .iter()
+                .any(|object| object == "metadata_state.write_requirement")
         );
         for optional in [
             "snapshot_policies",

@@ -39,6 +39,10 @@ pub(super) const SELECT_BOOTSTRAP_CHECKPOINT_DESCRIPTOR: &str = r#"
 pub(super) const SELECT_METADATA_FORMAT_VERSION: &str =
     "SELECT metadata_format_version FROM metadata_state WHERE vol = $1";
 
+/// Both publication gates, reread to explain a refused `BUMP_METADATA_VERSION`.
+pub(super) const SELECT_PUBLICATION_GATES: &str =
+    "SELECT metadata_format_version, write_requirement FROM metadata_state WHERE vol = $1";
+
 pub(super) const SELECT_METADATA_REPLAY_STATE: &str = r#"
     SELECT metadata_format_version, checkpoint_version, event_log_prune_floor
     FROM metadata_state
@@ -53,7 +57,7 @@ pub(super) const BUMP_METADATA_VERSION: &str = r#"
     SET version = version + 1,
         total_event_payload_bytes = total_event_payload_bytes + $3,
         updated_at = now()
-    WHERE vol = $1 AND metadata_format_version = $2
+    WHERE vol = $1 AND metadata_format_version = $2 AND write_requirement <= $4
     RETURNING
         version,
         checkpoint_version,
