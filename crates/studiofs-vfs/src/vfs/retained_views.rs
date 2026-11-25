@@ -1159,15 +1159,17 @@ impl StudioVfs {
 
     fn trash_view_mode_and_size(&self, attr: &InodeAttr, regular_size: u64) -> (u16, u64) {
         match attr.kind {
-            FileType::Directory
-                if matches!(
-                    self.native_trash_profile(),
-                    NativeTrashProfile::Linux { .. }
-                ) =>
-            {
-                (0o700, 0)
+            FileType::Directory => {
+                let mode = match self.native_trash_profile() {
+                    NativeTrashProfile::Linux { .. } => 0o700,
+                    // macFUSE maps legacy uid 0 to the mounting user and checks
+                    // owner write here before forwarding child deletes. VFS
+                    // authorizes Clear against the receipt's original parent.
+                    NativeTrashProfile::MacOs { uid } if attr.uid == uid || attr.uid == 0 => 0o755,
+                    _ => 0o555,
+                };
+                (mode, 0)
             }
-            FileType::Directory => (0o555, 0),
             FileType::Symlink => (0o777, attr.size),
             FileType::RegularFile => (0o444, regular_size),
         }

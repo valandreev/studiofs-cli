@@ -5146,6 +5146,62 @@ mod tests {
     }
 
     #[test]
+    fn peer_can_clear_retained_directory_after_reopen() {
+        let writer = ContractVfsFixture::new("macfuse-trash-writer").expect("writer fixture");
+        let mut peer = ContractVfsFixture::new("macfuse-trash-peer").expect("peer fixture");
+        let adapter = StudioVfsAdapter::new(writer.vfs(), writer.runtime().handle().clone());
+        let caller = adapter.mount_caller();
+        writer
+            .meta()
+            .compare_and_set_trash_days(0, 7)
+            .unwrap()
+            .unwrap();
+        let dir = writer
+            .vfs()
+            .mkdir(ROOT_INO, b"album", caller.uid, caller.gid, 0o755)
+            .unwrap();
+        writer
+            .vfs()
+            .create(dir.ino, b"child.bin", caller.uid, caller.gid, 0o644)
+            .unwrap();
+        let trashes = adapter.lookup(ROOT_INO, b".Trashes").unwrap();
+        let uid = caller.uid.to_string();
+        let trash = adapter.lookup(trashes.ino, uid.as_bytes()).unwrap();
+        writer
+            .vfs()
+            .rename(ROOT_INO, b"album", trash.ino, b"album", false)
+            .unwrap();
+
+        let snapshot = writer.meta().export_snapshot().unwrap();
+        peer.meta().import_snapshot(&snapshot).unwrap();
+        let adapter =
+            StudioVfsAdapter::new(peer.reopen_vfs().unwrap(), peer.runtime().handle().clone());
+        let trashes = adapter.lookup(ROOT_INO, b".Trashes").unwrap();
+        let trash = adapter.lookup(trashes.ino, uid.as_bytes()).unwrap();
+        let album = adapter.lookup(trash.ino, b"album").unwrap();
+        let child = adapter.lookup(album.ino, b"child.bin").unwrap();
+        for attrs in [
+            adapter.attr_to_stat(&album),
+            adapter.getattr(album.ino).unwrap(),
+        ] {
+            assert_eq!((attrs.st_uid, attrs.st_gid), (caller.uid, caller.gid));
+            assert_eq!(
+                attrs.st_mode & 0o777,
+                0o755,
+                "kernel must permit owner child deletes"
+            );
+        }
+        assert_eq!(adapter.attr_to_stat(&child).st_mode & 0o777, 0o444);
+        assert_eq!(adapter.rmdir(trash.ino, b"album"), Err(libc::ENOTEMPTY));
+        adapter.unlink(album.ino, b"child.bin").unwrap();
+        adapter.rmdir(trash.ino, b"album").unwrap();
+        assert_eq!(
+            adapter.lookup(trash.ino, b"album").unwrap_err(),
+            libc::ENOENT
+        );
+    }
+
+    #[test]
     fn namespace_creation_records_the_requesting_caller() {
         let fixture = ContractVfsFixture::new("macfuse-create-caller-owner").expect("fixture");
         let adapter = StudioVfsAdapter::new(fixture.vfs(), fixture.runtime().handle().clone());

@@ -119,13 +119,16 @@ struct MountedPathError {
 }
 
 fn mounted_path_error(label: &str, path: &Path, source: io::Error) -> io::Error {
-    let hint = if source.kind() == io::ErrorKind::PermissionDenied
+    #[cfg(unix)]
+    let hint = if source.raw_os_error() == Some(libc::EPERM)
         && path.components().any(|part| part.as_os_str() == ".Trashes")
     {
         ". Grant Full Disk Access to the launching app (Terminal, iTerm, or IDE) in System Settings → Privacy & Security, then rerun"
     } else {
         ""
     };
+    #[cfg(not(unix))]
+    let hint = "";
     io::Error::new(
         source.kind(),
         MountedPathError {
@@ -397,48 +400,28 @@ fn wait_state(
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
     #[test]
-    fn permission_denied_on_trash_path_has_full_disk_access_hint() {
-        for (path, kind, hinted) in [
-            ("mount/.Trashes/501", io::ErrorKind::PermissionDenied, true),
-            ("mount/.Trashes/501", io::ErrorKind::NotFound, false),
-            (
-                "mount/.Trashes-backup",
-                io::ErrorKind::PermissionDenied,
-                false,
-            ),
+    fn trash_path_error_preserves_errno_and_hints_only_for_eperm() {
+        for (path, errno, hinted) in [
+            ("mount/.Trashes/501", libc::EPERM, true),
+            ("mount/.Trashes/501", libc::EACCES, false),
+            ("mount/.Trashes/501", libc::ENOENT, false),
+            ("mount/.Trashes-backup", libc::EPERM, false),
         ] {
-            let error = mounted_path_error("list", Path::new(path), io::Error::from(kind));
+            let source = io::Error::from_raw_os_error(errno);
+            let kind = source.kind();
+            let error = mounted_path_error("list", Path::new(path), source);
             assert_eq!(error.kind(), kind);
+            let context = error
+                .get_ref()
+                .and_then(|error| error.downcast_ref::<MountedPathError>())
+                .unwrap();
+            assert_eq!(context.source.raw_os_error(), Some(errno));
             let message = error.to_string();
             assert!(message.contains(path), "{message}");
             assert_eq!(message.contains("Full Disk Access"), hinted, "{message}");
-            if hinted {
-                assert!(
-                    message.contains("System Settings → Privacy & Security"),
-                    "{message}"
-                );
-                assert!(message.contains("launching app"), "{message}");
-            }
         }
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn trash_path_error_preserves_original_eperm() {
-        let error = mounted_path_error(
-            "list",
-            Path::new("mount/.Trashes/501"),
-            io::Error::from_raw_os_error(libc::EPERM),
-        );
-        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
-        let context = error
-            .get_ref()
-            .and_then(|error| error.downcast_ref::<MountedPathError>())
-            .unwrap();
-        assert_eq!(context.source.raw_os_error(), Some(libc::EPERM));
-        assert_eq!(context.source.kind(), io::ErrorKind::PermissionDenied);
-        assert!(error.to_string().contains("Full Disk Access"));
     }
 
     #[test]
