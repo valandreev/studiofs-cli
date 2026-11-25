@@ -15,7 +15,7 @@ After this milestone, the repository has a written contract that splits that num
 - [x] (2026-11-25) SFS-1001: wrote the persisted-format audit `docs/persisted-format-compatibility.md`, ADR 0018, the forward-compatibility rows in `docs/local-first-validation-matrix.md`, and these five milestone plans.
 - [x] (2026-11-25) SFS-1002: pinned the provisional 0.2.5 baseline fixtures (FormatInfo JSON, `VolumeSettings` with compression, serving checkpoint bytes, one event per tag, STFS v2 in 1 MiB SFEC frames, the reused STFS v3 fixture, payload index, snapshot artifact, clean and dirty local caches, version-4 dump) and captured format 5 (v0.2.2) and format 6 (v0.2.4) volumes from the published binaries. Manifest and drift test: `crates/studiofs-meta/tests/fixtures/baseline-0.2.5/manifest.json`, `crates/studiofs-meta/tests/baseline_fixture_manifest.rs`. Successor fixtures moved to SFS-1131 (scope decision of 2026-11-25). The published volumes are captured by the opt-in `studiofs-e2e` scenario `published-volume-fixture-capture` on the runner-owned Compose stack.
 - [ ] SFS-1131: define the test-successor build, its manifest of declared capabilities, and the release guard that keeps it out of shipped artifacts.
-- [ ] SFS-1003: split the client, shared schema, volume protocol, redb, event and checkpoint identities in code; make unknown `FormatInfo` fields and unknown `MetadataBackend` variants return typed `UpgradeRequired`.
+- [x] (2026-11-25) SFS-1003: added `crates/studiofs-meta/src/version.rs` with typed identities (informative client release, shared volume format, local redb layout, event codec wire, serving checkpoint format and schema) and a pointer table to the identities owned by other crates; routed every existing strict check to the identity it guards without bumping any value; made the checkpoint schema a supported range; added `MetaError::UpgradeRequired` for unknown `FormatInfo` fields and enum variants, kept through the bootstrap descriptor (`PgSyncFailure::UpgradeRequired`); documented the version-bump rules in `docs/persisted-format-compatibility.md`.
 - [ ] SFS-1004: implement the central capability evaluator with deterministic decisions.
 
 ## Surprises & Discoveries
@@ -29,7 +29,22 @@ After this milestone, the repository has a written contract that splits that num
 - Observation: an active lease cannot be pinned as offline bytes; lease liveness is a PostgreSQL row evaluated against the server clock. The manifest records it under `not_representable`.
   Evidence: `crates/studiofs-meta/src/pg_engine/sql.rs:158`.
 
+- Observation: the local redb header has no version field of its own; it is the `FormatInfo` JSON in `SETTINGS_TABLE["format"]`, so the local layout and shared format identities read the same field until SFS-1012 adds a local marker.
+  Evidence: `crates/studiofs-meta/src/redb_engine/format.rs:70`.
+- Observation: `EncryptionConfig` also uses `deny_unknown_fields`, so an unknown field there is reported as `UpgradeRequired` like the other nested configs.
+  Evidence: `format_info_decode_reports_unknown_field_as_upgrade_required`.
+
 ## Decision Log
+
+- Decision: keep `CURRENT_FORMAT_VERSION` as the value `FormatInfo` writers stamp, defined as `SHARED_VOLUME_FORMAT.current`, and route checks through `version::SHARED_VOLUME_FORMAT` or `version::LOCAL_METADATA_LAYOUT`.
+  Rationale: about sixty call sites only construct `FormatInfo` (the shared format); renaming them adds churn without changing behavior. Every check now names its own identity.
+  Date/Author: 2026-11-25, SFS-1003 implementer.
+- Decision: the local redb header stays the `FormatInfo` copy; local opens judge it by `LOCAL_METADATA_LAYOUT`, shared reads by `SHARED_VOLUME_FORMAT`. A dedicated local marker is left to SFS-1012.
+  Rationale: adding a new redb field would change the persisted layout, which this issue must not do.
+  Date/Author: 2026-11-25, SFS-1003 implementer.
+- Decision: `UpgradeRequired` is derived from serde's stable `unknown field` / `unknown variant` messages and keeps only the backtick-quoted schema name (at most 64 characters), never stored values.
+  Rationale: smallest change that keeps `deny_unknown_fields`; the rendered error cannot carry DSNs or keys.
+  Date/Author: 2026-11-25, SFS-1003 implementer.
 
 - Decision: the audit and ADR are the single source of truth; milestone plans reference them instead of copying the tables.
   Rationale: the tables cite exact source lines and will be updated as gaps close; duplicated copies would drift.
