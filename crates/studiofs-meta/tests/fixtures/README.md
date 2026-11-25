@@ -36,9 +36,12 @@ candidate. Regenerate only with the baseline encoder, never a successor build:
   <generator> -- --ignored`. Generators are `#[ignore]` and also skip without
   the variable, so normal and `--ignored` runs never rewrite fixtures.
 - Published v0.2.2 / v0.2.4 volumes: `pwsh
-  tools/fixtures/capture-published-volume-fixtures.ps1` (needs `gh`, Docker
-  and network; uses PostgreSQL and RustFS images from
-  `docker/compose.e2e.yml`).
+  tools/fixtures/capture-published-volume-fixtures.ps1`. It downloads and
+  verifies the release binary, runs the opt-in `studiofs-e2e` scenario
+  `published-volume-fixture-capture` with `--infra compose` (the runner owns
+  PostgreSQL and RustFS and their fixed test-only credentials), and copies the
+  run artifacts here with LF line endings. Needs `gh`, Docker and network. No
+  tool or test starts its own Docker stack.
 
 Then copy the new digests from the drift test output into the manifest and
 append the reason to `regenerations`. All keys are throwaway test values;

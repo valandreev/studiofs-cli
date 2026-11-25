@@ -13,7 +13,7 @@ After this milestone, the repository has a written contract that splits that num
 ## Progress
 
 - [x] (2026-11-25) SFS-1001: wrote the persisted-format audit `docs/persisted-format-compatibility.md`, ADR 0018, the forward-compatibility rows in `docs/local-first-validation-matrix.md`, and these five milestone plans.
-- [x] (2026-11-25) SFS-1002: pinned the provisional 0.2.5 baseline fixtures (FormatInfo JSON, `VolumeSettings` with compression, serving checkpoint bytes, one event per tag, STFS v2 in 1 MiB SFEC frames, the reused STFS v3 fixture, payload index, snapshot artifact, clean and dirty local caches, version-4 dump) and captured format 5 (v0.2.2) and format 6 (v0.2.4) volumes from the published binaries. Manifest and drift test: `crates/studiofs-meta/tests/fixtures/baseline-0.2.5/manifest.json`, `crates/studiofs-meta/tests/baseline_fixture_manifest.rs`. Successor fixtures moved to SFS-1131 (scope decision of 2026-11-25).
+- [x] (2026-11-25) SFS-1002: pinned the provisional 0.2.5 baseline fixtures (FormatInfo JSON, `VolumeSettings` with compression, serving checkpoint bytes, one event per tag, STFS v2 in 1 MiB SFEC frames, the reused STFS v3 fixture, payload index, snapshot artifact, clean and dirty local caches, version-4 dump) and captured format 5 (v0.2.2) and format 6 (v0.2.4) volumes from the published binaries. Manifest and drift test: `crates/studiofs-meta/tests/fixtures/baseline-0.2.5/manifest.json`, `crates/studiofs-meta/tests/baseline_fixture_manifest.rs`. Successor fixtures moved to SFS-1131 (scope decision of 2026-11-25). The published volumes are captured by the opt-in `studiofs-e2e` scenario `published-volume-fixture-capture` on the runner-owned Compose stack.
 - [ ] SFS-1131: define the test-successor build, its manifest of declared capabilities, and the release guard that keeps it out of shipped artifacts.
 - [ ] SFS-1003: split the client, shared schema, volume protocol, redb, event and checkpoint identities in code; make unknown `FormatInfo` fields and unknown `MetadataBackend` variants return typed `UpgradeRequired`.
 - [ ] SFS-1004: implement the central capability evaluator with deterministic decisions.
@@ -40,6 +40,9 @@ After this milestone, the repository has a written contract that splits that num
 - Decision: SFS-1002 pins baseline fixtures only; successor fixtures come from the SFS-1131 test-successor build. One JSON manifest next to the studiofs-meta fixtures lists every pinned file by workspace-relative path, so fixtures stay in their owning crate and the existing STFS v3 fixture is reused.
   Rationale: Linear scope decision of 2026-11-25; extends the existing `include_bytes!` fixture convention instead of adding a parallel mechanism.
   Date/Author: 2026-11-25, SFS-1002 implementer.
+- Decision: published v0.2.2/v0.2.4 volumes are captured by the opt-in `studiofs-e2e` scenario `published-volume-fixture-capture` with `--infra compose`, not by a private Docker stack in the PowerShell script, and not against the shared `.env` services.
+  Rationale: the project does not allow private Docker stacks started by tools or tests (precedent: `.agent/execplans/janitor-docker-tests-to-env-and-e2e.md`). `FormatInfo` embeds the S3 keys and the PostgreSQL DSN, so capturing against `.env` services would commit real dev credentials; the Compose runner uses fixed test-only credentials, so the captured bytes stay raw product output. The script only downloads and verifies the binary, runs the scenario and copies artifacts.
+  Date/Author: 2026-11-25, user decision, implemented by SFS-1002 implementer.
 
 ## Outcomes & Retrospective
 

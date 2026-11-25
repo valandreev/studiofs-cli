@@ -1,20 +1,17 @@
 {
-  "release": "v0.2.4",
-  "release_asset": "studiofs-0.2.4-x86_64-pc-windows.zip",
-  "release_asset_sha256": "cbd877327d86adc2e77395578298f9cc5f9a3d4a517559f9d8904698b805c3a6",
-  "metadata_format_version": 6,
-  "version": 1,
+  "bootstrap_checkpoint_lease_rows": 0,
+  "checkpoint_generation": 1,
+  "checkpoint_publication_state": "published",
+  "checkpoint_sha256": "04b6d71f7d3003b28d163ac92317f765d063ec07dc4054d8e89ccb8033ca4862",
   "checkpoint_version": 0,
   "event_log_prune_floor": 0,
-  "checkpoint_sha256": "f01555662441ba734e30fd1d7e14668a45303d8ef96ee2468809b338591d9788",
-  "checkpoint_publication_state": "published",
-  "checkpoint_generation": 1,
   "event_log_rows": 1,
-  "bootstrap_checkpoint_lease_rows": 0,
+  "metadata_format_version": 6,
   "schema_components": [
     {
       "component": "payload_gc",
       "version": 2
     }
-  ]
+  ],
+  "version": 1
 }

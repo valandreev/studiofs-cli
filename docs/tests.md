@@ -289,6 +289,19 @@ opt-in SFS-979 benchmark described in
 cargo run -p studiofs-e2e -- run janitor-postgres-restart-recovery --studiofs-bin target/debug/studiofs --infra compose --retain always
 ```
 
+`published-volume-fixture-capture` is the opt-in SFS-1002 capture of the bytes a
+published release writes at `init`. Pass the published binary; the scenario
+requires Compose infrastructure so only the runner's test-only credentials reach
+the artifacts under
+`target/e2e-runs/<run-id>/artifacts/scenarios/published-volume-fixture-capture/published-volume/`.
+`tools/fixtures/capture-published-volume-fixtures.ps1` downloads and verifies
+v0.2.2 and v0.2.4, runs the scenario, and copies the artifacts into
+`crates/studiofs-meta/tests/fixtures/published-<tag>/`:
+
+```sh
+cargo run -p studiofs-e2e -- run published-volume-fixture-capture --studiofs-bin <published studiofs> --infra compose --run-id sfs-1002-capture-v0-2-4 --retain always
+```
+
 For SFS-1066, select
 `live_cli_disposable_retires_abandoned_upload_but_protects_delayed_publication`
 to verify actual S3 removal of a retired upload and protection through delayed

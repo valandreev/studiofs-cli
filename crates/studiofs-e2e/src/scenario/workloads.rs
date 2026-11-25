@@ -254,6 +254,7 @@ mod logical_quota;
 mod macos_mmap_exec;
 mod namespace_collision;
 mod posix_acl_xattr;
+pub(super) mod published_volume_capture;
 mod random_write_packing;
 mod recoverable_trash;
 mod recoverable_trash_durability;
