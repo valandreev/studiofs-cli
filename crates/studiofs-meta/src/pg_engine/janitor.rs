@@ -416,7 +416,7 @@ impl PgJanitorSession {
                 "janitor PostgreSQL session was not initialized".into(),
             ));
         };
-        let mut owner = SessionOwner::new();
+        let owner = SessionOwner::new();
         let volume = self.volume_id;
         let timeout = self.command_timeout;
         let (lease, _) = runtime.block_on(async {
@@ -444,11 +444,18 @@ impl PgJanitorSession {
         let cancel = CancellationToken::new();
         let shutdown = cancel.clone();
         let task = runtime.spawn(async move {
+            // The owner that may hold a live row. Updated before a rotated
+            // registration starts, so cancellation mid-rotation still closes it.
+            let latest = std::sync::Mutex::new(owner);
             let mut expected_token = Some(lease.token());
             loop {
                 let refresh = async {
                     tokio::time::sleep(HEARTBEAT_INTERVAL).await;
-                    match owner
+                    let current = latest
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .clone();
+                    match current
                         .heartbeat_on_pool(
                             pool.clone(),
                             timeout,
@@ -458,12 +465,16 @@ impl PgJanitorSession {
                         )
                         .await
                     {
-                        Ok((renewed, _)) => Ok((owner.clone(), renewed)),
+                        Ok((renewed, _)) => Ok(renewed),
                         Err(HeartbeatError::Fenced) => {
                             // Generation diverged after an ambiguous renewal; close
                             // the old owner and rotate to a fresh session identity.
-                            let _ = owner.close_on_pool(pool.clone(), timeout, volume).await;
+                            let _ = current.close_on_pool(pool.clone(), timeout, volume).await;
                             let rotated = SessionOwner::new();
+                            *latest
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                                rotated.clone();
                             let (renewed, _) = rotated
                                 .heartbeat_on_pool(
                                     pool.clone(),
@@ -474,19 +485,16 @@ impl PgJanitorSession {
                                 )
                                 .await
                                 .map_err(HeartbeatError::into_meta_error)?;
-                            Ok((rotated, renewed))
+                            Ok(renewed)
                         }
                         Err(HeartbeatError::Other(error)) => Err(error),
                     }
                 };
                 tokio::select! {
                     biased;
-                    _ = shutdown.cancelled() => return owner,
+                    _ = shutdown.cancelled() => break,
                     result = refresh => match result {
-                        Ok((active_owner, renewed)) => {
-                            owner = active_owner;
-                            expected_token = Some(renewed.token());
-                        }
+                        Ok(renewed) => expected_token = Some(renewed.token()),
                         Err(error) => {
                             // Keep expected_token fenced; never fall back to unfenced None.
                             tracing::debug!(%error, "janitor session heartbeat deferred");
@@ -494,6 +502,9 @@ impl PgJanitorSession {
                     }
                 }
             }
+            latest
+                .into_inner()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
         });
         self.session_heartbeat = Some((cancel, task));
         Ok(())

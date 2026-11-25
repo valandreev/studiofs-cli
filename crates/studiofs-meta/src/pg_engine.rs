@@ -253,6 +253,9 @@ pub struct PgMetaEngine {
     checkpoint_freshness_state: Mutex<checkpoint_freshness::CheckpointFreshnessState>,
     pg_sync_progress_state: Mutex<PgSyncProgressState>,
     client_session_state: Mutex<client_sessions::ClientSessionState>,
+    /// Single-flight guard for client session refreshes; acquire before
+    /// `client_session_state`, never while holding it.
+    client_session_refresh: Mutex<()>,
     checkpoint_coordinator_state: checkpoint_coordinator::CheckpointCoordinatorState,
     checkpoint_single_flight: Mutex<()>,
     command_pool: Arc<runtime::PgConnectionPool>,
@@ -1684,6 +1687,7 @@ impl PgMetaEngine {
             ),
             pg_sync_progress_state: Mutex::new(PgSyncProgressState::default()),
             client_session_state: Mutex::new(client_sessions::ClientSessionState::new()),
+            client_session_refresh: Mutex::new(()),
             checkpoint_coordinator_state: checkpoint_coordinator::CheckpointCoordinatorState::new(),
             checkpoint_single_flight: Mutex::new(()),
             command_pool: Arc::new(runtime::PgConnectionPool::new(

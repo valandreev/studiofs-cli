@@ -1,7 +1,7 @@
 use super::*;
 use crate::engine::UpgradeRequiredReason;
 use crate::pg_engine::client_sessions::{
-    HeartbeatError, INACTIVE_SESSION_RETENTION_SECONDS, SessionOwner, SessionRole,
+    HeartbeatError, INACTIVE_SESSION_RETENTION_SECONDS, REFRESH_IO_HOOK, SessionOwner, SessionRole,
     prune_expired_client_sessions,
 };
 use crate::pg_engine::{
@@ -627,4 +627,171 @@ fn client_session_leases_stamp_shared_format5_upgrade_without_policy() {
         Ok(())
     })
     .expect("verify format 5 upgrade publication session");
+}
+
+#[test]
+#[ignore = "requires a disposable PostgreSQL instance"]
+fn client_session_leases_concurrent_refreshes_converge_on_one_live_owner() {
+    let dsn = pg_dsn().expect("STUDIOFS_TEST_PG_DSN is required");
+    let schema = IsolatedPgSchema::new(&dsn);
+    let volume = PgTestVolume::new(&schema.dsn, "sfs1008-refresh-race");
+    let dir = studiofs_test_support::workspace_target_tempdir("sfs1008-refresh-race-");
+    let path = dir.path().join("mount");
+    seed_local(&path, &volume.format_info());
+    let engine = PgMetaEngine::open_with_options(
+        path,
+        PgOpenOptions {
+            background_poll: false,
+            ..PgOpenOptions::default()
+        },
+    )
+    .expect("open engine");
+    let stale = engine.refresh_client_session().expect("register session");
+    execute_test_sql(
+        &schema.dsn,
+        format!(
+            "UPDATE client_sessions SET lease_expires_at = clock_timestamp() - interval '1 second' WHERE vol = {}",
+            volume.volume_id
+        ),
+    )
+    .expect("expire mount session");
+
+    // Hold the first refresh before its I/O until a second refresh also reaches
+    // I/O. With single-flight refresh the second never arrives and the bounded
+    // wait lapses; the assertions below hold for every interleaving.
+    let arrivals = Arc::new((Mutex::new(0_usize), std::sync::Condvar::new()));
+    let hook_arrivals = Arc::clone(&arrivals);
+    *REFRESH_IO_HOOK.lock().expect("hook") = Some(Arc::new(move || {
+        let (count, cvar) = &*hook_arrivals;
+        let mut count = count.lock().expect("arrivals");
+        *count += 1;
+        cvar.notify_all();
+        let _ = cvar
+            .wait_timeout_while(count, Duration::from_secs(2), |count| *count < 2)
+            .expect("arrivals");
+    }));
+    let (first, second) = std::thread::scope(|scope| {
+        let first = scope.spawn(|| engine.force_refresh_publication_session(&stale));
+        let second = scope.spawn(|| engine.force_refresh_publication_session(&stale));
+        (
+            first.join().expect("join first refresh"),
+            second.join().expect("join second refresh"),
+        )
+    });
+    *REFRESH_IO_HOOK.lock().expect("hook") = None;
+    let first = first.expect("first refresh");
+    let second = second.expect("second refresh");
+    assert!(
+        first.owner() == second.owner() && first.token() == second.token(),
+        "concurrent refreshes must return the same live lease"
+    );
+    let sessions = run_async(async {
+        let (client, connection) = tokio_postgres::connect(&schema.dsn, tokio_postgres::NoTls)
+            .await
+            .expect("connect");
+        let _connection = tokio::spawn(connection);
+        read_client_sessions(&client, volume.volume_id).await
+    })
+    .expect("read sessions");
+    let active: Vec<_> = sessions.iter().filter(|s| s.active).collect();
+    assert_eq!(active.len(), 1, "exactly one live session: {sessions:?}");
+    assert_eq!(active[0].session_id.to_string(), first.owner().id());
+    assert_eq!(active[0].fencing_token, first.token());
+    engine.prepare_for_close().expect("close engine");
+    let after_close = run_async(async {
+        let (client, connection) = tokio_postgres::connect(&schema.dsn, tokio_postgres::NoTls)
+            .await
+            .expect("connect");
+        let _connection = tokio::spawn(connection);
+        read_client_sessions(&client, volume.volume_id).await
+    })
+    .expect("read sessions after close");
+    assert!(after_close.iter().all(|s| !s.active), "{after_close:?}");
+}
+
+#[test]
+#[ignore = "requires a disposable PostgreSQL instance"]
+fn client_session_leases_prune_skips_row_renewed_concurrently() {
+    let dsn = pg_dsn().expect("STUDIOFS_TEST_PG_DSN is required");
+    let schema = IsolatedPgSchema::new(&dsn);
+    let volume = PgTestVolume::new(&schema.dsn, "sfs1008-prune-race");
+    run_async(async {
+        let connect = || async {
+            let (client, connection) = tokio_postgres::connect(&schema.dsn, tokio_postgres::NoTls)
+                .await
+                .expect("connect");
+            tokio::spawn(connection);
+            client
+        };
+        let mut renewer = connect().await;
+        let pruner = connect().await;
+        let observer = connect().await;
+        let vol = volume.volume_id;
+        let owner = SessionOwner::new();
+        owner
+            .heartbeat(&renewer, vol, None, SessionRole::Mount)
+            .await
+            .map_err(HeartbeatError::into_meta_error)?;
+        renewer
+            .execute(
+                "UPDATE client_sessions SET lease_expires_at = clock_timestamp() - interval '2 days'
+                 WHERE vol = $1 AND session_id = $2",
+                &[&vol, &owner.id()],
+            )
+            .await
+            .expect("backdate session past retention");
+
+        // An uncommitted renewal holds the row lock while prune evaluates its CTE.
+        let renewal = renewer.transaction().await.expect("begin renewal");
+        renewal
+            .execute(
+                "UPDATE client_sessions SET lease_expires_at = clock_timestamp() + interval '60 seconds'
+                 WHERE vol = $1 AND session_id = $2",
+                &[&vol, &owner.id()],
+            )
+            .await
+            .expect("renew session");
+        let pruner_pid: i32 = pruner
+            .query_one("SELECT pg_backend_pid()", &[])
+            .await
+            .expect("pruner pid")
+            .get(0);
+        let prune = tokio::spawn(async move {
+            prune_expired_client_sessions(&pruner, vol, INACTIVE_SESSION_RETENTION_SECONDS).await
+        });
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let waiting: bool = observer
+                .query_one(
+                    "SELECT EXISTS (SELECT 1 FROM pg_stat_activity
+                     WHERE pid = $1 AND wait_event_type = 'Lock')",
+                    &[&pruner_pid],
+                )
+                .await
+                .expect("observe pruner")
+                .get(0);
+            if waiting {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "prune never blocked on the renewed row"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        renewal.commit().await.expect("commit renewal");
+        let pruned = prune.await.expect("join prune")?;
+        assert_eq!(pruned, 0, "a concurrently renewed session must survive prune");
+        let remaining: i64 = observer
+            .query_one(
+                "SELECT count(*) FROM client_sessions WHERE vol = $1 AND session_id = $2",
+                &[&vol, &owner.id()],
+            )
+            .await
+            .expect("count sessions")
+            .get(0);
+        assert_eq!(remaining, 1);
+        Ok(())
+    })
+    .expect("prune race");
 }

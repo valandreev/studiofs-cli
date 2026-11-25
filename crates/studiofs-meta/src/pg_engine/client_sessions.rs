@@ -17,6 +17,11 @@ pub(super) const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 const FAILED_REFRESH_BACKOFF: Duration = Duration::from_millis(250);
 const LEASE_SECONDS: i32 = 60;
 pub(super) const INACTIVE_SESSION_RETENTION_SECONDS: i32 = 86_400;
+
+/// Test hook run before refresh network I/O, used to force refresh interleavings.
+#[cfg(test)]
+pub(super) static REFRESH_IO_HOOK: std::sync::Mutex<Option<Arc<dyn Fn() + Send + Sync>>> =
+    std::sync::Mutex::new(None);
 const PRUNE_INACTIVE_BATCH_LIMIT: i64 = 128;
 
 pub(super) const SCHEMA: &str = "
@@ -106,8 +111,10 @@ const PRUNE_EXPIRED: &str = "
         LIMIT $3
     )
     DELETE FROM client_sessions s
-    USING expired
-    WHERE s.vol = expired.vol AND s.session_id = expired.session_id";
+    USING expired, observed
+    WHERE s.vol = expired.vol AND s.session_id = expired.session_id
+      -- Rechecked on the latest row version so a concurrent renewal survives.
+      AND s.lease_expires_at < observed.now_ts - ($2::INT * interval '1 second')";
 
 const STAMP: &str = "
     WITH observed AS MATERIALIZED (SELECT clock_timestamp() AS now_ts),
@@ -474,6 +481,11 @@ impl SessionLease {
     }
 
     #[cfg(test)]
+    pub(super) fn owner(&self) -> &SessionOwner {
+        &self.owner
+    }
+
+    #[cfg(test)]
     pub(super) fn policy_epoch(&self) -> i64 {
         self.policy_epoch
     }
@@ -578,11 +590,12 @@ impl ClientSessionState {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RefreshMode {
+#[derive(Clone, Copy)]
+enum RefreshMode<'a> {
     Background,
     Publication,
-    ForcePublication,
+    /// Refresh past `stale` unless a concurrent refresh already replaced it.
+    ForcePublication(&'a SessionLease),
 }
 
 /// A short-lived session for a command publishing within one transaction.
@@ -665,20 +678,18 @@ impl PgMetaEngine {
         &self,
         stale: &SessionLease,
     ) -> MetaResult<SessionLease> {
-        {
-            let mut state = self
-                .client_session_state
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if state.owner.id == stale.owner.id {
-                state.next_heartbeat = None;
-                state.retry_after = None;
-            }
-        }
-        self.refresh_client_session_inner(RefreshMode::ForcePublication)
+        self.refresh_client_session_inner(RefreshMode::ForcePublication(stale))
     }
 
-    fn refresh_client_session_inner(&self, mode: RefreshMode) -> MetaResult<SessionLease> {
+    fn refresh_client_session_inner(&self, mode: RefreshMode<'_>) -> MetaResult<SessionLease> {
+        // Single-flight: concurrent refreshes would fence each other and race
+        // their state writes. Waiters re-check the fast path below and reuse
+        // the lease the previous refresh produced. `release_client_session`
+        // never takes this guard, so close is not blocked by in-flight I/O.
+        let _refresh = self
+            .client_session_refresh
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (initial_owner, expected_token) = {
             let mut state = self
                 .client_session_state
@@ -723,7 +734,17 @@ impl PgMetaEngine {
                         }));
                     }
                 }
-                RefreshMode::ForcePublication => {}
+                RefreshMode::ForcePublication(stale) => {
+                    if state.next_heartbeat.is_some_and(|next| now < next)
+                        && let Some(lease) = state.lease.clone()
+                        && (lease.owner != stale.owner || lease.token != stale.token)
+                    {
+                        if let Some(policy_error) = state.policy_error.clone() {
+                            return Err(policy_error);
+                        }
+                        return Ok(lease);
+                    }
+                }
             }
             state.registration_attempted = true;
             (
@@ -731,6 +752,15 @@ impl PgMetaEngine {
                 state.lease.as_ref().map(SessionLease::token),
             )
         };
+
+        #[cfg(test)]
+        if let Some(hook) = REFRESH_IO_HOOK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+        {
+            hook();
+        }
 
         // Never hold `client_session_state` across PostgreSQL network I/O.
         let pool = self.command_pool.clone();
@@ -791,7 +821,7 @@ impl PgMetaEngine {
                         state.retry_after = None;
                         state.last_error = None;
                         state.policy_error = policy_error.clone();
-                        let out = if mode != RefreshMode::Background {
+                        let out = if !matches!(mode, RefreshMode::Background) {
                             if let Some(error) = policy_error {
                                 Err(error)
                             } else {
