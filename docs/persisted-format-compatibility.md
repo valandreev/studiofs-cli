@@ -554,7 +554,7 @@ behavior. It never changes a baseline encoder.
 successor change bumps must appear in that list. `baseline` 0 marks an
 identity that the baseline does not report. Each identity has at most one
 bump; changes that share an identity declare one combined bump.
-`python tools/test_successor/build.py` builds the baseline and the successor
+`python3 tools/test_successor/build.py` builds the baseline and the successor
 (`target/test-successor/`). It diffs both reports and fails unless every
 `current` difference is a declared bump and every `min_supported` value is
 unchanged. It writes `target/test-successor/manifest.json` with the source
