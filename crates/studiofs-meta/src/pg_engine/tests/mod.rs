@@ -19,6 +19,7 @@ mod lock_order;
 mod lock_workers;
 mod metadata_notify;
 mod metadata_paging;
+mod migrations;
 mod remote_apply;
 mod replication_backlog;
 mod runtime;

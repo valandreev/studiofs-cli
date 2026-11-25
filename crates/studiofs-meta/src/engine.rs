@@ -209,6 +209,17 @@ pub enum UpgradeRequiredReason {
         /// Name of the unknown variant.
         variant: String,
     },
+    /// The shared PostgreSQL schema records a component version this binary
+    /// does not know; `known` is 0 for a component it has never heard of.
+    #[error("PostgreSQL schema component `{component}` is at version {found}, newer than {known}")]
+    SchemaComponentNewer {
+        /// Component name in `studiofs_schema_components`.
+        component: String,
+        /// Recorded version.
+        found: i32,
+        /// Highest version this binary knows.
+        known: i32,
+    },
 }
 
 #[derive(Debug, Clone, thiserror::Error)]
@@ -410,6 +421,22 @@ pub enum MetaError {
     UpgradeRequired {
         /// What this binary does not understand.
         reason: UpgradeRequiredReason,
+    },
+
+    /// A non-additive PostgreSQL schema migration is pending, so implicit
+    /// schema provisioning refuses to run (SFS-1005).
+    #[error(
+        "PostgreSQL schema migration {component} {version} ({name}, {phase}) is pending; stop mounts and janitors, then run `studiofs upgrade NAME`"
+    )]
+    SchemaMigrationPending {
+        /// Component of the pending migration.
+        component: &'static str,
+        /// Version the migration records.
+        version: i32,
+        /// Migration name.
+        name: &'static str,
+        /// `additive`, `backfill` or `contract`.
+        phase: &'static str,
     },
 
     /// An xattr write exceeded the backend-supported value size limit.

@@ -171,6 +171,24 @@ that declares support for 0.2.5 (the compiled test successor of
   0.2.5.
 - Incompatible: dropping or retyping a column 0.2.5 reads, changing trigger
   semantics 0.2.5 relies on, or raising a component version 0.2.5 checks.
+- Migration registry (SFS-1005,
+  `crates/studiofs-meta/src/pg_engine/migrations.rs`): `MIGRATIONS` lists
+  numbered steps per component, each `additive`, `backfill` or `contract`.
+  The `core` component's version 1 is the frozen 0.2.5 baseline
+  (`studiofs_pg_schema_sql`, checksum pinned by a unit test); every later
+  schema change is a new step, and `POSTGRES_CORE_SCHEMA` tracks the latest
+  `core` version. Each `studiofs_schema_components` row also stores a SHA-256
+  chained over the component's steps, and a recorded history that differs
+  from the registry is refused as `RepairRequired`. A recorded version newer
+  than the binary knows, or an unknown component, is refused as
+  `UpgradeRequired` (`schema_component_newer`) before any DDL. Each step
+  commits with its marker under the existing advisory lock (`902202603`).
+  `init` and `load` apply only pending additive steps and run no DDL against
+  a verified schema; a pending backfill or contract step makes them refuse
+  with `SchemaMigrationPending`. `studiofs upgrade` (`--dry-run` reports
+  only) applies every step in its own transaction, resumes after a failure,
+  and re-applies the baseline while nothing is recorded above it to repair
+  dropped objects. The test successor adds `core` 2, one additive table.
 - Fail-closed outcome: typed `UpgradeRequired` (unknown required component) or
   `MaintenanceForbidden` (Janitor); no DDL from an older binary. Owner:
   [SFS-1005](https://linear.app/valandreev/issue/SFS-1005) (migration registry)
@@ -474,7 +492,7 @@ successor can fence it safely. "Current state" is what `main` does today.
 | Unknown checkpoint formats fail closed with a typed reason. | Missing typed reason: snapshot sources fail closed, but one untyped `snapshot source checkpoint is invalid` covers unknown format, checksum mismatch and schema mismatch (`crates/studiofs-meta/src/pg_engine/snapshot_control.rs:360`). The serving checkpoint has no format field of its own and relies on `metadata_format_version`. | [SFS-1011](https://linear.app/valandreev/issue/SFS-1011) |
 | Unknown payload object formats fail closed with a typed reason. | Present: `UnsupportedVersion` and `UnsupportedCodec` (`crates/studiofs-data/src/object.rs:325`, `crates/studiofs-data/src/object.rs:160`); SFEC version and flags are strict. | [SFS-1009](https://linear.app/valandreev/issue/SFS-1009) (write gating) |
 | Unknown local formats fail closed with a typed reason. | Partial: payload index format is typed (`crates/studiofs-cache/src/payload_index.rs:1299`), entry encoding is `Corruption` (`crates/studiofs-cache/src/payload_index.rs:1790`); redb has no own identity. | [SFS-1012](https://linear.app/valandreev/issue/SFS-1012), [SFS-1003](https://linear.app/valandreev/issue/SFS-1003) |
-| Additive PG objects are tolerated when declared capabilities allow it. | Partial: extra tables are ignored by `validate_postgres_schema`, but the required list is global and not capability-scoped (`crates/studiofs-meta/src/pg_engine.rs:1314`); `init`/`load`/`upgrade` re-run `CREATE OR REPLACE` DDL without checking for newer components. | [SFS-1006](https://linear.app/valandreev/issue/SFS-1006), [SFS-1005](https://linear.app/valandreev/issue/SFS-1005) |
+| Additive PG objects are tolerated when declared capabilities allow it. | Partial: extra tables are ignored by `validate_postgres_schema`, but the required list is global and not capability-scoped (`crates/studiofs-meta/src/pg_engine.rs:1314`). DDL from `init`/`load`/`upgrade` goes through the SFS-1005 migration registry, which refuses newer or unknown components before any DDL. | [SFS-1006](https://linear.app/valandreev/issue/SFS-1006) |
 | Policy epoch is revalidated after reconnect. | Partial: the format predicate is re-evaluated in every publication transaction; no policy epoch exists. | [SFS-1015](https://linear.app/valandreev/issue/SFS-1015), [SFS-1007](https://linear.app/valandreev/issue/SFS-1007) |
 | Unknown `MetadataBackend` variant or unknown `FormatInfo` field fails closed with typed `UpgradeRequired`. | Present (SFS-1003): `decode_format_info` returns `MetaError::UpgradeRequired` naming the field or variant, including nested configs, and the bootstrap descriptor keeps it instead of reporting an invalid checkpoint. | [SFS-1003](https://linear.app/valandreev/issue/SFS-1003) |
 | 0.2.x volumes adopt the baseline by `studiofs upgrade` to format 7. | Missing: upgrade handles 5→6 only (`crates/studiofs-meta/src/pg_engine/format_upgrade.rs:35`). | [SFS-1132](https://linear.app/valandreev/issue/SFS-1132) |
@@ -520,7 +538,7 @@ persisted boundary:
 | New `MetaEvent` wire envelope | `EVENT_CODEC_WIRE`; a new event kind is a new append-only tag instead | shared format |
 | New serving checkpoint suffix | `SERVING_CHECKPOINT_FORMAT` (keep older formats in range) | shared format |
 | Serving-state schema change | `SERVING_CHECKPOINT_SCHEMA` | checkpoint format |
-| Additive PostgreSQL table, column or index | the matching `studiofs_schema_components` component (`POSTGRES_PAYLOAD_GC_SCHEMA` for the existing `payload_gc` component, with further components in SFS-1005) | every identity above |
+| Additive PostgreSQL table, column or index | a new step in `pg_engine::migrations::MIGRATIONS`, which raises its component (`POSTGRES_CORE_SCHEMA` for `core`); `POSTGRES_PAYLOAD_GC_SCHEMA` only when the Janitor's GC schema changes | every identity above |
 | Payload index, snapshot artifact, dump, STFS, SFEC | the owner constant listed in `version.rs` | every identity above |
 
 Today the local redb header is still the `FormatInfo` copy in

@@ -10,8 +10,12 @@ Keep each computer's metadata and payload cache, including unpublished offline
 changes. Run the updated binary on each stopped local cache:
 
 ```bash
+studiofs upgrade myvolume --dry-run
 studiofs upgrade myvolume
 ```
+
+Back up the PostgreSQL database first. `--dry-run` shows the schema migrations
+and the format change that would run, and changes nothing.
 
 The command requires online PostgreSQL access and schema deployment privileges.
 It verifies the volume identity, fences old publishers and deletion claims,

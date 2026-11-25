@@ -1,4 +1,4 @@
-use crate::engine::{MetaError, MetaResult};
+use crate::engine::MetaResult;
 
 /// Returns the canonical fresh-install PostgreSQL DDL for StudioFS.
 ///
@@ -9,8 +9,9 @@ use crate::engine::{MetaError, MetaResult};
 /// thick snapshot table is intentionally not created.
 ///
 /// The returned SQL creates objects if absent and does not copy or migrate v1
-/// snapshot rows.
-pub fn studiofs_pg_schema_sql() -> &'static str {
+/// snapshot rows. It is frozen as `core` migration 1 (SFS-1005); add a new
+/// migration in `pg_engine::migrations` instead of editing it.
+pub const fn studiofs_pg_schema_sql() -> &'static str {
     r#"
         CREATE TABLE IF NOT EXISTS volumes (
             vol BIGSERIAL PRIMARY KEY,
@@ -922,25 +923,23 @@ pub fn studiofs_pg_schema_sql() -> &'static str {
 pub const PAYLOAD_GC_SCHEMA_VERSION: i32 =
     crate::version::POSTGRES_PAYLOAD_GC_SCHEMA.current as i32;
 
-/// Ensures the canonical Snapshot v2 schema exists for a client or transaction.
+/// Ensures the canonical schema through the migration registry: applies the
+/// pending additive migrations of this binary and refuses newer, drifted or
+/// non-additive state. See
+/// [`super::migrations::ensure_registered_schema`].
 ///
 /// The caller owns transaction boundaries. Passing a transaction makes schema
-/// creation part of that transaction; passing a client executes it directly.
-/// This helper performs no v1 row migration or compatibility write.
+/// creation part of that transaction and holds the schema lock until it ends.
 ///
 /// # Errors
 ///
-/// Returns a redacted metadata error when PostgreSQL rejects the DDL. The
-/// backend error text is intentionally not included because it may contain
-/// connection or credential data.
+/// Typed refusals from the registry, or a redacted `RemoteUnavailable` when
+/// PostgreSQL rejects the DDL.
 pub async fn ensure_studiofs_pg_schema<C>(client: &C) -> MetaResult<()>
 where
     C: tokio_postgres::GenericClient + Sync,
 {
-    client
-        .batch_execute(studiofs_pg_schema_sql())
-        .await
-        .map_err(|_| MetaError::RemoteUnavailable("postgres schema ensure failed".to_owned()))
+    super::migrations::ensure_registered_schema(client).await
 }
 
 #[cfg(test)]

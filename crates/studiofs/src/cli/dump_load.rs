@@ -410,7 +410,16 @@ fn apply_dump(postgres_address: &str, dump: &MetadataDump) -> DumpLoadResult<i64
         let connection_task = tokio::spawn(connection);
 
         let result = async {
-            ensure_studiofs_pg_schema(&client).await?;
+            // Short schema transaction: DDL table locks must not span the load.
+            let schema_tx = client
+                .transaction()
+                .await
+                .map_err(|source| postgres_operation("start schema transaction", source))?;
+            ensure_studiofs_pg_schema(&schema_tx).await?;
+            schema_tx
+                .commit()
+                .await
+                .map_err(|source| postgres_operation("commit schema transaction", source))?;
             let tx = client
                 .transaction()
                 .await

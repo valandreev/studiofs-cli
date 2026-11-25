@@ -81,6 +81,19 @@ pub const POSTGRES_PAYLOAD_GC_SCHEMA: VersionIdentity = VersionIdentity {
     min_supported: 2,
 };
 
+/// Database-wide PostgreSQL `core` schema component: the 0.2.5 baseline is
+/// version 1 and each later migration in
+/// `pg_engine::migrations::MIGRATIONS` raises it by one (SFS-1005).
+pub const POSTGRES_CORE_SCHEMA: VersionIdentity = VersionIdentity {
+    name: "PostgreSQL core schema",
+    current: if cfg!(feature = "test-successor") {
+        2
+    } else {
+        1
+    },
+    min_supported: 1,
+};
+
 /// Local redb metadata layout, recorded in the redb `SETTINGS_TABLE["format"]`
 /// header. Both checks use `FormatInfo.format_version` until SFS-1012 adds a
 /// dedicated local layout marker, so their supported ranges must agree.
@@ -125,6 +138,7 @@ pub const IDENTITIES: &[VersionIdentity] = &[
     EVENT_CODEC_WIRE,
     SERVING_CHECKPOINT_FORMAT,
     SERVING_CHECKPOINT_SCHEMA,
+    POSTGRES_CORE_SCHEMA,
 ];
 
 /// Machine-readable report of this binary's identities, printed by

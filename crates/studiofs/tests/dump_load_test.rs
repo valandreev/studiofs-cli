@@ -464,6 +464,24 @@ async fn dump_load_restores_volume_and_discovery_reads_data() {
     );
     assert_ok(&init, "init");
 
+    // SFS-1005: the upgrade preflight reports the registry and changes nothing.
+    let dry_run = run_studiofs(home_a.path(), &["upgrade", &disk_name, "--dry-run"]);
+    assert_ok(&dry_run, "upgrade --dry-run");
+    let report = String::from_utf8_lossy(&dry_run.stdout);
+    for expected in [
+        "Dry run: nothing was changed.",
+        "  core = 1\n",
+        "  payload_gc = 2\n",
+        "  core 1 0.2.5 baseline (additive)\n",
+        "Volume format: local 6, shared 6",
+        "back up the database",
+    ] {
+        assert!(
+            report.contains(expected),
+            "missing {expected:?} in {report}"
+        );
+    }
+
     seed_remote_file(home_a.path(), &disk_name, payload).await;
 
     let dump = run_studiofs(

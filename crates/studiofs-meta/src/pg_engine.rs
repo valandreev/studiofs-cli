@@ -539,6 +539,8 @@ mod metadata_io;
 mod metadata_notify;
 #[path = "pg_engine/metadata_sync.rs"]
 mod metadata_sync;
+/// Ordered, checksummed PostgreSQL schema migration registry (SFS-1005).
+pub mod migrations;
 #[path = "pg_engine/remote_apply.rs"]
 mod remote_apply;
 #[path = "pg_engine/replication_api.rs"]
