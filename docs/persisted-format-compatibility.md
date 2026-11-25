@@ -283,31 +283,31 @@ that declares support for 0.2.5 (the compiled test successor of
 
 - Location: `event_log.event_type` and `event_log.event_payload`
   (`crates/studiofs-meta/src/pg_engine/schema.rs:51`); local journal in redb.
-- Version fields: wire envelope `SFS-EVT` plus wire version 1
-  (`crates/studiofs-meta/src/events.rs:6`), and a one-byte kind tag
-  (`crates/studiofs-meta/src/events.rs:8`). Tags are append-only; 16 and 17 are
-  reserved (`crates/studiofs-meta/src/events.rs:23`,
-  `crates/studiofs-meta/src/events.rs:29`).
-- Existing evolution mechanism: tag-per-version for `VolumeSettings`: tag 19
-  (revision, trash), 20 (adds quota), 21 (full settings with compression)
-  (`crates/studiofs-meta/src/events.rs:25`). The encoder picks the oldest tag
-  that can carry the value (`crates/studiofs-meta/src/events.rs:297`), and the
-  PostgreSQL `event_type` `set_volume_settings` accepts all three
-  (`crates/studiofs-meta/src/events.rs:387`).
-- Reader strictness: an unknown wire version, kind tag, or `event_type`
-  fails closed, but as `MetaError::Serialization`
-  (`crates/studiofs-meta/src/events.rs:433`,
-  `crates/studiofs-meta/src/events.rs:617`,
-  `crates/studiofs-meta/src/events.rs:383`), which the lifecycle maps to a
-  generic storage error (`crates/studiofs-meta/src/engine.rs:974`).
-- Successor may change additively: new tags, published only after the volume
-  activates the capability that requires them.
-- Incompatible: reusing a tag or changing an existing tag's payload.
-- Fail-closed outcome: a typed unsupported-event error naming the tag, mapped
-  to `UpgradeRequired` (ADR 0018), that stops replay at the last applied
-  version without advancing the local cursor. Owner:
-  [SFS-1009](https://linear.app/valandreev/issue/SFS-1009) (codecs) and
-  [SFS-1010](https://linear.app/valandreev/issue/SFS-1010) (negotiation).
+- Envelope: seven magic bytes `SFS-EVT`, one wire version byte, one kind tag
+  byte, then the exact postcard payload for that tag. The reader and writer
+  both support wire version 1. The reader also accepts the baseline's
+  untagged postcard ordinals 0 through 14.
+- The append-only registry in `crates/studiofs-meta/src/events.rs` binds
+  each tag to its payload and PostgreSQL kind. Tag 18 is journal-only.
+  Retired snapshot tags 16 and 17 are permanently reserved.
+- A new kind, field layout, or apply meaning requires a new tag, exact byte
+  fixtures, a required read capability, and a defined rollback policy.
+  Settings show the tag-per-version pattern. Tag 19 carries revision and
+  trash, tag 20 adds quota, and tag 21 adds compression. The writer selects
+  the oldest tag that preserves the requested policy.
+- Unknown tagged wire versions, tags, and PostgreSQL kinds return
+  `UpgradeRequired` with `UnsupportedEventReason`. An unknown ordinal in the
+  frozen untagged format, a known PostgreSQL kind that disagrees with the
+  tag, malformed or truncated bytes, and trailing payload bytes return
+  `Serialization`.
+  Replay decodes the complete page before opening the local apply
+  transaction, so the durable cursor cannot cross a refused event. Snapshot
+  reconstruction reports unsupported events as a permanent upgrade requirement.
+- The compiled test successor reads tag 22 (`set_user_xattr`), an
+  unconditional xattr assignment with a name relative to `user.`. The
+  ordinary encoder in both builds emits tag 10 for the equivalent mutation.
+  Publishing a successor tag requires an activated capability and the
+  encoding selection from [SFS-1010](https://linear.app/valandreev/issue/SFS-1010).
 
 ### 6. Serving checkpoints
 
@@ -348,11 +348,12 @@ that declares support for 0.2.5 (the compiled test successor of
 - Fields: `revision`, `trash`, `logical_quota_bytes`, and `compression`
   (`crates/studiofs-meta/src/trash.rs:220`), a `CompressionPolicy` of mode
   `off` or `zstd` with level 1–19 (`crates/studiofs-meta/src/trash.rs:105`).
-- Reader strictness: no `deny_unknown_fields`. The JSON form protects quota by
-  renaming `revision` to `quota_v1_revision` when a quota is set, so a
-  quota-unaware reader fails instead of dropping the quota
-  (`crates/studiofs-meta/src/trash.rs:224`). An unknown `CompressionMode`
-  fails to decode.
+- Stored settings JSON rejects unknown fields in the settings object, trash
+  policy, and compression policy. An unknown field or enum variant returns
+  `UpgradeRequired` on CLI reads and before a compare-and-set can rewrite
+  the record.
+  Historical missing quota and compression fields still use their defaults.
+  Quota-enabled records retain the `quota_v1_revision` spelling.
 - Writers: `studiofs volume` settings commands through `compare_and_set_*`,
   which use the publication predicate
   (`crates/studiofs-meta/src/pg_engine/volume_settings.rs:336`).
@@ -390,6 +391,9 @@ that declares support for 0.2.5 (the compiled test successor of
   `crates/studiofs-vfs/src/fetch.rs:2476`.
 - Successor may change additively: a new codec id or a new STFS/SFEC version,
   written only after the volume activates the capability that requires it.
+  The baseline write capability set includes STFS v2/v3 and SFEC v1.
+  The successor fixture adds only an event read capability. Future payload
+  encoders require their own write capability and activation before use.
   Objects are immutable and never rewritten.
 - Fail-closed outcome: typed read error for that object only; the payload is
   never cached and the read returns `EIO`. Writers never emit a format the
@@ -532,7 +536,7 @@ successor can fence it safely. "Current state" is what `main` does today.
 | Every publication stamps its session and policy epoch (GUC or column) so a later trigger can reject it. | Missing: publication sets no GUC; `event_log.client_id` exists (`crates/studiofs-meta/src/pg_engine/schema.rs:57`) but there is no session or epoch. | [SFS-1014](https://linear.app/valandreev/issue/SFS-1014), [SFS-1008](https://linear.app/valandreev/issue/SFS-1008) |
 | Destructive maintenance sets a maintenance capability GUC before deleting. | Partial: Janitor claims set `studiofs.deletion_format` (`crates/studiofs-meta/src/pg_engine/janitor.rs:1089`); snapshot cleanup, event-log pruning and checkpoint pruning set none. | [SFS-1016](https://linear.app/valandreev/issue/SFS-1016) |
 | Unknown required capabilities fail closed with a typed reason. | Present in the pure evaluator (SFS-1004): `compat::evaluate` refuses unknown required capabilities, unknown safety-critical optional ones, unknown events and payload formats with stable reason codes. Not wired into mount, replay or publication until the volume policy and enforcement land. | [SFS-1004](https://linear.app/valandreev/issue/SFS-1004) |
-| Unknown event tags fail closed with a typed reason. | Partial: fails closed as `Serialization` (`crates/studiofs-meta/src/events.rs:617`). | [SFS-1009](https://linear.app/valandreev/issue/SFS-1009) |
+| Unknown event tags fail closed with a typed reason. | Present: replay preserves `UpgradeRequired` with `UnsupportedEventReason` and leaves the durable cursor at its last applied position. | [SFS-1009](https://linear.app/valandreev/issue/SFS-1009) |
 | Unknown checkpoint formats fail closed with a typed reason. | Missing typed reason: snapshot sources fail closed, but one untyped `snapshot source checkpoint is invalid` covers unknown format, checksum mismatch and schema mismatch (`crates/studiofs-meta/src/pg_engine/snapshot_control.rs:360`). The serving checkpoint has no format field of its own and relies on `metadata_format_version`. | [SFS-1011](https://linear.app/valandreev/issue/SFS-1011) |
 | Unknown payload object formats fail closed with a typed reason. | Present: `UnsupportedVersion` and `UnsupportedCodec` (`crates/studiofs-data/src/object.rs:325`, `crates/studiofs-data/src/object.rs:160`); SFEC version and flags are strict. | [SFS-1009](https://linear.app/valandreev/issue/SFS-1009) (write gating) |
 | Unknown local formats fail closed with a typed reason. | Partial: payload index format is typed (`crates/studiofs-cache/src/payload_index.rs:1299`), entry encoding is `Corruption` (`crates/studiofs-cache/src/payload_index.rs:1790`); redb has no own identity. | [SFS-1012](https://linear.app/valandreev/issue/SFS-1012), [SFS-1003](https://linear.app/valandreev/issue/SFS-1003) |

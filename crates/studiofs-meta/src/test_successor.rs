@@ -72,18 +72,31 @@ pub struct SuccessorChange {
 }
 
 /// Declared successor changes. Format issues append their entries here.
-pub const CHANGES: &[SuccessorChange] = &[SuccessorChange {
-    id: "postgres-core-schema-2",
-    issue: "SFS-1005",
-    kind: ChangeKind::PostgresMigration,
-    // The component version never moves back, so 0.2.5 `init`/`load` stay refused.
-    rollback: Rollback::Irreversible,
-    bump: Some(IdentityBump {
-        identity: crate::version::POSTGRES_CORE_SCHEMA.name,
-        baseline: 1,
-        successor: 2,
-    }),
-}];
+pub const CHANGES: &[SuccessorChange] = &[
+    SuccessorChange {
+        id: "postgres-core-schema-2",
+        issue: "SFS-1005",
+        kind: ChangeKind::PostgresMigration,
+        // The component version never moves back, so 0.2.5 `init`/`load` stay refused.
+        rollback: Rollback::Irreversible,
+        bump: Some(IdentityBump {
+            identity: crate::version::POSTGRES_CORE_SCHEMA.name,
+            baseline: 1,
+            successor: 2,
+        }),
+    },
+    SuccessorChange {
+        id: "event-set-user-xattr-v1",
+        issue: "SFS-1009",
+        kind: ChangeKind::EventKind,
+        // Persisted tag 22 cannot be replayed by the baseline.
+        rollback: Rollback::Irreversible,
+        bump: None,
+    },
+];
+
+/// Read capability for the successor's namespace-specific xattr event.
+pub const SET_USER_XATTR_CAPABILITY: &str = "event.set_user_xattr.v1";
 
 #[cfg(test)]
 mod tests {
@@ -104,6 +117,13 @@ mod tests {
             assert_eq!(identity.current, bump.successor, "{}", bump.identity);
             assert_ne!(bump.baseline, bump.successor, "{}", bump.identity);
         }
+    }
+
+    #[test]
+    fn successor_event_capability_is_read_only() {
+        let capabilities = crate::compat::ClientCapabilities::current();
+        assert!(capabilities.read.contains(SET_USER_XATTR_CAPABILITY));
+        assert!(!capabilities.write.contains(SET_USER_XATTR_CAPABILITY));
     }
 
     #[test]

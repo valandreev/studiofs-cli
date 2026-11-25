@@ -1754,9 +1754,12 @@ impl<'a> RemoteApplyCoordinator<'a> {
                 ))
             })?;
             let event = decode_event_with_type(event_type, payload).map_err(|error| {
-                MetaError::Serialization(format!(
-                    "postgres event_log decode failed (seq_id={seq_id}, batch_version={row_batch_version}, event_type={event_type}): {error}"
-                ))
+                match error {
+                    MetaError::Serialization(_) => MetaError::Serialization(format!(
+                        "postgres event_log decode failed (seq_id={seq_id}, batch_version={row_batch_version}, event_type={event_type}): {error}"
+                    )),
+                    other => other,
+                }
             })?;
             batch_events.push(event);
             idx += 1;

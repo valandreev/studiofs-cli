@@ -130,8 +130,8 @@ const _: () = assert!(
 /// `MetaEvent` wire envelope version (`SFS-EVT`); tags are append-only.
 pub const EVENT_CODEC_WIRE: VersionIdentity = VersionIdentity {
     name: "event codec wire",
-    current: crate::events::META_EVENT_WIRE_VERSION as u16,
-    min_supported: crate::events::META_EVENT_WIRE_VERSION as u16,
+    current: crate::events::META_EVENT_WRITE_VERSION as u16,
+    min_supported: crate::events::META_EVENT_READ_VERSIONS[0] as u16,
 };
 
 /// Serving checkpoint byte format (formats 1–4 decode).

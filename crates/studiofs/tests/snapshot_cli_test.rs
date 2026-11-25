@@ -579,6 +579,54 @@ fn compression_cli_updates_shared_setting_handles_cas_conflict_and_converges() {
     let local = engine.retained_store().unwrap().volume_settings().unwrap();
     assert_eq!(local, expected);
     drop(engine);
+
+    let mut future_settings = serde_json::to_value(expected).unwrap();
+    future_settings["future_policy"] = serde_json::json!(true);
+    let future_bytes = serde_json::to_vec(&future_settings).unwrap();
+    runtime
+        .block_on(client.execute(
+            "UPDATE metadata_state SET volume_settings=$2 WHERE vol=$1",
+            &[&id, &future_bytes],
+        ))
+        .unwrap();
+    for args in [&[][..], &["off"][..]] {
+        let output = run(args);
+        let message = output_text(&output);
+        assert!(!output.status.success(), "{message}");
+        assert!(
+            message.contains("upgrade required: unknown volume settings field or variant"),
+            "{message}"
+        );
+        assert!(
+            !message.contains("check PostgreSQL connectivity"),
+            "{message}"
+        );
+    }
+    let error = runtime
+        .block_on(studiofs_meta::pg_engine::set_shared_compression(
+            &mut client,
+            id,
+            Some(expected.revision),
+            CompressionPolicy::off(),
+            "compression-cli-fixture",
+            0,
+        ))
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        studiofs_meta::MetaError::UpgradeRequired {
+            reason: studiofs_meta::UpgradeRequiredReason::VolumeSettingsUnknown
+        }
+    ));
+    let stored_bytes: Vec<u8> = runtime
+        .block_on(client.query_one(
+            "SELECT volume_settings FROM metadata_state WHERE vol=$1",
+            &[&id],
+        ))
+        .unwrap()
+        .get(0);
+    assert_eq!(stored_bytes, future_bytes);
+
     drop(client);
     let _ = runtime.block_on(connection_task);
 }
