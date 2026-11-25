@@ -333,7 +333,7 @@ async fn update_volume_settings_in_tx(
     let payload = crate::events::encode_event(&event)?;
     let payload_bytes = i64::try_from(payload.len())
         .map_err(|_| MetaError::Storage("volume settings payload too large".into()))?;
-    let format = i16::try_from(CURRENT_FORMAT_VERSION)
+    let format = i16::try_from(crate::version::SHARED_VOLUME_FORMAT.current)
         .map_err(|_| MetaError::Storage("metadata format exceeds SMALLINT".into()))?;
     let row = tx
         .query_one(

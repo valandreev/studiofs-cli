@@ -68,7 +68,10 @@ descriptor, and the publication predicate. Every check is an exact equality:
 So a harmless additive change, such as a new optional table, must either reuse
 format 6 (and be invisible to older readers) or bump the number (and lock out
 every older reader and writer at once). The rest of this page splits that
-number into separate identities.
+number into separate identities. SFS-1003 implemented the split in code
+(`crates/studiofs-meta/src/version.rs`) without changing any value; see
+"Version-bump rules" below. The line references in this audit describe `main`
+before that change.
 
 ## Boundary audit
 
@@ -470,7 +473,7 @@ successor can fence it safely. "Current state" is what `main` does today.
 | Unknown local formats fail closed with a typed reason. | Partial: payload index format is typed (`crates/studiofs-cache/src/payload_index.rs:1299`), entry encoding is `Corruption` (`crates/studiofs-cache/src/payload_index.rs:1790`); redb has no own identity. | [SFS-1012](https://linear.app/valandreev/issue/SFS-1012), [SFS-1003](https://linear.app/valandreev/issue/SFS-1003) |
 | Additive PG objects are tolerated when declared capabilities allow it. | Partial: extra tables are ignored by `validate_postgres_schema`, but the required list is global and not capability-scoped (`crates/studiofs-meta/src/pg_engine.rs:1314`); `init`/`load`/`upgrade` re-run `CREATE OR REPLACE` DDL without checking for newer components. | [SFS-1006](https://linear.app/valandreev/issue/SFS-1006), [SFS-1005](https://linear.app/valandreev/issue/SFS-1005) |
 | Policy epoch is revalidated after reconnect. | Partial: the format predicate is re-evaluated in every publication transaction; no policy epoch exists. | [SFS-1015](https://linear.app/valandreev/issue/SFS-1015), [SFS-1007](https://linear.app/valandreev/issue/SFS-1007) |
-| Unknown `MetadataBackend` variant or unknown `FormatInfo` field fails closed with typed `UpgradeRequired`. | Missing: both surface as `Serialization` (`crates/studiofs-meta/src/lib.rs:103`). `deny_unknown_fields` is present on `FormatInfo`, `MetadataConfig`, `PostgresConfig`, shared through `metadata_state.format_info`. | [SFS-1003](https://linear.app/valandreev/issue/SFS-1003) |
+| Unknown `MetadataBackend` variant or unknown `FormatInfo` field fails closed with typed `UpgradeRequired`. | Present (SFS-1003): `decode_format_info` returns `MetaError::UpgradeRequired` naming the field or variant, including nested configs, and the bootstrap descriptor keeps it instead of reporting an invalid checkpoint. | [SFS-1003](https://linear.app/valandreev/issue/SFS-1003) |
 | 0.2.x volumes adopt the baseline by `studiofs upgrade` to format 7. | Missing: upgrade handles 5→6 only (`crates/studiofs-meta/src/pg_engine/format_upgrade.rs:35`). | [SFS-1132](https://linear.app/valandreev/issue/SFS-1132) |
 
 ## Version and operation support matrix
@@ -491,6 +494,46 @@ the compiled test successor
 | Pre-0.2.5 ↔ 0.2.5 binary | No guarantee; adopt via `studiofs upgrade` | No guarantee; adopt via `studiofs upgrade` | No guarantee; adopt via `studiofs upgrade` | No guarantee; adopt via `studiofs upgrade` | No guarantee; adopt via `studiofs upgrade` | No guarantee; adopt via `studiofs upgrade` | No guarantee |
 
 ## Rules
+
+### Version-bump rules
+
+The identities live in `crates/studiofs-meta/src/version.rs` (SFS-1003). Each
+is a `VersionIdentity` with the version this binary writes (`current`) and the
+oldest it reads (`min_supported`); `check` refuses anything outside that range
+with the typed `UnsupportedFormatVersion`. The version to change depends on the
+persisted boundary:
+
+| Change | Identity to bump | Not bumped |
+|---|---|---|
+| Shared volume layout or the `metadata_state` protocol all writers must speak (only the SFS-1132 6→7 adoption; from format 7 on, use capabilities) | `SHARED_VOLUME_FORMAT` (`FormatInfo.format_version`, `metadata_format_version`). Keep `LOCAL_METADATA_LAYOUT` in sync while both use that field. | codecs |
+| Key or value encoding of an existing local redb table | With the dedicated marker and migration from SFS-1012, bump `LOCAL_METADATA_LAYOUT`. Before that, defer an independent local layout change. | shared format once the local marker exists |
+| New `MetaEvent` wire envelope | `EVENT_CODEC_WIRE`; a new event kind is a new append-only tag instead | shared format |
+| New serving checkpoint suffix | `SERVING_CHECKPOINT_FORMAT` (keep older formats in range) | shared format |
+| Serving-state schema change | `SERVING_CHECKPOINT_SCHEMA` | checkpoint format |
+| Additive PostgreSQL table, column or index | the matching `studiofs_schema_components` component (`POSTGRES_PAYLOAD_GC_SCHEMA` for the existing `payload_gc` component, with further components in SFS-1005) | every identity above |
+| Payload index, snapshot artifact, dump, STFS, SFEC | the owner constant listed in `version.rs` | every identity above |
+
+Today the local redb header is still the `FormatInfo` copy in
+`SETTINGS_TABLE["format"]`, so both checks read `FormatInfo.format_version`.
+Local header reads use `LOCAL_METADATA_LAYOUT`. Shared `FormatInfo`, the
+descriptor, `ensure_supported_pg_sync_format_version`, and publication use
+`SHARED_VOLUME_FORMAT`. A compile-time assertion keeps both current versions
+and minimum supported versions equal until SFS-1012 adds a dedicated marker.
+
+`CLIENT_RELEASE` (the binary's `CARGO_PKG_VERSION`) is informative only. It
+appears in diagnostics and, later, in session records; it is never a storage
+compatibility gate.
+
+`FormatInfo`, `MetadataConfig`, `PostgresConfig`, `RemoteStoreConfig`, and
+`EncryptionConfig` keep `deny_unknown_fields`. `decode_format_info` reports
+an unknown field or enum variant (for example a new `MetadataBackend`) as
+`MetaError::UpgradeRequired` with the schema identifier when it meets the
+diagnostic redaction rules. Invalid types and malformed values are decoding
+errors. A new optional field must use `#[serde(default, skip_serializing_if = ...)]` so a
+volume that does not use it keeps byte-identical `FormatInfo` and stays
+readable by 0.2.5. A field or variant that a volume needs (such as the 0.2.7
+Redis backend) is a required capability: writing it fences 0.2.5 readers with
+`UpgradeRequired`, which is the intended outcome.
 
 ### Pending local writes
 

@@ -43,6 +43,8 @@ pub mod snapshot_ports;
 pub mod trash;
 /// Public metadata model types shared across engines and callers.
 pub mod types;
+/// Typed version identities of the persisted boundaries.
+pub mod version;
 
 use sha2::{Digest, Sha256};
 use std::path::Path;
@@ -62,6 +64,7 @@ pub use engine::{
     ScratchAuxTable, ScratchConflictRecord, ScratchConsistencyRepairSummary,
     ScratchConsistencyReport, ScratchDanglingDentry, ScratchOrphanAuxRow, ScratchOrphanEntry,
     ScratchOrphanInode, ScratchOrphanRecord, ScratchPayloadObjectRef, ScratchRenameResult,
+    UpgradeRequiredReason,
 };
 pub use events::MetaEvent;
 pub use janitor::{
@@ -86,23 +89,75 @@ struct FormatVersionOnly {
     format_version: u16,
 }
 
-/// Decode and validate persisted [`FormatInfo`] while checking its version first.
+/// Decode and validate shared [`FormatInfo`] while checking its version first.
 ///
 /// The version-only pass preserves the actionable incompatibility error even when
-/// an older format no longer satisfies the current JSON shape.
+/// an older format no longer satisfies the current JSON shape. An unknown field
+/// or enum variant is a newer writer's addition and returns
+/// [`MetaError::UpgradeRequired`] naming it.
 pub fn decode_format_info(bytes: &[u8]) -> MetaResult<FormatInfo> {
+    decode_format_info_as(bytes, version::SHARED_VOLUME_FORMAT)
+}
+
+fn decode_local_format_info(bytes: &[u8]) -> MetaResult<FormatInfo> {
+    decode_format_info_as(bytes, version::LOCAL_METADATA_LAYOUT)
+}
+
+/// [`decode_format_info`] with the version judged by `identity`, so the local
+/// redb header copy and shared `FormatInfo` answer to separate identities.
+fn decode_format_info_as(
+    bytes: &[u8],
+    identity: version::VersionIdentity,
+) -> MetaResult<FormatInfo> {
     let version: FormatVersionOnly =
-        serde_json::from_slice(bytes).map_err(|e| MetaError::Serialization(e.to_string()))?;
-    if version.format_version != CURRENT_FORMAT_VERSION {
-        return Err(MetaError::UnsupportedFormatVersion {
-            found: version.format_version,
-            expected: CURRENT_FORMAT_VERSION,
-        });
-    }
-    let info: FormatInfo =
-        serde_json::from_slice(bytes).map_err(|e| MetaError::Serialization(e.to_string()))?;
+        serde_json::from_slice(bytes).map_err(|error| invalid_format_info_json(&error))?;
+    identity.check(version.format_version)?;
+    let info: FormatInfo = serde_json::from_slice(bytes).map_err(format_info_decode_error)?;
     info.validate_format_contract()?;
     Ok(info)
+}
+
+/// Maps serde's unknown field/variant errors to [`MetaError::UpgradeRequired`].
+///
+/// `serde_json::Error` exposes a data category for both cases. The pinned
+/// decoder regression tests guard the Serde diagnostic syntax used here.
+fn format_info_decode_error(error: serde_json::Error) -> MetaError {
+    if !error.is_data() {
+        return invalid_format_info_json(&error);
+    }
+    let message = error.to_string();
+    let quoted = |prefix: &str| {
+        let rest = message.strip_prefix(prefix)?;
+        let (name, _) = rest.rsplit_once("`, expected ")?;
+        let safe_name = if name.is_empty()
+            || name.len() > 64
+            || !name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+        {
+            "<redacted>"
+        } else {
+            name
+        };
+        Some(safe_name.to_owned())
+    };
+    let reason = if let Some(field) = quoted("unknown field `") {
+        UpgradeRequiredReason::UnknownFormatInfoField { field }
+    } else if let Some(variant) = quoted("unknown variant `") {
+        UpgradeRequiredReason::UnknownFormatInfoVariant { variant }
+    } else {
+        return invalid_format_info_json(&error);
+    };
+    MetaError::UpgradeRequired { reason }
+}
+
+fn invalid_format_info_json(error: &serde_json::Error) -> MetaError {
+    // Serde's data errors can contain the original value of a malformed field.
+    MetaError::Serialization(format!(
+        "invalid FormatInfo JSON at line {}, column {}",
+        error.line(),
+        error.column(),
+    ))
 }
 
 /// Validate the atomic PostgreSQL serving-checkpoint descriptor.
@@ -186,14 +241,17 @@ impl Default for MetaOpenOptions {
     }
 }
 
-/// Validate the local/remote metadata format before opening or importing it.
+/// Validate shared [`FormatInfo`] against the shared volume format before
+/// opening or importing it.
 pub fn ensure_supported_format_version(info: &FormatInfo) -> MetaResult<()> {
-    if info.format_version != CURRENT_FORMAT_VERSION {
-        return Err(MetaError::UnsupportedFormatVersion {
-            found: info.format_version,
-            expected: CURRENT_FORMAT_VERSION,
-        });
-    }
+    version::SHARED_VOLUME_FORMAT.check(info.format_version)?;
+    info.validate_format_contract()?;
+    Ok(())
+}
+
+/// Validate a local redb header against the local metadata layout identity.
+fn ensure_supported_local_format_version(info: &FormatInfo) -> MetaResult<()> {
+    version::LOCAL_METADATA_LAYOUT.check(info.format_version)?;
     info.validate_format_contract()?;
     Ok(())
 }
@@ -207,13 +265,7 @@ pub fn ensure_supported_pg_sync_format_version(found: Option<i16>) -> MetaResult
     let found = found
         .and_then(|value| u16::try_from(value).ok())
         .unwrap_or_default();
-    if found != CURRENT_FORMAT_VERSION {
-        return Err(MetaError::UnsupportedFormatVersion {
-            found,
-            expected: CURRENT_FORMAT_VERSION,
-        });
-    }
-    Ok(())
+    version::SHARED_VOLUME_FORMAT.check(found)
 }
 
 /// Open metadata engine based on format settings.
@@ -229,7 +281,7 @@ pub fn open_meta_engine_with_options(
     let path = path.as_ref();
     match RedbMetaEngine::read_format_info_readonly(path) {
         Ok(info) if info.metadata.backend == MetadataBackend::Postgres => {
-            ensure_supported_format_version(&info)?;
+            ensure_supported_local_format_version(&info)?;
             let pg = PgMetaEngine::open_with_options(
                 path,
                 PgOpenOptions {
@@ -249,10 +301,10 @@ pub fn open_meta_engine_with_options(
             Ok(pg)
         }
         Ok(info) => {
-            ensure_supported_format_version(&info)?;
+            ensure_supported_local_format_version(&info)?;
             let redb = RedbMetaEngine::open(path)?;
             let redb_info = redb.get_format_info()?;
-            ensure_supported_format_version(&redb_info)?;
+            ensure_supported_local_format_version(&redb_info)?;
             if redb_info.metadata.backend != info.metadata.backend {
                 return Err(MetaError::Storage(
                     "metadata backend switched during RedbMetaEngine open".to_string(),
@@ -277,7 +329,7 @@ pub fn open_meta_engine_with_options(
             let info = {
                 let redb = RedbMetaEngine::open(path)?;
                 let info = redb.get_format_info()?;
-                ensure_supported_format_version(&info)?;
+                ensure_supported_local_format_version(&info)?;
                 if info.metadata.backend == MetadataBackend::Postgres {
                     mark_unclean_pg_local_graph(&redb)?;
                 }
@@ -364,6 +416,170 @@ mod tests {
                 Err(MetaError::Serialization(_))
             ));
         }
+    }
+
+    fn baseline_format_info_json() -> serde_json::Value {
+        serde_json::to_value(baseline_fixtures::fixture_format_info()).unwrap()
+    }
+
+    fn assert_upgrade_required(bytes: &[u8], expected: &UpgradeRequiredReason) {
+        let error = decode_format_info(bytes).unwrap_err();
+        assert!(
+            matches!(&error, MetaError::UpgradeRequired { reason } if reason == expected),
+            "{error:?}"
+        );
+        let message = error.to_string();
+        assert!(message.contains("upgrade required"), "{message}");
+        assert!(!message.contains("sfs-fixture-secret"), "{message}");
+        assert!(!message.contains("postgres://"), "{message}");
+    }
+
+    #[test]
+    fn format_info_decode_reports_unknown_field_as_upgrade_required() {
+        let mut baseline = baseline_format_info_json();
+        baseline["metadata"]["remote"] = serde_json::json!({
+            "endpoint": "http://127.0.0.1:9000",
+            "bucket": "metadata",
+            "access_key": "fixture-access",
+            "secret_key": "sfs-fixture-secret",
+            "region": "us-east-1",
+        });
+        for pointer in [
+            "",
+            "/metadata",
+            "/metadata/remote",
+            "/metadata/postgres",
+            "/encryption",
+        ] {
+            let mut json = baseline.clone();
+            json.pointer_mut(pointer)
+                .and_then(serde_json::Value::as_object_mut)
+                .unwrap_or_else(|| panic!("object at {pointer:?}"))
+                .insert("successor_field".to_string(), serde_json::json!(true));
+            assert_upgrade_required(
+                &serde_json::to_vec(&json).unwrap(),
+                &UpgradeRequiredReason::UnknownFormatInfoField {
+                    field: "successor_field".to_string(),
+                },
+            );
+        }
+    }
+
+    #[test]
+    fn format_info_decode_reports_unknown_backend_as_upgrade_required() {
+        let mut json = baseline_format_info_json();
+        json["metadata"]["backend"] = serde_json::json!("redis");
+        assert_upgrade_required(
+            &serde_json::to_vec(&json).unwrap(),
+            &UpgradeRequiredReason::UnknownFormatInfoVariant {
+                variant: "redis".to_string(),
+            },
+        );
+    }
+
+    #[test]
+    fn format_info_decode_redacts_non_identifier_backend_names() {
+        let mut json = baseline_format_info_json();
+        json["metadata"]["backend"] = serde_json::json!("future\nbackend");
+        assert_upgrade_required(
+            &serde_json::to_vec(&json).unwrap(),
+            &UpgradeRequiredReason::UnknownFormatInfoVariant {
+                variant: "<redacted>".to_string(),
+            },
+        );
+    }
+
+    #[test]
+    fn format_info_decode_redacts_malformed_field_values() {
+        let mut json = baseline_format_info_json();
+        json["metadata"]["postgres"]["volume_id"] = serde_json::json!("fixture-private-value");
+        let error = decode_format_info(&serde_json::to_vec(&json).unwrap()).unwrap_err();
+        assert!(matches!(error, MetaError::Serialization(_)));
+        assert!(!format!("{error}").contains("fixture-private-value"));
+        assert!(!format!("{error:?}").contains("fixture-private-value"));
+    }
+
+    #[test]
+    fn format_info_version_is_checked_before_unknown_fields() {
+        let mut json = baseline_format_info_json();
+        json["format_version"] = serde_json::json!(5);
+        json["successor_field"] = serde_json::json!(true);
+        assert!(matches!(
+            decode_format_info(&serde_json::to_vec(&json).unwrap()),
+            Err(MetaError::UnsupportedFormatVersion {
+                found: 5,
+                expected: 6
+            })
+        ));
+    }
+
+    #[test]
+    fn persisted_version_gates_distinguish_volume_and_checkpoint_fields() {
+        use crate::snapshot::ServingCheckpoint;
+
+        // A newer serving checkpoint format is still outside the serving schema
+        // range, and a shared volume's version is outside both checkpoint ranges.
+        let checkpoint_format = ServingCheckpoint::FORMAT_VERSION;
+        let checkpoint_schema = ServingCheckpoint::SCHEMA_VERSION;
+        let info = baseline_fixtures::fixture_format_info();
+        let volume_format = i16::try_from(info.format_version).unwrap();
+        assert!(ServingCheckpoint::supports_format_version(
+            checkpoint_format
+        ));
+        assert!(ServingCheckpoint::supports_schema_version(
+            checkpoint_schema
+        ));
+        assert!(!ServingCheckpoint::supports_schema_version(
+            checkpoint_format
+        ));
+        assert!(!ServingCheckpoint::supports_format_version(volume_format));
+        assert!(!ServingCheckpoint::supports_schema_version(volume_format));
+
+        let dir = studiofs_test_support::workspace_target_tempdir("version-gates-");
+        let path = dir.path().join("metadata.redb");
+        let redb = RedbMetaEngine::open(&path).unwrap();
+        redb.set_format_info(&info).unwrap();
+        drop(redb);
+        let local = RedbMetaEngine::read_format_info_readonly(&path).unwrap();
+        assert_eq!(local.format_version, info.format_version);
+        ensure_supported_pg_sync_format_version(Some(volume_format)).unwrap();
+        assert!(matches!(
+            ensure_supported_pg_sync_format_version(Some(checkpoint_format)),
+            Err(MetaError::UnsupportedFormatVersion { .. })
+        ));
+    }
+
+    #[test]
+    fn bootstrap_descriptor_keeps_format_info_upgrade_required() {
+        let mut json = baseline_format_info_json();
+        json["successor_field"] = serde_json::json!(true);
+        let checkpoint_bytes = b"checkpoint".to_vec();
+        let descriptor = BootstrapCheckpointDescriptor {
+            volume_id: 1,
+            volume_uuid: baseline_fixtures::fixture_format_info().uuid,
+            format_info_bytes: serde_json::to_vec(&json).unwrap(),
+            metadata_format_version: version::SHARED_VOLUME_FORMAT.current,
+            remote_head_version: 1,
+            checkpoint_version: 1,
+            checkpoint_sha256: Sha256::digest(&checkpoint_bytes).to_vec(),
+            checkpoint_bytes,
+            publication_state: "published".to_string(),
+            publication_generation: 1,
+        };
+        let error = descriptor.validate_and_decode().unwrap_err();
+        assert!(
+            matches!(
+                error,
+                MetaError::UpgradeRequired {
+                    reason: UpgradeRequiredReason::UnknownFormatInfoField { .. }
+                }
+            ),
+            "{error:?}"
+        );
+        assert_eq!(
+            PgSyncFailure::from_error(&error),
+            PgSyncFailure::UpgradeRequired
+        );
     }
 
     #[test]

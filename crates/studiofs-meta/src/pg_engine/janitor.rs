@@ -430,7 +430,13 @@ impl PgJanitorSession {
         let expected = crate::pg_engine::schema::PAYLOAD_GC_SCHEMA_VERSION;
         let problem = match version {
             None => "payload GC schema version is not recorded",
-            Some(version) if version != expected => "payload GC schema version is unsupported",
+            Some(version)
+                if !u16::try_from(version).is_ok_and(|version| {
+                    crate::version::POSTGRES_PAYLOAD_GC_SCHEMA.supports(version)
+                }) =>
+            {
+                "payload GC schema version is unsupported"
+            }
             Some(_) if usize::try_from(guards) != Ok(PAYLOAD_GC_GUARD_TRIGGERS.len()) => {
                 "payload GC schema is incomplete: a deletion guard trigger is missing or disabled"
             }

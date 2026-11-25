@@ -60,6 +60,7 @@ enum SnapshotSourceError {
     Retryable,
     Permanent,
     MissingFormatInfo,
+    UpgradeRequired,
     UnsupportedFormatVersion { found: u16, expected: u16 },
 }
 
@@ -94,6 +95,10 @@ impl SnapshotSourceError {
                 "missing_format_info",
                 "snapshot source format info is missing",
             ),
+            Self::UpgradeRequired => SnapshotPortError::permanent(
+                "upgrade_required",
+                "snapshot source requires a newer StudioFS client",
+            ),
             Self::UnsupportedFormatVersion { found, expected } => SnapshotPortError::permanent(
                 "unsupported_format_version",
                 &format!(
@@ -102,6 +107,19 @@ impl SnapshotSourceError {
             ),
         }
     }
+}
+
+fn decode_snapshot_source_format_info(bytes: &[u8]) -> Result<FormatInfo, SnapshotSourceError> {
+    if bytes.is_empty() {
+        return Err(SnapshotSourceError::MissingFormatInfo);
+    }
+    crate::decode_format_info(bytes).map_err(|error| match error {
+        MetaError::UnsupportedFormatVersion { found, expected } => {
+            SnapshotSourceError::UnsupportedFormatVersion { found, expected }
+        }
+        MetaError::UpgradeRequired { .. } => SnapshotSourceError::UpgradeRequired,
+        _ => SnapshotSourceError::Permanent,
+    })
 }
 
 impl PgSnapshotBackend {
@@ -360,7 +378,7 @@ impl PgSnapshotBackend {
         if raw.checkpoint_version < 0
             || raw.checkpoint_version > cut.cut_version()
             || !ServingCheckpoint::supports_format_version(raw.checkpoint_format_version)
-            || raw.checkpoint_schema_version != ServingCheckpoint::SCHEMA_VERSION
+            || !ServingCheckpoint::supports_schema_version(raw.checkpoint_schema_version)
             || raw.checkpoint_sha256.as_slice() != Sha256::digest(&raw.checkpoint_bytes).as_slice()
         {
             return Err(SnapshotSourceError::permanent(snapshot_control_error(
@@ -374,18 +392,7 @@ impl PgSnapshotBackend {
                 ))
             })?,
         );
-        if raw.format_info_bytes.is_empty() {
-            return Err(SnapshotSourceError::MissingFormatInfo);
-        }
-        let format_info =
-            crate::decode_format_info(&raw.format_info_bytes).map_err(|error| match error {
-                MetaError::UnsupportedFormatVersion { found, expected } => {
-                    SnapshotSourceError::UnsupportedFormatVersion { found, expected }
-                }
-                _ => SnapshotSourceError::permanent(snapshot_control_error(
-                    "snapshot format info is invalid",
-                )),
-            })?;
+        let format_info = decode_snapshot_source_format_info(&raw.format_info_bytes)?;
         let descriptor = SnapshotSourceDescriptor {
             checkpoint_id: snapshot_id_text,
             checkpoint_version: raw.checkpoint_version,
@@ -679,7 +686,7 @@ impl<T: SnapshotBackendAccess + Send + Sync> SnapshotSourceReader for T {
                 || descriptor.checkpoint_version < 0
                 || descriptor.checkpoint_version > cut.cut_version()
                 || !ServingCheckpoint::supports_format_version(descriptor.checkpoint_format_version)
-                || descriptor.checkpoint_schema_version != ServingCheckpoint::SCHEMA_VERSION
+                || !ServingCheckpoint::supports_schema_version(descriptor.checkpoint_schema_version)
             {
                 return Err(SnapshotPortError::permanent(
                     "invalid_source",
@@ -994,6 +1001,22 @@ mod tests {
                 .into_port_error()
                 .to_string(),
             "snapshot operation rejected: missing_format_info: snapshot source format info is missing"
+        );
+    }
+
+    #[test]
+    fn snapshot_source_format_info_preserves_upgrade_required() {
+        let info = crate::baseline_fixtures::fixture_format_info();
+        let mut json = serde_json::to_value(info).unwrap();
+        json["successor_field"] = serde_json::json!(true);
+        let error =
+            decode_snapshot_source_format_info(&serde_json::to_vec(&json).unwrap()).unwrap_err();
+        assert_eq!(
+            error.into_port_error(),
+            SnapshotPortError::permanent(
+                "upgrade_required",
+                "snapshot source requires a newer StudioFS client",
+            ),
         );
     }
 

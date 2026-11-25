@@ -138,12 +138,7 @@ impl BootstrapCheckpointDescriptor {
                 reason: CheckpointDescriptorFailure::VolumeIdentity,
             });
         }
-        if self.metadata_format_version != crate::schema::CURRENT_FORMAT_VERSION {
-            return Err(MetaError::UnsupportedFormatVersion {
-                found: self.metadata_format_version,
-                expected: crate::schema::CURRENT_FORMAT_VERSION,
-            });
-        }
+        crate::version::SHARED_VOLUME_FORMAT.check(self.metadata_format_version)?;
         if self.checkpoint_version < 0
             || self.remote_head_version < 0
             || self.checkpoint_version > self.remote_head_version
@@ -160,7 +155,10 @@ impl BootstrapCheckpointDescriptor {
         )?;
 
         let format_info = crate::decode_format_info(&self.format_info_bytes).map_err(|error| {
-            if matches!(error, MetaError::UnsupportedFormatVersion { .. }) {
+            if matches!(
+                error,
+                MetaError::UnsupportedFormatVersion { .. } | MetaError::UpgradeRequired { .. }
+            ) {
                 error
             } else {
                 MetaError::InvalidCheckpointDescriptor {
@@ -193,6 +191,24 @@ impl BootstrapCheckpointDescriptor {
     pub fn validate(&self) -> MetaResult<()> {
         self.validate_and_decode().map(|_| ())
     }
+}
+
+/// Why persisted state needs a newer binary. The decoder reports schema names
+/// or a redaction marker; diagnostics omit the contents of malformed fields.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum UpgradeRequiredReason {
+    /// `FormatInfo` (or a nested config) has a field this binary does not know.
+    #[error("unknown FormatInfo field `{field}`")]
+    UnknownFormatInfoField {
+        /// Name of the unknown field.
+        field: String,
+    },
+    /// `FormatInfo` uses an enum variant, such as a `MetadataBackend`, this binary does not know.
+    #[error("unknown FormatInfo variant `{variant}`")]
+    UnknownFormatInfoVariant {
+        /// Name of the unknown variant.
+        variant: String,
+    },
 }
 
 #[derive(Debug, Clone, thiserror::Error)]
@@ -383,6 +399,17 @@ pub enum MetaError {
         found: u16,
         /// Version expected by the running binary.
         expected: u16,
+    },
+
+    /// Persisted shared state uses something this binary does not know, so a
+    /// newer StudioFS release is required.
+    #[error(
+        "upgrade required: {reason}; StudioFS {} cannot use this volume, install a newer StudioFS release",
+        crate::version::CLIENT_RELEASE
+    )]
+    UpgradeRequired {
+        /// What this binary does not understand.
+        reason: UpgradeRequiredReason,
     },
 
     /// An xattr write exceeded the backend-supported value size limit.
@@ -907,6 +934,8 @@ pub enum PgSyncFailure {
         /// Format version expected by this binary.
         expected: u16,
     },
+    /// Persisted shared state needs a newer StudioFS release.
+    UpgradeRequired,
     /// The local and remote volume identities differ.
     UuidMismatch,
     /// The local serving lifecycle entered its fatal state.
@@ -967,6 +996,7 @@ impl PgSyncFailure {
                 found: *found,
                 expected: *expected,
             },
+            MetaError::UpgradeRequired { .. } => Self::UpgradeRequired,
             MetaError::UuidMismatch { .. } => Self::UuidMismatch,
             MetaError::LifecycleFatal => Self::LifecycleFatal,
             MetaError::EventTooLarge { .. }
@@ -1047,6 +1077,7 @@ impl std::fmt::Display for PgSyncFailure {
                 formatter,
                 "unsupported format (found {found}, expected {expected})"
             ),
+            Self::UpgradeRequired => formatter.write_str("upgrade required"),
             Self::UuidMismatch => formatter.write_str("volume UUID mismatch"),
             Self::LifecycleFatal => formatter.write_str("fatal synchronization lifecycle"),
             Self::Storage => formatter.write_str("metadata storage error"),

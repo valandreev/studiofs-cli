@@ -4,7 +4,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 const META_EVENT_WIRE_MAGIC: [u8; 7] = *b"SFS-EVT";
-const META_EVENT_WIRE_VERSION: u8 = 1;
+pub(crate) const META_EVENT_WIRE_VERSION: u8 = 1;
 const TAG_SET_ATTR: u8 = 1;
 const TAG_REMOVE_ATTR: u8 = 2;
 const TAG_ADD_ENTRY: u8 = 3;

@@ -8,8 +8,8 @@ use super::{
 };
 use crate::engine::{BootstrapCheckpointDescriptor, MetaError, MetaResult};
 use crate::events::{MetaEvent, encode_event};
-use crate::schema::CURRENT_FORMAT_VERSION;
 use crate::snapshot::ServingCheckpoint;
+use crate::version::SHARED_VOLUME_FORMAT;
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -598,8 +598,8 @@ impl PgMetaEngine {
         let command_pool = self.command_pool.clone();
         let volume_id = self.volume_id;
         let now_ms = Self::now_millis();
-        let expected_metadata_format_version =
-            i16::try_from(CURRENT_FORMAT_VERSION).map_err(|_| {
+        let expected_metadata_format_version = i16::try_from(SHARED_VOLUME_FORMAT.current)
+            .map_err(|_| {
                 MetaError::Storage(
                     "metadata format version exceeds PostgreSQL SMALLINT".to_string(),
                 )

@@ -919,7 +919,8 @@ pub fn studiofs_pg_schema_sql() -> &'static str {
 
 /// Version of the payload GC queue, sweep-checkpoint and upload-fence schema
 /// that this binary creates and that the CLI Janitor requires before deleting.
-pub const PAYLOAD_GC_SCHEMA_VERSION: i32 = 2;
+pub const PAYLOAD_GC_SCHEMA_VERSION: i32 =
+    crate::version::POSTGRES_PAYLOAD_GC_SCHEMA.current as i32;
 
 /// Ensures the canonical Snapshot v2 schema exists for a client or transaction.
 ///

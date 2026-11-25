@@ -282,7 +282,7 @@ impl RedbMetaEngine {
                 .open_table(SETTINGS_TABLE)
                 .map_err(|error| MetaError::Storage(error.to_string()))?;
             let format = table.get("format")?.ok_or(MetaError::NotFormatted)?;
-            crate::decode_format_info(format.value())?;
+            crate::decode_local_format_info(format.value())?;
             table
                 .get(super::volume_settings::VOLUME_SETTINGS_KEY)?
                 .or(table.get(super::volume_settings::BASE_VOLUME_SETTINGS_KEY)?)
