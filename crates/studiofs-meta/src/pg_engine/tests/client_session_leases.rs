@@ -567,10 +567,17 @@ fn client_session_leases_failed_heartbeat_preserves_local_reads_and_recovers() {
         "ALTER TABLE unavailable_client_sessions RENAME TO client_sessions".to_owned(),
     )
     .expect("restore session registry");
-    std::thread::sleep(Duration::from_millis(300));
-    let recovered = engine
-        .refresh_client_session()
-        .expect("recover immediately after transient failure");
+    // Poll until the failed-refresh backoff lapses instead of assuming its length.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let recovered = loop {
+        match engine.refresh_client_session() {
+            Ok(lease) => break lease,
+            Err(error) if std::time::Instant::now() >= deadline => {
+                panic!("session did not recover within the deadline: {error}")
+            }
+            Err(_) => std::thread::sleep(Duration::from_millis(25)),
+        }
+    };
     assert_eq!(recovered.token(), 1);
     engine.prepare_for_close().expect("close recovered engine");
 }
@@ -659,8 +666,18 @@ fn client_session_leases_concurrent_refreshes_converge_on_one_live_owner() {
     // Hold the first refresh before its I/O until a second refresh also reaches
     // I/O. With single-flight refresh the second never arrives and the bounded
     // wait lapses; the assertions below hold for every interleaving.
+    // Clears the global hook even when a refresh thread panics.
+    struct ResetRefreshHook;
+    impl Drop for ResetRefreshHook {
+        fn drop(&mut self) {
+            *REFRESH_IO_HOOK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        }
+    }
     let arrivals = Arc::new((Mutex::new(0_usize), std::sync::Condvar::new()));
     let hook_arrivals = Arc::clone(&arrivals);
+    let reset_hook = ResetRefreshHook;
     *REFRESH_IO_HOOK.lock().expect("hook") = Some(Arc::new(move || {
         let (count, cvar) = &*hook_arrivals;
         let mut count = count.lock().expect("arrivals");
@@ -678,7 +695,7 @@ fn client_session_leases_concurrent_refreshes_converge_on_one_live_owner() {
             second.join().expect("join second refresh"),
         )
     });
-    *REFRESH_IO_HOOK.lock().expect("hook") = None;
+    drop(reset_hook);
     let first = first.expect("first refresh");
     let second = second.expect("second refresh");
     assert!(
