@@ -376,13 +376,13 @@ Notes:
   admission are local-first, so clients may temporarily overshoot the shared
   limit.
 
-### `compression` (planned)
+### `compression`
 
 ```bash
 studiofs compression <name> [off|zstd[:<level>]]
 ```
 
-Planned by [ADR 0015](adr/0015-adaptive-zstd-payload-compression.md). Shows or
+Defined by [ADR 0015](adr/0015-adaptive-zstd-payload-compression.md). Shows or
 changes the shared compression policy for remote payload fragments.
 
 Notes:
