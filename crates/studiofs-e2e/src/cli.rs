@@ -11,6 +11,7 @@ use crate::infra::InfraMode;
 use crate::process_diagnostics;
 use crate::runner::{
     self, CleanRequest, PlatformSelection, RetentionPolicy, RunOneRequest, RunRequest,
+    ScenarioStatus,
 };
 use crate::scenario;
 
@@ -446,8 +447,13 @@ pub fn dispatch(cli: Cli) -> Result<i32> {
         }
         Commands::Run(args) => {
             let outcome = runner::run(args.into_request())?;
+            let scenarios_skipped = outcome
+                .scenarios
+                .iter()
+                .filter(|scenario| scenario.status == ScenarioStatus::Skipped)
+                .count();
             println!(
-                "timestamp={} run_id={} status={:?} report={}",
+                "timestamp={} run_id={} status={:?} report={} scenarios_skipped={scenarios_skipped}",
                 timestamp(),
                 outcome.run_id,
                 outcome.status,

@@ -551,9 +551,11 @@ file, writes through a mapping of a created handle, and executes a just-copied
 binary twice; each mapping runs in a forked child, and `macos-mmap-exec.json` records
 how each step ended. Mapping a file reopened for write remains a known limitation
 (`docs/platform-bridges.md`), so the scenario does not cover it. It needs macOS;
-elsewhere the runner records a `platform` `skipped` event and passes it without
-running hooks, and the Linux full E2E target leaves it out. Scenarios bound to one
-platform declare it through `Scenario::unsupported_platform`.
+elsewhere the runner records a `platform` / `skipped` event and reports the
+scenario as `skipped` with the reason in `error`. The skip runs no scenario
+hooks and allows the run to succeed. The Linux full E2E target leaves this
+scenario out. Platform-specific scenarios declare their requirement through
+`Scenario::unsupported_platform`.
 
 ```sh
 cargo build -p studiofs -p studiofs-e2e
@@ -1580,7 +1582,41 @@ services. Run each name separately with the command above:
 Both rely on the publication fence (ADR 0013): an unclean image written with
 the fence keeps its own graph instead of the PostgreSQL graph repair, and an
 established client restarted offline keeps write authority. None changes host
-networking or host trash. Focused unit coverage:
+networking or host trash.
+
+#### macFUSE two-client recoverable trash
+
+`mounted-macos-recoverable-trash-two-client` uses two independent macFUSE
+mounts of a volume with seven days of retention and runner-owned PostgreSQL
+and RustFS. Client A uses Finder-style renames to move a binary file and a
+directory into `.Trashes/<uid>`. Both mounts must list the retained entries
+and lose the original paths. Client B verifies the exact file bytes on its
+first payload read and an increase in its S3 GET counter. It restores the file
+to the original path, restarts with the directory still retained, then clears
+it using child unlink and directory removal. The writer and peer observe the
+result, and the `.DS_Store` created by A appears only on A. AppleDouble
+creation in the native trash container is unsupported. This scenario uses
+filesystem operations and covers macFUSE; Finder UI and FSKit need their own
+acceptance runs.
+
+On macOS with macFUSE and Docker Compose, configure the internal mount root
+as described above. The app launching the runner needs macOS privacy
+permission to read volume trash folders. A macOS System Policy denial for
+`.Trashes/<uid>` fails the scenario with the original OS error. Grant Full Disk
+Access to the launching app in System Settings → Privacy & Security, then run:
+
+```sh
+cargo build -p studiofs -p studiofs-e2e
+target/debug/studiofs-e2e run mounted-macos-recoverable-trash-two-client \
+  --studiofs-bin target/debug/studiofs --platform macos-fuse --infra compose \
+  --run-id macos-trash-1 --retain always
+```
+
+On success, `artifacts/scenarios/mounted-macos-recoverable-trash-two-client/trash-summary.json`
+in the retained run records `passed`, the payload hashes, and the peer's S3
+GET counts. The scenario reports a platform skip on other operating systems.
+
+#### Focused publication-fence unit coverage
 
 ```sh
 cargo test -p studiofs-meta --lib unclean_pg_image
@@ -1721,13 +1757,12 @@ helper exit checks, and timeout containment remain required.
 `mounted-symlink-attribute-convergence` is the next post-1-16 promotion
 scenario. It uses public mounted filesystem behavior for symlink
 create/read-target/rename/unlink-recreate target replacement, writes near the
-symlink namespace, and checks the supported read-only file attribute. Platform
-capability skips are explicit in `symlink-attribute-summary.json`; on
-Windows/WinFSP, `ERROR_GEN_FAILURE` from symlink creation after the bounded
-mount-readiness retry is treated as an unsupported symlink skip. Supported
-behavior must converge through mounted reads and the mounted-tree validator. It
-writes `operations.ndjson`, `symlink-attribute-summary.json`, and
-`validation.json`.
+symlink namespace, and checks the read-only file attribute. Windows/WinFSP
+capability skip reasons appear in `validation.json` under `symlink_attributes`
+and in `symlink-attribute-summary.json`. WinFSP's `ERROR_GEN_FAILURE` can
+qualify for a symlink creation skip after the bounded mount-readiness retry.
+Linux FUSE and macOS macFUSE require both checks to pass. Supported behavior
+must converge through mounted reads and the mounted-tree validator.
 
 Hosted Linux real mounted E2E is operator-run once the target host has
 `/dev/fuse`, `fusermount3`, libfuse3, Docker, PostgreSQL, and RustFS available.

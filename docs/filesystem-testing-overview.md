@@ -278,13 +278,11 @@ looking inside StudioFS internals: the read-only flag on a file. One mounted
 client marks a file as read-only, and the others must eventually see that same
 public attribute through their own mounts.
 
-Not every platform exposes every detail the same way. On Windows/WinFSP, for
-example, symlink creation can be unavailable in the current bridge path. That
-is not treated as a mysterious failure. The scenario records an explicit
-platform skip for the unsupported symlink behavior, then still validates the
-supported parts of the scenario. This keeps the test honest: we do not fake
-features a bridge cannot expose, but we do require supported public filesystem
-state to converge.
+On Windows/WinFSP, qualifying capability errors can skip the affected symlink
+or read-only attribute check. The skip reason appears in `validation.json`
+under `symlink_attributes` and in `symlink-attribute-summary.json`. The
+remaining checks still run. Linux FUSE and macOS macFUSE require both checks
+to pass.
 
 ## What The Baseline Gate Means
 

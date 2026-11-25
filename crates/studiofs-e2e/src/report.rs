@@ -73,7 +73,7 @@ pub struct RunReport {
     pub environment: EnvironmentReport,
     /// Preflight checks report.
     pub preflight: PreflightReport,
-    /// Scenario-level reports for each executed scenario.
+    /// Scenario-level reports for each executed or skipped scenario.
     pub scenarios: Vec<ScenarioReport>,
     /// Collected artifacts for the run.
     pub artifacts: Vec<ArtifactReport>,
@@ -186,6 +186,16 @@ pub struct PreflightCheckReport {
     pub detail: String,
 }
 
+/// Reason a scenario was skipped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScenarioSkipKind {
+    /// The host platform cannot run this scenario.
+    UnsupportedPlatform,
+    /// An earlier mounted scenario left the runner in an unsafe state.
+    ContaminatedRunner,
+}
+
 /// Scenario-level report item.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScenarioReport {
@@ -195,6 +205,9 @@ pub struct ScenarioReport {
     pub seed: u64,
     /// Scenario execution status.
     pub status: ScenarioStatus,
+    /// Machine-readable reason for a skipped scenario.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skip_kind: Option<ScenarioSkipKind>,
     /// UTC timestamp when scenario started.
     pub started_at: String,
     /// UTC timestamp when scenario finished.
@@ -203,8 +216,21 @@ pub struct ScenarioReport {
     pub duration_ms: u64,
     /// Paths of artifacts produced by the scenario.
     pub artifacts: Vec<String>,
-    /// Optional scenario failure detail.
+    /// Optional scenario failure or skip detail.
     pub error: Option<String>,
+}
+
+impl ScenarioReport {
+    pub(crate) fn fails_run(&self) -> bool {
+        !matches!(
+            (self.status, self.skip_kind),
+            (ScenarioStatus::Passed, _)
+                | (
+                    ScenarioStatus::Skipped,
+                    Some(ScenarioSkipKind::UnsupportedPlatform)
+                )
+        )
+    }
 }
 
 /// Produced artifact metadata.
@@ -258,6 +284,7 @@ mod tests {
             name: "basic-multi-client-smoke".to_string(),
             seed: 1,
             status: ScenarioStatus::Passed,
+            skip_kind: None,
             started_at: "2026-05-01T00:00:00Z".to_string(),
             finished_at: "2026-05-01T00:00:01Z".to_string(),
             duration_ms: duration,

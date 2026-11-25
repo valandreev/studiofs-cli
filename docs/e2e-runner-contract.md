@@ -524,12 +524,13 @@ promotion scenario and writes `symlink-attribute-summary.json`,
 `operations.ndjson`, and `validation.json`. It uses three mounted clients to
 exercise symlink creation, public target readback, rename, target replacement
 by unlink/recreate, a write near the symlink namespace, and a supported
-read-only file attribute. Symlink and attribute behavior are platform-gated:
-permission or unsupported errors are recorded as explicit skips in the summary,
-while supported behavior must converge through public mounted filesystem
-observations and the normal mounted-tree validator. On Windows/WinFSP,
-`ERROR_GEN_FAILURE` from symlink creation after the bounded mount-readiness
-retry is recorded as an unsupported symlink capability skip.
+read-only file attribute. Linux FUSE and macOS macFUSE require both checks to
+pass. Only Windows/WinFSP treats qualifying permission or unsupported errors
+as capability skips. The reasons appear in `validation.json` under
+`symlink_attributes` and in `symlink-attribute-summary.json`.
+`ERROR_GEN_FAILURE` after the bounded mount-readiness retry qualifies for a
+symlink creation skip on Windows. Supported behavior must converge through
+public mounted filesystem observations and the normal mounted-tree validator.
 
 ## Mounted Tree Convergence Validation
 
@@ -665,23 +666,31 @@ Run and scenario status values:
 
 | Status | Meaning |
 |---|---|
-| `passed` | The hook or scenario completed and validation passed. |
+| `passed` | The hook or scenario completed successfully, or the run completed with successful cleanup and only passed or platform-skipped scenarios. |
 | `failed` | Scenario validation or an expected child command failed. |
-| `skipped` | Scenario did not run because its gate or platform requirement was not selected. |
+| `skipped` | Scenario did not run because the host platform is unsupported or an earlier mounted scenario left the runner contaminated. |
 | `preflight_failed` | Required host, Docker, mount, command, port allocation, or stale mounts check failed before scenario setup. |
 | `cleanup_failed` | Cleanup could not return the host to a safe state or could not prove that retained resources are recorded. |
 | `timed_out` | A hook or whole run exceeded its timeout and cleanup was attempted. |
 | `interrupted` | The runner received Ctrl+C or a termination signal and cleanup was attempted. |
 
+A skipped scenario records its reason in `error` and its kind in `skip_kind`.
+`unsupported_platform` skips all scenario hooks and allows exit code `0` in
+both direct and supervised execution. A run containing only platform skips
+needs neither a StudioFS binary nor Compose preflight or services. For a mixed
+selection, the runner prepares infrastructure for the runnable scenarios.
+The CLI summary shows `scenarios_skipped`. A `contaminated_runner` skip counts
+as a run failure.
+
 Exit codes:
 
 | Exit code | Contract |
 |---|---|
-| `0` | All selected scenarios passed and cleanup passed. |
-| `1` | At least one selected scenario failed or timed out. |
+| `0` | Every selected scenario passed or was skipped on an unsupported platform, and cleanup passed. |
+| `1` | At least one selected scenario failed, timed out, or was skipped due to runner contamination. |
 | `2` | Preflight failed and no scenario ran. |
 | `3` | Runner usage/configuration error, such as invalid flags or unsupported scenario name. |
-| `4` | Scenarios passed, but cleanup failed. If scenarios also failed, use `1` and record `cleanup.status = "cleanup_failed"`. |
+| `4` | Every selected scenario passed or was skipped on an unsupported platform, and cleanup failed. If scenarios also failed, use `1` and record `cleanup.status = "cleanup_failed"`. |
 | `130` | Interrupted by Ctrl+C after writing the best-effort report. |
 
 The runner must write a best-effort `report.json` for every non-usage failure.

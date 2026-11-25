@@ -23,7 +23,10 @@ for scenario in report.get("scenarios", []):
     scenario_status = scenario.get("status")
     print(f"scenario={name} status={scenario_status}")
     error = scenario.get("error")
-    if error:
+    if scenario_status == "skipped":
+        print(f"skip_kind={scenario.get('skip_kind')}")
+        print(f"skip_reason={error}")
+    elif scenario_status in ("failed", "timed_out") and error:
         print(f"failed_invariant={error}")
     for artifact in scenario.get("artifacts", []):
         print(f"scenario_artifact={artifact}")

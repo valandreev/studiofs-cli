@@ -575,6 +575,13 @@ fn symlink_attribute_disabled_run_writes_reproducible_artifacts() {
         summary["symlink_attributes"]["final_validation_result"],
         "mounted_tree_convergence"
     );
+    let validation = read_json(
+        sandbox.join("artifacts/scenarios/mounted-symlink-attribute-convergence/validation.json"),
+    );
+    assert_eq!(
+        validation["symlink_attributes"],
+        summary["symlink_attributes"]
+    );
 
     let operations = fs::read_to_string(
         sandbox.join("artifacts/scenarios/mounted-symlink-attribute-convergence/operations.ndjson"),

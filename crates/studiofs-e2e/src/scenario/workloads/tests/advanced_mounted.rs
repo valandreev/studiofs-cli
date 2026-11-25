@@ -447,15 +447,37 @@ fn hotspot_helper_bulk_create_delete_leaves_only_namespace_root() {
 }
 
 #[test]
-fn symlink_helper_skip_accepts_windows_error_gen_failure() {
+fn symlink_helper_skip_accepts_error_gen_failure_only_on_windows() {
     let error = ScenarioError::Io(io::Error::other(
         "hotspot helper failed for client-a symlink create: status=exit code: 1; stderr=A device attached to the system is not functioning. (os error 31)",
     ));
 
-    assert!(
+    assert_eq!(
         hotspot_helper_error_is_supported_symlink_skip(&error),
-        "WinFSP may report unsupported symlink creation as ERROR_GEN_FAILURE"
+        cfg!(windows)
     );
+}
+
+#[test]
+fn symlink_and_readonly_helper_capability_errors_skip_only_on_windows() {
+    for message in [
+        "permission denied",
+        "unsupported",
+        "privilege",
+        "operation not permitted",
+    ] {
+        let error = ScenarioError::Io(io::Error::other(message));
+        assert_eq!(
+            hotspot_helper_error_is_supported_symlink_skip(&error),
+            cfg!(windows),
+            "{message}"
+        );
+        assert_eq!(
+            hotspot_helper_error_is_supported_readonly_skip(&error),
+            cfg!(windows),
+            "{message}"
+        );
+    }
 }
 
 #[test]
