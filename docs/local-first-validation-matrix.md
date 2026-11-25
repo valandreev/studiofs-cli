@@ -319,6 +319,41 @@ mounted scenario on WinFSP when available.
 | Runtime counters and status keep v5 clients working. | `cargo test -p studiofs --bin studiofs cache_scrub` covers `diagnostics_runtime_snapshot_cache_scrub_is_additive_in_v5` and `mounted_status_formats_cache_scrub` (SFS-1120) |
 | The mounted worker refetches objects with a flipped byte, a missing file, or a truncated file. Reads return the original bytes, and an unpublished payload survives a full offline pass unchanged. | `studiofs-e2e run --scenario mounted-cache-scrub --studiofs-bin <rebuilt-binary> --infra compose --retain always` passed on Linux FUSE (WSL) and WinFSP (SFS-1120).<br>macFUSE 5.5.0 passed on 2026-11-20 with both binaries rebuilt from `main` at `1c7d6362` (SFS-1121). The retained run report is `target/e2e-runs/sfs1121-macfuse-1c7d6362/report.json`. Its `artifacts/scenarios/mounted-cache-scrub/cache-scrub.json` records three refetches, zero refetch failures, and an unchanged unpublished payload. |
 
+## Planned: forward-compatibility gate (ADR 0018)
+
+[ADR 0018](adr/0018-version-identities-and-capability-model.md) and the
+[persisted-format audit](persisted-format-compatibility.md) define the 0.2.5
+baseline contract. Each invariant gets its tests in the owning issue of the
+Linear project "[0.2.5] Metadata Compatibility Layer"; this table names the
+evidence that must exist before the gate closes.
+
+| Invariant | Evidence (owning issue) |
+|---|---|
+| Unknown `FormatInfo` fields and unknown `MetadataBackend` variants fail closed with typed `UpgradeRequired`, not `Serialization` | planned unit tests (SFS-1003) |
+| The capability evaluator is deterministic and never returns `Allowed` for an unknown required capability | planned evaluator tests (SFS-1004) |
+| Schema migrations are explicit, resumable and never move a component version backwards; an older binary runs no DDL against newer components | existing `payload_gc_version_marker_is_the_last_statement_and_never_downgrades`; planned registry tests (SFS-1005) |
+| Startup schema validation is scoped to required capabilities and tolerates declared additive objects | planned schema-validation tests (SFS-1006) |
+| Activate raises the per-volume write requirement and policy epoch atomically; publication by a binary without the capability is rejected in the same UPDATE | planned PostgreSQL integration tests (SFS-1007, SFS-1014) |
+| Activate never raises `metadata_format_version`; a 0.2.5 reader keeps mounting a volume activated for a read-compatible capability | planned PostgreSQL integration tests (SFS-1007) |
+| A refused volume-settings publication returns a typed reason, not a generic PostgreSQL error | planned PostgreSQL integration tests (SFS-1007) |
+| Sessions record release, capabilities, epoch and a server-clock lease; expired sessions are reported | planned session registry tests (SFS-1008) |
+| Unknown event tags and wire versions fail closed with a typed reason; tags 19–21 keep decoding | planned codec tests (SFS-1009) |
+| Replay stops at the first event it cannot decode without advancing the replay cursor, and publication uses only encodings the volume protocol allows | planned negotiation tests (SFS-1010) |
+| A 0.2.5 binary refuses to rewrite `VolumeSettings` it cannot represent instead of dropping an unknown field | planned settings codec tests (SFS-1009) |
+| Bootstrap and pruning keep a checkpoint every supported reader can decode; unknown checkpoint formats fail closed with a typed reason | planned checkpoint tests (SFS-1011) |
+| Local redb and payload-index migrations are crash-safe; a newer local format is refused as `LocalUpgradeRequired`, never treated as corruption, and dirty entries survive | planned crash-injection tests (SFS-1012) |
+| `studiofs upgrade` adopts format 5 and 6 volumes into format 7, is retryable after a lost response, and fences older 0.2.x writers | planned upgrade tests (SFS-1132) |
+| `discover` refuses an unsupported format with a typed reason before any local write | planned CLI tests (SFS-1013) |
+| Snapshot mount, cleanup and re-verify refuse an artifact version they cannot decode with a typed reason | planned snapshot tests (SFS-1013, SFS-1016) |
+| `load` refuses an unsupported dump version with a typed reason before any DDL or write | planned dump/load tests (SFS-1013) |
+| Janitor, GC, snapshot cleanup and pruning declare a maintenance capability that a backend guard checks before any deletion | planned maintenance-guard tests (SFS-1016) |
+| The deletion-claim trigger compares the Janitor's GUC with the volume's current format or capability, so a 0.2.3/0.2.4 Janitor is rejected on a format 7 volume | planned PostgreSQL trigger tests (SFS-1132, SFS-1016) |
+| A database-wide Contract is refused while any volume in the database still needs the object | planned cutover tests (SFS-1017) |
+| The operator report and Activate preflight list, per volume, the sessions that would be fenced and whether pending 0.2.5 work survives Activate | planned report tests and operator documentation (SFS-1018) |
+| A mount revalidates the policy epoch after reconnect and keeps unpublished local work when publication is refused | planned lifecycle tests (SFS-1015) |
+| STFS v3 objects remain readable byte-for-byte by the baseline | existing `STFS_V3_BASELINE_FIXTURE` tests in `studiofs-data` and `studiofs-vfs`; pinned baseline fixtures (SFS-1002) |
+| The 0.2.5 RC and a compiled test successor follow the support matrix, including crash and rollback cases | `studiofs-e2e` matrix (SFS-1131, SFS-1019, SFS-1020) |
+
 ## SFS-356 Encrypted remote object regression gate
 
 Run this gate when encryption-at-rest, `DataStore`, fetch, cache, prefetch,

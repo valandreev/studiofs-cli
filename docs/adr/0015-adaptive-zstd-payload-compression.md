@@ -141,6 +141,8 @@ most three object-store reads.
 
 ### Compatibility
 
+Superseded by the SFS-1001 amendment below; kept as the original 0.2.4 text.
+
 Clients older than 0.2.4 are not supported. STFS v3, 64 KiB SFEC frames, and the
 `compression` setting are part of the 0.2.4 compatibility baseline (SFS-1001,
 SFS-1002), so they need no separate capability. A pre-0.2.4 reader rejects v3
@@ -201,3 +203,12 @@ SFEC frame sizes exist side by side, and every reader must handle both.
 Validation needs a mounted `studiofs-e2e` scenario with compressible and
 incompressible data, cold range reads, and a policy switch, on macFUSE and Linux
 FUSE. Native WinFSP validation is a separate gate.
+
+## Amendment (SFS-1001, 2026-11-25): Forward-Compatibility Baseline Is 0.2.5
+
+STFS v3, 64 KiB SFEC frames, and the `compression` setting shipped in 0.2.4.
+The forward-compatibility baseline is 0.2.5, not 0.2.4
+([ADR 0018](0018-version-identities-and-capability-model.md)). A 0.2.4 volume
+(shared format 6) joins the baseline only through `studiofs upgrade` to format 7
+(SFS-1132). StudioFS gives no interop guarantee with pre-0.2.5 clients,
+including 0.2.4.
