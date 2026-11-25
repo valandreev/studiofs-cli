@@ -81,6 +81,11 @@ snapshot, dump/load) with a typed reason: `Allowed`, `UpgradeRequired`
 tested without a backend. Unknown names in any required set are treated as
 missing; the decision never falls back to `Allowed`.
 
+Boundary decoders report their own typed errors (an unknown event tag, an
+unknown checkpoint format, an unsupported dump version, an unknown
+`FormatInfo` field); these map into the evaluator's `UpgradeRequired`. A refusal
+of the local redb or payload index format maps into `LocalUpgradeRequired`.
+
 ### Per-volume policy and policy epoch
 
 Each volume has one policy record in the shared backend holding the three
@@ -92,8 +97,11 @@ Expand–Migrate–Activate–Contract cutover (SFS-1017):
    working.
 2. Migrate rewrites or backfills data while both formats are readable.
 3. Activate adds the new capability to a required set and bumps the epoch in
-   the same transaction that raises the write-requirement field checked by
-   publication.
+   the same transaction that raises the per-volume write-requirement field
+   (SFS-1007). Publication checks that field in the same UPDATE as
+   `BUMP_METADATA_VERSION`. Activate never raises `metadata_format_version`:
+   readers check it by exact equality, so raising it would lock out 0.2.5
+   readers too. From format 7 on that field stays fixed.
 4. Contract removes what no supported binary needs. Contract on a database-wide
    object needs agreement from every volume in the database.
 
@@ -112,7 +120,8 @@ Fencing is enforced by the backend, not by trusting the client.
 
 - Every publication stamps its session and policy epoch, and checks the
   write-requirement field in the same atomic step that advances the volume
-  version. In PostgreSQL this is the `BUMP_METADATA_VERSION` predicate plus a
+  version. In PostgreSQL this is the `BUMP_METADATA_VERSION` predicate, extended
+  with the write-requirement field, plus a
   transaction GUC read by a trigger (SFS-1014), following the existing
   `studiofs.deletion_format` pattern.
 - Every destructive maintenance step first declares its maintenance capability
@@ -130,10 +139,11 @@ that a server-side check can reject.
 - An additive change no longer locks out older binaries. Only an activated
   required capability does, and the refusal is typed.
 - The 0.2.5 binary must ship the evaluator, the policy read, the session
-  registration, the publication stamp, the maintenance stamp, and typed
+  registration, the publication stamp, the maintenance stamp, typed
   `UpgradeRequired` for unknown `FormatInfo` fields, backend variants, event
-  tags, checkpoint formats, payload formats, and local formats. Gaps found in
-  the audit are listed there with owners.
+  tags, checkpoint formats, and payload formats, and typed
+  `LocalUpgradeRequired` for unknown local redb and payload index formats. Gaps
+  found in the audit are listed there with owners.
 - Pre-0.2.5 volumes are adopted only by `studiofs upgrade` to format 7, which
   fences 0.2.0–0.2.4 writers. Those releases are not part of any support
   matrix.

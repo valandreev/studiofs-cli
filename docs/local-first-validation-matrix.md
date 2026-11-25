@@ -334,13 +334,22 @@ evidence that must exist before the gate closes.
 | Schema migrations are explicit, resumable and never move a component version backwards; an older binary runs no DDL against newer components | existing `payload_gc_version_marker_is_the_last_statement_and_never_downgrades`; planned registry tests (SFS-1005) |
 | Startup schema validation is scoped to required capabilities and tolerates declared additive objects | planned schema-validation tests (SFS-1006) |
 | Activate raises the per-volume write requirement and policy epoch atomically; publication by a binary without the capability is rejected in the same UPDATE | planned PostgreSQL integration tests (SFS-1007, SFS-1014) |
+| Activate never raises `metadata_format_version`; a 0.2.5 reader keeps mounting a volume activated for a read-compatible capability | planned PostgreSQL integration tests (SFS-1007) |
+| A refused volume-settings publication returns a typed reason, not a generic PostgreSQL error | planned PostgreSQL integration tests (SFS-1007) |
 | Sessions record release, capabilities, epoch and a server-clock lease; expired sessions are reported | planned session registry tests (SFS-1008) |
-| Unknown event tags and wire versions fail closed with a typed reason and do not advance the replay cursor; tags 19–21 keep decoding | planned codec tests (SFS-1009, SFS-1010) |
+| Unknown event tags and wire versions fail closed with a typed reason; tags 19–21 keep decoding | planned codec tests (SFS-1009) |
+| Replay stops at the first event it cannot decode without advancing the replay cursor, and publication uses only encodings the volume protocol allows | planned negotiation tests (SFS-1010) |
+| A 0.2.5 binary refuses to rewrite `VolumeSettings` it cannot represent instead of dropping an unknown field | planned settings codec tests (SFS-1009) |
 | Bootstrap and pruning keep a checkpoint every supported reader can decode; unknown checkpoint formats fail closed with a typed reason | planned checkpoint tests (SFS-1011) |
-| Local redb and payload-index migrations are crash-safe; a newer local format is refused as `UpgradeRequired`, never treated as corruption, and dirty entries survive | planned crash-injection tests (SFS-1012) |
+| Local redb and payload-index migrations are crash-safe; a newer local format is refused as `LocalUpgradeRequired`, never treated as corruption, and dirty entries survive | planned crash-injection tests (SFS-1012) |
 | `studiofs upgrade` adopts format 5 and 6 volumes into format 7, is retryable after a lost response, and fences older 0.2.x writers | planned upgrade tests (SFS-1132) |
-| Discover, snapshot mounts and dump/load refuse unsupported versions with typed reasons before any write or DDL | planned CLI and snapshot tests (SFS-1013) |
+| `discover` refuses an unsupported format with a typed reason before any local write | planned CLI tests (SFS-1013) |
+| Snapshot mount, cleanup and re-verify refuse an artifact version they cannot decode with a typed reason | planned snapshot tests (SFS-1013, SFS-1016) |
+| `load` refuses an unsupported dump version with a typed reason before any DDL or write | planned dump/load tests (SFS-1013) |
 | Janitor, GC, snapshot cleanup and pruning declare a maintenance capability that a backend guard checks before any deletion | planned maintenance-guard tests (SFS-1016) |
+| The deletion-claim trigger compares the Janitor's GUC with the volume's current format or capability, so a 0.2.3/0.2.4 Janitor is rejected on a format 7 volume | planned PostgreSQL trigger tests (SFS-1132, SFS-1016) |
+| A database-wide Contract is refused while any volume in the database still needs the object | planned cutover tests (SFS-1017) |
+| The operator report and Activate preflight list, per volume, the sessions that would be fenced and whether pending 0.2.5 work survives Activate | planned report tests and operator documentation (SFS-1018) |
 | A mount revalidates the policy epoch after reconnect and keeps unpublished local work when publication is refused | planned lifecycle tests (SFS-1015) |
 | STFS v3 objects remain readable byte-for-byte by the baseline | existing `STFS_V3_BASELINE_FIXTURE` tests in `studiofs-data` and `studiofs-vfs`; pinned baseline fixtures (SFS-1002) |
 | The 0.2.5 RC and a compiled test successor follow the support matrix, including crash and rollback cases | `studiofs-e2e` matrix (SFS-1131, SFS-1019, SFS-1020) |

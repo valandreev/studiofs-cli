@@ -20,6 +20,8 @@ After this milestone the database itself rejects writes and deletions from a bin
 
 - Observation: only Janitor deletion claims set a capability GUC today; snapshot cleanup and event-log or checkpoint pruning set none.
   Evidence: `crates/studiofs-meta/src/pg_engine/janitor.rs:1089`.
+- Observation: `studiofs_fence_legacy_deletion_claim` checks `metadata_format_version >= 6` and compares the GUC with the constant `'6'`, so a 0.2.3 or 0.2.4 Janitor passes it on a format 7 volume; only the app-side format check fences it. SFS-1016 (with SFS-1132) must make the trigger compare the GUC with the volume's current format or maintenance capability.
+  Evidence: `crates/studiofs-meta/src/pg_engine/schema.rs:574`, `crates/studiofs-meta/src/pg_engine/schema.rs:575`, `crates/studiofs-meta/src/pg_engine/janitor.rs:571`.
 
 ## Decision Log
 

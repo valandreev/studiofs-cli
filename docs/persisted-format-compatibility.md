@@ -118,14 +118,14 @@ that declares support for 0.2.5 (the compiled test successor of
   and `upgrade_local_format5` rewrites only the header after the shared
   authority is upgraded (`crates/studiofs-meta/src/redb_engine/format.rs:33`).
   A cache whose header is still at format 5 keeps serving local writes but
-  blocks settings events and checkpoint export
-  (`crates/studiofs-meta/src/redb_engine/volume_settings.rs:139`).
+  blocks settings events and checkpoint export (test evidence:
+  `crates/studiofs-meta/src/redb_engine/volume_settings.rs:139`).
 - Writers: the mounted engine, `discover`, `upgrade`, snapshot materialization.
 - Successor may change additively: new tables that an older binary never
   opens, if the local format identity records them as optional.
 - Incompatible: changing an existing table's key or value encoding.
-- Fail-closed outcome: typed `UpgradeRequired` before any write transaction;
-  the cache is never reset. Owner:
+- Fail-closed outcome: typed `LocalUpgradeRequired` before any write
+  transaction; the cache is never reset. Owner:
   [SFS-1003](https://linear.app/valandreev/issue/SFS-1003) (identity split) and
   [SFS-1012](https://linear.app/valandreev/issue/SFS-1012) (crash-safe local
   migration).
@@ -137,7 +137,7 @@ that declares support for 0.2.5 (the compiled test successor of
   `ensure_studiofs_pg_schema` (`crates/studiofs-meta/src/pg_engine/schema.rs:935`).
 - Version field: only the `payload_gc` component in
   `studiofs_schema_components`
-  (`crates/studiofs-meta/src/pg_engine/schema.rs:893`), value
+  (`crates/studiofs-meta/src/pg_engine/schema.rs:903`), value
   `PAYLOAD_GC_SCHEMA_VERSION = 2`
   (`crates/studiofs-meta/src/pg_engine/schema.rs:922`). The marker insert is the
   last statement and never moves backwards
@@ -150,8 +150,8 @@ that declares support for 0.2.5 (the compiled test successor of
   The Janitor requires `payload_gc` to equal exactly 2 and its guard triggers
   to be enabled (`crates/studiofs-meta/src/pg_engine/janitor.rs:430`).
 - Writers: DDL runs only from CLI commands: `init`
-  (`crates/studiofs/src/cli/init.rs:322`, `crates/studiofs/src/cli/init.rs:420`,
-  `crates/studiofs/src/cli/init.rs:972`), `load`
+  (`crates/studiofs/src/cli/init.rs:322`, `crates/studiofs/src/cli/init.rs:420`),
+  `load`
   (`crates/studiofs/src/cli/dump_load.rs:413`) and `upgrade`
   (`crates/studiofs/src/cli/upgrade.rs:43`). Mounts never run DDL.
 - Database-wide versus per-volume: DDL, functions and triggers are database
@@ -159,7 +159,7 @@ that declares support for 0.2.5 (the compiled test successor of
   activation are per volume (`metadata_state` row). The DDL uses
   `CREATE OR REPLACE FUNCTION` for trigger bodies, for example
   `studiofs_fence_legacy_deletion_claim`
-  (`crates/studiofs-meta/src/pg_engine/schema.rs:579`). An older binary's
+  (`crates/studiofs-meta/src/pg_engine/schema.rs:569`). An older binary's
   `init` or `load` into a database that a successor already expanded would
   replace the successor's function bodies. 0.2.5 must refuse DDL when any
   `studiofs_schema_components` row is newer than it knows.
@@ -187,14 +187,25 @@ that declares support for 0.2.5 (the compiled test successor of
   `crates/studiofs-meta/src/pg_engine/metadata_io.rs:644`) and, when no row
   matches, re-reads the format to report a typed error
   (`crates/studiofs-meta/src/pg_engine/metadata_io.rs:660`). Volume-settings
-  writes use the same predicate
-  (`crates/studiofs-meta/src/pg_engine/volume_settings.rs:340`).
-- This predicate is the existing per-volume field a successor raises at
-  Activate. It is evaluated inside the publication transaction, so a writer
-  that reconnects is re-checked on its next publication.
-- Successor may change: raise the value at Activate in the same transaction
-  that changes the protocol, which fences 0.2.5 writers but not readers only
-  if read compatibility is declared separately (ADR 0018).
+  writes use the same predicate, but through `query_one` and
+  `classify_pg_error("order volume settings")`
+  (`crates/studiofs-meta/src/pg_engine/volume_settings.rs:339`), so a format
+  mismatch there surfaces as a generic PostgreSQL error, not the typed
+  `UnsupportedFormatVersion` that event publication reports
+  (`crates/studiofs-meta/src/pg_engine/metadata_io.rs:671`).
+- `metadata_format_version` is also the read gate: the checkpoint descriptor
+  (`crates/studiofs-meta/src/engine.rs:141`),
+  `ensure_supported_pg_sync_format_version`
+  (`crates/studiofs-meta/src/lib.rs:206`) and the Janitor
+  (`crates/studiofs-meta/src/pg_engine/janitor.rs:571`) require exact
+  equality. Raising it would lock out 0.2.5 readers, so a successor must not
+  raise it at Activate. From format 7 on it stays fixed (ADR 0018).
+- Successor may change: `BUMP_METADATA_VERSION` is the template. SFS-1007 adds
+  a separate per-volume write-requirement field that publication checks in the
+  same UPDATE. Activate raises that field, which fences 0.2.5 writers and
+  leaves 0.2.5 readers working when the capability is read-compatible. The
+  check runs inside the publication transaction, so a writer that reconnects
+  is re-checked on its next publication.
 - Fail-closed outcome: publication returns `UpgradeRequired`; the local
   journal is kept as unpublished local work. Owner:
   [SFS-1007](https://linear.app/valandreev/issue/SFS-1007) (per-volume
@@ -225,8 +236,9 @@ that declares support for 0.2.5 (the compiled test successor of
 - Successor may change additively: new tags, published only after the volume
   activates the capability that requires them.
 - Incompatible: reusing a tag or changing an existing tag's payload.
-- Fail-closed outcome: typed `UnsupportedEvent { tag }` that stops replay at
-  the last applied version without advancing the local cursor. Owner:
+- Fail-closed outcome: a typed unsupported-event error naming the tag, mapped
+  to `UpgradeRequired` (ADR 0018), that stops replay at the last applied
+  version without advancing the local cursor. Owner:
   [SFS-1009](https://linear.app/valandreev/issue/SFS-1009) (codecs) and
   [SFS-1010](https://linear.app/valandreev/issue/SFS-1010) (negotiation).
 
@@ -246,14 +258,18 @@ that declares support for 0.2.5 (the compiled test successor of
   source checkpoints are rejected unless
   `supports_format_version` (1..=4, `crates/studiofs-meta/src/snapshot.rs:315`)
   accepts them (`crates/studiofs-meta/src/pg_engine/snapshot_control.rs:362`,
-  `crates/studiofs-meta/src/pg_engine/snapshot_control.rs:681`).
+  `crates/studiofs-meta/src/pg_engine/snapshot_control.rs:681`), but the
+  refusal is untyped: an unknown format, a checksum mismatch and a schema
+  mismatch all return the same permanent `snapshot source checkpoint is
+  invalid` (`crates/studiofs-meta/src/pg_engine/snapshot_control.rs:360`).
 - Writers: checkpoint coordinator under `bootstrap_checkpoint_leases`
   (`crates/studiofs-meta/src/pg_engine/schema.rs:158`). The lease uses the
   server clock (`clock_timestamp()`) and increments a fencing token on
   takeover (`crates/studiofs-meta/src/pg_engine/sql.rs:158`).
 - Successor may change additively: a new checkpoint format published beside
   the format 4 one while any 0.2.5 reader is supported.
-- Fail-closed outcome: typed `UnsupportedCheckpointFormat`; bootstrap falls
+- Fail-closed outcome: a typed unsupported-checkpoint error, mapped to
+  `UpgradeRequired` (ADR 0018); bootstrap falls
   back to a supported checkpoint plus bounded replay, or refuses. Pruning must
   keep the newest checkpoint each supported reader can decode. Owner:
   [SFS-1011](https://linear.app/valandreev/issue/SFS-1011).
@@ -333,8 +349,8 @@ that declares support for 0.2.5 (the compiled test successor of
   unpublished data.
 - Successor may change additively: a new entry encoding only after a crash-safe
   local migration that 0.2.5 can refuse cleanly.
-- Fail-closed outcome: typed `UpgradeRequired` before the mount serves; dirty
-  entries are left untouched. Owner:
+- Fail-closed outcome: typed `LocalUpgradeRequired` before the mount serves;
+  dirty entries are left untouched. Owner:
   [SFS-1012](https://linear.app/valandreev/issue/SFS-1012).
 
 ### 10. Snapshot artifacts
@@ -366,8 +382,9 @@ that declares support for 0.2.5 (the compiled test successor of
   (`crates/studiofs/src/cli/dump_load.rs:693`) with an untyped message.
 - Successor may change: a new dump version that records the source release and
   required capabilities.
-- Fail-closed outcome: typed `UnsupportedDump`; `load` performs no DDL and no
-  writes before the version check. Owner:
+- Fail-closed outcome: a typed unsupported-dump error, mapped to
+  `UpgradeRequired` (ADR 0018); `load` performs no DDL and no writes before the
+  version check. Owner:
   [SFS-1013](https://linear.app/valandreev/issue/SFS-1013).
 
 ### 12. Janitor and GC state
@@ -380,9 +397,15 @@ that declares support for 0.2.5 (the compiled test successor of
   `CLAIM_PUBLICATION_FENCE_SQL`, which sets the transaction GUC
   `studiofs.deletion_format = '6'` under a share lock on `metadata_state`
   (`crates/studiofs-meta/src/pg_engine/janitor.rs:1089`). The trigger
-  `studiofs_fence_legacy_deletion_claim` rejects a deletion claim on a format
-  6 volume when that GUC is absent
-  (`crates/studiofs-meta/src/pg_engine/schema.rs:575`). The schema probe
+  `studiofs_fence_legacy_deletion_claim` rejects a deletion claim on a volume
+  with `metadata_format_version >= 6` when that GUC is not `'6'`
+  (`crates/studiofs-meta/src/pg_engine/schema.rs:574`,
+  `crates/studiofs-meta/src/pg_engine/schema.rs:575`). The GUC is compared
+  with the constant `'6'`, so a 0.2.3 or 0.2.4 Janitor passes the trigger on a
+  format 7 volume; only the app-side format check
+  (`crates/studiofs-meta/src/pg_engine/janitor.rs:571`) fences it. SFS-1132 and
+  SFS-1016 must make the trigger compare the GUC with the volume's current
+  format or maintenance capability, not a constant. The schema probe
   requires the exact component version and enabled guards
   (`crates/studiofs-meta/src/pg_engine/janitor.rs:60`).
   `upgrade_shared_format5` takes the Janitor advisory lock and requires settled
@@ -399,10 +422,10 @@ Later issues must build on these instead of adding parallel mechanisms:
 
 | Mechanism | Source | Extend in |
 |---|---|---|
-| `studiofs_schema_components` with monotonic marker (SFS-980) | `crates/studiofs-meta/src/pg_engine/schema.rs:893` | SFS-1005, SFS-1006 |
+| `studiofs_schema_components` with monotonic marker (SFS-980) | `crates/studiofs-meta/src/pg_engine/schema.rs:903` | SFS-1005, SFS-1006 |
 | `studiofs upgrade` (format 5→6) | `crates/studiofs/src/cli/upgrade.rs:15`, `crates/studiofs-meta/src/pg_engine/format_upgrade.rs:10` | SFS-1132 |
 | `BUMP_METADATA_VERSION` format predicate on publication | `crates/studiofs-meta/src/pg_engine/sql.rs:51` | SFS-1007, SFS-1014 |
-| `studiofs_fence_legacy_deletion_claim` trigger with `studiofs.deletion_format` GUC | `crates/studiofs-meta/src/pg_engine/schema.rs:579`, `crates/studiofs-meta/src/pg_engine/janitor.rs:1089` | SFS-1014, SFS-1016 |
+| `studiofs_fence_legacy_deletion_claim` trigger with `studiofs.deletion_format` GUC | `crates/studiofs-meta/src/pg_engine/schema.rs:569`, `crates/studiofs-meta/src/pg_engine/janitor.rs:1089` | SFS-1014, SFS-1016 |
 | `bootstrap_checkpoint_leases` (server-clock expiry, fencing token) | `crates/studiofs-meta/src/pg_engine/schema.rs:158`, `crates/studiofs-meta/src/pg_engine/sql.rs:158` | SFS-1008, SFS-1011 |
 | VolumeSettings tag-per-version events (19, 20, 21) | `crates/studiofs-meta/src/events.rs:25` | SFS-1009 |
 | `STFS_V3_BASELINE_FIXTURE` | `crates/studiofs-data/src/object.rs:2358` | SFS-1002 |
@@ -416,7 +439,11 @@ they change shared objects:
 - Expand that installs or replaces a trigger or function, because the body
   applies to every volume's rows. The trigger body must branch on per-volume
   state (as `studiofs_fence_legacy_deletion_claim` does with
-  `metadata_format_version >= 6`).
+  `metadata_format_version >= 6`). It must also compare the actor's GUC with
+  that per-volume state, not with a constant: the current trigger accepts
+  `studiofs.deletion_format = '6'` on any format 6 or later volume, so it does
+  not fence a 0.2.3 or 0.2.4 Janitor on a format 7 volume (SFS-1132,
+  SFS-1016).
 - Contract (dropping a table, column or trigger body branch), which requires
   that no volume in the database still needs it.
 - Raising a database-wide component version that older Janitors check exactly
@@ -433,11 +460,12 @@ successor can fence it safely. "Current state" is what `main` does today.
 | Obligation | Current state | Owner |
 |---|---|---|
 | Publication checks a per-volume field that a successor can raise at Activate, in the same UPDATE as the version bump. | Partial: `BUMP_METADATA_VERSION` checks `metadata_format_version` (`crates/studiofs-meta/src/pg_engine/sql.rs:56`), but that field is also the read gate, so raising it locks out readers. A separate write-requirement field is missing. | [SFS-1007](https://linear.app/valandreev/issue/SFS-1007) |
+| A refused volume-settings publication reports a typed reason, like event publication. | Missing: `query_one` plus `classify_pg_error("order volume settings")` turns a format mismatch into a generic PostgreSQL error (`crates/studiofs-meta/src/pg_engine/volume_settings.rs:339`); event publication re-reads the format and returns `UnsupportedFormatVersion` (`crates/studiofs-meta/src/pg_engine/metadata_io.rs:671`). | [SFS-1007](https://linear.app/valandreev/issue/SFS-1007) |
 | Every publication stamps its session and policy epoch (GUC or column) so a later trigger can reject it. | Missing: publication sets no GUC; `event_log.client_id` exists (`crates/studiofs-meta/src/pg_engine/schema.rs:57`) but there is no session or epoch. | [SFS-1014](https://linear.app/valandreev/issue/SFS-1014), [SFS-1008](https://linear.app/valandreev/issue/SFS-1008) |
 | Destructive maintenance sets a maintenance capability GUC before deleting. | Partial: Janitor claims set `studiofs.deletion_format` (`crates/studiofs-meta/src/pg_engine/janitor.rs:1089`); snapshot cleanup, event-log pruning and checkpoint pruning set none. | [SFS-1016](https://linear.app/valandreev/issue/SFS-1016) |
 | Unknown required capabilities fail closed with a typed reason. | Missing: no capability set exists. | [SFS-1004](https://linear.app/valandreev/issue/SFS-1004) |
 | Unknown event tags fail closed with a typed reason. | Partial: fails closed as `Serialization` (`crates/studiofs-meta/src/events.rs:617`). | [SFS-1009](https://linear.app/valandreev/issue/SFS-1009) |
-| Unknown checkpoint formats fail closed with a typed reason. | Partial: snapshot sources are checked (`crates/studiofs-meta/src/pg_engine/snapshot_control.rs:362`); the serving checkpoint has no own format field and relies on `metadata_format_version`. | [SFS-1011](https://linear.app/valandreev/issue/SFS-1011) |
+| Unknown checkpoint formats fail closed with a typed reason. | Missing typed reason: snapshot sources fail closed, but one untyped `snapshot source checkpoint is invalid` covers unknown format, checksum mismatch and schema mismatch (`crates/studiofs-meta/src/pg_engine/snapshot_control.rs:360`). The serving checkpoint has no format field of its own and relies on `metadata_format_version`. | [SFS-1011](https://linear.app/valandreev/issue/SFS-1011) |
 | Unknown payload object formats fail closed with a typed reason. | Present: `UnsupportedVersion` and `UnsupportedCodec` (`crates/studiofs-data/src/object.rs:325`, `crates/studiofs-data/src/object.rs:160`); SFEC version and flags are strict. | [SFS-1009](https://linear.app/valandreev/issue/SFS-1009) (write gating) |
 | Unknown local formats fail closed with a typed reason. | Partial: payload index format is typed (`crates/studiofs-cache/src/payload_index.rs:1299`), entry encoding is `Corruption` (`crates/studiofs-cache/src/payload_index.rs:1790`); redb has no own identity. | [SFS-1012](https://linear.app/valandreev/issue/SFS-1012), [SFS-1003](https://linear.app/valandreev/issue/SFS-1003) |
 | Additive PG objects are tolerated when declared capabilities allow it. | Partial: extra tables are ignored by `validate_postgres_schema`, but the required list is global and not capability-scoped (`crates/studiofs-meta/src/pg_engine.rs:1314`); `init`/`load`/`upgrade` re-run `CREATE OR REPLACE` DDL without checking for newer components. | [SFS-1006](https://linear.app/valandreev/issue/SFS-1006), [SFS-1005](https://linear.app/valandreev/issue/SFS-1005) |
@@ -455,11 +483,11 @@ the compiled test successor
 | Pair | Read / mount | Write / publish | Maintenance, GC, Janitor | Snapshot | Dump / load | Offline client with pending local writes | Rollback |
 |---|---|---|---|---|---|---|---|
 | 0.2.5 ↔ 0.2.5 | Supported | Supported | Supported | Supported | Supported | Publishes on reconnect | Not applicable |
-| Successor state, 0.2.5 binary, successor capability not activated | Supported | Supported | Supported if `payload_gc` is unchanged; otherwise `MaintenanceForbidden` | Supported for artifacts it can decode; others `unsupported_artifact_version` | Load of a successor dump: `UnsupportedDump` | Publishes on reconnect | Supported: nothing activated |
-| Successor state, 0.2.5 binary, capability activated as read-compatible | Supported | `UpgradeRequired` at publication; journal kept | `MaintenanceForbidden` | Mount of new artifacts refused; create refused | `UnsupportedDump` | Keeps serving locally; publication refused with `UpgradeRequired`; pending work kept until the binary is upgraded | Only before Contract, by the successor's documented deactivate step |
-| Successor state, 0.2.5 binary, capability activated as read-incompatible | `UpgradeRequired` at mount and discover; an open mount stops replay at the last applied version | `UpgradeRequired` | `MaintenanceForbidden` | Refused | `UnsupportedDump` | Local journal kept; never discarded or reset | None after Activate |
+| Successor state, 0.2.5 binary, successor capability not activated | Supported | Supported | Supported if `payload_gc` is unchanged; otherwise `MaintenanceForbidden` | Supported for artifacts it can decode; others `unsupported_artifact_version` | Load of a successor dump: `UpgradeRequired` (unsupported dump) | Publishes on reconnect | Supported: nothing activated |
+| Successor state, 0.2.5 binary, capability activated as read-compatible (Activate raised the per-volume write-requirement field from SFS-1007; `metadata_format_version` unchanged) | Supported | `UpgradeRequired` at publication, from the write-requirement check; journal kept | `MaintenanceForbidden` | Mount of new artifacts refused; create refused | `UpgradeRequired` (unsupported dump) | Keeps serving locally; publication refused with `UpgradeRequired`; pending work kept until the binary is upgraded | Only before Contract, by the successor's documented deactivate step |
+| Successor state, 0.2.5 binary, capability activated as read-incompatible | `UpgradeRequired` at mount and discover; an open mount stops replay at the last applied version | `UpgradeRequired` | `MaintenanceForbidden` | Refused | `UpgradeRequired` (unsupported dump) | Local journal kept; never discarded or reset | None after Activate |
 | 0.2.5 state, successor binary | Supported | Supported until it activates | Supported | Supported | Loads 0.2.5 dumps | Publishes on reconnect | Not applicable |
-| Unknown future ↔ 0.2.5 binary | `UpgradeRequired` for any unknown required capability, tag, checkpoint, payload or local format | `UpgradeRequired` | `MaintenanceForbidden` | Refused with typed reason | `UnsupportedDump` | Local journal kept; refused at publication | No guarantee |
+| Unknown future ↔ 0.2.5 binary | `UpgradeRequired` for any unknown required capability, tag, checkpoint or payload format; `LocalUpgradeRequired` for an unknown local format | `UpgradeRequired` | `MaintenanceForbidden` | Refused with typed reason | `UpgradeRequired` (unsupported dump) | Local journal kept; refused at publication | No guarantee |
 | Pre-0.2.5 ↔ 0.2.5 binary | No guarantee; adopt via `studiofs upgrade` | No guarantee; adopt via `studiofs upgrade` | No guarantee; adopt via `studiofs upgrade` | No guarantee; adopt via `studiofs upgrade` | No guarantee; adopt via `studiofs upgrade` | No guarantee; adopt via `studiofs upgrade` | No guarantee |
 
 ## Rules
