@@ -5,6 +5,7 @@ use anyhow::{Context, bail};
 use clap::Args;
 use std::time::Duration;
 use studiofs_meta::pg_engine::migrations::{migrate_registered_schema, registered_schema_status};
+use studiofs_meta::schema::{FormatInfo, PostgresConfig};
 use studiofs_meta::{RedbMetaEngine, decode_format_info};
 
 const BACKUP_GUIDANCE: &str = "Before upgrading: stop every mount and janitor of every volume in this PostgreSQL database, back up the database (for example with pg_dump), and run `studiofs dump` for each volume. Schema migrations are database-wide and never move back.";
@@ -16,6 +17,9 @@ pub struct UpgradeArgs {
     /// Report the schema migrations and format upgrade that would run, without changing anything.
     #[arg(long)]
     pub dry_run: bool,
+    /// Re-apply the 0.2.5 baseline schema to restore dropped objects; allowed only while no later schema migration is recorded.
+    #[arg(long)]
+    pub repair_schema: bool,
 }
 
 impl UpgradeArgs {
@@ -28,73 +32,39 @@ impl UpgradeArgs {
         if !path.is_file() {
             bail!("Local volume metadata is missing; discover the volume before upgrading.");
         }
+        let runtime = tokio::runtime::Runtime::new()?;
+        if self.dry_run {
+            // Read-only: the exclusive open below creates missing tables and commits.
+            let format = RedbMetaEngine::read_format_info_for_upgrade_readonly(&path)
+                .context("Cannot read local metadata; nothing was changed")?;
+            let pg = postgres_binding(&format, &self.name)?;
+            let report = runtime
+                .block_on(async {
+                    tokio::time::timeout(
+                        Duration::from_secs(45),
+                        dry_run_report(&format, pg, self.repair_schema),
+                    )
+                    .await
+                })
+                .context("Schema preflight timed out; nothing was changed")?
+                .context("Schema preflight failed; nothing was changed")?;
+            println!("{report}{BACKUP_GUIDANCE}");
+            return Ok(());
+        }
         // redb owns the same exclusive database lock required by mount startup.
         // Keep it through both commits, including recovery after a lost response.
         let local = RedbMetaEngine::open_for_format_upgrade(&path)
             .context("Cannot own local metadata; stop every process using this volume and retry")?;
         let format = local.format_info_for_upgrade()?;
-        if format.name != self.name {
-            bail!("Local volume name does not match its header; metadata was not changed.");
-        }
-        let pg = format
-            .metadata
-            .postgres
-            .as_ref()
-            .context("This volume has no PostgreSQL authority binding")?;
-        let runtime = tokio::runtime::Runtime::new()?;
-        if self.dry_run {
-            let report = runtime
-                .block_on(super::init::with_postgres_client(
-                    &pg.url,
-                    |client| async move {
-                        let (recorded, pending) = registered_schema_status(&client).await?;
-                        let shared: Option<i16> = client
-                            .query_opt(
-                                "SELECT metadata_format_version FROM metadata_state WHERE vol=$1",
-                                &[&pg.volume_id],
-                            )
-                            .await?
-                            .map(|row| row.get(0));
-                        let mut report =
-                            String::from("Dry run: nothing was changed.\nSchema components:\n");
-                        for row in &recorded {
-                            report.push_str(&format!("  {} = {}\n", row.component, row.version));
-                        }
-                        if recorded.is_empty() {
-                            report.push_str("  none recorded\n");
-                        }
-                        report.push_str("Schema migrations to apply:\n");
-                        for step in &pending {
-                            report.push_str(&format!(
-                                "  {} {} {} ({})\n",
-                                step.component,
-                                step.version,
-                                step.name,
-                                step.phase.as_str()
-                            ));
-                        }
-                        if pending.is_empty() {
-                            report.push_str("  none\n");
-                        }
-                        report.push_str(&format!(
-                            "Volume format: local {}, shared {}; upgrade writes {}.\n",
-                            format.format_version,
-                            shared.map_or_else(|| "missing".to_owned(), |v| v.to_string()),
-                            studiofs_meta::schema::CURRENT_FORMAT_VERSION
-                        ));
-                        Ok(report)
-                    },
-                ))
-                .context("Schema preflight failed; nothing was changed")?;
-            println!("{report}{BACKUP_GUIDANCE}");
-            return Ok(());
-        }
+        let pg = postgres_binding(&format, &self.name)?;
+        let uuid = &format.uuid;
+        let repair_schema = self.repair_schema;
         let shared = runtime.block_on(async {
             tokio::time::timeout(Duration::from_secs(45), super::init::with_postgres_client(&pg.url, |mut client| async move {
-                for step in migrate_registered_schema(&mut client).await? {
-                    println!("Applied schema migration {} {} ({}, {}).", step.component, step.version, step.name, step.phase.as_str());
+                for step in migrate_registered_schema(&mut client, repair_schema).await? {
+                    println!("Applied schema migration {step}.");
                 }
-                studiofs_meta::pg_engine::upgrade_shared_format5(&mut client, pg.volume_id, &format.uuid).await?;
+                studiofs_meta::pg_engine::upgrade_shared_format5(&mut client, pg.volume_id, uuid).await?;
                 let row = client.query_one("SELECT format_info FROM metadata_state WHERE vol=$1", &[&pg.volume_id]).await?;
                 let bytes: Vec<u8> = row.get(0);
                 Ok(decode_format_info(&bytes)?)
@@ -108,6 +78,58 @@ impl UpgradeArgs {
         );
         Ok(())
     }
+}
+
+fn postgres_binding<'a>(format: &'a FormatInfo, name: &str) -> anyhow::Result<&'a PostgresConfig> {
+    if format.name != name {
+        bail!("Local volume name does not match its header; metadata was not changed.");
+    }
+    format
+        .metadata
+        .postgres
+        .as_ref()
+        .context("This volume has no PostgreSQL authority binding")
+}
+
+async fn dry_run_report(
+    format: &FormatInfo,
+    pg: &PostgresConfig,
+    repair_schema: bool,
+) -> anyhow::Result<String> {
+    super::init::with_postgres_client(&pg.url, |client| async move {
+        let (recorded, pending) = registered_schema_status(&client, repair_schema).await?;
+        // Backend error text may echo connection data; keep only the operation.
+        let shared: Option<i16> = client
+            .query_opt(
+                "SELECT metadata_format_version FROM metadata_state WHERE vol=$1",
+                &[&pg.volume_id],
+            )
+            .await
+            .map_err(|_| anyhow::anyhow!("reading the shared volume format failed"))?
+            .map(|row| row.get(0));
+        let mut report = String::from("Dry run: nothing was changed.\nSchema components:\n");
+        for row in &recorded {
+            report.push_str(&format!("  {} = {}\n", row.component, row.version));
+        }
+        if recorded.is_empty() {
+            report.push_str("  none recorded\n");
+        }
+        report.push_str("Schema migrations to apply:\n");
+        for step in &pending {
+            report.push_str(&format!("  {step}\n"));
+        }
+        if pending.is_empty() {
+            report.push_str("  none\n");
+        }
+        report.push_str(&format!(
+            "Volume format: local {}, shared {}; upgrade writes {}.\n",
+            format.format_version,
+            shared.map_or_else(|| "missing".to_owned(), |v| v.to_string()),
+            studiofs_meta::schema::CURRENT_FORMAT_VERSION
+        ));
+        Ok(report)
+    })
+    .await
 }
 
 #[cfg(test)]
@@ -132,5 +154,11 @@ mod tests {
     fn dry_run_is_an_opt_in_flag() {
         assert!(!parse(&["upgrade", "volume"]).unwrap().dry_run);
         assert!(parse(&["upgrade", "volume", "--dry-run"]).unwrap().dry_run);
+        assert!(!parse(&["upgrade", "volume"]).unwrap().repair_schema);
+        assert!(
+            parse(&["upgrade", "volume", "--repair-schema"])
+                .unwrap()
+                .repair_schema
+        );
     }
 }

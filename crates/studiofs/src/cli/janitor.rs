@@ -4779,10 +4779,10 @@ mod tests {
             FormatInfo, MetadataBackend, MetadataConfig, PostgresConfig,
         };
 
-        let (client, connection) =
+        let (mut client, connection) =
             tokio_postgres::connect(postgres_url, tokio_postgres::NoTls).await?;
         let connection_task = tokio::spawn(connection);
-        studiofs_meta::pg_engine::schema::ensure_studiofs_pg_schema(&client).await?;
+        studiofs_meta::pg_engine::schema::ensure_studiofs_pg_schema_committed(&mut client).await?;
 
         let run_id = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)?

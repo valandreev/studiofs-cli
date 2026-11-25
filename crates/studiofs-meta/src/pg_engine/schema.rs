@@ -928,18 +928,33 @@ pub const PAYLOAD_GC_SCHEMA_VERSION: i32 =
 /// non-additive state. See
 /// [`super::migrations::ensure_registered_schema`].
 ///
-/// The caller owns transaction boundaries. Passing a transaction makes schema
-/// creation part of that transaction and holds the schema lock until it ends.
+/// The caller owns the transaction: schema creation becomes part of it, and
+/// the schema lock is held until it ends.
 ///
 /// # Errors
 ///
-/// Typed refusals from the registry, or a redacted `RemoteUnavailable` when
-/// PostgreSQL rejects the DDL.
-pub async fn ensure_studiofs_pg_schema<C>(client: &C) -> MetaResult<()>
-where
-    C: tokio_postgres::GenericClient + Sync,
-{
-    super::migrations::ensure_registered_schema(client).await
+/// Typed refusals from the registry, or a redacted error when PostgreSQL
+/// rejects the DDL.
+pub async fn ensure_studiofs_pg_schema(tx: &tokio_postgres::Transaction<'_>) -> MetaResult<()> {
+    super::migrations::ensure_registered_schema(tx).await
+}
+
+/// [`ensure_studiofs_pg_schema`] in its own committed transaction, for
+/// callers that have no transaction of their own.
+///
+/// # Errors
+///
+/// As [`ensure_studiofs_pg_schema`], or a redacted error when the transaction
+/// cannot start or commit.
+pub async fn ensure_studiofs_pg_schema_committed(
+    client: &mut tokio_postgres::Client,
+) -> MetaResult<()> {
+    let failed = |_| {
+        crate::engine::MetaError::RemoteUnavailable("postgres schema transaction failed".to_owned())
+    };
+    let tx = client.transaction().await.map_err(failed)?;
+    ensure_studiofs_pg_schema(&tx).await?;
+    tx.commit().await.map_err(failed)
 }
 
 #[cfg(test)]

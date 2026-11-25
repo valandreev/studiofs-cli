@@ -147,6 +147,10 @@ Notes:
   second concurrent `upgrade` waits for the schema lock up to two seconds and
   then fails without changes. `init` and `load` apply only additive migrations
   and refuse with "run `studiofs upgrade NAME`" when another kind is pending.
+- `--repair-schema` re-applies the idempotent 0.2.5 baseline to restore a
+  dropped table or guard trigger. It runs only while no later schema
+  migration is recorded; otherwise no command runs DDL against a verified
+  schema.
 - Unmount the volume and stop its janitors first; `upgrade` refuses an active
   local mount and holds the exclusive local `redb` lock for the whole command.
 - It upgrades the shared PostgreSQL schema and volume format, then completes

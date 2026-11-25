@@ -25,9 +25,12 @@ The shared PostgreSQL database holds the schema that every StudioFS client and m
 
 ## Decision Log
 
-- Decision: `init` and `load` run no DDL when the recorded `core` checksum matches; only `studiofs upgrade` re-applies the baseline (while nothing is recorded above it) to repair dropped objects.
-  Rationale: implicit DDL on every provisioning call blocked behind live writers; repair is an explicit operator action. Re-applying is unsafe once later steps exist, because the baseline's `CREATE OR REPLACE FUNCTION` would revert their function bodies.
-  Date/Author: 2026-11-25, SFS-1005.
+- Decision: no entry point runs DDL against a verified schema. `init`/`load` refuse a differing baseline; `studiofs upgrade` reconciles it, and `--repair-schema` re-applies a verified baseline to restore dropped objects, both only while nothing is recorded above it.
+  Rationale: implicit DDL blocked behind live writers, and an unconditional re-apply in `upgrade` deadlocked with concurrent writers (`snapshot_cli_test` failed 2/3 runs; 1/3 on `main`, which re-ran the batch too). Re-applying is unsafe once later steps exist, because the baseline's `CREATE OR REPLACE FUNCTION` would revert their function bodies.
+  Date/Author: 2026-11-25, SFS-1005 review.
+- Decision: `ensure_studiofs_pg_schema` takes a `Transaction`; `ensure_studiofs_pg_schema_committed` wraps callers without one.
+  Rationale: the advisory lock is transaction-scoped, so an autocommit client ran the DDL and marker unlocked.
+  Date/Author: 2026-11-25, SFS-1005 review.
 - Decision: one `studiofs_schema_components` row per component with a SHA-256 chained over its steps, instead of a per-step history table.
   Rationale: the issue forbids a second schema-version table; the chain still detects any difference in applied history.
   Date/Author: 2026-11-25, SFS-1005.

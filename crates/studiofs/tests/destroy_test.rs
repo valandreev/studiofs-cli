@@ -163,14 +163,14 @@ impl Drop for ChildGuard {
 fn ensure_pg_schema(dsn: &str) {
     let rt = tokio::runtime::Runtime::new().expect("build runtime");
     rt.block_on(async {
-        let (client, connection) = tokio_postgres::connect(dsn, tokio_postgres::NoTls)
+        let (mut client, connection) = tokio_postgres::connect(dsn, tokio_postgres::NoTls)
             .await
             .expect("connect postgres");
         let conn_task = tokio::spawn(async move {
             let _ = connection.await;
         });
 
-        studiofs_meta::pg_engine::schema::ensure_studiofs_pg_schema(&client)
+        studiofs_meta::pg_engine::schema::ensure_studiofs_pg_schema_committed(&mut client)
             .await
             .expect("create StudioFS PostgreSQL schema");
 

@@ -694,11 +694,12 @@ fn ensure_test_schema_once(dsn: &str) {
         return;
     }
     run_async(async {
-        let (client, connection) = tokio_postgres::connect(dsn, tokio_postgres::NoTls)
+        let (mut client, connection) = tokio_postgres::connect(dsn, tokio_postgres::NoTls)
             .await
             .map_err(|e| MetaError::Storage(format!("postgres connect failed: {}", pg_err(e))))?;
         let conn_task = tokio::spawn(connection);
-        let result = crate::pg_engine::schema::ensure_studiofs_pg_schema(&client).await;
+        let result =
+            crate::pg_engine::schema::ensure_studiofs_pg_schema_committed(&mut client).await;
         conn_task.abort();
         result
     })

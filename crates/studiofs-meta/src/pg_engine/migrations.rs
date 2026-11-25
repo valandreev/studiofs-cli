@@ -14,8 +14,9 @@
 //! ([`ensure_registered_schema`]) and run no DDL against a verified schema.
 //! `studiofs upgrade` ([`migrate_registered_schema`]) also runs backfill and
 //! contract steps and, while nothing is recorded above the baseline,
-//! re-applies it (it is idempotent) to repair dropped objects. Later
-//! migrations apply exactly once. Mounts run no DDL.
+//! reconciles a baseline whose checksum differs by re-applying it (it is
+//! idempotent). Every migration applies exactly once otherwise. Mounts run no
+//! DDL.
 
 use sha2::{Digest, Sha256};
 use tokio_postgres::GenericClient;
@@ -72,6 +73,22 @@ pub struct Migration {
     pub sql: &'static str,
 }
 
+impl std::fmt::Display for Migration {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "{} {} {} ({})",
+            self.component,
+            self.version,
+            self.name,
+            self.phase.as_str()
+        )
+    }
+}
+
+// Tagged additive: its UPDATE and SET NOT NULL statements only converge
+// pre-0.2.5 layouts and are no-ops on its own layout. `ensure` applies it only
+// to a database that has no `core` row yet.
 const BASELINE: Migration = Migration {
     component: CORE_COMPONENT,
     version: 1,
@@ -152,14 +169,14 @@ fn latest_version(registry: &[Migration], component: &str) -> i32 {
         .unwrap_or(0)
 }
 
-/// Steps still to run for `recorded`, in order. A recorded `core` baseline is
-/// listed again when `repair` is set or its checksum differs. Refuses a newer
-/// or unknown component and any recorded history above the baseline that
+/// Steps still to run for `recorded`, in order. With `reconcile`, a recorded
+/// `core` baseline whose checksum differs is listed again instead of refused.
+/// Refuses a newer or unknown component and any other recorded history that
 /// differs from `registry`.
 fn plan(
     recorded: &[RecordedComponent],
     registry: &[Migration],
-    repair: bool,
+    reconcile: bool,
 ) -> MetaResult<Vec<Migration>> {
     let recorded_version = |component: &str| {
         recorded
@@ -188,18 +205,21 @@ fn plan(
         }
         let matches = row.checksum.as_deref()
             == Some(chain_checksum(registry, &row.component, row.version).as_slice());
-        if row.component == CORE_COMPONENT && row.version == BASELINE.version {
+        let baseline = row.component == CORE_COMPONENT && row.version == BASELINE.version;
+        if matches {
+            continue;
+        }
+        if reconcile && baseline {
             // Nothing is built on the baseline yet, so re-applying it is safe.
-            if repair || !matches {
-                pending.extend(
-                    registry
-                        .iter()
-                        .find(|step| step.component == CORE_COMPONENT && step.version == 1),
-                );
-            }
-        } else if !matches {
+            pending.push(BASELINE);
+        } else {
+            let remedy = if baseline {
+                "stop mounts and janitors and run `studiofs upgrade NAME` to reconcile the baseline"
+            } else {
+                "use the StudioFS release that applied it, or restore the database from backup"
+            };
             return Err(MetaError::RepairRequired(format!(
-                "PostgreSQL schema component `{}` version {} was applied by a migration history this binary does not match; nothing was changed. Use the StudioFS release that applied it, or restore the database from backup",
+                "PostgreSQL schema component `{}` version {} was applied by a migration history this binary does not match; nothing was changed. To continue, {remedy}",
                 row.component, row.version
             )));
         }
@@ -214,11 +234,11 @@ fn plan(
 
 fn pg_failure(context: &str, error: &tokio_postgres::Error) -> MetaError {
     // Backend text may echo connection data, so only the SQLSTATE is kept.
-    let code = error
-        .code()
-        .map(|code| format!(" (SQLSTATE {})", code.code()))
-        .unwrap_or_default();
-    MetaError::RemoteUnavailable(format!("{context} failed{code}"))
+    // A statement PostgreSQL rejected is a storage error, not lost connectivity.
+    match error.code() {
+        Some(code) => MetaError::Storage(format!("{context} failed (SQLSTATE {})", code.code())),
+        None => MetaError::RemoteUnavailable(format!("{context} failed")),
+    }
 }
 
 /// Reads the registry rows without creating anything; an absent table or a
@@ -287,13 +307,7 @@ async fn apply<C>(client: &C, step: &Migration, registry: &[Migration]) -> MetaR
 where
     C: GenericClient + Sync,
 {
-    let context = format!(
-        "PostgreSQL schema migration {} {} ({}, {})",
-        step.component,
-        step.version,
-        step.name,
-        step.phase.as_str()
-    );
+    let context = format!("PostgreSQL schema migration {step}");
     client
         .batch_execute(step.sql)
         .await
@@ -309,26 +323,25 @@ where
 /// Applies this binary's pending additive migrations: the implicit DDL of
 /// `init` and `load`.
 ///
-/// Pass a transaction so the steps commit together with their markers and
-/// the caller's work; the advisory lock is held until it ends.
+/// It takes a transaction because the schema lock is transaction-scoped: the
+/// steps commit together with their markers and the caller's work, and the
+/// lock is held until the transaction ends.
 ///
 /// # Errors
 ///
 /// `UpgradeRequired` when the database records a newer or unknown component,
 /// `RepairRequired` on history drift, `SchemaMigrationPending` when a backfill
 /// or contract step is pending (nothing is applied then), and a redacted
-/// `RemoteUnavailable` when PostgreSQL rejects a statement.
-pub async fn ensure_registered_schema<C>(client: &C) -> MetaResult<()>
-where
-    C: GenericClient + Sync,
-{
-    ensure_with(client, MIGRATIONS).await
+/// `Storage` or `RemoteUnavailable` error when PostgreSQL rejects a statement
+/// or cannot be reached.
+pub async fn ensure_registered_schema(tx: &tokio_postgres::Transaction<'_>) -> MetaResult<()> {
+    ensure_with(tx, MIGRATIONS).await
 }
 
-pub(crate) async fn ensure_with<C>(client: &C, registry: &[Migration]) -> MetaResult<()>
-where
-    C: GenericClient + Sync,
-{
+pub(crate) async fn ensure_with(
+    client: &tokio_postgres::Transaction<'_>,
+    registry: &[Migration],
+) -> MetaResult<()> {
     // A verified baseline is not re-applied: no DDL, so no table locks behind live writers.
     let pending = plan(&lock_and_read(client).await?, registry, false)?;
     if let Some(step) = pending
@@ -359,15 +372,35 @@ where
 ///
 /// As [`ensure_registered_schema`], except that backfill and contract steps
 /// are applied instead of refused.
+///
+/// `repair_baseline` re-applies the idempotent baseline once to restore
+/// dropped objects, only while nothing is recorded above it.
 pub async fn migrate_registered_schema(
     client: &mut tokio_postgres::Client,
+    repair_baseline: bool,
 ) -> MetaResult<Vec<Migration>> {
-    migrate_with(client, MIGRATIONS).await
+    migrate_with(client, MIGRATIONS, repair_baseline).await
+}
+
+/// Puts the baseline first when a repair was asked for and nothing is built on it.
+fn with_repair(
+    recorded: &[RecordedComponent],
+    mut pending: Vec<Migration>,
+    repair: bool,
+) -> Vec<Migration> {
+    let at_baseline = recorded
+        .iter()
+        .any(|row| row.component == CORE_COMPONENT && row.version == BASELINE.version);
+    if repair && at_baseline && !pending.contains(&BASELINE) {
+        pending.insert(0, BASELINE);
+    }
+    pending
 }
 
 pub(crate) async fn migrate_with(
     client: &mut tokio_postgres::Client,
     registry: &[Migration],
+    mut repair_baseline: bool,
 ) -> MetaResult<Vec<Migration>> {
     let mut applied: Vec<Migration> = Vec::new();
     loop {
@@ -379,10 +412,10 @@ pub(crate) async fn migrate_with(
             .await
             .map_err(|error| pg_failure("start schema migration", &error))?;
         let recorded = lock_and_read(&tx).await?;
-        // The baseline repair is listed on every plan; run it once per call.
-        let next = plan(&recorded, registry, true)?
+        let pending = plan(&recorded, registry, true)?;
+        let next = with_repair(&recorded, pending, std::mem::take(&mut repair_baseline))
             .into_iter()
-            .find(|step| !applied.contains(step));
+            .next();
         let Some(step) = next else {
             tx.commit()
                 .await
@@ -405,12 +438,14 @@ pub(crate) async fn migrate_with(
 /// Same refusals as [`ensure_registered_schema`] for newer or drifted history.
 pub async fn registered_schema_status<C>(
     client: &C,
+    repair_baseline: bool,
 ) -> MetaResult<(Vec<RecordedComponent>, Vec<Migration>)>
 where
     C: GenericClient + Sync,
 {
     let (recorded, _) = read_recorded(client).await?;
     let pending = plan(&recorded, MIGRATIONS, true)?;
+    let pending = with_repair(&recorded, pending, repair_baseline);
     Ok((recorded, pending))
 }
 
@@ -537,7 +572,7 @@ mod tests {
     }
 
     #[test]
-    fn verified_baseline_is_replanned_only_for_repair_and_payload_gc_is_not_versioned_here() {
+    fn only_a_differing_baseline_is_reconciled_and_payload_gc_is_not_versioned_here() {
         let payload_gc = RecordedComponent {
             component: PAYLOAD_GC_COMPONENT.to_owned(),
             version: 2,
@@ -545,10 +580,11 @@ mod tests {
         };
         let verified = [row(CORE_COMPONENT, 1, MIGRATIONS), payload_gc.clone()];
         let later = MIGRATIONS.len() - 1;
-        assert_eq!(plan(&verified, MIGRATIONS, false).unwrap().len(), later);
-        let pending = plan(&verified, MIGRATIONS, true).unwrap();
-        assert_eq!((pending[0], pending.len()), (BASELINE, later + 1));
-        // A baseline with a different checksum has nothing built on it and is reconciled.
+        for reconcile in [false, true] {
+            assert_eq!(plan(&verified, MIGRATIONS, reconcile).unwrap().len(), later);
+        }
+        // A differing baseline is drift for implicit provisioning; only the
+        // explicit upgrade, with nothing built on it, reconciles it.
         let stale = [
             RecordedComponent {
                 checksum: Some(vec![0; 32]),
@@ -556,6 +592,18 @@ mod tests {
             },
             payload_gc,
         ];
-        assert_eq!(plan(&stale, MIGRATIONS, false).unwrap()[0], BASELINE);
+        assert!(matches!(
+            plan(&stale, MIGRATIONS, false),
+            Err(MetaError::RepairRequired(message)) if message.contains("studiofs upgrade")
+        ));
+        assert_eq!(plan(&stale, MIGRATIONS, true).unwrap()[0], BASELINE);
+        // An explicit repair re-lists a verified baseline exactly once.
+        let repaired = with_repair(&verified, plan(&verified, MIGRATIONS, true).unwrap(), true);
+        assert_eq!((repaired[0], repaired.len()), (BASELINE, later + 1));
+        let reconciled = with_repair(&stale, plan(&stale, MIGRATIONS, true).unwrap(), true);
+        assert_eq!(
+            reconciled.iter().filter(|step| **step == BASELINE).count(),
+            1
+        );
     }
 }

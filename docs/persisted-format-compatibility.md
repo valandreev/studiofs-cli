@@ -185,10 +185,14 @@ that declares support for 0.2.5 (the compiled test successor of
   commits with its marker under the existing advisory lock (`902202603`).
   `init` and `load` apply only pending additive steps and run no DDL against
   a verified schema; a pending backfill or contract step makes them refuse
-  with `SchemaMigrationPending`. `studiofs upgrade` (`--dry-run` reports
-  only) applies every step in its own transaction, resumes after a failure,
-  and re-applies the baseline while nothing is recorded above it to repair
-  dropped objects. The test successor adds `core` 2, one additive table.
+  with `SchemaMigrationPending`, and a baseline whose checksum differs makes
+  them refuse with `RepairRequired`. `studiofs upgrade` (`--dry-run` reports
+  only) applies every step in its own transaction and resumes after a
+  failure. While nothing is recorded above the baseline, it reconciles a
+  differing baseline, and `--repair-schema` re-applies a verified one to
+  restore dropped objects. It runs no DDL against a verified schema
+  otherwise. Neither path checks the shape of tables that already existed;
+  that is SFS-1006. The test successor adds `core` 2, one additive table.
 - Fail-closed outcome: typed `UpgradeRequired` (unknown required component) or
   `MaintenanceForbidden` (Janitor); no DDL from an older binary. Owner:
   [SFS-1005](https://linear.app/valandreev/issue/SFS-1005) (migration registry)
