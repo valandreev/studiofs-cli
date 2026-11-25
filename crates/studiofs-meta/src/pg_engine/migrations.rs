@@ -6,13 +6,13 @@
 //! component up to it, so a database whose history differs from this binary's
 //! registry is refused as drift. A migration commits together with its marker,
 //! so an interrupted run leaves the last committed version and resumes from
-//! the next step. Every run holds [`SCHEMA_ADVISORY_LOCK`], so concurrent
+//! the next step. Every run holds [`SCHEMA_ADVISORY_LOCK`](crate::pg_engine::migrations::SCHEMA_ADVISORY_LOCK), so concurrent
 //! migrators serialize.
 //!
-//! `core` version 1 is the canonical 0.2.5 baseline ([`studiofs_pg_schema_sql`]).
+//! `core` version 1 is the canonical 0.2.5 baseline ([`studiofs_pg_schema_sql`](crate::pg_engine::schema::studiofs_pg_schema_sql)).
 //! `init` and `load` apply only pending additive steps
-//! ([`ensure_registered_schema`]) and run no DDL against a verified schema.
-//! `studiofs upgrade` ([`migrate_registered_schema`]) also runs backfill and
+//! ([`ensure_registered_schema`](crate::pg_engine::migrations::ensure_registered_schema)) and run no DDL against a verified schema.
+//! `studiofs upgrade` ([`migrate_registered_schema`](crate::pg_engine::migrations::migrate_registered_schema)) also runs backfill and
 //! contract steps and, while nothing is recorded above the baseline,
 //! reconciles a baseline whose checksum differs by re-applying it (it is
 //! idempotent). Every migration applies exactly once otherwise. Mounts run no
