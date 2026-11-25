@@ -8,6 +8,10 @@ license.workspace = true
 [lints]
 workspace = true
 
+[features]
+# Test-only successor build (SFS-1131); refused by release profiles.
+test-successor = []
+
 [dependencies]
 redb.workspace = true
 chrono.workspace = true

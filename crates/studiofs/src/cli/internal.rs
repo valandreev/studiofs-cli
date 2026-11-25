@@ -41,6 +41,11 @@ impl InternalArgs {
                     ))
                 }
             }
+            InternalAction::VersionIdentities => {
+                let report = studiofs_meta::version::identity_report();
+                println!("{}", serde_json::to_string_pretty(&report)?);
+                Ok(())
+            }
             InternalAction::DiagnosticsDiscover => {
                 let sessions = diagnostics::discover_local_sessions()?;
                 println!("{}", serde_json::to_string_pretty(&sessions)?);
@@ -105,6 +110,9 @@ enum InternalAction {
     },
     #[command(name = "winfsp-bootstrap-mountmgr", hide = true)]
     WinfspBootstrapMountmgr,
+    /// Print version identities and declared test-successor changes as JSON.
+    #[command(name = "version-identities", hide = true)]
+    VersionIdentities,
     #[command(name = "diagnostics-discover", hide = true)]
     DiagnosticsDiscover,
     #[command(name = "diagnostics-attach", hide = true)]
