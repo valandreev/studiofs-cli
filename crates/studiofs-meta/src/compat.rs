@@ -15,13 +15,18 @@ use std::ops::RangeInclusive;
 
 use crate::version::{
     LOCAL_METADATA_LAYOUT, POSTGRES_PAYLOAD_GC_SCHEMA, SERVING_CHECKPOINT_FORMAT,
-    SERVING_CHECKPOINT_SCHEMA, VersionIdentity,
+    SERVING_CHECKPOINT_SCHEMA, SHARED_VOLUME_FORMAT, VersionIdentity,
 };
 
 /// Shared volume format of the 0.2.5 baseline, written by `studiofs upgrade`
 /// (SFS-1132). From this format on the number stays fixed; later changes move
 /// capabilities and identities instead.
 pub const BASELINE_VOLUME_FORMAT: u16 = 7;
+
+const _: () = assert!(
+    BASELINE_VOLUME_FORMAT == SHARED_VOLUME_FORMAT.current + 1,
+    "SFS-1132: reconcile the evaluator baseline with SHARED_VOLUME_FORMAT"
+);
 
 /// Shared formats of 0.2.0–0.2.4 volumes that `studiofs upgrade` adopts.
 pub const MIGRATABLE_VOLUME_FORMATS: RangeInclusive<u16> = 5..=6;
@@ -42,17 +47,11 @@ pub const CAP_MAINTENANCE_PAYLOAD_GC_V2: &str = "maintenance.payload_gc.v2";
 const SAFETY_CRITICAL_NAMESPACES: &[&str] = &["event.", "payload.", "checkpoint."];
 
 /// Local payload index format (`studiofs-cache` `INDEX_FORMAT_VERSION`; format 1
-/// is migrated in place on open).
+/// is migrated in place on open). `studiofs-vfs` tests pin it to the cache
+/// constants. Entry encodings are per record, not a store identity.
 pub const LOCAL_PAYLOAD_INDEX_FORMAT: VersionIdentity = VersionIdentity {
     name: "local payload index format",
     current: 2,
-    min_supported: 1,
-};
-
-/// Local payload index entry encoding (`studiofs-cache` `ENTRY_ENCODING_VERSION`).
-pub const LOCAL_PAYLOAD_INDEX_ENTRY_ENCODING: VersionIdentity = VersionIdentity {
-    name: "local payload index entry encoding",
-    current: 3,
     min_supported: 1,
 };
 
@@ -78,12 +77,18 @@ pub struct ClientCapabilities {
 }
 
 impl ClientCapabilities {
-    /// Capabilities of this binary.
+    /// Capabilities of this binary once `studiofs upgrade` writes format
+    /// [`BASELINE_VOLUME_FORMAT`] (SFS-1132). Until then the shipped binary
+    /// still serves [`SHARED_VOLUME_FORMAT`], so this must not be wired into
+    /// mount (SFS-1015) before SFS-1132 lands.
+    ///
+    /// Requiring [`POSTGRES_PAYLOAD_GC_SCHEMA`] is PostgreSQL-specific; SFS-1034
+    /// parameterises the schema components by metadata backend.
     #[must_use]
     pub fn current() -> Self {
         Self {
             volume_format: VersionIdentity {
-                name: "shared volume format",
+                name: SHARED_VOLUME_FORMAT.name,
                 current: BASELINE_VOLUME_FORMAT,
                 min_supported: BASELINE_VOLUME_FORMAT,
             },
@@ -103,11 +108,7 @@ impl ClientCapabilities {
             schema_components: vec![POSTGRES_PAYLOAD_GC_SCHEMA],
             checkpoint_format: SERVING_CHECKPOINT_FORMAT,
             checkpoint_schema: SERVING_CHECKPOINT_SCHEMA,
-            local_formats: vec![
-                LOCAL_METADATA_LAYOUT,
-                LOCAL_PAYLOAD_INDEX_FORMAT,
-                LOCAL_PAYLOAD_INDEX_ENTRY_ENCODING,
-            ],
+            local_formats: vec![LOCAL_METADATA_LAYOUT, LOCAL_PAYLOAD_INDEX_FORMAT],
         }
     }
 }
@@ -258,6 +259,8 @@ pub enum ReasonCode {
     SchemaComponentOutdated,
     /// Shared schema component newer than this binary maintains.
     SchemaComponentNewer,
+    /// Shared schema component this binary does not know.
+    SchemaComponentUnknown,
     /// Event kind or codec this binary cannot decode.
     EventKindUnknown,
     /// Payload object format this binary cannot read.
@@ -288,6 +291,7 @@ impl ReasonCode {
             Self::SchemaComponentMissing => "schema_component_missing",
             Self::SchemaComponentOutdated => "schema_component_outdated",
             Self::SchemaComponentNewer => "schema_component_newer",
+            Self::SchemaComponentUnknown => "schema_component_unknown",
             Self::EventKindUnknown => "event_kind_unknown",
             Self::PayloadFormatUnsupported => "payload_format_unsupported",
             Self::ReadCapabilityMissing => "read_capability_missing",
@@ -313,6 +317,7 @@ impl ReasonCode {
             | Self::LocalFormatUnknown
             | Self::LocalFormatNewer
             | Self::SchemaComponentNewer
+            | Self::SchemaComponentUnknown
             | Self::EventKindUnknown
             | Self::PayloadFormatUnsupported
             | Self::ReadCapabilityMissing
@@ -339,12 +344,13 @@ impl ReasonCode {
                 "the volume predates StudioFS 0.2.0 and is not supported; restore it with the release that wrote it"
             }
             Self::CheckpointFormatUnsupported => {
-                "publish a new serving checkpoint with a supported StudioFS release"
+                "the serving checkpoint predates any supported StudioFS release; restore it with the release that wrote it"
             }
             Self::VolumeFormatNewer
             | Self::LocalFormatUnknown
             | Self::LocalFormatNewer
             | Self::SchemaComponentNewer
+            | Self::SchemaComponentUnknown
             | Self::EventKindUnknown
             | Self::PayloadFormatUnsupported
             | Self::ReadCapabilityMissing
@@ -371,7 +377,7 @@ pub struct Refusal {
 pub struct OperationAssessment {
     /// Assessed operation.
     pub operation: Operation,
-    /// First refusal in evaluation order, if any.
+    /// Worst-class refusal, if any; within a class the first in check order.
     pub refusal: Option<Refusal>,
 }
 
@@ -419,10 +425,15 @@ pub fn evaluate(
         operation,
         refusal: None,
     });
-    // Checks run in a fixed order; each operation keeps its first refusal.
+    // Checks run in a fixed order; each operation keeps its worst-class
+    // refusal, and the first one on a tie.
     let mut refuse = |targets: &[Operation], reason: ReasonCode, subject: String| {
         for assessment in &mut operations {
-            if assessment.refusal.is_none() && targets.contains(&assessment.operation) {
+            let worse = assessment
+                .refusal
+                .as_ref()
+                .is_none_or(|refusal| reason.class() > refusal.reason.class());
+            if worse && targets.contains(&assessment.operation) {
                 assessment.refusal = Some(Refusal {
                     reason,
                     subject: subject.clone(),
@@ -474,6 +485,16 @@ pub fn evaluate(
             |found| format!("{} {found}", id.name),
         );
         refuse(targets, reason, subject);
+    }
+    // This binary must not delete under a component's rules it does not know.
+    for (name, found) in &volume.schema_components {
+        if !client.schema_components.iter().any(|id| id.name == name) {
+            refuse(
+                &[Maintenance],
+                ReasonCode::SchemaComponentUnknown,
+                format!("{name} {found}"),
+            );
+        }
     }
 
     // Unknown safety-critical names are refused wherever the volume declares them.
@@ -551,11 +572,17 @@ pub fn evaluate(
 
     // Bootstrap and replay decide whether the volume mounts at all; the worst
     // of their refusals wins. Publication alone only downgrades to read-only.
-    let read_refusal = operations[..2]
-        .iter()
-        .filter_map(|assessment| assessment.refusal.as_ref())
+    let refusal_of = |operation: Operation| {
+        operations
+            .iter()
+            .find(|assessment| assessment.operation == operation)
+            .and_then(|assessment| assessment.refusal.as_ref())
+    };
+    let read_refusal = [Operation::Bootstrap, Operation::Replay]
+        .into_iter()
+        .filter_map(refusal_of)
         .max_by_key(|refusal| (refusal.reason.class(), std::cmp::Reverse(refusal.reason)));
-    let (compatibility, reason) = match (read_refusal, &operations[2].refusal) {
+    let (compatibility, reason) = match (read_refusal, refusal_of(Publication)) {
         (Some(refusal), _) => (refusal.reason.class(), Some(refusal.clone())),
         (None, Some(refusal)) => (Compatibility::CompatibleRo, Some(refusal.clone())),
         (None, None) => (Compatibility::CompatibleRw, None),
@@ -578,7 +605,6 @@ mod tests {
                 LOCAL_METADATA_LAYOUT.current,
             ),
             (LOCAL_PAYLOAD_INDEX_FORMAT.name.to_owned(), 2),
-            (LOCAL_PAYLOAD_INDEX_ENTRY_ENCODING.name.to_owned(), 3),
         ])
     }
 
@@ -742,11 +768,48 @@ mod tests {
     }
 
     #[test]
-    fn compat_newer_or_extra_schema_component_only_forbids_maintenance() {
+    fn compat_missing_pg_column_maps_to_outdated_schema_component() {
+        // SFS-1006 schema validation reports a component whose required
+        // column is missing as below `min_supported`; the evaluator sees only
+        // that version, never the column.
+        let mut volume = VolumeRequirements::baseline();
+        volume.schema_components.insert(
+            POSTGRES_PAYLOAD_GC_SCHEMA.name.to_owned(),
+            POSTGRES_PAYLOAD_GC_SCHEMA.min_supported - 1,
+        );
+        let decision = eval(&volume);
+        assert_eq!(
+            overall(&decision),
+            ("needs_migration", Some("schema_component_outdated"))
+        );
+        assert!(Operation::ALL.iter().all(|op| !decision.allows(*op)));
+        assert!(
+            decision
+                .reason
+                .unwrap()
+                .reason
+                .action()
+                .contains("studiofs upgrade")
+        );
+    }
+
+    #[test]
+    fn compat_newer_schema_component_only_forbids_maintenance() {
         let mut volume = VolumeRequirements::baseline();
         volume
             .schema_components
             .insert(POSTGRES_PAYLOAD_GC_SCHEMA.name.to_owned(), 3);
+        let decision = eval(&volume);
+        assert_eq!(decision.compatibility, Compatibility::CompatibleRw);
+        assert_eq!(
+            reason(&decision, Operation::Maintenance),
+            Some("schema_component_newer")
+        );
+    }
+
+    #[test]
+    fn compat_extra_schema_component_only_forbids_maintenance() {
+        let mut volume = VolumeRequirements::baseline();
         volume
             .schema_components
             .insert("successor_stats".to_owned(), 1);
@@ -754,7 +817,45 @@ mod tests {
         assert_eq!(decision.compatibility, Compatibility::CompatibleRw);
         assert_eq!(
             reason(&decision, Operation::Maintenance),
-            Some("schema_component_newer")
+            Some("schema_component_unknown")
+        );
+        assert_eq!(
+            decision.refusal(Operation::Maintenance).unwrap().subject,
+            "successor_stats 1"
+        );
+    }
+
+    #[test]
+    fn compat_worse_class_wins_over_earlier_migration_refusal() {
+        let mut volume = VolumeRequirements::baseline();
+        volume.read.insert("event.volume_settings.v4".to_owned());
+        let expected = ("upgrade_required", Some("event_kind_unknown"));
+
+        // Outdated local redb layout is checked before capabilities.
+        let mut local = baseline_local();
+        local.insert(LOCAL_METADATA_LAYOUT.name.to_owned(), 5);
+        let decision = evaluate(&ClientCapabilities::current(), &volume, &local);
+        assert_eq!(overall(&decision), expected);
+        assert_eq!(
+            reason(&decision, Operation::Replay),
+            Some("event_kind_unknown")
+        );
+
+        // Missing schema component is checked before capabilities too.
+        volume.schema_components.clear();
+        let decision = eval(&volume);
+        assert_eq!(overall(&decision), expected);
+        assert_eq!(
+            reason(&decision, Operation::Maintenance),
+            Some("event_kind_unknown")
+        );
+
+        // Within one class the first refusal in check order still wins.
+        volume.schema_components = VolumeRequirements::baseline().schema_components;
+        volume.read.insert("aa.future.v1".to_owned());
+        assert_eq!(
+            reason(&eval(&volume), Operation::Replay),
+            Some("read_capability_missing")
         );
     }
 
@@ -922,13 +1023,13 @@ mod tests {
         volume.format = 6;
         let first = eval(&volume);
         assert_eq!(first, eval(&volume));
-        // Format is checked before capabilities.
+        // A worse class outranks the earlier migration refusal; within a
+        // class the first name in sorted order wins.
         assert_eq!(
             overall(&first),
-            ("needs_migration", Some("volume_format_needs_migration"))
+            ("upgrade_required", Some("read_capability_missing"))
         );
-        volume.format = BASELINE_VOLUME_FORMAT;
-        assert_eq!(eval(&volume).reason.unwrap().subject, "aa.future.v1");
+        assert_eq!(first.reason.as_ref().unwrap().subject, "aa.future.v1");
         let ops: Vec<_> = first.operations.iter().map(|a| a.operation).collect();
         assert_eq!(ops, Operation::ALL);
     }
@@ -979,6 +1080,11 @@ mod tests {
             (
                 ReasonCode::SchemaComponentNewer,
                 "schema_component_newer",
+                "upgrade_required",
+            ),
+            (
+                ReasonCode::SchemaComponentUnknown,
+                "schema_component_unknown",
                 "upgrade_required",
             ),
             (

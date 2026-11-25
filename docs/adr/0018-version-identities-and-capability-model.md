@@ -82,7 +82,7 @@ evaluator is a pure function so it can be tested without a backend and adds no
 round trip to a hot path.
 
 It assesses each operation (bootstrap, replay, publication, checkpoint,
-maintenance) and reports one overall class: `CompatibleRW`, `CompatibleRO`
+maintenance) and reports one overall class: `CompatibleRw`, `CompatibleRo`
 (publication refused), `NeedsMigration` (the volume, its shared schema or a
 local store must be migrated, for example a format 5 or 6 volume that
 `studiofs upgrade` adopts), `UpgradeRequired` (this binary is too old), or
@@ -90,8 +90,11 @@ local store must be migrated, for example a format 5 or 6 volume that
 machine-readable reason code (for example `event_kind_unknown`,
 `write_capability_missing`, `maintenance_capability_missing`) and a human
 action. A refused maintenance operation is reported per operation with
-`maintenance_capability_missing` or `schema_component_newer`; it does not
-change the overall class. Unknown names in any required set are treated as
+`maintenance_capability_missing`, `schema_component_newer` or
+`schema_component_unknown`; it does not change the overall class. Each
+operation keeps its worst-class refusal (the first in check order on a tie),
+so a pending migration never hides an `UpgradeRequired` or `Incompatible`
+reason. Unknown names in any required set are treated as
 missing, and write authority comes only from the declared write set, never
 from a version range.
 

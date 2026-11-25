@@ -175,7 +175,10 @@ that declares support for 0.2.5 (the compiled test successor of
   `MaintenanceForbidden` (Janitor); no DDL from an older binary. Owner:
   [SFS-1005](https://linear.app/valandreev/issue/SFS-1005) (migration registry)
   and [SFS-1006](https://linear.app/valandreev/issue/SFS-1006)
-  (capability-scoped validation).
+  (capability-scoped validation). A missing PostgreSQL column reaches the
+  capability evaluator only as `schema_component_missing` or
+  `schema_component_outdated` for its component, produced by SFS-1006 schema
+  validation; the evaluator never inspects columns.
 
 ### 4. Shared metadata state and publication
 
@@ -485,8 +488,8 @@ the compiled test successor
 
 Outcome names map onto the capability evaluator
 (`crates/studiofs-meta/src/compat.rs`): `MaintenanceForbidden` is a refused
-maintenance operation (reason `maintenance_capability_missing` or
-`schema_component_newer`). `LocalUpgradeRequired` is `UpgradeRequired` with
+maintenance operation (reason `maintenance_capability_missing`,
+`schema_component_newer` or `schema_component_unknown`). `LocalUpgradeRequired` is `UpgradeRequired` with
 `local_format_newer` or `local_format_unknown`, or `NeedsMigration` with
 `local_format_outdated` for a local store older than the binary opens.
 

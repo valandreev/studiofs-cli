@@ -20,8 +20,10 @@ use redb::{
 
 use crate::local::{LocalPayloadLifecycleState, LocalPayloadOrigin, LocalPayloadUploadState};
 
-const LEGACY_INDEX_FORMAT_VERSION: u64 = 1;
-const INDEX_FORMAT_VERSION: u64 = 2;
+/// Oldest index format still opened; it is migrated in place.
+pub const LEGACY_INDEX_FORMAT_VERSION: u64 = 1;
+/// Index format this binary writes.
+pub const INDEX_FORMAT_VERSION: u64 = 2;
 const LEGACY_ENTRY_ENCODING_VERSION: u8 = 1;
 const ENTRY_ENCODING_VERSION_V2: u8 = 2;
 const ENTRY_ENCODING_VERSION: u8 = 3;
