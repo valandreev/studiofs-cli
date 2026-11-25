@@ -17,8 +17,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::compat::{
-    CAP_EVENT_CODEC_V1, CAP_MAINTENANCE_PAYLOAD_GC_V2, CAP_PAYLOAD_SFEC_V1, CAP_PAYLOAD_STFS_V2,
-    CAP_PAYLOAD_STFS_V3, ClientCapabilities, VolumeRequirements,
+    BASELINE_WRITE_CAPABILITIES, CAP_EVENT_CODEC_V1, CAP_MAINTENANCE_PAYLOAD_GC_V2,
+    CAP_PAYLOAD_SFEC_V1, CAP_PAYLOAD_STFS_V2, CAP_PAYLOAD_STFS_V3, CheckpointDescriptor,
+    ClientCapabilities, VolumeRequirements,
 };
 use crate::engine::{MetaError, MetaResult, UpgradeRequiredReason};
 use crate::version::SHARED_WRITE_REQUIREMENT;
@@ -69,6 +70,8 @@ pub struct ProtocolRequirements {
     pub write: BTreeSet<String>,
     /// A binary missing any of these must not delete, prune or run GC.
     pub maintain: BTreeSet<String>,
+    /// Serving checkpoint format and state schema selected for this volume.
+    pub checkpoint: CheckpointDescriptor,
     /// Activation state of every feature the volume has ever known.
     pub features: BTreeMap<String, FeatureState>,
 }
@@ -81,7 +84,7 @@ pub struct VolumeProtocol {
     /// Publication succeeds only when this is at most the publisher's
     /// [`SHARED_WRITE_REQUIREMENT`]. Activate raises it to fence older writers.
     pub write_requirement: u16,
-    /// Required sets and feature states.
+    /// Required sets, checkpoint identity and feature states.
     pub requirements: ProtocolRequirements,
 }
 
@@ -116,6 +119,14 @@ pub enum ProtocolRejection {
     /// The acting binary would require a capability it does not declare.
     #[error("this StudioFS binary does not declare capability `{0}` and cannot activate it")]
     UnknownCapability(String),
+    /// The proposed checkpoint format or schema is unsupported by the actor.
+    #[error("this StudioFS binary does not support {identity} {found}")]
+    UnsupportedCheckpoint {
+        /// Boundary of the unsupported version.
+        identity: &'static str,
+        /// Proposed version.
+        found: u16,
+    },
     /// The write requirement does not follow the write-set change.
     #[error("write requirement {found} is invalid: {rule}")]
     WriteRequirement {
@@ -150,6 +161,7 @@ impl VolumeProtocol {
                 read: base.read,
                 write: base.write,
                 maintain: base.maintain,
+                checkpoint: CheckpointDescriptor::BASELINE,
                 features,
             },
         }
@@ -191,13 +203,14 @@ impl VolumeProtocol {
         Ok(())
     }
 
-    /// Copies the required sets and the `compatible` (optional, in use)
-    /// features into evaluator input.
+    /// Copies the required sets, checkpoint identity and `compatible`
+    /// (optional, in use) features into evaluator input.
     pub fn apply_to(&self, volume: &mut VolumeRequirements) {
         let sets = &self.requirements;
         volume.read.clone_from(&sets.read);
         volume.write.clone_from(&sets.write);
         volume.maintain.clone_from(&sets.maintain);
+        volume.checkpoint = Some(sets.checkpoint);
         volume.optional = sets
             .features
             .iter()
@@ -253,7 +266,11 @@ impl VolumeProtocol {
 /// or `required`, and every capability added to a required set, must be
 /// declared by `actor` in the matching set; adding a write capability raises
 /// the write requirement, an unchanged write set keeps it, and it never
-/// exceeds what `actor` itself can publish.
+/// exceeds what `actor` itself can publish. Lowering the requirement requires
+/// the actor to declare every retained write capability. Returning to the
+/// baseline requires baseline writers to support them as well. Changing the
+/// checkpoint identity requires the actor to support the proposed format and
+/// schema.
 ///
 /// # Errors
 ///
@@ -318,6 +335,39 @@ pub fn check_update(
     };
     if let Some(rule) = rule {
         return Err(ProtocolRejection::WriteRequirement { found, rule });
+    }
+    if found < current.write_requirement {
+        if let Some(name) = new
+            .write
+            .iter()
+            .find(|name| !actor.write.contains(name.as_str()))
+        {
+            return Err(ProtocolRejection::UnknownCapability(name.clone()));
+        }
+        if found == SHARED_WRITE_REQUIREMENT.min_supported
+            && new
+                .write
+                .iter()
+                .any(|name| !BASELINE_WRITE_CAPABILITIES.contains(&name.as_str()))
+        {
+            return Err(ProtocolRejection::WriteRequirement {
+                found,
+                rule: "baseline writers must support every retained write capability",
+            });
+        }
+    }
+    if new.checkpoint != old.checkpoint {
+        for (identity, found) in [
+            (actor.checkpoint_format, new.checkpoint.format),
+            (actor.checkpoint_schema, new.checkpoint.schema),
+        ] {
+            if !identity.supports(found) {
+                return Err(ProtocolRejection::UnsupportedCheckpoint {
+                    identity: identity.name,
+                    found,
+                });
+            }
+        }
     }
     Ok(found != current.write_requirement || new != old)
 }
@@ -397,6 +447,49 @@ mod tests {
     }
 
     #[test]
+    fn stored_checkpoint_requirements_drive_policy_validation_and_evaluation() {
+        use crate::compat::{CheckpointDescriptor, ReasonCode};
+
+        let baseline = VolumeProtocol::baseline();
+        let actor = ClientCapabilities::current();
+        let mut json: serde_json::Value =
+            serde_json::from_str(&baseline.encode_requirements().unwrap()).unwrap();
+        for (format, schema, supported) in [(3, 1, true), (5, 1, false), (4, 2, false)] {
+            json["checkpoint"] = serde_json::json!({"format": format, "schema": schema});
+            let proposal = VolumeProtocol::decode(1, 1, &json.to_string()).unwrap();
+            let round_trip =
+                VolumeProtocol::decode(1, 1, &proposal.encode_requirements().unwrap()).unwrap();
+            assert_eq!(round_trip, proposal);
+            let mut volume = VolumeRequirements::baseline();
+            volume.checkpoint = None;
+            round_trip.apply_to(&mut volume);
+            assert_eq!(
+                volume.checkpoint,
+                Some(CheckpointDescriptor { format, schema })
+            );
+            let assessment = evaluate(&actor, &volume, &BTreeMap::new());
+            if supported {
+                assert_eq!(check_update(&baseline, &proposal, &actor), Ok(true));
+                assert!(assessment.allows(Operation::Checkpoint));
+            } else {
+                let (identity, found) = if format > actor.checkpoint_format.current {
+                    (actor.checkpoint_format.name, format)
+                } else {
+                    (actor.checkpoint_schema.name, schema)
+                };
+                assert_eq!(
+                    check_update(&baseline, &proposal, &actor),
+                    Err(ProtocolRejection::UnsupportedCheckpoint { identity, found })
+                );
+                assert_eq!(
+                    assessment.refusal(Operation::Checkpoint).unwrap().reason,
+                    ReasonCode::CheckpointFormatNewer
+                );
+            }
+        }
+    }
+
+    #[test]
     fn features_move_one_lifecycle_step_and_retired_is_terminal() {
         let actor = successor_actor();
         let baseline = VolumeProtocol::baseline();
@@ -468,6 +561,46 @@ mod tests {
         let mut bumped = compatible.clone();
         bumped.write_requirement = 0;
         assert!(check_update(&compatible, &bumped, &actor).is_err());
+    }
+
+    #[test]
+    fn lowering_the_write_requirement_checks_every_remaining_write_capability() {
+        let actor = successor_actor();
+        let remaining = "metadata.other_writer.v1";
+        let current = with(&VolumeProtocol::baseline(), |next| {
+            next.requirements
+                .write
+                .insert(CAP_PAYLOAD_STFS_V2.to_owned());
+            for name in [FUTURE, remaining] {
+                next.requirements.write.insert(name.to_owned());
+                next.requirements
+                    .features
+                    .insert(name.to_owned(), FeatureState::Required);
+            }
+            next.write_requirement = 2;
+        });
+        let rollback = with(&current, |next| {
+            next.requirements.write.remove(FUTURE);
+            set_state(FeatureState::Compatible)(next);
+            next.write_requirement = 1;
+        });
+        assert_eq!(
+            check_update(&current, &rollback, &actor),
+            Err(ProtocolRejection::UnknownCapability(remaining.to_owned()))
+        );
+        let mut capable_actor = actor;
+        capable_actor.write.insert(remaining);
+        assert!(matches!(
+            check_update(&current, &rollback, &capable_actor),
+            Err(ProtocolRejection::WriteRequirement { found: 1, .. })
+        ));
+        let full_rollback = with(&rollback, |next| {
+            next.requirements.write.remove(remaining);
+            next.requirements
+                .features
+                .insert(remaining.to_owned(), FeatureState::Compatible);
+        });
+        assert!(check_update(&current, &full_rollback, &capable_actor).unwrap());
     }
 
     #[test]

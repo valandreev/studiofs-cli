@@ -509,7 +509,7 @@ mod tests {
         let hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
         assert_eq!(
             hex,
-            "b4892a10cc5baaa989eaa7db891a85778c340e70ad49e2fef8cdcdc31809f392"
+            "f3261295118fbd878ec17853fa436034baf5f48c4308d8155bab1fd475d6eb9f"
         );
     }
 

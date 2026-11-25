@@ -231,6 +231,13 @@ that declares support for 0.2.5 (the compiled test successor of
   (`crates/studiofs-meta/src/pg_engine/janitor.rs:571`) require exact
   equality. Raising it would lock out 0.2.5 readers, so a successor must not
   raise it at Activate. From format 7 on it stays fixed (ADR 0018).
+- Policy (SFS-1007): `volume_protocol` stores the required capabilities,
+  feature states, checkpoint format and state schema, and policy epoch.
+  Provisioning writes the baseline policy with checkpoint format 4 and
+  schema 1. Schema reconciliation creates the shared tables. A legacy
+  format 5 or 6 volume receives its policy during explicit adoption in
+  SFS-1132. When `load` replaces an existing metadata state, it preserves the
+  target policy and write requirement.
 - Write requirement (SFS-1007): `metadata_state.write_requirement SMALLINT`,
   value 1 (`SHARED_WRITE_REQUIREMENT`). `BUMP_METADATA_VERSION` also requires
   `write_requirement <= $4`, where `$4` is the publisher's

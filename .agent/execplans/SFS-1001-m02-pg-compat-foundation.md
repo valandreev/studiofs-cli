@@ -13,6 +13,7 @@ The shared PostgreSQL database holds the schema that every StudioFS client and m
 - [x] SFS-1005: explicit, resumable PostgreSQL schema migration registry and CLI, extending `studiofs_schema_components` (2026-11-25; `pg_engine/migrations.rs`, `studiofs upgrade --dry-run`).
 - [ ] SFS-1006: replace the global table check with capability-scoped schema validation.
 - [x] SFS-1007: persist per-volume protocol requirements (read, write, maintenance sets) and the policy epoch (2026-11-25; `volume_protocol.rs`, `pg_engine/volume_protocol.rs`, `metadata_state.write_requirement`).
+- [x] SFS-1007 review follow-up: lock the metadata row before reading the policy, reject history conflicts atomically, preserve checkpoint format and schema, and require explicit per-volume provisioning.
 - [ ] SFS-1008: track active client sessions, capabilities and expired leases.
 
 ## Surprises & Discoveries
@@ -23,6 +24,12 @@ The shared PostgreSQL database holds the schema that every StudioFS client and m
 - Observation: re-applying the baseline DDL takes `ACCESS EXCLUSIVE` and `SHARE` table locks, so an implicit re-application in `load` waited behind an open writer transaction and the load race test timed out.
   Evidence: `dump_load_rejects_accounting_row_committed_while_load_waits` failed at its second lock wait until `ensure` stopped re-applying a verified baseline.
 
+- Observation: under READ COMMITTED, a joined policy read that waits for the metadata row lock can retain an earlier policy snapshot.
+  Evidence: `volume_protocol_waiting_update_rechecks_policy_epoch_on_live_postgres` detects the second updater waiting on the first via `pg_blocking_pids`. The expected outcome is `EpochConflict` with the winner's policy and audit row intact.
+
+- Observation: a binary that knows a retained write capability can still propose a rollback that would let 0.2.5 writers publish without that capability.
+  Evidence: the focused rollback unit test rejected the same proposal only after it checked the baseline write capabilities as well as the actor.
+
 ## Decision Log
 
 - Decision: SFS-1007 extends the `core` 1 baseline instead of registering `core` 2, and re-pins its checksum.
@@ -31,9 +38,12 @@ The shared PostgreSQL database holds the schema that every StudioFS client and m
 - Decision: the write requirement is an integer in `metadata_state` (`SHARED_WRITE_REQUIREMENT`), not a capability set; the policy record is a separate `volume_protocol` row.
   Rationale: publication already updates `metadata_state`, so `write_requirement <= $4` adds no lock or round trip (SFS-1014 preflight); comparing sets would need the policy row on every publication. `check_update` ties the two: adding a write capability must raise the integer.
   Date/Author: 2026-11-25, SFS-1007.
-- Decision: `load` keeps the target's write requirement and existing policy; it writes the baseline policy only when none exists.
-  Rationale: a load replaces volume data, not the protocol; resetting the requirement would re-admit writers a successor fenced.
-  Date/Author: 2026-11-25, SFS-1007.
+- Decision: `load` keeps the target's write requirement and existing policy when replacing metadata state. Creating metadata state for a volume provisions its baseline policy.
+  Rationale: preserving the write requirement keeps writers fenced after a load. Schema reconciliation only creates the shared policy tables. While format 6 is current, the format value alone cannot identify an eligible volume. Tests explicitly select an existing fixture. Production legacy volumes are adopted individually by SFS-1132.
+  Date/Author: 2026-11-25, SFS-1007 review.
+- Decision: lock `metadata_state` before reading the policy in a separate statement. Append history without ignoring duplicate epochs.
+  Rationale: the second statement takes a fresh READ COMMITTED snapshot after any wait. A history conflict aborts the update transaction. Initial policy and history use one SQL statement.
+  Date/Author: 2026-11-25, SFS-1007 review.
 
 - Decision: no entry point runs DDL against a verified schema. `init`/`load` refuse a differing baseline; `studiofs upgrade` reconciles it, and `--repair-schema` re-applies a verified baseline to restore dropped objects, both only while nothing is recorded above it.
   Rationale: implicit DDL blocked behind live writers, and an unconditional re-apply in `upgrade` deadlocked with concurrent writers (`snapshot_cli_test` failed 2/3 runs; 1/3 on `main`, which re-ran the batch too). Re-applying is unsafe once later steps exist, because the baseline's `CREATE OR REPLACE FUNCTION` would revert their function bodies.
@@ -77,6 +87,10 @@ From the repository root, with PostgreSQL available as described in `docs/tests.
     cargo clippy -p studiofs-meta --all-targets -- -D warnings
 
 ## Validation and Acceptance
+
+For SFS-1007, run `cargo test -p studiofs-meta --lib volume_protocol` for unit coverage, then repeat with `-- --ignored` against an explicitly configured local PostgreSQL service. The two live tests cover selected provisioning, legacy neighbors, audit conflicts, write fencing and a waiting updater. Run the `baseline_checksum_is_pinned` test after editing the unreleased baseline.
+
+SFS-1007 verification on Windows (2026-11-25) passed 94 focused metadata tests, both protocol cases and the migration registry case on PostgreSQL 18, and the CLI dump/load/discover case on PostgreSQL 18 and RustFS 1.0.4. Clippy passed for `studiofs-meta` and `studiofs`. The mounted gates remain separate.
 
 An older-binary simulation that runs DDL against a database with a newer component version is refused with a typed error and leaves the schema unchanged. A mount against a database containing an extra unknown table succeeds when no required capability names it. Two concurrent migration runs leave one consistent component version. Session rows appear for a mount and expire after their lease.
 

@@ -44,6 +44,14 @@ pub const CAP_PAYLOAD_SFEC_V1: &str = "payload.sfec.v1";
 /// Payload GC and Janitor deletion protocol of `payload_gc` schema 2.
 pub const CAP_MAINTENANCE_PAYLOAD_GC_V2: &str = "maintenance.payload_gc.v2";
 
+/// Capabilities understood by writers at the 0.2.5 write requirement.
+pub(crate) const BASELINE_WRITE_CAPABILITIES: [&str; 4] = [
+    CAP_EVENT_CODEC_V1,
+    CAP_PAYLOAD_STFS_V2,
+    CAP_PAYLOAD_STFS_V3,
+    CAP_PAYLOAD_SFEC_V1,
+];
+
 /// Capability namespaces that are never ignorable: data in them changes what
 /// a reader serves, so an unknown name is refused even when declared optional.
 const SAFETY_CRITICAL_NAMESPACES: &[&str] = &["event.", "payload.", "checkpoint."];
@@ -100,12 +108,7 @@ impl ClientCapabilities {
                 CAP_PAYLOAD_STFS_V3,
                 CAP_PAYLOAD_SFEC_V1,
             ]),
-            write: BTreeSet::from([
-                CAP_EVENT_CODEC_V1,
-                CAP_PAYLOAD_STFS_V2,
-                CAP_PAYLOAD_STFS_V3,
-                CAP_PAYLOAD_SFEC_V1,
-            ]),
+            write: BTreeSet::from(BASELINE_WRITE_CAPABILITIES),
             maintain: BTreeSet::from([CAP_MAINTENANCE_PAYLOAD_GC_V2]),
             schema_components: vec![POSTGRES_PAYLOAD_GC_SCHEMA],
             checkpoint_format: SERVING_CHECKPOINT_FORMAT,
@@ -115,8 +118,9 @@ impl ClientCapabilities {
     }
 }
 
-/// Latest serving checkpoint descriptor of a volume.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Serving checkpoint format and state schema of a volume.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CheckpointDescriptor {
     /// Serving checkpoint byte format.
     pub format: u16,
@@ -145,6 +149,13 @@ pub struct VolumeRequirements {
     pub checkpoint: Option<CheckpointDescriptor>,
 }
 
+impl CheckpointDescriptor {
+    pub(crate) const BASELINE: Self = Self {
+        format: SERVING_CHECKPOINT_FORMAT.current,
+        schema: SERVING_CHECKPOINT_SCHEMA.current,
+    };
+}
+
 impl VolumeRequirements {
     /// Requirements of a volume adopted into the 0.2.5 baseline.
     #[must_use]
@@ -165,10 +176,7 @@ impl VolumeRequirements {
                 POSTGRES_PAYLOAD_GC_SCHEMA.name.to_owned(),
                 POSTGRES_PAYLOAD_GC_SCHEMA.current,
             )]),
-            checkpoint: Some(CheckpointDescriptor {
-                format: SERVING_CHECKPOINT_FORMAT.current,
-                schema: SERVING_CHECKPOINT_SCHEMA.current,
-            }),
+            checkpoint: Some(CheckpointDescriptor::BASELINE),
         }
     }
 }

@@ -1,10 +1,10 @@
 //! PostgreSQL storage of the per-volume protocol policy (SFS-1007).
 //!
-//! The policy record is `volume_protocol` (epoch plus required sets and
-//! feature states); its write requirement lives in `metadata_state`, the row
-//! `BUMP_METADATA_VERSION` already updates, so publication checks it without
-//! an extra lock or round trip. Every change locks that row first, which
-//! serializes it with publication, and appends `volume_protocol_history`.
+//! The policy record is `volume_protocol` (epoch, required sets, checkpoint
+//! identity and feature states). Its write requirement lives in the
+//! `metadata_state` row that `BUMP_METADATA_VERSION` already updates.
+//! Publication checks it in the same UPDATE. A policy update locks that row to serialize
+//! with publication and appends to `volume_protocol_history`.
 
 use tokio_postgres::GenericClient;
 
@@ -21,8 +21,7 @@ const SELECT_PROTOCOL: &str = "
 
 const INSERT_HISTORY: &str = "
     INSERT INTO volume_protocol_history (vol, policy_epoch, write_requirement, requirements, changed_by)
-    VALUES ($1, $2, $3, $4::TEXT::JSONB, $5)
-    ON CONFLICT (vol, policy_epoch) DO NOTHING";
+    VALUES ($1, $2, $3, $4::TEXT::JSONB, $5)";
 
 fn epoch_i64(epoch: u64) -> MetaResult<i64> {
     i64::try_from(epoch).map_err(|_| MetaError::Storage("volume policy epoch overflow".into()))
@@ -52,49 +51,21 @@ where
     let requirements = baseline.encode_requirements()?;
     let epoch = epoch_i64(baseline.epoch)?;
     let write_requirement = requirement_i16(baseline.write_requirement)?;
-    let inserted = client
+    client
         .execute(
-            "INSERT INTO volume_protocol (vol, policy_epoch, requirements, updated_by)
-             VALUES ($1, $2, $3::TEXT::JSONB, $4) ON CONFLICT (vol) DO NOTHING",
-            &[&volume, &epoch, &requirements, &actor],
+            "WITH inserted AS (
+                INSERT INTO volume_protocol (vol, policy_epoch, requirements, updated_by)
+                VALUES ($1, $2, $3::TEXT::JSONB, $4) ON CONFLICT (vol) DO NOTHING
+                RETURNING vol, policy_epoch, requirements, updated_by
+            )
+            INSERT INTO volume_protocol_history
+                (vol, policy_epoch, write_requirement, requirements, changed_by)
+            SELECT vol, policy_epoch, $5, requirements, updated_by FROM inserted",
+            &[&volume, &epoch, &requirements, &actor, &write_requirement],
         )
         .await
         .map_err(|error| PgMetaEngine::classify_pg_error("insert volume protocol", error))?;
-    if inserted == 1 {
-        client
-            .execute(
-                INSERT_HISTORY,
-                &[&volume, &epoch, &write_requirement, &requirements, &actor],
-            )
-            .await
-            .map_err(|error| PgMetaEngine::classify_pg_error("record volume protocol", error))?;
-    }
     Ok(())
-}
-
-async fn select_protocol<C>(client: &C, volume: i64, lock: bool) -> MetaResult<VolumeProtocol>
-where
-    C: GenericClient + Sync,
-{
-    let query = if lock {
-        format!("{SELECT_PROTOCOL} FOR UPDATE OF m")
-    } else {
-        SELECT_PROTOCOL.to_owned()
-    };
-    let row = client
-        .query_opt(&query, &[&volume])
-        .await
-        .map_err(|error| PgMetaEngine::classify_pg_error("read volume protocol", error))?;
-    let Some(row) = row else {
-        return Err(ProtocolRejection::Missing.into());
-    };
-    let (Some(epoch), Some(requirements)) = (
-        row.get::<_, Option<i64>>(0),
-        row.get::<_, Option<String>>(2),
-    ) else {
-        return Err(ProtocolRejection::Missing.into());
-    };
-    VolumeProtocol::decode(epoch, row.get(1), &requirements)
 }
 
 /// Reads a volume's policy.
@@ -107,7 +78,20 @@ pub async fn read_volume_protocol<C>(client: &C, volume: i64) -> MetaResult<Volu
 where
     C: GenericClient + Sync,
 {
-    select_protocol(client, volume, false).await
+    let row = client
+        .query_opt(SELECT_PROTOCOL, &[&volume])
+        .await
+        .map_err(|error| PgMetaEngine::classify_pg_error("read volume protocol", error))?;
+    let Some(row) = row else {
+        return Err(ProtocolRejection::Missing.into());
+    };
+    let (Some(epoch), Some(requirements)) = (
+        row.get::<_, Option<i64>>(0),
+        row.get::<_, Option<String>>(2),
+    ) else {
+        return Err(ProtocolRejection::Missing.into());
+    };
+    VolumeProtocol::decode(epoch, row.get(1), &requirements)
 }
 
 /// Replaces the policy with `proposed` (its `epoch` is ignored) when the
@@ -130,7 +114,32 @@ pub async fn update_volume_protocol(
     actor: &ClientCapabilities,
     actor_id: &str,
 ) -> MetaResult<VolumeProtocol> {
-    let current = select_protocol(tx, volume, true).await?;
+    let failed = |error| PgMetaEngine::classify_pg_error("update volume protocol", error);
+    // Use the same lock order as load: its volume lock conflicts with the
+    // foreign-key lock needed by the history insert.
+    let volume_row = tx
+        .query_opt(
+            "SELECT vol FROM volumes WHERE vol = $1 FOR KEY SHARE",
+            &[&volume],
+        )
+        .await
+        .map_err(failed)?;
+    if volume_row.is_none() {
+        return Err(ProtocolRejection::Missing.into());
+    }
+    let state_row = tx
+        .query_opt(
+            "SELECT vol FROM metadata_state WHERE vol = $1 FOR UPDATE",
+            &[&volume],
+        )
+        .await
+        .map_err(failed)?;
+    if state_row.is_none() {
+        return Err(ProtocolRejection::Missing.into());
+    }
+    // Under READ COMMITTED a statement that waited for a row lock can still
+    // have a stale snapshot of other tables. Read the policy in a new statement.
+    let current = read_volume_protocol(tx, volume).await?;
     let same = current.write_requirement == proposed.write_requirement
         && current.requirements == proposed.requirements;
     if current.epoch != expected_epoch {
@@ -156,7 +165,6 @@ pub async fn update_volume_protocol(
     let epoch = epoch_i64(next.epoch)?;
     let write_requirement = requirement_i16(next.write_requirement)?;
     let requirements = next.encode_requirements()?;
-    let failed = |error| PgMetaEngine::classify_pg_error("update volume protocol", error);
     tx.execute(
         "UPDATE volume_protocol SET policy_epoch = $2, requirements = $3::TEXT::JSONB,
                 updated_by = $4, updated_at = now() WHERE vol = $1",
