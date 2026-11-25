@@ -74,10 +74,10 @@ impl SnapshotSourceError {
     }
 
     fn local(error: MetaError) -> Self {
-        if matches!(error, MetaError::Serialization(_)) {
-            Self::Permanent
-        } else {
-            Self::Retryable
+        match error {
+            MetaError::UpgradeRequired { .. } => Self::UpgradeRequired,
+            MetaError::Serialization(_) => Self::Permanent,
+            _ => Self::Retryable,
         }
     }
 
@@ -1013,6 +1013,18 @@ mod tests {
             decode_snapshot_source_format_info(&serde_json::to_vec(&json).unwrap()).unwrap_err();
         assert_eq!(
             error.into_port_error(),
+            SnapshotPortError::permanent(
+                "upgrade_required",
+                "snapshot source requires a newer StudioFS client",
+            ),
+        );
+    }
+
+    #[test]
+    fn snapshot_source_local_replay_preserves_upgrade_required() {
+        let error = crate::events::decode_event(b"SFS-EVT\x02\x02\x2a").unwrap_err();
+        assert_eq!(
+            SnapshotSourceError::local(error).into_port_error(),
             SnapshotPortError::permanent(
                 "upgrade_required",
                 "snapshot source requires a newer StudioFS client",

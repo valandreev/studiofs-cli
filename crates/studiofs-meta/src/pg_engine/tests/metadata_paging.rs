@@ -487,6 +487,80 @@ fn pg_foreign_event_decode_error_identifies_the_event_log_row() {
 
 #[test]
 #[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
+fn pg_unsupported_event_stops_replay_before_durable_cursor_advance() {
+    use crate::engine::{MetaError, MetaInodes, UpgradeRequiredReason};
+    use crate::events::UnsupportedEventReason;
+    use crate::trash::{MetaVolumeSettings, VolumeSettings};
+
+    let dsn = pg_dsn().expect("STUDIOFS_TEST_PG_DSN is required for this ignored test");
+    let volume = PgTestVolume::new(&dsn, "pg-unsupported-event-replay");
+    let dir = studiofs_test_support::workspace_target_tempdir("test-");
+    let db = dir.path().join("meta.redb");
+    seed_local(&db, &volume.format_info());
+    let engine = PgMetaEngine::open_with_options(
+        &db,
+        PgOpenOptions {
+            background_poll: false,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let settings = VolumeSettings {
+        revision: 1,
+        ..Default::default()
+    };
+    let known = encode_event(&MetaEvent::SetVolumeSettings { settings }).unwrap();
+    let unknown = b"SFS-EVT\x01\xff";
+    run_async(async {
+        let (client, connection) = tokio_postgres::connect(&dsn, tokio_postgres::NoTls).await.unwrap();
+        let connection_task = tokio::spawn(connection);
+        client.execute(
+            "INSERT INTO event_log (vol, batch_version, event_type, event_payload, client_id)              VALUES ($1, 1, 'set_volume_settings', $2, 'remote'),                     ($1, 2, 'set_volume_settings', $3, 'remote')",
+            &[&volume.volume_id, &known, &&unknown[..]],
+        ).await.unwrap();
+        client.execute("UPDATE metadata_state SET version=2 WHERE vol=$1", &[&volume.volume_id]).await.unwrap();
+        connection_task.abort();
+        let _ = connection_task.await;
+        Ok(())
+    })
+    .unwrap();
+
+    let apply = |target| engine.pull_foreign_events_locked_to_target(None, target, None);
+    let cursor = || {
+        engine
+            .local
+            .get_counter(crate::pg_engine::LOCAL_PG_VERSION_COUNTER)
+            .unwrap()
+    };
+    let unsupported = |result| {
+        matches!(
+            result,
+            Err(MetaError::UpgradeRequired {
+                reason: UpgradeRequiredReason::UnsupportedEvent(UnsupportedEventReason::Tag(255))
+            })
+        )
+    };
+
+    assert!(unsupported(apply(2)));
+    assert_eq!(cursor(), 0);
+    assert_eq!(
+        engine.local.volume_settings().unwrap(),
+        VolumeSettings::default()
+    );
+
+    assert!(apply(1).unwrap(), "valid prefix applies when fetched alone");
+    assert_eq!(cursor(), 1);
+    assert_eq!(engine.local.volume_settings().unwrap(), settings);
+    assert!(
+        unsupported(apply(2)),
+        "retry still refuses the unsupported batch"
+    );
+    assert_eq!(cursor(), 1);
+    assert_eq!(engine.local_version.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+#[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
 fn pg_producer_splits_projected_batch_before_assigning_versions() {
     let dsn = pg_dsn().expect("STUDIOFS_TEST_PG_DSN is required for this ignored test");
     let _bytes = set_test_env(PG_SYNC_MAX_RESPONSE_BYTES_PER_PAGE_ENV_VAR, "128");

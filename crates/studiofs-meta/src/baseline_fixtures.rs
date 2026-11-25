@@ -551,6 +551,7 @@ fn baseline_events_decode_one_per_tag() {
         assert_eq!(bytes[7], 1, "{file}: wire version");
         assert_eq!(bytes[8], tag, "{file}: kind tag");
         assert_eq!(decode_event(&bytes).expect(file), expected, "{file}");
+        assert_eq!(encode_event(&expected).expect(file), bytes, "{file}");
         // RemoveLocalEntry is journal-only and never published to PostgreSQL.
         if tag != 18 {
             assert_eq!(

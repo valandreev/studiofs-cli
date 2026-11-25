@@ -144,9 +144,8 @@ async fn check_expiry_revision(
 /// The shared settings (absent settings mean the disabled default).
 fn shared_settings(bytes: Option<&[u8]>) -> MetaResult<VolumeSettings> {
     Ok(bytes
-        .map(serde_json::from_slice::<VolumeSettings>)
-        .transpose()
-        .map_err(|error| MetaError::Serialization(error.to_string()))?
+        .map(VolumeSettings::decode_json)
+        .transpose()?
         .unwrap_or_default())
 }
 

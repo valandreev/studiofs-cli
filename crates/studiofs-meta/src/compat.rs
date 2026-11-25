@@ -107,6 +107,8 @@ impl ClientCapabilities {
                 CAP_PAYLOAD_STFS_V2,
                 CAP_PAYLOAD_STFS_V3,
                 CAP_PAYLOAD_SFEC_V1,
+                #[cfg(feature = "test-successor")]
+                crate::test_successor::SET_USER_XATTR_CAPABILITY,
             ]),
             write: BTreeSet::from(BASELINE_WRITE_CAPABILITIES),
             maintain: BTreeSet::from([CAP_MAINTENANCE_PAYLOAD_GC_V2]),

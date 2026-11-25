@@ -317,9 +317,8 @@ async fn update_volume_settings_in_tx(
     let bytes: Option<Vec<u8>> = row.get(1);
     let mut settings = bytes
         .as_deref()
-        .map(serde_json::from_slice::<VolumeSettings>)
-        .transpose()
-        .map_err(|error| MetaError::Serialization(error.to_string()))?
+        .map(VolumeSettings::decode_json)
+        .transpose()?
         .unwrap_or_default();
     if expected_revision.is_some_and(|expected| settings.revision != expected) {
         return Ok(None);
