@@ -141,9 +141,9 @@ most three object-store reads.
 
 ### Compatibility
 
-Clients older than 0.2.5 are not supported. STFS v3, 64 KiB SFEC frames, and the
-`compression` setting are part of the 0.2.5 compatibility baseline (SFS-1001,
-SFS-1002), so they need no separate capability. A pre-0.2.5 reader rejects v3
+Clients older than 0.2.4 are not supported. STFS v3, 64 KiB SFEC frames, and the
+`compression` setting are part of the 0.2.4 compatibility baseline (SFS-1001,
+SFS-1002), so they need no separate capability. A pre-0.2.4 reader rejects v3
 through its version check.
 
 ### Accounting
