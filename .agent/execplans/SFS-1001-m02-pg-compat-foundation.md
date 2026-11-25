@@ -14,7 +14,8 @@ The shared PostgreSQL database holds the schema that every StudioFS client and m
 - [ ] SFS-1006: replace the global table check with capability-scoped schema validation.
 - [x] SFS-1007: persist per-volume protocol requirements (read, write, maintenance sets) and the policy epoch (2026-11-25; `volume_protocol.rs`, `pg_engine/volume_protocol.rs`, `metadata_state.write_requirement`).
 - [x] SFS-1007 review follow-up: lock the metadata row before reading the policy, reject history conflicts atomically, preserve checkpoint format and schema, and require explicit per-volume provisioning.
-- [ ] SFS-1008: track active client sessions, capabilities and expired leases.
+- [x] SFS-1008: register per-volume client session leases, renew and expire them, and stamp publication transactions (2026-11-25).
+- [x] SFS-1008 review follow-up: validate `policy_epoch` against `ClientCapabilities` per role (Mount vs Maintenance), integrate `client_sessions` into startup schema validation and `--repair-schema`, eliminate unfenced `None` updates and close/ABA resurrection races, release mutex around PG I/O with bounded retry/recovery, stamp `upgrade_shared_format5` and `dump_load` pre-delete, document `event_log_pruning` as non-publication, delete short-lived `PublicationSession` rows on finish, and add bounded expired-session retention with index (2026-11-25).
 
 ## Surprises & Discoveries
 
@@ -30,7 +31,17 @@ The shared PostgreSQL database holds the schema that every StudioFS client and m
 - Observation: a binary that knows a retained write capability can still propose a rollback that would let 0.2.5 writers publish without that capability.
   Evidence: the focused rollback unit test rejected the same proposal only after it checked the baseline write capabilities as well as the actor.
 
+- Observation: settings updates and provisioning publish shared metadata outside the mounted event batch function.
+  Evidence: the session stamp is used by event batches, checkpoint publication, mounted and CLI settings updates, init, and dump load.
+
 ## Decision Log
+
+- Decision: register the session schema as additive component `client_sessions` version 1. The core checksum stays stable. Existing deployments apply it with `studiofs upgrade NAME`. A failed registration leaves local reads available and publication requires an active session.
+  Date/Author: 2026-11-25, SFS-1008.
+- Decision: each process instance owns a random session ID and owner nonce. PostgreSQL assigns 60-second leases and the client attempts renewal every 15 seconds. Reacquiring an expired lease advances its generation. Release and publication compare the owner and generation. Janitor renews its session while it owns the global advisory lock. Provisioning and settings commands register and close a session in their publication transaction.
+  Date/Author: 2026-11-25, SFS-1008.
+- Decision: `read_client_sessions` classifies the active and inactive rows of one volume using one SQL snapshot and one server clock observation. Heartbeats validate `volume_protocol` against `ClientCapabilities::current()` per role (`Mount` vs `Maintenance`) before advancing `client_sessions.policy_epoch`, keeping epoch zero for legacy volumes awaiting policy adoption and refusing to stamp stale or unvalidated epochs. Initial registration is INSERT-only (`ON CONFLICT DO NOTHING`), renewals require an exact `fencing_token`, and clean shutdown writes a closed owner tombstone so delayed SQL cannot resurrect a closed session. Short-lived `PublicationSession` rows are deleted on `finish()`, while long-lived inactive rows are pruned in bounded batches past a 24-hour retention window using `idx_client_sessions_vol_lease_expires_at`. `event_log` pruning is non-publication retention maintenance and intentionally does not stamp a publication session; SFS-1014 scopes publication triggers accordingly.
+  Date/Author: 2026-11-25, SFS-1008 review follow-up.
 
 - Decision: SFS-1007 extends the `core` 1 baseline instead of registering `core` 2, and re-pins its checksum.
   Rationale: 0.2.5 is unreleased and ships the policy, so it belongs to its baseline. A `core` 2 would leave every new database above the baseline, where `--repair-schema` and baseline reconciliation never apply. Development databases recorded with the old checksum get `RepairRequired` until `studiofs upgrade` reconciles them.
@@ -64,7 +75,9 @@ The shared PostgreSQL database holds the schema that every StudioFS client and m
 
 ## Outcomes & Retrospective
 
-Not started.
+SFS-1008 adds plain session data in `crates/studiofs-meta/src/client_sessions.rs` and its PostgreSQL adapter in `crates/studiofs-meta/src/pg_engine/client_sessions.rs`. Each publication transaction sets `studiofs.session_id`, `studiofs.policy_epoch`, and `studiofs.session_fencing_token` before writing. Clean close expires the last confirmed lease when PostgreSQL is reachable within the shutdown budget. Lease expiry covers an interrupted close or a lost process. The registry persists inactive rows for later inspection.
+
+Run `cargo test -p studiofs-meta --lib client_session_leases -- --ignored --nocapture --test-threads=1` with `STUDIOFS_TEST_PG_DSN` pointing at a disposable PostgreSQL server. Four tests passed on disposable Docker PostgreSQL 16. The tests use isolated schemas and unique volumes and cover concurrent engine registration, deferred startup, renewal, clean close, Janitor registration and release, forced server-side expiry, generation fencing, failed registration with local reads, and transaction-local publication context. The focused migration registry, volume policy, and checkpoint publication regressions also passed. WinFSP, FUSE, S3, and cross-release deployment need separate validation.
 
 ## Context and Orientation
 

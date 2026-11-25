@@ -585,7 +585,7 @@ impl PgMetaEngine {
 
         let client_id = self.current_client_id()?;
         let retained_digest = super::retained::publication_digest(&client_id, &events)?;
-        let batches = Self::split_projected_event_batches(
+        let mut batches = Self::split_projected_event_batches(
             events,
             &client_id,
             self.sync_max_response_bytes_per_page,
@@ -595,194 +595,237 @@ impl PgMetaEngine {
         // make the published journal durable first. A recovered image then
         // holds every event peers can see and stays this client's authority.
         self.local.sync_local_metadata()?;
-        let command_pool = self.command_pool.clone();
-        let volume_id = self.volume_id;
-        let now_ms = Self::now_millis();
+        // Local rejections (oversized event, failed fence) must win before PostgreSQL is contacted.
+        let mut session = match self.acquire_publication_session() {
+            Ok(session) => session,
+            Err(error) => return self.record_remote_operation_result(Err(error)),
+        };
         let expected_metadata_format_version = i16::try_from(SHARED_VOLUME_FORMAT.current)
             .map_err(|_| {
                 MetaError::Storage(
                     "metadata format version exceeds PostgreSQL SMALLINT".to_string(),
                 )
             })?;
-        let command_timeout = self.command_timeout;
 
-        let result = self.run_async(async move {
-            Self::with_postgres_client_timeout(
-                command_pool,
-                command_timeout,
-                "push event log batch",
-                move |client| Box::pin(async move {
-                    let tx = client
-                        .transaction()
-                        .await
-                        .map_err(|e| Self::classify_pg_error("postgres begin tx failed", e))?;
+        let mut attempt = 0_u8;
+        let result = loop {
+            let command_pool = self.command_pool.clone();
+            let volume_id = self.volume_id;
+            let now_ms = Self::now_millis();
+            let command_timeout = self.command_timeout;
+            let current_session = session.clone();
+            let current_client_id = client_id.clone();
+            let current_retained_digest = retained_digest.clone();
+            let current_batches = batches;
+            let outcome = self.run_async(async move {
+                Self::with_postgres_client_timeout(
+                    command_pool,
+                    command_timeout,
+                    "push event log batch",
+                    move |client| {
+                        Box::pin(async move {
+                            let tx = client
+                                .transaction()
+                                .await
+                                .map_err(|e| Self::classify_pg_error("postgres begin tx failed", e))?;
 
-                    let mut last_batch_version = None;
-                    let mut retained_locked = std::collections::HashMap::new();
-                    let mut last_observation = None;
-                    if let Some(digest) = &retained_digest {
-                        // Serialize receipt lookup with publication. A lost response
-                        // retries the whole transaction without replaying namespace data.
-                        let row = tx.query_one(
-                            &format!("{} FOR UPDATE", sql::SELECT_CHECKPOINT_FRESHNESS),
-                            &[&volume_id],
-                        ).await.map_err(|e| Self::classify_pg_error("lock retained publication", e))?;
-                        crate::ensure_supported_pg_sync_format_version(row.get::<_, Option<i16>>(6))?;
-                        if let Some(receipt) = tx.query_opt(
-                            "SELECT version FROM trash_publication_receipts WHERE vol=$1 AND digest=$2",
-                            &[&volume_id, digest],
-                        ).await.map_err(|e| Self::classify_pg_error("read retained publication receipt", e))? {
-                            let observation = checkpoint_freshness_observation_from_row(&row)?;
-                            let version = receipt.get::<_, i64>(0);
-                            tx.commit().await.map_err(|e| Self::classify_pg_error("commit retained publication retry", e))?;
-                            return Ok((version, observation));
-                        }
-                    }
-                    for batch in batches {
-                        let batch_version_row = tx
-                            .query_opt(
-                                sql::BUMP_METADATA_VERSION,
-                                &[
-                                    &volume_id,
-                                    &expected_metadata_format_version,
-                                    &batch.payload_bytes,
-                                    &super::volume_protocol::PUBLICATION_WRITE_REQUIREMENT,
-                                ],
-                            )
-                            .await
-                            .map_err(|e| {
-                                Self::classify_pg_error(
-                                    "postgres metadata_state bump failed",
-                                    e,
-                                )
-                            })?;
-                        let Some(batch_version_row) = batch_version_row else {
-                            return Err(super::volume_protocol::refused_publication(&tx, volume_id).await);
-                        };
-                        let batch_version = row_i64(
-                            &batch_version_row,
-                            0,
-                            "postgres metadata batch version",
-                        )?;
-                        let batch_observation =
-                            checkpoint_freshness_observation_from_row(&batch_version_row)?;
-                        last_observation = Some(batch_observation);
-
-                        super::retained::apply_retained_authority(&tx, volume_id, &batch.events, true, &mut retained_locked).await?;
-
-                        for (event_chunk, payload_chunk) in batch
-                            .events
-                            .chunks(PG_EVENT_INSERT_CHUNK_SIZE)
-                            .zip(batch.payloads.chunks(PG_EVENT_INSERT_CHUNK_SIZE))
-                        {
-                            let event_types: Vec<&str> =
-                                event_chunk.iter().map(|event| event.kind()).collect();
-                            let payloads = payload_chunk;
-                            tx.execute(
-                                sql::INSERT_EVENT_LOG_BATCH,
-                                &[
-                                    &volume_id,
-                                    &batch_version,
-                                    &client_id,
-                                    &now_ms,
-                                    &event_types,
-                                    &payloads,
-                                ],
-                            )
-                            .await
-                            .map_err(|e| {
-                                Self::classify_pg_error(
-                                    "postgres event_log batch insert failed",
-                                    e,
-                                )
-                            })?;
-                        }
-
-                        for event in &batch.events {
-                            match event {
-                                MetaEvent::SetAclRule {
-                                    ino,
-                                    principal,
-                                    access_level,
-                                } => {
-                                    tx.execute(
-                                        r#"
-                                        INSERT INTO acl_rules (vol, ino, principal, access_level, updated_at)
-                                        VALUES ($1, $2, $3, $4, now())
-                                        ON CONFLICT (vol, ino, principal) DO UPDATE
-                                        SET access_level = EXCLUDED.access_level,
-                                            updated_at = now()
-                                        "#,
-                                        &[&volume_id, &(*ino as i64), principal, &(*access_level as i16)],
-                                    )
-                                    .await
-                                    .map_err(|e| {
-                                        Self::classify_pg_error(
-                                            "postgres acl_rules upsert failed",
-                                            e,
-                                        )
-                                    })?;
+                            match current_session.stamp_checked(&tx, volume_id).await {
+                                Ok(()) => {}
+                                Err(error @ (super::client_sessions::StampError::SessionInactive
+                                    | super::client_sessions::StampError::PolicyStale)) => {
+                                    drop(tx);
+                                    return Ok(Err((error, current_batches)));
                                 }
-                                MetaEvent::RemoveAclRule { ino, principal } => {
-                                    tx.execute(
-                                        "DELETE FROM acl_rules WHERE vol=$1 AND ino=$2 AND principal=$3",
-                                        &[&volume_id, &(*ino as i64), principal],
-                                    )
-                                    .await
-                                    .map_err(|e| {
-                                        Self::classify_pg_error(
-                                            "postgres acl_rules delete failed",
-                                            e,
-                                        )
-                                    })?;
+                                Err(super::client_sessions::StampError::Other(error)) => {
+                                    return Err(error);
                                 }
-                                _ => {}
                             }
+                            let mut last_batch_version = None;
+                            let mut retained_locked = std::collections::HashMap::new();
+                            let mut last_observation = None;
+                            if let Some(digest) = &current_retained_digest {
+                                // Serialize receipt lookup with publication. A lost response
+                                // retries the whole transaction without replaying namespace data.
+                                let row = tx.query_one(
+                                    &format!("{} FOR UPDATE", sql::SELECT_CHECKPOINT_FRESHNESS),
+                                    &[&volume_id],
+                                ).await.map_err(|e| Self::classify_pg_error("lock retained publication", e))?;
+                                crate::ensure_supported_pg_sync_format_version(row.get::<_, Option<i16>>(6))?;
+                                if let Some(receipt) = tx.query_opt(
+                                    "SELECT version FROM trash_publication_receipts WHERE vol=$1 AND digest=$2",
+                                    &[&volume_id, digest],
+                                ).await.map_err(|e| Self::classify_pg_error("read retained publication receipt", e))? {
+                                    let observation = checkpoint_freshness_observation_from_row(&row)?;
+                                    let version = receipt.get::<_, i64>(0);
+                                    tx.commit().await.map_err(|e| Self::classify_pg_error("commit retained publication retry", e))?;
+                                    return Ok(Ok((version, observation)));
+                                }
+                            }
+                            for batch in current_batches {
+                                let batch_version_row = tx
+                                    .query_opt(
+                                        sql::BUMP_METADATA_VERSION,
+                                        &[
+                                            &volume_id,
+                                            &expected_metadata_format_version,
+                                            &batch.payload_bytes,
+                                            &super::volume_protocol::PUBLICATION_WRITE_REQUIREMENT,
+                                        ],
+                                    )
+                                    .await
+                                    .map_err(|e| {
+                                        Self::classify_pg_error(
+                                            "postgres metadata_state bump failed",
+                                            e,
+                                        )
+                                    })?;
+                                let Some(batch_version_row) = batch_version_row else {
+                                    return Err(super::volume_protocol::refused_publication(&tx, volume_id).await);
+                                };
+                                let batch_version = row_i64(
+                                    &batch_version_row,
+                                    0,
+                                    "postgres metadata batch version",
+                                )?;
+                                let batch_observation =
+                                    checkpoint_freshness_observation_from_row(&batch_version_row)?;
+                                last_observation = Some(batch_observation);
+
+                                super::retained::apply_retained_authority(&tx, volume_id, &batch.events, true, &mut retained_locked).await?;
+
+                                for (event_chunk, payload_chunk) in batch
+                                    .events
+                                    .chunks(PG_EVENT_INSERT_CHUNK_SIZE)
+                                    .zip(batch.payloads.chunks(PG_EVENT_INSERT_CHUNK_SIZE))
+                                {
+                                    let event_types: Vec<&str> =
+                                        event_chunk.iter().map(|event| event.kind()).collect();
+                                    let payloads = payload_chunk;
+                                    tx.execute(
+                                        sql::INSERT_EVENT_LOG_BATCH,
+                                        &[
+                                            &volume_id,
+                                            &batch_version,
+                                            &current_client_id,
+                                            &now_ms,
+                                            &event_types,
+                                            &payloads,
+                                        ],
+                                    )
+                                    .await
+                                    .map_err(|e| {
+                                        Self::classify_pg_error(
+                                            "postgres event_log batch insert failed",
+                                            e,
+                                        )
+                                    })?;
+                                }
+
+                                for event in &batch.events {
+                                    match event {
+                                        MetaEvent::SetAclRule {
+                                            ino,
+                                            principal,
+                                            access_level,
+                                        } => {
+                                            tx.execute(
+                                                r#"
+                                                INSERT INTO acl_rules (vol, ino, principal, access_level, updated_at)
+                                                VALUES ($1, $2, $3, $4, now())
+                                                ON CONFLICT (vol, ino, principal) DO UPDATE
+                                                SET access_level = EXCLUDED.access_level,
+                                                    updated_at = now()
+                                                "#,
+                                                &[&volume_id, &(*ino as i64), principal, &(*access_level as i16)],
+                                            )
+                                            .await
+                                            .map_err(|e| {
+                                                Self::classify_pg_error(
+                                                    "postgres acl_rules upsert failed",
+                                                    e,
+                                                )
+                                            })?;
+                                        }
+                                        MetaEvent::RemoveAclRule { ino, principal } => {
+                                            tx.execute(
+                                                "DELETE FROM acl_rules WHERE vol=$1 AND ino=$2 AND principal=$3",
+                                                &[&volume_id, &(*ino as i64), principal],
+                                            )
+                                            .await
+                                            .map_err(|e| {
+                                                Self::classify_pg_error(
+                                                    "postgres acl_rules delete failed",
+                                                    e,
+                                                )
+                                            })?;
+                                        }
+                                        _ => {}
+                                    }
+                                }
+
+                                super::snapshot_reachability::apply_object_lifetime_changes(
+                                    &tx,
+                                    volume_id,
+                                    batch_version,
+                                    &batch.events,
+                                )
+                                .await?;
+                                last_batch_version = Some(batch_version);
+                            }
+
+                            let last_batch_version = last_batch_version.ok_or_else(|| {
+                                MetaError::Storage("encoded event batches unexpectedly empty".to_string())
+                            })?;
+
+                            let channel = Self::metadata_notify_channel(volume_id);
+                            if let Some(digest) = &current_retained_digest {
+                                tx.execute(
+                                    "INSERT INTO trash_publication_receipts(vol,digest,version) VALUES($1,$2,$3)",
+                                    &[&volume_id, digest, &last_batch_version],
+                                ).await.map_err(|e| Self::classify_pg_error("record retained publication receipt", e))?;
+                            }
+                            let _ = tx
+                                .execute(
+                                    "SELECT pg_notify($1, $2)",
+                                    &[&channel, &last_batch_version.to_string()],
+                                )
+                                .await;
+
+                            let observation = last_observation.ok_or_else(|| {
+                                MetaError::Storage(
+                                    "metadata publication did not return checkpoint freshness state"
+                                        .to_string(),
+                                )
+                            })?;
+
+                            tx.commit()
+                                .await
+                                .map_err(|e| Self::classify_pg_error("postgres commit failed", e))?;
+                            Ok(Ok((last_batch_version, observation)))
+                        })
+                    },
+                )
+                .await
+            });
+            match outcome {
+                Ok(Ok(done)) => break Ok(done),
+                Ok(Err((stamp_error, returned_batches))) => {
+                    if attempt == 0 {
+                        attempt += 1;
+                        batches = returned_batches;
+                        match self.force_refresh_publication_session(&session) {
+                            Ok(refreshed) => {
+                                session = refreshed;
+                                continue;
+                            }
+                            Err(error) => break Err(error),
                         }
-
-                        super::snapshot_reachability::apply_object_lifetime_changes(
-                            &tx,
-                            volume_id,
-                            batch_version,
-                            &batch.events,
-                        )
-                        .await?;
-                        last_batch_version = Some(batch_version);
                     }
-
-                    let last_batch_version = last_batch_version.ok_or_else(|| {
-                        MetaError::Storage("encoded event batches unexpectedly empty".to_string())
-                    })?;
-
-                    let channel = Self::metadata_notify_channel(volume_id);
-                    if let Some(digest) = &retained_digest {
-                        tx.execute(
-                            "INSERT INTO trash_publication_receipts(vol,digest,version) VALUES($1,$2,$3)",
-                            &[&volume_id, digest, &last_batch_version],
-                        ).await.map_err(|e| Self::classify_pg_error("record retained publication receipt", e))?;
-                    }
-                    let _ = tx
-                        .execute(
-                            "SELECT pg_notify($1, $2)",
-                            &[&channel, &last_batch_version.to_string()],
-                        )
-                        .await;
-
-                    let observation = last_observation.ok_or_else(|| {
-                        MetaError::Storage(
-                            "metadata publication did not return checkpoint freshness state"
-                                .to_string(),
-                        )
-                    })?;
-
-                    tx.commit()
-                        .await
-                        .map_err(|e| Self::classify_pg_error("postgres commit failed", e))?;
-                    Ok((last_batch_version, observation))
-                }),
-            )
-            .await
-        });
+                    break Err(stamp_error.into_meta_error());
+                }
+                Err(error) => break Err(error),
+            }
+        };
         let result = self.record_remote_operation_result(result);
         if let Ok((_, observation)) = &result {
             self.record_checkpoint_freshness_observation(*observation);

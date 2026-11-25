@@ -1220,7 +1220,8 @@ fn janitor_refuses_missing_interrupted_drifted_or_unsupported_gc_schema() {
     let dsn = pg_dsn().expect("STUDIOFS_TEST_PG_DSN is required for this explicit test");
     let schema = IsolatedPgSchema::new(&dsn);
     let isolated_dsn = schema.dsn.clone();
-    // A volume row is not needed: only the advisory lock and schema probe run.
+    // The janitor lock registers a maintenance client session, which needs the
+    // session table and a volume row; both are created after first deployment.
     let volume_id = i64::from(rand::random::<u32>()) + 1_000_000_000;
 
     let sql = |statement: String| {
@@ -1273,10 +1274,21 @@ fn janitor_refuses_missing_interrupted_drifted_or_unsupported_gc_schema() {
         ),
         other => panic!("expected schema refusal containing {reason:?}, got {other:?}"),
     };
+    // Without a deployed schema the session registration refuses the lock.
+    let lock_refused = |reason: &str| {
+        let mut session = PgJanitorSession::new(isolated_dsn.clone(), volume_id);
+        let error = session
+            .try_acquire_global_janitor_lock()
+            .expect_err("lock must be refused without a deployed schema");
+        assert!(
+            error.to_string().contains(reason),
+            "expected lock refusal containing {reason:?}, got {error}"
+        );
+    };
 
     {
         // Empty database: nothing deployed.
-        refused("SQLSTATE 42P01");
+        lock_refused("SQLSTATE 42P01");
 
         // Interrupted application: the final marker insert fails, and the
         // single-transaction batch leaves no partial GC table behind.
@@ -1290,15 +1302,19 @@ fn janitor_refuses_missing_interrupted_drifted_or_unsupported_gc_schema() {
             ),
             0
         );
-        refused("version is not recorded");
+        lock_refused("SQLSTATE 42P01");
         sql("DROP VIEW studiofs_schema_components".to_owned()).expect("remove the conflict");
 
         // Retry and repeatable application on empty and populated databases.
         sql(studiofs_pg_schema_sql().to_owned()).expect("first application");
+        sql(format!(
+            "{} INSERT INTO volumes (vol, name, uuid, block_size) VALUES ({volume_id}, 'sfs980', 'sfs980', 8192);",
+            crate::pg_engine::client_sessions::SCHEMA
+        ))
+        .expect("deploy session registry and volume");
         verdict().expect("deployed schema is accepted");
         sql(format!(
-            "INSERT INTO volumes (vol, name, uuid, block_size) VALUES ({volume_id}, 'sfs980', 'sfs980', 8192); \
-             INSERT INTO snapshot_payload_gc_candidates (vol, object_id) VALUES ({volume_id}, 7); \
+            "INSERT INTO snapshot_payload_gc_candidates (vol, object_id) VALUES ({volume_id}, 7); \
              INSERT INTO snapshot_payload_sweep_checkpoints (vol, schema_version, volume_uuid, endpoint, bucket, data_prefix, listing_strategy, after_key) \
                  VALUES ({volume_id}, 1, 'sfs980', 'e', 'b', 'p/', 's', 'p/0007/0000000000000007')"
         ))
@@ -1347,6 +1363,13 @@ fn janitor_refuses_missing_interrupted_drifted_or_unsupported_gc_schema() {
         refused("incomplete");
         sql(studiofs_pg_schema_sql().to_owned()).expect("restoring application");
         verdict().expect("restored guard is accepted");
+
+        // A missing version marker is refused until re-application records it.
+        sql("DELETE FROM studiofs_schema_components WHERE component = 'payload_gc'".to_owned())
+            .expect("remove the version marker");
+        refused("version is not recorded");
+        sql(studiofs_pg_schema_sql().to_owned()).expect("re-recording application");
+        verdict().expect("re-recorded schema is accepted");
 
         // A newer schema is unsupported, and re-application never downgrades it.
         sql(format!(

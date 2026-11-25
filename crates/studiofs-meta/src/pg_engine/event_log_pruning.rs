@@ -63,6 +63,14 @@ impl PgMetaEngine {
     ///
     /// Returns `None` when pruning is not currently eligible or another
     /// maintenance attempt owns the per-volume advisory lock.
+    ///
+    /// Retention pruning is non-publication maintenance: it deletes only
+    /// already-checkpointed `event_log` batches and advances
+    /// `metadata_state.event_log_prune_floor` / `event_log_pruned_rows` without
+    /// publishing new metadata versions, events, checkpoints, format headers, or
+    /// settings. It intentionally does not stamp a publication session; SFS-1014
+    /// enforcement triggers must scope publication checks to publication writes
+    /// rather than retention floor updates.
     pub(super) fn run_event_log_prune_once(&self) -> MetaResult<Option<EventLogPruneResult>> {
         Self::validate_event_log_prune_batch_limit(self.event_log_prune_batches)?;
 

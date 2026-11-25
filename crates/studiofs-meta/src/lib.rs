@@ -13,6 +13,8 @@ pub(crate) mod allocator_state;
 
 /// Async adapters for invoking synchronous metadata capabilities from Tokio.
 pub mod async_engine;
+/// Backend-neutral client session data.
+pub mod client_sessions;
 /// Platform-neutral invalidation intents for committed local metadata views.
 pub mod coherence;
 /// Pure capability evaluator deciding per-operation volume compatibility.

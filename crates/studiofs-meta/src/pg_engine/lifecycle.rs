@@ -598,6 +598,8 @@ impl PgMetaEngine {
                 let _cancellation = super::runtime::WorkerRemoteCancellationScope::enter();
                 let mut last_retained_sweep: Option<Instant> = None;
                 let mut s3_refresh_failed = false;
+                let mut poll_deadline = Instant::now() + interval;
+                let mut heartbeat_deadline = Instant::now() + super::client_sessions::HEARTBEAT_INTERVAL;
                 loop {
                     if shutdown.load(Ordering::Acquire) {
                         break;
@@ -606,7 +608,7 @@ impl PgMetaEngine {
                     let mut wakeup_guard = wakeup_lock
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    let deadline = Instant::now() + interval;
+                    let deadline = poll_deadline.min(heartbeat_deadline);
                     while !*wakeup_guard {
                         if shutdown.load(Ordering::Acquire) {
                             return;
@@ -622,6 +624,7 @@ impl PgMetaEngine {
                             Err(poisoned) => poisoned.into_inner().0,
                         };
                     }
+                    let poll_due = *wakeup_guard || Instant::now() >= poll_deadline;
                     *wakeup_guard = false;
                     drop(wakeup_guard);
                     if shutdown.load(Ordering::Acquire) {
@@ -630,6 +633,15 @@ impl PgMetaEngine {
                     let Some(engine) = engine.upgrade() else {
                         break;
                     };
+                    if Instant::now() >= heartbeat_deadline {
+                        if engine.remote_identity_validated.load(Ordering::Acquire) {
+                            engine.heartbeat_client_session();
+                        }
+                        heartbeat_deadline = Instant::now() + super::client_sessions::HEARTBEAT_INTERVAL;
+                    }
+                    if !poll_due {
+                        continue;
+                    }
                     if let Err(error) = engine.prune_local_event_log_for_poll(&shutdown) {
                         warn!(
                             error = %error,
@@ -651,6 +663,9 @@ impl PgMetaEngine {
                         engine.sync_metadata_with_source(MetadataSyncSource::FallbackPoll)
                     };
                     if let Ok(initial_changed) = sync_result {
+                        if engine.remote_identity_validated.load(Ordering::Acquire) {
+                            engine.heartbeat_client_session();
+                        }
                         match engine.refresh_shared_s3_format_info() {
                             Ok(()) => s3_refresh_failed = false,
                             Err(error) if !s3_refresh_failed => {
@@ -730,6 +745,7 @@ impl PgMetaEngine {
                             "postgres background metadata synchronization did not complete"
                         );
                     }
+                    poll_deadline = Instant::now() + interval;
                 }
             })
             .map_err(|error| {

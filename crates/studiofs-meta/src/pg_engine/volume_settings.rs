@@ -81,38 +81,9 @@ impl MetaVolumeSettings for PgMetaEngine {
         expected_revision: u64,
         days: u32,
     ) -> MetaResult<Option<VolumeSettings>> {
-        let pool = self.command_pool.clone();
-        let timeout = self.command_timeout;
-        let volume = self.volume_id;
-        let client_id = self.current_client_id()?;
-        let now_ms = PgMetaEngine::now_millis();
-        let accepted = self.run_async(async move {
-            Self::with_postgres_client_timeout(
-                pool,
-                timeout,
-                "update volume settings",
-                move |client| {
-                    Box::pin(async move {
-                        set_shared_trash_days(
-                            client,
-                            volume,
-                            Some(expected_revision),
-                            days,
-                            &client_id,
-                            now_ms,
-                        )
-                        .await
-                    })
-                },
-            )
-            .await
-        })?;
-        if let Some(settings) = accepted {
-            let events = [MetaEvent::SetVolumeSettings { settings }];
-            self.local.apply_replica_events_to_base(&events)?;
-            self.local.apply_replica_serving_state(&events)?;
-        }
-        Ok(accepted)
+        self.change_mounted_settings(expected_revision, move |settings| {
+            settings.trash.set_days(days)
+        })
     }
 
     fn compare_and_set_logical_quota_bytes(
@@ -120,38 +91,9 @@ impl MetaVolumeSettings for PgMetaEngine {
         expected_revision: u64,
         bytes: Option<u64>,
     ) -> MetaResult<Option<VolumeSettings>> {
-        let pool = self.command_pool.clone();
-        let timeout = self.command_timeout;
-        let volume = self.volume_id;
-        let client_id = self.current_client_id()?;
-        let now_ms = PgMetaEngine::now_millis();
-        let accepted = self.run_async(async move {
-            Self::with_postgres_client_timeout(
-                pool,
-                timeout,
-                "update volume quota",
-                move |client| {
-                    Box::pin(async move {
-                        set_shared_logical_quota_bytes(
-                            client,
-                            volume,
-                            Some(expected_revision),
-                            bytes,
-                            &client_id,
-                            now_ms,
-                        )
-                        .await
-                    })
-                },
-            )
-            .await
-        })?;
-        if let Some(settings) = accepted {
-            let events = [MetaEvent::SetVolumeSettings { settings }];
-            self.local.apply_replica_events_to_base(&events)?;
-            self.local.apply_replica_serving_state(&events)?;
-        }
-        Ok(accepted)
+        self.change_mounted_settings(expected_revision, move |settings| {
+            settings.logical_quota_bytes = bytes
+        })
     }
 
     fn compare_and_set_compression(
@@ -159,32 +101,86 @@ impl MetaVolumeSettings for PgMetaEngine {
         expected_revision: u64,
         compression: crate::trash::CompressionPolicy,
     ) -> MetaResult<Option<VolumeSettings>> {
-        let pool = self.command_pool.clone();
-        let timeout = self.command_timeout;
-        let volume = self.volume_id;
+        self.change_mounted_settings(expected_revision, move |settings| {
+            settings.compression = compression
+        })
+    }
+}
+
+impl PgMetaEngine {
+    fn change_mounted_settings(
+        &self,
+        expected_revision: u64,
+        mut update: impl FnOnce(&mut VolumeSettings) + Send + 'static,
+    ) -> MetaResult<Option<VolumeSettings>> {
+        self.ensure_remote_format_validated()?;
+        let mut session = self.acquire_publication_session()?;
         let client_id = self.current_client_id()?;
-        let now_ms = PgMetaEngine::now_millis();
-        let accepted = self.run_async(async move {
-            Self::with_postgres_client_timeout(
-                pool,
-                timeout,
-                "update volume compression",
-                move |client| {
-                    Box::pin(async move {
-                        set_shared_compression(
-                            client,
-                            volume,
-                            Some(expected_revision),
-                            compression,
-                            &client_id,
-                            now_ms,
-                        )
-                        .await
-                    })
-                },
-            )
-            .await
-        })?;
+        let mut attempt = 0_u8;
+        let accepted = loop {
+            let pool = self.command_pool.clone();
+            let timeout = self.command_timeout;
+            let volume = self.volume_id;
+            let current_client_id = client_id.clone();
+            let now_ms = Self::now_millis();
+            let current_session = session.clone();
+            let current_update = update;
+            let outcome =
+                self.run_async(async move {
+                    Self::with_postgres_client_timeout(
+                        pool,
+                        timeout,
+                        "update volume settings",
+                        move |client| {
+                            Box::pin(async move {
+                                let tx = client.transaction().await.map_err(|error| {
+                                    Self::classify_pg_error("begin volume settings", error)
+                                })?;
+                                match current_session.stamp_checked(&tx, volume).await {
+                                Ok(()) => {}
+                                Err(error @ (super::client_sessions::StampError::SessionInactive
+                                    | super::client_sessions::StampError::PolicyStale)) => {
+                                    drop(tx);
+                                    return Ok(Err((error, current_update)));
+                                }
+                                Err(super::client_sessions::StampError::Other(error)) => {
+                                    return Err(error);
+                                }
+                            }
+                                let accepted = update_volume_settings_in_tx(
+                                    &tx,
+                                    volume,
+                                    Some(expected_revision),
+                                    &current_client_id,
+                                    now_ms,
+                                    current_update,
+                                )
+                                .await?;
+                                if accepted.is_some() {
+                                    tx.commit().await.map_err(|error| {
+                                        Self::classify_pg_error("commit volume settings", error)
+                                    })?;
+                                }
+                                Ok(Ok(accepted))
+                            })
+                        },
+                    )
+                    .await
+                });
+            match outcome {
+                Ok(Ok(accepted)) => break accepted,
+                Ok(Err((stamp_error, returned_update))) => {
+                    if attempt == 0 {
+                        attempt += 1;
+                        update = returned_update;
+                        session = self.force_refresh_publication_session(&session)?;
+                        continue;
+                    }
+                    return Err(stamp_error.into_meta_error());
+                }
+                Err(error) => return Err(error),
+            }
+        };
         if let Some(settings) = accepted {
             let events = [MetaEvent::SetVolumeSettings { settings }];
             self.local.apply_replica_events_to_base(&events)?;
@@ -287,10 +283,12 @@ async fn update_volume_settings(
         .transaction()
         .await
         .map_err(|error| PgMetaEngine::classify_pg_error("begin volume settings", error))?;
+    let session = PublicationSession::begin(&tx, volume).await?;
     let accepted =
         update_volume_settings_in_tx(&tx, volume, expected_revision, client_id, now_ms, update)
             .await?;
     if accepted.is_some() {
+        session.finish(&tx, volume).await?;
         tx.commit()
             .await
             .map_err(|error| PgMetaEngine::classify_pg_error("commit volume settings", error))?;
@@ -398,6 +396,7 @@ pub async fn update_shared_s3_settings(
         .transaction()
         .await
         .map_err(|error| PgMetaEngine::classify_pg_error("begin shared volume update", error))?;
+    let session = PublicationSession::begin(&tx, volume).await?;
     let row = tx
         .query_one(
             "SELECT ms.metadata_format_version, ms.format_info, v.uuid FROM metadata_state ms JOIN volumes v ON v.vol=ms.vol WHERE ms.vol=$1 FOR UPDATE OF ms",
@@ -445,6 +444,7 @@ pub async fn update_shared_s3_settings(
         .await?
         .ok_or_else(|| MetaError::Storage("shared trash settings update was rejected".into()))?;
     }
+    session.finish(&tx, volume).await?;
     tx.commit()
         .await
         .map_err(|error| PgMetaEngine::classify_pg_error("commit shared volume update", error))?;

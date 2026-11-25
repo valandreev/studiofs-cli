@@ -10,6 +10,7 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 mod checkpoint_scalability;
+mod client_session_leases;
 mod event_log_pruning;
 mod inode_allocator;
 mod janitor;
@@ -546,6 +547,8 @@ fn unit_pg_engine_from_local(local: Arc<RedbMetaEngine>) -> PgMetaEngine {
             ),
         ),
         pg_sync_progress_state: Mutex::new(PgSyncProgressState::default()),
+        client_session_state: Mutex::new(client_sessions::ClientSessionState::new()),
+        client_session_refresh: Mutex::new(()),
         checkpoint_coordinator_state: checkpoint_coordinator::CheckpointCoordinatorState::new(),
         checkpoint_single_flight: Mutex::new(()),
         command_pool: Arc::new(

@@ -99,8 +99,11 @@ fn migration_registry_applies_resumes_and_refuses_drift_on_live_postgres() {
         let mut connection = connect(&dsn).await?;
         let client = &mut connection.client;
 
-        // Fresh database: the baseline records core 1 and payload_gc 2.
-        ensure_in_tx(client, MIGRATIONS).await?;
+        // An existing baseline gains only the additive client session migration.
+        let (sessions, prior) = MIGRATIONS.split_last().expect("registered session migration");
+        assert_eq!(sessions.component, "client_sessions");
+        ensure_in_tx(client, prior).await?;
+        assert_eq!(migrate_with(client, MIGRATIONS, false).await?, [*sessions]);
         ensure_in_tx(client, MIGRATIONS).await?;
         assert_eq!(
             scalar(client, "SELECT count(*) FROM studiofs_schema_components WHERE (component, version) IN (('core', 1), ('payload_gc', 2)) AND (component = 'payload_gc' OR octet_length(checksum) = 32)").await,
@@ -109,16 +112,22 @@ fn migration_registry_applies_resumes_and_refuses_drift_on_live_postgres() {
 
         // A verified schema gets no DDL from either path.
         let lock_table = "SELECT count(*) FROM pg_class WHERE relname = 'file_lock_leases' AND relnamespace = current_schema()::regnamespace";
+        let sessions_table = "SELECT count(*) FROM pg_class WHERE relname = 'client_sessions' AND relnamespace = current_schema()::regnamespace";
         client
-            .batch_execute("DROP TABLE file_lock_leases")
+            .batch_execute("DROP TABLE file_lock_leases; DROP TABLE client_sessions")
             .await
             .map_err(|e| MetaError::Storage(pg_err(e)))?;
         ensure_in_tx(client, MIGRATIONS).await?;
-        assert_eq!(migrate_with(client, MIGRATIONS, false).await?.len(), MIGRATIONS.len() - 1);
+        assert!(migrate_with(client, MIGRATIONS, false).await?.is_empty());
         assert_eq!(scalar(client, lock_table).await, 0);
-        // `--repair-schema` re-applies the verified baseline once.
-        assert_eq!(migrate_with(client, MIGRATIONS, true).await?.len(), MIGRATIONS.len());
+        assert_eq!(scalar(client, sessions_table).await, 0);
+        // `--repair-schema` re-applies the verified baseline and client_sessions once.
+        assert_eq!(
+            migrate_with(client, MIGRATIONS, true).await?,
+            [MIGRATIONS[0], *sessions]
+        );
         assert_eq!(scalar(client, lock_table).await, 1);
+        assert_eq!(scalar(client, sessions_table).await, 1);
         client
             .batch_execute("DROP TABLE file_lock_leases")
             .await
@@ -131,7 +140,7 @@ fn migration_registry_applies_resumes_and_refuses_drift_on_live_postgres() {
             .await
             .map_err(|e| MetaError::Storage(pg_err(e)))?;
         assert!(matches!(ensure_in_tx(client, MIGRATIONS).await, Err(MetaError::RepairRequired(_))));
-        assert_eq!(migrate_with(client, MIGRATIONS, false).await?.len(), MIGRATIONS.len());
+        assert_eq!(migrate_with(client, MIGRATIONS, false).await?, [MIGRATIONS[0]]);
         assert_eq!(scalar(client, lock_table).await, 1);
 
         // A newer core is refused before any DDL runs.

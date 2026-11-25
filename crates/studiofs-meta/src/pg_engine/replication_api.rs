@@ -306,6 +306,8 @@ impl MetaReplication for PgMetaEngine {
             }
         };
         self.background_workers
-            .shutdown(deadline.saturating_duration_since(std::time::Instant::now()))
+            .shutdown(deadline.saturating_duration_since(std::time::Instant::now()))?;
+        self.release_client_session(deadline);
+        Ok(())
     }
 }

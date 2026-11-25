@@ -94,6 +94,13 @@ pub const POSTGRES_CORE_SCHEMA: VersionIdentity = VersionIdentity {
     min_supported: 1,
 };
 
+/// Database-wide PostgreSQL `client_sessions` schema component (SFS-1008).
+pub const POSTGRES_CLIENT_SESSIONS_SCHEMA: VersionIdentity = VersionIdentity {
+    name: "PostgreSQL client sessions schema",
+    current: 1,
+    min_supported: 1,
+};
+
 /// Per-volume write requirement (`metadata_state.write_requirement`, SFS-1007).
 /// Publication succeeds only while the volume's value is at most `current`, in
 /// the same UPDATE that bumps the volume version; Activate of a write
@@ -151,6 +158,7 @@ pub const IDENTITIES: &[VersionIdentity] = &[
     SERVING_CHECKPOINT_SCHEMA,
     POSTGRES_CORE_SCHEMA,
     SHARED_WRITE_REQUIREMENT,
+    POSTGRES_CLIENT_SESSIONS_SCHEMA,
 ];
 
 /// Machine-readable report of this binary's identities, printed by
