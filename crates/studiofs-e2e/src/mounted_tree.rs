@@ -1064,7 +1064,7 @@ fn path_to_json_string(path: &Path) -> Result<String, MountedTreeError> {
 }
 
 /// Encodes bytes into a lowercase hexadecimal string.
-fn hex_lower(bytes: &[u8]) -> String {
+pub(crate) fn hex_lower(bytes: &[u8]) -> String {
     let mut encoded = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
         write!(&mut encoded, "{byte:02x}").expect("writing to string cannot fail");

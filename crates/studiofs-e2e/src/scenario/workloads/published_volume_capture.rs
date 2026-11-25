@@ -15,6 +15,7 @@
 use super::recoverable_trash_janitor::with_pg;
 use super::*;
 use crate::client::ClientControllerConfig;
+use crate::mounted_tree::hex_lower;
 
 pub(in crate::scenario) struct PublishedVolumeFixtureCapture;
 
@@ -49,12 +50,10 @@ impl Scenario for PublishedVolumeFixtureCapture {
         }
         let mut controller =
             MultiClientController::new(config.clone(), SystemClientProcessExecutor);
-        controller
-            .bootstrap_volume(VolumeBootstrapOptions {
-                client_names: vec![CLIENT.into()],
-                clean_existing_local_metadata: true,
-            })
-            .map_err(io::Error::other)?;
+        controller.bootstrap_volume(VolumeBootstrapOptions {
+            client_names: vec![CLIENT.into()],
+            clean_existing_local_metadata: true,
+        })?;
         let out = context.scenario_dir.join(OUTPUT_DIR);
         let local_db = controller.clients()[0].local_metadata_db.clone();
         fs::copy(&local_db, out.join("local-cache.redb"))?;
@@ -83,10 +82,6 @@ const CAPTURED_FILES: [&str; 5] = [
     "event-log.json",
     "local-cache.redb",
 ];
-
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
-}
 
 fn pretty_json(value: &serde_json::Value) -> Result<Vec<u8>, ScenarioError> {
     let mut bytes = serde_json::to_vec_pretty(value)?;
@@ -142,7 +137,7 @@ fn capture_postgres_rows(config: &ClientControllerConfig, out: &Path) -> Result<
             "version": state.get::<_, i64>(4),
             "checkpoint_version": state.get::<_, i64>(5),
             "event_log_prune_floor": state.get::<_, i64>(6),
-            "checkpoint_sha256": hex(&state.get::<_, Vec<u8>>(7)),
+            "checkpoint_sha256": hex_lower(&state.get::<_, Vec<u8>>(7)),
             "checkpoint_publication_state": state.get::<_, String>(8),
             "checkpoint_generation": state.get::<_, i64>(9),
             "event_log_rows": events.len(),
@@ -165,7 +160,7 @@ fn capture_postgres_rows(config: &ClientControllerConfig, out: &Path) -> Result<
                 serde_json::json!({
                     "batch_version": row.get::<_, i64>(0),
                     "event_type": row.get::<_, String>(1),
-                    "event_payload_hex": hex(&row.get::<_, Vec<u8>>(2)),
+                    "event_payload_hex": hex_lower(&row.get::<_, Vec<u8>>(2)),
                 })
             })
             .collect::<Vec<_>>();
