@@ -500,6 +500,8 @@ fn apply_dump(postgres_address: &str, dump: &MetadataDump) -> DumpLoadResult<i64
                     .await?;
             }
             let write_requirement: i16 = previous_state.map_or(1, |row| row.get(0));
+            let session =
+                studiofs_meta::pg_engine::PublicationSession::begin(&tx, target_vol).await?;
             tx.execute(
                 "INSERT INTO metadata_state (vol, metadata_format_version, version, checkpoint_version, snapshot, checkpoint_sha256, format_info, checkpoint_publication_state, checkpoint_generation, write_requirement) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
                 &[
@@ -576,6 +578,7 @@ fn apply_dump(postgres_address: &str, dump: &MetadataDump) -> DumpLoadResult<i64
             )
             .await?;
 
+            session.finish(&tx, target_vol).await?;
             tx.commit()
                 .await
                 .map_err(|source| postgres_operation("commit load transaction", source))?;

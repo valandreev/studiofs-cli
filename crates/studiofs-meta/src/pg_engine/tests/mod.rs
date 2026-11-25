@@ -9,6 +9,7 @@ use crate::schema::counters::{LOCAL_PG_FLUSHED_EVENT_SEQ, NEXT_EVENT_SEQ};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+mod client_session_leases;
 mod checkpoint_scalability;
 mod event_log_pruning;
 mod inode_allocator;
@@ -546,6 +547,8 @@ fn unit_pg_engine_from_local(local: Arc<RedbMetaEngine>) -> PgMetaEngine {
             ),
         ),
         pg_sync_progress_state: Mutex::new(PgSyncProgressState::default()),
+        client_session_owner: client_sessions::SessionOwner::new(),
+        client_session_state: Mutex::default(),
         checkpoint_coordinator_state: checkpoint_coordinator::CheckpointCoordinatorState::new(),
         checkpoint_single_flight: Mutex::new(()),
         command_pool: Arc::new(

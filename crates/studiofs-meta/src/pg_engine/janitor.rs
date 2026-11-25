@@ -1,3 +1,5 @@
+use super::client_sessions::{HEARTBEAT_INTERVAL, SessionLease, SessionOwner};
+use super::runtime::PgConnectionPool;
 use super::{PgMetaEngine, PgTimeoutContext};
 use crate::engine::{MetaError, MetaResult};
 use crate::janitor::{
@@ -6,11 +8,12 @@ use crate::janitor::{
 use crate::pg_transport::connect_studiofs_postgres;
 use crate::schema::FormatInfo;
 use std::collections::{HashMap, HashSet};
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 use tokio::runtime::Runtime;
 use tokio::task::JoinHandle;
 use tokio_postgres::{Client, Statement};
+use tokio_util::sync::CancellationToken;
 
 const PG_JANITOR_LOCK_SALT: i64 = 0x5f53_4653_5f4a_414e;
 
@@ -67,6 +70,7 @@ pub(crate) struct PgJanitorSession {
     runtime: Option<Runtime>,
     client: Option<Client>,
     connection_task: Option<JoinHandle<()>>,
+    session_heartbeat: Option<(CancellationToken, JoinHandle<SessionLease>)>,
     /// Statements prepared on `client`, keyed by SQL; cleared with the connection.
     statements: HashMap<String, Statement>,
 }
@@ -228,6 +232,7 @@ impl PgJanitorSession {
             runtime: None,
             client: None,
             connection_task: None,
+            session_heartbeat: None,
             statements: HashMap::new(),
         }
     }
@@ -380,8 +385,13 @@ impl PgJanitorSession {
                 let acquired = row.get::<usize, bool>(0);
                 if !acquired {
                     self.close_connection();
+                    return Ok(false);
                 }
-                Ok(acquired)
+                if let Err(error) = self.start_session_heartbeat() {
+                    self.close_connection();
+                    return Err(error);
+                }
+                Ok(true)
             }
             Ok(Err(error)) => {
                 self.close_connection();
@@ -398,6 +408,64 @@ impl PgJanitorSession {
                 ))
             }
         }
+    }
+
+    fn start_session_heartbeat(&mut self) -> MetaResult<()> {
+        let (Some(client), Some(runtime)) = (self.client.as_ref(), self.runtime.as_ref()) else {
+            return Err(MetaError::Storage(
+                "janitor PostgreSQL session was not initialized".into(),
+            ));
+        };
+        let owner = SessionOwner::new();
+        let volume = self.volume_id;
+        let timeout = self.command_timeout;
+        let mut lease = runtime.block_on(async {
+            tokio::time::timeout(timeout, owner.heartbeat(client, volume, None))
+                .await
+                .map_err(|_| {
+                    PgMetaEngine::pg_timeout_error(
+                        PgTimeoutContext::Command("register janitor session"),
+                        timeout,
+                    )
+                })?
+        })?;
+        // The advisory-lock connection runs pipelined transactions. A separate,
+        // lazy connection keeps heartbeats outside those transactions.
+        let pool = Arc::new(PgConnectionPool::new(
+            self.postgres_url.clone(),
+            self.connect_timeout,
+            self.connect_timeout,
+            1,
+        )?);
+        let cancel = CancellationToken::new();
+        let shutdown = cancel.clone();
+        let task = runtime.spawn(async move {
+            let mut expected_token = Some(lease.token());
+            loop {
+                let refresh = async {
+                    tokio::time::sleep(HEARTBEAT_INTERVAL).await;
+                    owner
+                        .heartbeat_on_pool(pool.clone(), timeout, volume, expected_token)
+                        .await
+                };
+                tokio::select! {
+                    biased;
+                    _ = shutdown.cancelled() => return lease,
+                    result = refresh => match result {
+                        Ok(renewed) => {
+                            expected_token = Some(renewed.token());
+                            lease = renewed;
+                        }
+                        Err(error) => {
+                            expected_token = None;
+                            tracing::debug!(%error, "janitor session heartbeat deferred");
+                        }
+                    }
+                }
+            }
+        });
+        self.session_heartbeat = Some((cancel, task));
+        Ok(())
     }
 
     /// Refuses destructive work unless the deployed payload GC schema is the
@@ -485,6 +553,18 @@ impl PgJanitorSession {
     }
 
     fn close_connection(&mut self) {
+        if let Some((cancel, task)) = self.session_heartbeat.take() {
+            cancel.cancel();
+            if let (Some(runtime), Some(client)) = (self.runtime.as_ref(), self.client.as_ref()) {
+                let volume = self.volume_id;
+                let timeout = self.command_timeout;
+                runtime.block_on(async {
+                    if let Ok(lease) = task.await {
+                        let _ = tokio::time::timeout(timeout, lease.release(client, volume)).await;
+                    }
+                });
+            }
+        }
         self.statements.clear();
         drop(self.client.take());
         if let Some(task) = self.connection_task.take() {

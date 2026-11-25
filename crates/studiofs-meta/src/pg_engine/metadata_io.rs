@@ -584,6 +584,7 @@ impl PgMetaEngine {
         self.ensure_remote_format_validated()?;
 
         let client_id = self.current_client_id()?;
+        let session = self.refresh_client_session()?;
         let retained_digest = super::retained::publication_digest(&client_id, &events)?;
         let batches = Self::split_projected_event_batches(
             events,
@@ -617,6 +618,7 @@ impl PgMetaEngine {
                         .await
                         .map_err(|e| Self::classify_pg_error("postgres begin tx failed", e))?;
 
+                    session.stamp(&tx, volume_id).await?;
                     let mut last_batch_version = None;
                     let mut retained_locked = std::collections::HashMap::new();
                     let mut last_observation = None;

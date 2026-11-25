@@ -97,6 +97,14 @@ const BASELINE: Migration = Migration {
     sql: studiofs_pg_schema_sql(),
 };
 
+const CLIENT_SESSIONS: Migration = Migration {
+    component: "client_sessions",
+    version: 1,
+    name: "per-volume client session leases",
+    phase: MigrationPhase::Additive,
+    sql: super::client_sessions::SCHEMA,
+};
+
 /// Test-successor change (SFS-1131): one additive table that 0.2.5 ignores.
 #[cfg(feature = "test-successor")]
 const SUCCESSOR_PROBE: Migration = Migration {
@@ -112,10 +120,10 @@ const SUCCESSOR_PROBE: Migration = Migration {
 
 /// Every migration this binary knows, grouped by component in version order.
 #[cfg(not(feature = "test-successor"))]
-pub const MIGRATIONS: &[Migration] = &[BASELINE];
+pub const MIGRATIONS: &[Migration] = &[BASELINE, CLIENT_SESSIONS];
 /// Every migration this binary knows, grouped by component in version order.
 #[cfg(feature = "test-successor")]
-pub const MIGRATIONS: &[Migration] = &[BASELINE, SUCCESSOR_PROBE];
+pub const MIGRATIONS: &[Migration] = &[BASELINE, SUCCESSOR_PROBE, CLIENT_SESSIONS];
 
 /// A `studiofs_schema_components` row.
 #[derive(Debug, Clone, PartialEq, Eq)]

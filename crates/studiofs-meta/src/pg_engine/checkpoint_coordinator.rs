@@ -527,6 +527,7 @@ impl PgMetaEngine {
         let volume_id = self.volume_id;
         let owner = owner.to_string();
         let fencing_token = lease.fencing_token;
+        let session = self.refresh_client_session()?;
         let result = self.run_async(async move {
             Self::with_postgres_client_timeout(
                 command_pool,
@@ -535,7 +536,11 @@ impl PgMetaEngine {
                 move |client| {
                     Box::pin(async move {
                         let sha_slice: &[u8] = &checkpoint.checkpoint_sha256;
-                        let row = client
+                        let tx = client.transaction().await.map_err(|error| {
+                            Self::classify_pg_error("begin bootstrap checkpoint publication", error)
+                        })?;
+                        session.stamp(&tx, volume_id).await?;
+                        let row = tx
                             .query_opt(
                                 sql::UPSERT_FENCED_METADATA_CHECKPOINT,
                                 &[
@@ -558,9 +563,17 @@ impl PgMetaEngine {
                                     error,
                                 )
                             })?;
-                        row.as_ref()
+                        let observation = row
+                            .as_ref()
                             .map(super::metadata_io::checkpoint_freshness_observation_from_row)
-                            .transpose()
+                            .transpose()?;
+                        tx.commit().await.map_err(|error| {
+                            Self::classify_pg_error(
+                                "commit bootstrap checkpoint publication",
+                                error,
+                            )
+                        })?;
+                        Ok(observation)
                     })
                 },
             )

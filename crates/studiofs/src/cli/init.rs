@@ -473,9 +473,10 @@ fn seed_pg_metadata_state(
 ) -> anyhow::Result<()> {
     let metadata_format_version = i16::try_from(CURRENT_FORMAT_VERSION)?;
     let checkpoint_sha256 = Sha256::digest(checkpoint_bytes);
-    rt.block_on(with_postgres_client(dsn, |client| async move {
-        client
-            .execute(
+    rt.block_on(with_postgres_client(dsn, |mut client| async move {
+        let tx = client.transaction().await?;
+        let session = studiofs_meta::pg_engine::PublicationSession::begin(&tx, volume_id).await?;
+        tx.execute(
                 r#"
                 INSERT INTO metadata_state (
                     vol,
@@ -502,6 +503,8 @@ fn seed_pg_metadata_state(
             )
             .await
             .map_err(|e| anyhow::anyhow!("failed to seed metadata_state: {e}"))?;
+        session.finish(&tx, volume_id).await?;
+        tx.commit().await?;
         Ok(())
     }))
 }

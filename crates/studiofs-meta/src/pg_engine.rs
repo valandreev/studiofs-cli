@@ -252,6 +252,8 @@ pub struct PgMetaEngine {
     checkpoint_freshness_policy: checkpoint_freshness::CheckpointFreshnessPolicy,
     checkpoint_freshness_state: Mutex<checkpoint_freshness::CheckpointFreshnessState>,
     pg_sync_progress_state: Mutex<PgSyncProgressState>,
+    client_session_owner: client_sessions::SessionOwner,
+    client_session_state: Mutex<client_sessions::ClientSessionState>,
     checkpoint_coordinator_state: checkpoint_coordinator::CheckpointCoordinatorState,
     checkpoint_single_flight: Mutex<()>,
     command_pool: Arc<runtime::PgConnectionPool>,
@@ -509,6 +511,7 @@ struct ClaimedPendingBatch {
 
 #[path = "pg_engine/checkpoint_coordinator.rs"]
 mod checkpoint_coordinator;
+mod client_sessions;
 #[path = "pg_engine/checkpoint_freshness.rs"]
 mod checkpoint_freshness;
 #[path = "pg_engine/engine_core.rs"]
@@ -570,6 +573,7 @@ mod sql;
 mod startup_schema;
 mod volume_protocol;
 mod volume_settings;
+pub use client_sessions::{PublicationSession, read_client_sessions};
 pub use format_upgrade::upgrade_shared_format5;
 use janitor::PgJanitorLock;
 #[cfg(test)]
@@ -1680,6 +1684,8 @@ impl PgMetaEngine {
                 checkpoint_freshness::CheckpointFreshnessState::new(&checkpoint_freshness_policy),
             ),
             pg_sync_progress_state: Mutex::new(PgSyncProgressState::default()),
+            client_session_owner: client_sessions::SessionOwner::new(),
+            client_session_state: Mutex::default(),
             checkpoint_coordinator_state: checkpoint_coordinator::CheckpointCoordinatorState::new(),
             checkpoint_single_flight: Mutex::new(()),
             command_pool: Arc::new(runtime::PgConnectionPool::new(
@@ -1898,6 +1904,9 @@ impl PgMetaEngine {
             } else {
                 let _ = engine.bootstrap_allocator_state_with_retry();
             }
+        }
+        if engine.remote_identity_validated.load(Ordering::Acquire) {
+            engine.heartbeat_client_session();
         }
         if options.background_poll {
             engine.ensure_metadata_notify_listener_started()?;

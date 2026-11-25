@@ -99,8 +99,11 @@ fn migration_registry_applies_resumes_and_refuses_drift_on_live_postgres() {
         let mut connection = connect(&dsn).await?;
         let client = &mut connection.client;
 
-        // Fresh database: the baseline records core 1 and payload_gc 2.
-        ensure_in_tx(client, MIGRATIONS).await?;
+        // An existing baseline gains only the additive client session migration.
+        let (sessions, prior) = MIGRATIONS.split_last().expect("registered session migration");
+        assert_eq!(sessions.component, "client_sessions");
+        ensure_in_tx(client, prior).await?;
+        assert_eq!(migrate_with(client, MIGRATIONS, false).await?, [*sessions]);
         ensure_in_tx(client, MIGRATIONS).await?;
         assert_eq!(
             scalar(client, "SELECT count(*) FROM studiofs_schema_components WHERE (component, version) IN (('core', 1), ('payload_gc', 2)) AND (component = 'payload_gc' OR octet_length(checksum) = 32)").await,
@@ -114,10 +117,10 @@ fn migration_registry_applies_resumes_and_refuses_drift_on_live_postgres() {
             .await
             .map_err(|e| MetaError::Storage(pg_err(e)))?;
         ensure_in_tx(client, MIGRATIONS).await?;
-        assert_eq!(migrate_with(client, MIGRATIONS, false).await?.len(), MIGRATIONS.len() - 1);
+        assert!(migrate_with(client, MIGRATIONS, false).await?.is_empty());
         assert_eq!(scalar(client, lock_table).await, 0);
         // `--repair-schema` re-applies the verified baseline once.
-        assert_eq!(migrate_with(client, MIGRATIONS, true).await?.len(), MIGRATIONS.len());
+        assert_eq!(migrate_with(client, MIGRATIONS, true).await?, [MIGRATIONS[0]]);
         assert_eq!(scalar(client, lock_table).await, 1);
         client
             .batch_execute("DROP TABLE file_lock_leases")
@@ -131,7 +134,7 @@ fn migration_registry_applies_resumes_and_refuses_drift_on_live_postgres() {
             .await
             .map_err(|e| MetaError::Storage(pg_err(e)))?;
         assert!(matches!(ensure_in_tx(client, MIGRATIONS).await, Err(MetaError::RepairRequired(_))));
-        assert_eq!(migrate_with(client, MIGRATIONS, false).await?.len(), MIGRATIONS.len());
+        assert_eq!(migrate_with(client, MIGRATIONS, false).await?, [MIGRATIONS[0]]);
         assert_eq!(scalar(client, lock_table).await, 1);
 
         // A newer core is refused before any DDL runs.
