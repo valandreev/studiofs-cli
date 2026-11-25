@@ -8,6 +8,10 @@ The canonical PostgreSQL lifecycle and replay contract lives in
 [pg-sync-contract.md](./pg-sync-contract.md). It separates local serving
 readiness, remote catch-up, and read/write authority.
 
+Persisted-format boundaries and the 0.2.5 forward-compatibility policy live in
+[persisted-format-compatibility.md](./persisted-format-compatibility.md) and
+[ADR 0018](./adr/0018-version-identities-and-capability-model.md).
+
 ## System Design
 
 StudioFS mounts S3-compatible object storage as a local-first filesystem with a
