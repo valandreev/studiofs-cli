@@ -54,8 +54,11 @@ jobs:
         run: |
           python3 tools/test_successor/test_build.py
           python3 tools/release/test_package.py
-          cargo check -p studiofs-meta --release --features test-successor 2>&1 \
-            | grep -F 'the test-successor feature is test-only'
+          if cargo check -p studiofs-meta --release --features test-successor > target/test-successor-release-check.log 2>&1; then
+            echo 'release profile accepted the test-successor feature' >&2
+            exit 1
+          fi
+          grep -F 'the test-successor feature is test-only' target/test-successor-release-check.log
       - name: cargo doc
         run: cargo doc --workspace --no-deps
         env:
