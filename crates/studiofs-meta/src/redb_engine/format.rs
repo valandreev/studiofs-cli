@@ -79,7 +79,7 @@ impl RedbMetaEngine {
             .get("format")
             .map_err(|e| MetaError::Storage(e.to_string()))?
             .ok_or(MetaError::NotFormatted)?;
-        crate::decode_format_info(entry.value())
+        crate::decode_format_info_as(entry.value(), crate::version::LOCAL_METADATA_LAYOUT)
     }
 
     /// Read persisted format metadata from a redb file without opening the full engine.
@@ -120,7 +120,7 @@ impl RedbMetaEngine {
             .get("format")
             .map_err(|e| MetaError::Storage(e.to_string()))?
             .ok_or(MetaError::NotFormatted)?;
-        crate::decode_format_info(entry.value())
+        crate::decode_format_info_as(entry.value(), crate::version::LOCAL_METADATA_LAYOUT)
     }
 }
 

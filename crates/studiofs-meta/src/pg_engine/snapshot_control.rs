@@ -360,7 +360,7 @@ impl PgSnapshotBackend {
         if raw.checkpoint_version < 0
             || raw.checkpoint_version > cut.cut_version()
             || !ServingCheckpoint::supports_format_version(raw.checkpoint_format_version)
-            || raw.checkpoint_schema_version != ServingCheckpoint::SCHEMA_VERSION
+            || !ServingCheckpoint::supports_schema_version(raw.checkpoint_schema_version)
             || raw.checkpoint_sha256.as_slice() != Sha256::digest(&raw.checkpoint_bytes).as_slice()
         {
             return Err(SnapshotSourceError::permanent(snapshot_control_error(
@@ -679,7 +679,7 @@ impl<T: SnapshotBackendAccess + Send + Sync> SnapshotSourceReader for T {
                 || descriptor.checkpoint_version < 0
                 || descriptor.checkpoint_version > cut.cut_version()
                 || !ServingCheckpoint::supports_format_version(descriptor.checkpoint_format_version)
-                || descriptor.checkpoint_schema_version != ServingCheckpoint::SCHEMA_VERSION
+                || !ServingCheckpoint::supports_schema_version(descriptor.checkpoint_schema_version)
             {
                 return Err(SnapshotPortError::permanent(
                     "invalid_source",
