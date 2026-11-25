@@ -26,7 +26,8 @@ use uuid::Uuid;
 const INITIAL_METADATA_STATE_VERSION: i64 = 0;
 const ACTIVE_CRYPTO_KEY_STATE: &str = "active";
 /// Serializes schema setup and volume row creation between `init` and `load`.
-pub(super) const INIT_SCHEMA_ADVISORY_LOCK: i64 = 902_202_603;
+pub(super) const INIT_SCHEMA_ADVISORY_LOCK: i64 =
+    studiofs_meta::pg_engine::migrations::SCHEMA_ADVISORY_LOCK;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -978,9 +979,12 @@ mod tests {
             )
             .await
             .expect("insert pre-existing volume");
-            tx.batch_execute("DROP TABLE file_lock_leases")
-                .await
-                .expect("remove the new schema table from the legacy fixture");
+            // A pre-0.2.5 database has no `core` registry row (SFS-1005).
+            tx.batch_execute(
+                "DROP TABLE file_lock_leases; DELETE FROM studiofs_schema_components WHERE component = 'core'",
+            )
+            .await
+            .expect("remove the new schema table from the legacy fixture");
             tx.commit().await.expect("commit legacy fixture");
             conn_task.abort();
         });

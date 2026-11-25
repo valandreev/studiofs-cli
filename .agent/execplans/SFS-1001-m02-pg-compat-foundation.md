@@ -10,7 +10,7 @@ The shared PostgreSQL database holds the schema that every StudioFS client and m
 
 ## Progress
 
-- [ ] SFS-1005: explicit, resumable PostgreSQL schema migration registry and CLI, extending `studiofs_schema_components`.
+- [x] SFS-1005: explicit, resumable PostgreSQL schema migration registry and CLI, extending `studiofs_schema_components` (2026-11-25; `pg_engine/migrations.rs`, `studiofs upgrade --dry-run`).
 - [ ] SFS-1006: replace the global table check with capability-scoped schema validation.
 - [ ] SFS-1007: persist per-volume protocol requirements (read, write, maintenance sets) and the policy epoch.
 - [ ] SFS-1008: track active client sessions, capabilities and expired leases.
@@ -20,7 +20,20 @@ The shared PostgreSQL database holds the schema that every StudioFS client and m
 - Observation: the DDL batch uses `CREATE OR REPLACE FUNCTION` for trigger bodies and is re-run by `init`, `load` and `upgrade`, so an older binary would overwrite a successor's trigger function in a shared database.
   Evidence: `crates/studiofs-meta/src/pg_engine/schema.rs:569`, `crates/studiofs/src/cli/init.rs:322`, `crates/studiofs/src/cli/dump_load.rs:413`, `crates/studiofs/src/cli/upgrade.rs:43`.
 
+- Observation: re-applying the baseline DDL takes `ACCESS EXCLUSIVE` and `SHARE` table locks, so an implicit re-application in `load` waited behind an open writer transaction and the load race test timed out.
+  Evidence: `dump_load_rejects_accounting_row_committed_while_load_waits` failed at its second lock wait until `ensure` stopped re-applying a verified baseline.
+
 ## Decision Log
+
+- Decision: no entry point runs DDL against a verified schema. `init`/`load` refuse a differing baseline; `studiofs upgrade` reconciles it, and `--repair-schema` re-applies a verified baseline to restore dropped objects, both only while nothing is recorded above it.
+  Rationale: implicit DDL blocked behind live writers, and an unconditional re-apply in `upgrade` deadlocked with concurrent writers (`snapshot_cli_test` failed 2/3 runs; 1/3 on `main`, which re-ran the batch too). Re-applying is unsafe once later steps exist, because the baseline's `CREATE OR REPLACE FUNCTION` would revert their function bodies.
+  Date/Author: 2026-11-25, SFS-1005 review.
+- Decision: `ensure_studiofs_pg_schema` takes a `Transaction`; `ensure_studiofs_pg_schema_committed` wraps callers without one.
+  Rationale: the advisory lock is transaction-scoped, so an autocommit client ran the DDL and marker unlocked.
+  Date/Author: 2026-11-25, SFS-1005 review.
+- Decision: one `studiofs_schema_components` row per component with a SHA-256 chained over its steps, instead of a per-step history table.
+  Rationale: the issue forbids a second schema-version table; the chain still detects any difference in applied history.
+  Date/Author: 2026-11-25, SFS-1005.
 
 - Decision: extend `studiofs_schema_components` rather than add a second migration table.
   Rationale: it already has a monotonic marker that never moves backwards (SFS-980), and the Janitor already probes it.

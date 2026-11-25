@@ -443,7 +443,7 @@ impl PgJanitorSession {
             Some(_) => return Ok(()),
         };
         Err(JanitorMetadataError::SchemaUnavailable(format!(
-            "{problem} (expected version {expected}); rerun `studiofs init` with this binary to deploy the schema"
+            "{problem} (expected version {expected}); stop mounts and janitors, then run `studiofs upgrade NAME` with this binary to deploy the schema, adding `--repair-schema` to restore a dropped guard"
         )))
     }
 

@@ -84,28 +84,36 @@ impl RedbMetaEngine {
 
     /// Read persisted format metadata from a redb file without opening the full engine.
     pub fn read_format_info_readonly(path: impl AsRef<Path>) -> MetaResult<FormatInfo> {
-        let db = match ReadOnlyDatabase::open(path.as_ref()) {
-            Ok(db) => db,
-            Err(redb::DatabaseError::Storage(redb::StorageError::Io(err)))
-                if err.kind() == ErrorKind::NotFound =>
-            {
-                return Err(MetaError::NotFormatted);
-            }
-            Err(redb::DatabaseError::RepairAborted) => {
-                return Err(MetaError::RepairRequired(
-                    "redb database requires repair".to_string(),
-                ));
-            }
-            Err(e) => {
-                return Err(MetaError::Storage(format!(
-                    "failed to open redb read-only: {e}"
-                )));
-            }
-        };
-        let txn = db
+        let txn = Self::open_readonly(path)?
             .begin_read()
             .map_err(|e| MetaError::Storage(e.to_string()))?;
         Self::read_format_info_from_read_txn(&txn)
+    }
+
+    /// Like [`Self::format_info_for_upgrade`], read-only and without
+    /// creating tables, for `studiofs upgrade --dry-run`.
+    pub fn read_format_info_for_upgrade_readonly(path: impl AsRef<Path>) -> MetaResult<FormatInfo> {
+        let txn = Self::open_readonly(path)?
+            .begin_read()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Self::read_format_info_for_upgrade_from_read_txn(&txn)
+    }
+
+    fn open_readonly(path: impl AsRef<Path>) -> MetaResult<ReadOnlyDatabase> {
+        match ReadOnlyDatabase::open(path.as_ref()) {
+            Ok(db) => Ok(db),
+            Err(redb::DatabaseError::Storage(redb::StorageError::Io(err)))
+                if err.kind() == ErrorKind::NotFound =>
+            {
+                Err(MetaError::NotFormatted)
+            }
+            Err(redb::DatabaseError::RepairAborted) => Err(MetaError::RepairRequired(
+                "redb database requires repair".to_string(),
+            )),
+            Err(e) => Err(MetaError::Storage(format!(
+                "failed to open redb read-only: {e}"
+            ))),
+        }
     }
 
     #[cfg(test)]

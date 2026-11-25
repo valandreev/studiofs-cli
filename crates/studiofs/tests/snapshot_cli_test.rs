@@ -176,14 +176,14 @@ fn upgrade_cli_restarts_after_shared_success_and_preserves_local_journal() {
         .block_on(ensure_studiofs_database(&raw_dsn))
         .unwrap()
         .metadata_dsn;
-    let (client, connection) = runtime
+    let (mut client, connection) = runtime
         .block_on(tokio_postgres::connect(&dsn, tokio_postgres::NoTls))
         .unwrap();
     let connection_task = runtime.spawn(connection);
     runtime
-        .block_on(studiofs_meta::pg_engine::schema::ensure_studiofs_pg_schema(
-            &client,
-        ))
+        .block_on(
+            studiofs_meta::pg_engine::schema::ensure_studiofs_pg_schema_committed(&mut client),
+        )
         .unwrap();
     let name = format!("upgrade-cli-{}", Uuid::new_v4().simple());
     let _cleanup = PgVolumeCleanup {
@@ -290,14 +290,14 @@ fn trash_days_cli_updates_shared_setting_and_client_converges() {
         .block_on(ensure_studiofs_database(&raw_dsn))
         .unwrap()
         .metadata_dsn;
-    let (client, connection) = runtime
+    let (mut client, connection) = runtime
         .block_on(tokio_postgres::connect(&dsn, tokio_postgres::NoTls))
         .unwrap();
     let connection_task = runtime.spawn(connection);
     runtime
-        .block_on(studiofs_meta::pg_engine::schema::ensure_studiofs_pg_schema(
-            &client,
-        ))
+        .block_on(
+            studiofs_meta::pg_engine::schema::ensure_studiofs_pg_schema_committed(&mut client),
+        )
         .unwrap();
     let name = format!("trash-days-cli-{}", Uuid::new_v4().simple());
     let _cleanup = PgVolumeCleanup {
@@ -393,9 +393,9 @@ fn compression_cli_updates_shared_setting_handles_cas_conflict_and_converges() {
         .unwrap();
     let connection_task = runtime.spawn(connection);
     runtime
-        .block_on(studiofs_meta::pg_engine::schema::ensure_studiofs_pg_schema(
-            &client,
-        ))
+        .block_on(
+            studiofs_meta::pg_engine::schema::ensure_studiofs_pg_schema_committed(&mut client),
+        )
         .unwrap();
     let name = format!("compression-cli-{}", Uuid::new_v4().simple());
     let _cleanup = PgVolumeCleanup {
@@ -593,14 +593,14 @@ fn snapshot_cli_scopes_catalog_and_policy_to_the_named_volume() {
         .block_on(ensure_studiofs_database(&raw_dsn))
         .expect("prepare PostgreSQL test database")
         .metadata_dsn;
-    let (client, connection) = runtime
+    let (mut client, connection) = runtime
         .block_on(tokio_postgres::connect(&dsn, tokio_postgres::NoTls))
         .expect("connect to PostgreSQL test database");
     let connection_task = runtime.spawn(connection);
     runtime
-        .block_on(studiofs_meta::pg_engine::schema::ensure_studiofs_pg_schema(
-            &client,
-        ))
+        .block_on(
+            studiofs_meta::pg_engine::schema::ensure_studiofs_pg_schema_committed(&mut client),
+        )
         .expect("ensure StudioFS PostgreSQL schema");
 
     let suffix = Uuid::new_v4().simple().to_string();

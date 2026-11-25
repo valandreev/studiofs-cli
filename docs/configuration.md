@@ -125,13 +125,32 @@ studiofs init projectfs --endpoint http://127.0.0.1:9000 --bucket studiofs-test 
 
 ### `upgrade`
 
-Upgrades a stopped, locally discovered format 5 volume cache to format 6.
+Applies pending PostgreSQL schema migrations, then upgrades a stopped, locally
+discovered format 5 volume cache to format 6.
 
 ```bash
+studiofs upgrade <name> --dry-run   # report only; changes nothing
 studiofs upgrade <name>
 ```
 
 Notes:
+- Before upgrading, stop every mount and janitor of every volume in the
+  PostgreSQL database, back up the database (for example with `pg_dump`) and
+  run `studiofs dump` for each volume. Schema migrations are database-wide and
+  never move back.
+- `--dry-run` lists the recorded schema components, the migrations that would
+  run with their phase (`additive`, `backfill` or `contract`), and the local
+  and shared volume format. It refuses a database with a newer or unknown
+  component, or with a migration history that differs from this binary.
+- Each migration commits with its version marker. After a failure, the
+  committed migrations stay applied; rerun the same command to resume. A
+  second concurrent `upgrade` waits for the schema lock up to two seconds and
+  then fails without changes. `init` and `load` apply only additive migrations
+  and refuse with "run `studiofs upgrade NAME`" when another kind is pending.
+- `--repair-schema` re-applies the idempotent 0.2.5 baseline to restore a
+  dropped table or guard trigger. It runs only while no later schema
+  migration is recorded; otherwise no command runs DDL against a verified
+  schema.
 - Unmount the volume and stop its janitors first; `upgrade` refuses an active
   local mount and holds the exclusive local `redb` lock for the whole command.
 - It upgrades the shared PostgreSQL schema and volume format, then completes
