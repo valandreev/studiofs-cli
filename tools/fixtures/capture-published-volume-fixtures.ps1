@@ -43,10 +43,16 @@ $workRoot = Join-Path $repoRoot 'target/sfs-1002-published'
 $fixtureRoot = Join-Path $repoRoot 'crates/studiofs-meta/tests/fixtures'
 $scenario = 'published-volume-fixture-capture'
 
-# Windows release asset names changed between releases.
+# Windows release asset names changed between releases. The SHA-256 values are
+# pinned here and in the fixture manifest, so a replaced release asset is
+# refused even if its own published .sha256 file was replaced with it.
 $assetByTag = @{
     'v0.2.2' = 'studiofs-0.2.2-x86_64-pc-windows-msvc.zip'
     'v0.2.4' = 'studiofs-0.2.4-x86_64-pc-windows.zip'
+}
+$pinnedSha256ByTag = @{
+    'v0.2.2' = '10748f832568b8f918b1b316e48d819139ff9aaaccb190a77abf5aca5cbebff0'
+    'v0.2.4' = 'cbd877327d86adc2e77395578298f9cc5f9a3d4a517559f9d8904698b805c3a6'
 }
 
 function Invoke-Native {
@@ -69,6 +75,9 @@ function Get-ReleaseBinary {
     $expected = ((Get-Content "$zip.sha256" -Raw).Trim() -split '\s+')[0].ToLowerInvariant()
     $actual = (Get-FileHash -Algorithm SHA256 $zip).Hash.ToLowerInvariant()
     if ($expected -ne $actual) { throw "$asset SHA-256 mismatch: expected $expected, got $actual" }
+    if ($pinnedSha256ByTag[$Tag] -ne $actual) {
+        throw "$asset SHA-256 $actual differs from the pinned $($pinnedSha256ByTag[$Tag])"
+    }
     $bin = Join-Path $dir 'bin'
     Expand-Archive -Force $zip $bin
     $exe = Get-ChildItem -Recurse -Filter studiofs.exe $bin | Select-Object -First 1

@@ -447,8 +447,10 @@ fn regenerate_baseline_0_2_5_fixtures() {
     };
     write_fixture(&dir.join("serving-checkpoint.bin"), &checkpoint);
 
-    // Snapshot artifact: the snapshot worker's reconstruction of a cut whose
-    // checkpoint is the serving checkpoint above and whose event tail is empty.
+    // Snapshot artifact: a checkpoint import equivalent to an empty-tail
+    // reconstruction (`reconstruct_loaded_snapshot_source` opens redb, sets the
+    // format, imports the checkpoint, then replays zero rows). Unlike the
+    // worker, the fixture is compacted to keep it small.
     let artifact = dir.join("snapshot-artifact.redb");
     let _ = std::fs::remove_file(&artifact);
     {
@@ -598,11 +600,11 @@ fn baseline_clean_cache_has_no_unpublished_journal() {
         read_counter(&engine, crate::pg_engine::LOCAL_PG_VERSION_COUNTER),
         FIXTURE_REPLAY_CURSOR
     );
-    let next = read_counter(&engine, counters::NEXT_EVENT_SEQ);
-    let flushed = read_counter(&engine, counters::LOCAL_PG_FLUSHED_EVENT_SEQ);
+    // Both positions are exclusive ends, normalized as the publisher reads them.
+    let (local_end, acknowledged) = engine.local_outbound_ack_positions().unwrap();
     assert!(
-        next <= flushed,
-        "clean cache must not hold unpublished events"
+        local_end <= acknowledged,
+        "clean cache must not hold unpublished events: end {local_end}, acknowledged {acknowledged}"
     );
     assert!(engine.read_events_range(0, u64::MAX).unwrap().is_empty());
 }
@@ -620,6 +622,11 @@ fn baseline_dirty_cache_keeps_unpublished_journal() {
         read_counter(&engine, counters::LOCAL_EVENT_LOG_PRUNED_THROUGH_SEQ),
         0,
         "local replay floor"
+    );
+    let (local_end, acknowledged) = engine.local_outbound_ack_positions().unwrap();
+    assert!(
+        local_end > acknowledged,
+        "dirty cache must hold unacknowledged events: end {local_end}, acknowledged {acknowledged}"
     );
     let pending = engine.read_events_range(0, u64::MAX).unwrap();
     assert!(
@@ -648,8 +655,22 @@ fn published_v0_2_2_format5_volume_requires_upgrade() {
             expected: 6
         })
     ));
-    let checkpoint = read_fixture(&dir.join("serving-checkpoint.bin"));
-    ServingCheckpoint::decode(&checkpoint).expect("format-5 checkpoint decodes");
+    let bytes = read_fixture(&dir.join("serving-checkpoint.bin"));
+    let checkpoint = ServingCheckpoint::decode(&bytes).expect("v0.2.2 checkpoint decodes");
+    // Checkpoint format 2: the format 1 tables plus directory aliases, with no
+    // settings suffix, so settings decode as the default.
+    let format_2 = postcard::to_stdvec(&(
+        &checkpoint.inodes,
+        &checkpoint.dentries,
+        &checkpoint.regular_file_base,
+        &checkpoint.symlinks,
+        &checkpoint.xattrs,
+        &checkpoint.acl_rules,
+        &checkpoint.directory_aliases,
+    ))
+    .unwrap();
+    assert_eq!(bytes, format_2, "v0.2.2 checkpoint is exactly format 2");
+    assert_eq!(checkpoint.volume_settings, VolumeSettings::default());
 
     let (_tmp, path) = copy_to_temp(&dir.join("local-cache.redb"));
     assert!(matches!(
