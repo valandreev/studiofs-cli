@@ -1,6 +1,8 @@
 # StudioFS release downloads and builds
 
 Published releases are
+[v0.2.4](https://github.com/valandreev/studiofs-cli/releases/tag/v0.2.4)
+(19 assets, published 2026-11-25),
 [v0.2.3](https://github.com/valandreev/studiofs-cli/releases/tag/v0.2.3)
 (19 assets, published 2026-11-19),
 [v0.2.2](https://github.com/valandreev/studiofs-cli/releases/tag/v0.2.2)
@@ -8,9 +10,9 @@ Published releases are
 [v0.2.1](https://github.com/valandreev/studiofs-cli/releases/tag/v0.2.1)
 (19 assets, published 2026-11-08), and
 [v0.2.0](https://github.com/valandreev/studiofs-cli/releases/tag/v0.2.0).
-The platform instructions below describe the published v0.2.3 packages.
+The platform instructions below describe the published v0.2.4 packages.
 
-StudioFS 0.2.3 targets these five native platforms:
+StudioFS 0.2.4 targets these five native platforms:
 
 | Download suffix from v0.2.3 | Suffix up to v0.2.2 | Rust target triple | System | GitHub builder |
 | --- | --- | --- | --- | --- |
@@ -107,9 +109,9 @@ avoids building unrelated workspace test/scenario tools. Exact byte reproduction
 also depends on the native toolchain and library versions; this workflow records
 identity and linkage evidence, not a promise of bit-for-bit reproducible builds.
 
-The release's `studiofs-v0.2.3-source.tar.gz` contains the exact tracked project
+The release's `studiofs-v0.2.4-source.tar.gz` contains the exact tracked project
 source and build scripts. GitHub also supplies source archives for the tag.
-`studiofs-v0.2.3-dependency-source.tar.gz` contains `cargo vendor --locked`
+`studiofs-v0.2.4-dependency-source.tar.gz` contains `cargo vendor --locked`
 output for every locked Rust dependency, plus `Cargo.lock` and the Cargo source
 replacement configuration needed to build offline from it. Separately installed
 platform components (WinFsp, macFUSE, libfuse3 and desktop libraries) are not
