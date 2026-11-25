@@ -145,13 +145,36 @@ that declares support for 0.2.5 (the compiled test successor of
   (`crates/studiofs-meta/src/pg_engine/schema.rs:922`). The marker insert is the
   last statement and never moves backwards
   (`crates/studiofs-meta/src/pg_engine/schema.rs:912`).
-- Reader strictness: mount startup runs `validate_postgres_schema`
-  (`crates/studiofs-meta/src/pg_engine.rs:1280`) against one global list of
-  required tables (`crates/studiofs-meta/src/pg_engine.rs:1314`) and columns.
-  A missing table tells the operator to destroy and re-init
-  (`crates/studiofs-meta/src/pg_engine.rs:1365`). Extra tables are ignored.
-  The Janitor requires `payload_gc` to equal exactly 2 and its guard triggers
-  to be enabled (`crates/studiofs-meta/src/pg_engine/janitor.rs:430`).
+- Reader strictness (SFS-1006): mount startup runs `validate_postgres_schema`
+  (`crates/studiofs-meta/src/pg_engine/startup_schema.rs`) per component, not
+  against one global list of tables. `MOUNT_COMPONENTS` names the components
+  a mount uses and the objects it touches:
+  - `core`: the bootstrap, replay, publication, checkpoint and file-lock
+    tables, `trash_entry_authority` and `trash_publication_receipts` for
+    retained-entry publication and recovery, `snapshot_catalog` and
+    `snapshot_source_checkpoints` (event log prune floor), and the
+    `metadata_state` checkpoint and prune columns.
+  - `payload_gc`: the payload upload and reachability ledger that publication
+    writes.
+
+  Each component's `studiofs_schema_components` row must exist and be at least
+  its `min_supported`. A newer version or an unknown component is additive for
+  a mount and is accepted. A missing object refuses the mount as
+  `schema_component_outdated` naming the object, even under a newer version.
+  If an object is missing and its recorded component is newer than the
+  running binary, use a binary that supports that version or newer when
+  running `studiofs upgrade --repair-schema`.
+  A missing registry or row refuses the mount as `schema_component_missing`. These
+  refusals reuse the `compat::ReasonCode` codes and actions and are permanent
+  `Storage` errors. Only an unreachable PostgreSQL or a bounded timeout falls
+  back to local-first startup; a rejected probe statement fails startup.
+  Optional-feature tables are not checked at mount: snapshot creation jobs and
+  leases, cleanup and mount leases, policies, artifacts and attempts, and
+  Janitor sweep checkpoints. A missing one fails only that feature's
+  statements. Snapshot ports still report this as a redacted retryable
+  backend error. The Janitor requires `payload_gc` to equal exactly 2 and its
+  guard triggers to be enabled
+  (`crates/studiofs-meta/src/pg_engine/janitor.rs:430`).
 - Writers: DDL runs only from CLI commands: `init`
   (`crates/studiofs/src/cli/init.rs:322`, `crates/studiofs/src/cli/init.rs:420`),
   `load`

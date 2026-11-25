@@ -383,6 +383,8 @@ cargo test -p studiofs-meta metadata_notify_start_skips_start_lock_when_already_
 cargo test -p studiofs-meta prepare_for_close_is_idempotent_when_no_workers_are_running -- --nocapture
 cargo test -p studiofs-meta dropping_engine_signals_background_workers_without_waiting -- --nocapture
 cargo test -p studiofs-meta postgres_startup_reachability_classification_keeps_timeout_typed -- --nocapture
+cargo test -p studiofs-meta startup_schema -- --nocapture
+cargo test -p studiofs-meta startup_schema_distinguishes_additive_optional_absent_and_incompatible_schemas -- --ignored --nocapture
 cargo test -p studiofs-meta test_pg_foreground_file_lock_does_not_repair_missing_schema -- --ignored --nocapture
 cargo test -p studiofs-meta test_pg_lock_notify_listener_releases_engine_after_drop -- --ignored --nocapture
 cargo test -p studiofs init_pg_schema_provisions_volume_encryption_metadata -- --nocapture
