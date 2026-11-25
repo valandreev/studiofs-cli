@@ -48,6 +48,11 @@ impl VersionIdentity {
         u16::try_from(found).is_ok_and(|found| self.supports(found))
     }
 
+    pub(crate) const fn current_pg_smallint(&self) -> i16 {
+        assert!(self.current <= i16::MAX as u16);
+        self.current.cast_signed()
+    }
+
     /// Typed refusal of an unsupported persisted version.
     pub fn check(&self, found: u16) -> MetaResult<()> {
         if self.supports(found) {
@@ -67,6 +72,13 @@ pub const SHARED_VOLUME_FORMAT: VersionIdentity = VersionIdentity {
     name: "shared volume format",
     current: 6,
     min_supported: 6,
+};
+
+/// Physical PostgreSQL DDL version of the existing `payload_gc` schema component.
+pub const POSTGRES_PAYLOAD_GC_SCHEMA: VersionIdentity = VersionIdentity {
+    name: "PostgreSQL payload GC schema",
+    current: 2,
+    min_supported: 2,
 };
 
 /// Local redb metadata layout, recorded in the redb `SETTINGS_TABLE["format"]`
@@ -128,6 +140,9 @@ mod tests {
         assert_eq!(LOCAL_METADATA_LAYOUT.current, 6);
         assert_eq!(crate::schema::CURRENT_FORMAT_VERSION, 6);
         assert_eq!(EVENT_CODEC_WIRE.current, 1);
+        assert_eq!(POSTGRES_PAYLOAD_GC_SCHEMA.current, 2);
+        assert!(!POSTGRES_PAYLOAD_GC_SCHEMA.supports(1));
+        assert!(!POSTGRES_PAYLOAD_GC_SCHEMA.supports(3));
         assert_eq!(
             i16::try_from(SERVING_CHECKPOINT_FORMAT.current).unwrap(),
             crate::snapshot::ServingCheckpoint::FORMAT_VERSION

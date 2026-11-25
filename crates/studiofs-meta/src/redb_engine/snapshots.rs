@@ -443,7 +443,7 @@ impl RedbMetaEngine {
     ) -> MetaResult<RedbSnapshot> {
         let mut snapshot = self.export_snapshot()?;
         if let Some((_, bytes)) = snapshot.settings.iter().find(|(key, _)| key == "format") {
-            crate::decode_format_info(bytes)?;
+            crate::decode_local_format_info(bytes)?;
         }
         snapshot.settings.retain(|(key, _)| {
             key != super::volume_settings::VOLUME_SETTINGS_KEY
@@ -606,7 +606,7 @@ impl RedbMetaEngine {
                     if let Some((_, format)) =
                         snapshot.settings.iter().find(|(key, _)| key == "format")
                     {
-                        crate::decode_format_info(format)?;
+                        crate::decode_local_format_info(format)?;
                     }
                     serde_json::from_slice::<crate::trash::VolumeSettings>(v)
                         .map_err(|error| MetaError::Serialization(error.to_string()))?;

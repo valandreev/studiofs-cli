@@ -510,7 +510,7 @@ change:
 | New `MetaEvent` wire envelope | `EVENT_CODEC_WIRE`; a new event kind is a new append-only tag instead | shared format |
 | New serving checkpoint suffix | `SERVING_CHECKPOINT_FORMAT` (keep older formats in range) | shared format |
 | Serving-state schema change | `SERVING_CHECKPOINT_SCHEMA` | checkpoint format |
-| Additive PostgreSQL table, column or index | the `studiofs_schema_components` component (SFS-1005) | every identity above |
+| Additive PostgreSQL table, column or index | the matching `studiofs_schema_components` component (`POSTGRES_PAYLOAD_GC_SCHEMA` for the existing `payload_gc` component, with further components in SFS-1005) | every identity above |
 | Payload index, snapshot artifact, dump, STFS, SFEC | the owner constant listed in `version.rs` | every identity above |
 
 Today the local redb header is still the `FormatInfo` copy in
@@ -527,7 +527,8 @@ compatibility gate.
 `FormatInfo` rule: `FormatInfo`, `MetadataConfig`, `PostgresConfig` and
 `EncryptionConfig` keep `deny_unknown_fields`, and `decode_format_info` reports
 an unknown field or enum variant (for example a new `MetadataBackend`) as
-`MetaError::UpgradeRequired` naming it, never as `Serialization`. A new
+`MetaError::UpgradeRequired` with the schema identifier when it meets the
+diagnostic redaction rules. A new
 optional field must use `#[serde(default, skip_serializing_if = ...)]` so a
 volume that does not use it keeps byte-identical `FormatInfo` and stays
 readable by 0.2.5. A field or variant that a volume needs (such as the 0.2.7

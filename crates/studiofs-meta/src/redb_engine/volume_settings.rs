@@ -14,7 +14,7 @@ impl RedbMetaEngine {
             .open_table(SETTINGS_TABLE)
             .map_err(|error| MetaError::Storage(error.to_string()))?;
         if let Some(format) = table.get("format")? {
-            crate::decode_format_info(format.value())?;
+            crate::decode_local_format_info(format.value())?;
         }
         let current = table
             .get(key)?
@@ -95,7 +95,7 @@ impl RedbMetaEngine {
                 .open_table(SETTINGS_TABLE)
                 .map_err(|e| MetaError::Storage(e.to_string()))?;
             if let Some(format) = table.get("format")? {
-                crate::decode_format_info(format.value())?;
+                crate::decode_local_format_info(format.value())?;
             }
             table
                 .get(VOLUME_SETTINGS_KEY)?

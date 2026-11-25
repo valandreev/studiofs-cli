@@ -16,6 +16,7 @@ After this milestone, the repository has a written contract that splits that num
 - [x] (2026-11-25) SFS-1002: pinned the provisional 0.2.5 baseline fixtures (FormatInfo JSON, `VolumeSettings` with compression, serving checkpoint bytes, one event per tag, STFS v2 in 1 MiB SFEC frames, the reused STFS v3 fixture, payload index, snapshot artifact, clean and dirty local caches, version-4 dump) and captured format 5 (v0.2.2) and format 6 (v0.2.4) volumes from the published binaries. Manifest and drift test: `crates/studiofs-meta/tests/fixtures/baseline-0.2.5/manifest.json`, `crates/studiofs-meta/tests/baseline_fixture_manifest.rs`. Successor fixtures moved to SFS-1131 (scope decision of 2026-11-25). The published volumes are captured by the opt-in `studiofs-e2e` scenario `published-volume-fixture-capture` on the runner-owned Compose stack.
 - [ ] SFS-1131: define the test-successor build, its manifest of declared capabilities, and the release guard that keeps it out of shipped artifacts.
 - [x] (2026-11-25) SFS-1003: added `crates/studiofs-meta/src/version.rs` with typed identities (informative client release, shared volume format, local redb layout, event codec wire, serving checkpoint format and schema) and a pointer table to the identities owned by other crates; routed every existing strict check to the identity it guards without bumping any value; made the checkpoint schema a supported range; added `MetaError::UpgradeRequired` for unknown `FormatInfo` fields and enum variants, kept through the bootstrap descriptor (`PgSyncFailure::UpgradeRequired`); documented the version-bump rules in `docs/persisted-format-compatibility.md`.
+- [x] (2026-11-25) SFS-1003 review: wired the existing PostgreSQL `payload_gc` DDL identity and the local redb header checks in volume settings, retained entries, and redb snapshots. Snapshot source errors now preserve the upgrade-required outcome. Three focused regressions failed on the original paths before the correction. The subsequent Windows metadata selection passed 48 tests, with two ignored.
 - [ ] SFS-1004: implement the central capability evaluator with deterministic decisions.
 
 ## Surprises & Discoveries
@@ -42,8 +43,8 @@ After this milestone, the repository has a written contract that splits that num
 - Decision: the local redb header stays the `FormatInfo` copy; local opens judge it by `LOCAL_METADATA_LAYOUT`, shared reads by `SHARED_VOLUME_FORMAT`. A dedicated local marker is left to SFS-1012.
   Rationale: adding a new redb field would change the persisted layout, which this issue must not do.
   Date/Author: 2026-11-25, SFS-1003 implementer.
-- Decision: `UpgradeRequired` is derived from serde's stable `unknown field` / `unknown variant` messages and keeps only the backtick-quoted schema name (at most 64 characters), never stored values.
-  Rationale: smallest change that keeps `deny_unknown_fields`; the rendered error cannot carry DSNs or keys.
+- Decision: `UpgradeRequired` is derived from Serde's unknown-field and unknown-variant data diagnostics. Only short ASCII identifiers can be rendered as names. Other JSON errors report the input position.
+  Rationale: `serde_json` exposes both unknown-name errors under the same data category. Focused regression tests exercise that diagnostic boundary and the redaction rules.
   Date/Author: 2026-11-25, SFS-1003 implementer.
 
 - Decision: the audit and ADR are the single source of truth; milestone plans reference them instead of copying the tables.

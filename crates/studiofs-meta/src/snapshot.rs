@@ -307,9 +307,11 @@ struct ServingCheckpointV1 {
 
 impl ServingCheckpoint {
     /// The persisted checkpoint format version.
-    pub(crate) const FORMAT_VERSION: i16 = crate::version::SERVING_CHECKPOINT_FORMAT.current as i16;
+    pub(crate) const FORMAT_VERSION: i16 =
+        crate::version::SERVING_CHECKPOINT_FORMAT.current_pg_smallint();
     /// The serving-state schema version.
-    pub(crate) const SCHEMA_VERSION: i16 = crate::version::SERVING_CHECKPOINT_SCHEMA.current as i16;
+    pub(crate) const SCHEMA_VERSION: i16 =
+        crate::version::SERVING_CHECKPOINT_SCHEMA.current_pg_smallint();
 
     /// Whether checkpoints written with `version` can be decoded.
     pub(crate) fn supports_format_version(version: i16) -> bool {

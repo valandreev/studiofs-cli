@@ -99,14 +99,18 @@ pub fn decode_format_info(bytes: &[u8]) -> MetaResult<FormatInfo> {
     decode_format_info_as(bytes, version::SHARED_VOLUME_FORMAT)
 }
 
+fn decode_local_format_info(bytes: &[u8]) -> MetaResult<FormatInfo> {
+    decode_format_info_as(bytes, version::LOCAL_METADATA_LAYOUT)
+}
+
 /// [`decode_format_info`] with the version judged by `identity`, so the local
 /// redb header copy and shared `FormatInfo` answer to separate identities.
-pub(crate) fn decode_format_info_as(
+fn decode_format_info_as(
     bytes: &[u8],
     identity: version::VersionIdentity,
 ) -> MetaResult<FormatInfo> {
     let version: FormatVersionOnly =
-        serde_json::from_slice(bytes).map_err(|e| MetaError::Serialization(e.to_string()))?;
+        serde_json::from_slice(bytes).map_err(|error| invalid_format_info_json(&error))?;
     identity.check(version.format_version)?;
     let info: FormatInfo = serde_json::from_slice(bytes).map_err(format_info_decode_error)?;
     info.validate_format_contract()?;
@@ -115,24 +119,45 @@ pub(crate) fn decode_format_info_as(
 
 /// Maps serde's unknown field/variant errors to [`MetaError::UpgradeRequired`].
 ///
-/// serde reports both as "unknown field `NAME`, ..." / "unknown variant `NAME`, ...";
-/// only the backtick-quoted schema name is kept, never a stored value.
+/// `serde_json::Error` exposes a data category for both cases. The pinned
+/// decoder regression tests guard the Serde diagnostic syntax used here.
 fn format_info_decode_error(error: serde_json::Error) -> MetaError {
-    const MAX_NAME_CHARS: usize = 64;
+    if !error.is_data() {
+        return invalid_format_info_json(&error);
+    }
     let message = error.to_string();
     let quoted = |prefix: &str| {
         let rest = message.strip_prefix(prefix)?;
-        let (name, _) = rest.split_once('`')?;
-        Some(name.chars().take(MAX_NAME_CHARS).collect::<String>())
+        let (name, _) = rest.rsplit_once("`, expected ")?;
+        let safe_name = if name.is_empty()
+            || name.len() > 64
+            || !name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+        {
+            "<redacted>"
+        } else {
+            name
+        };
+        Some(safe_name.to_owned())
     };
     let reason = if let Some(field) = quoted("unknown field `") {
         UpgradeRequiredReason::UnknownFormatInfoField { field }
     } else if let Some(variant) = quoted("unknown variant `") {
         UpgradeRequiredReason::UnknownFormatInfoVariant { variant }
     } else {
-        return MetaError::Serialization(message);
+        return invalid_format_info_json(&error);
     };
     MetaError::UpgradeRequired { reason }
+}
+
+fn invalid_format_info_json(error: &serde_json::Error) -> MetaError {
+    // Serde's data errors can contain the original value of a malformed field.
+    MetaError::Serialization(format!(
+        "invalid FormatInfo JSON at line {}, column {}",
+        error.line(),
+        error.column(),
+    ))
 }
 
 /// Validate the atomic PostgreSQL serving-checkpoint descriptor.
@@ -436,6 +461,28 @@ mod tests {
                 variant: "redis".to_string(),
             },
         );
+    }
+
+    #[test]
+    fn format_info_decode_redacts_non_identifier_backend_names() {
+        let mut json = baseline_format_info_json();
+        json["metadata"]["backend"] = serde_json::json!("future\nbackend");
+        assert_upgrade_required(
+            &serde_json::to_vec(&json).unwrap(),
+            &UpgradeRequiredReason::UnknownFormatInfoVariant {
+                variant: "<redacted>".to_string(),
+            },
+        );
+    }
+
+    #[test]
+    fn format_info_decode_redacts_malformed_field_values() {
+        let mut json = baseline_format_info_json();
+        json["metadata"]["postgres"]["volume_id"] = serde_json::json!("fixture-private-value");
+        let error = decode_format_info(&serde_json::to_vec(&json).unwrap()).unwrap_err();
+        assert!(matches!(error, MetaError::Serialization(_)));
+        assert!(!format!("{error}").contains("fixture-private-value"));
+        assert!(!format!("{error:?}").contains("fixture-private-value"));
     }
 
     #[test]
