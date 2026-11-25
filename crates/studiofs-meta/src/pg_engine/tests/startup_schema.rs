@@ -27,11 +27,12 @@ fn refusal(dsn: &str, volume_id: i64) -> String {
 
 #[test]
 fn startup_schema_unreachable_postgres_falls_back_to_local_first() {
-    let socket = tokio::net::TcpSocket::new_v4().expect("create a TCP socket");
-    socket
-        .bind((Ipv4Addr::LOCALHOST, 0).into())
-        .expect("reserve a port without listening");
-    let addr = socket.local_addr().expect("read the reserved address");
+    // A bound but non-listening socket is refused on Linux, but Darwin drops
+    // the SYN and the connect times out instead. A released port is refused
+    // with RST on both.
+    let addr = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .and_then(|listener| listener.local_addr())
+        .expect("pick a loopback port and release it");
 
     let outcome = PgMetaEngine::validate_postgres_schema(
         &format!("postgres://{addr}/studiofs"),
