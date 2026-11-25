@@ -92,9 +92,6 @@ pub enum UnsupportedEventReason {
     /// The tag is unassigned, reserved, or absent in this build.
     #[error("unknown MetaEvent wire kind tag {0}")]
     Tag(u8),
-    /// The untagged postcard event uses an unsupported ordinal.
-    #[error("unknown legacy MetaEvent ordinal {0}")]
-    LegacyOrdinal(u32),
     /// The PostgreSQL kind is absent from the shared codec registry.
     #[error("unknown PostgreSQL MetaEvent type")]
     PostgresType,
@@ -528,7 +525,11 @@ fn decode_event_wire_parts(bytes: &[u8]) -> MetaResult<(u8, &[u8])> {
         12 => TAG_REMOVE_ACL_RULE,
         13 => TAG_ADD_PENDING_DELETION,
         14 => TAG_REMOVE_PENDING_DELETION,
-        _ => return Err(UnsupportedEventReason::LegacyOrdinal(ordinal).into()),
+        _ => {
+            return Err(MetaError::Serialization(format!(
+                "unknown legacy MetaEvent ordinal {ordinal}"
+            )));
+        }
     };
     Ok((tag, payload))
 }
@@ -1185,6 +1186,7 @@ mod tests {
     fn unknown_legacy_ordinal_is_rejected_with_actionable_error() {
         let error = decode_event(&[17_u8]).expect_err("unknown legacy ordinal");
 
+        assert!(matches!(error, MetaError::Serialization(_)));
         assert!(
             error
                 .to_string()
@@ -1230,10 +1232,12 @@ mod tests {
                 Err(MetaError::Serialization(_))
             ));
         }
-        assert!(matches!(
-            decode_event(b"SFS-BAD\x01\x02\x2a"),
-            Err(MetaError::Serialization(_))
-        ));
+        for corrupt in [b"SFS-BAD\x01\x02\x2a", b"XFS-EVT\x01\x02\x2a"] {
+            assert!(matches!(
+                decode_event(corrupt),
+                Err(MetaError::Serialization(_))
+            ));
+        }
     }
 
     #[test]

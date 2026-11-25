@@ -41,6 +41,8 @@ After this milestone, every data format a successor might change has its own ver
 
 SFS-1009 preserves every baseline event byte fixture and keeps tag 22 confined to the test-successor reader. An isolated PostgreSQL 18 test proved that the unknown event refused a whole replay page before any settings or cursor changes. The valid prefix applied on its own, and a retry kept the durable cursor at the last accepted batch. The redb settings regression proved that a failed rewrite preserves the original JSON and appends no event.
 
+Review regressions reproduced three failures before the correction. Snapshot reconstruction now reports a permanent upgrade requirement, a damaged envelope prefix reports a serialization error, and the CLI reports the upgrade requirement for unknown settings. A PostgreSQL 18 test verified that the CLI and authoritative settings update both refuse the unknown field and preserve the stored bytes.
+
 ## Context and Orientation
 
 Events are encoded in `crates/studiofs-meta/src/events.rs` with the magic `SFS-EVT`, a wire version byte and a kind tag; tags are append-only and 16–17 are reserved. Serving checkpoints are `ServingCheckpoint` in `crates/studiofs-meta/src/snapshot.rs` (format 4, decoded by suffix). The local metadata database is redb, opened by `RedbMetaEngine`; its header is `FormatInfo` in the `format` key of the settings table, handled in `crates/studiofs-meta/src/redb_engine/format.rs`. The local payload index (`crates/studiofs-cache/src/payload_index.rs`) stores dirty and upload state of payloads that are not yet published, with index format 2 and entry encoding 3. The existing upgrade command is `crates/studiofs/src/cli/upgrade.rs`, which calls `upgrade_shared_format5` in `crates/studiofs-meta/src/pg_engine/format_upgrade.rs` and then `upgrade_local_format5`.
@@ -57,11 +59,13 @@ From the repository root:
 
     cargo test -p studiofs-meta --lib events::tests
     cargo test -p studiofs-meta --lib --features test-successor events::tests
+    cargo test -p studiofs-meta --lib pg_engine::snapshot_control::tests
     cargo test -p studiofs-meta --lib baseline_fixtures::baseline_events_decode_one_per_tag
     cargo test -p studiofs-meta --lib --features test-successor test_successor::tests
     cargo test -p studiofs-meta --lib future_volume_settings_are_not_rewritten
     cargo test -p studiofs-meta --lib unknown_required_capabilities_never_grant_write_authority
     cargo test -p studiofs-meta --lib pg_unsupported_event_stops_replay_before_durable_cursor_advance -- --ignored
+    cargo test -p studiofs --test snapshot_cli_test compression_cli_updates_shared_setting_handles_cas_conflict_and_converges -- --ignored
     cargo test -p studiofs-meta --lib snapshot
     cargo test -p studiofs-cache --lib payload_index
     cargo test -p studiofs --bin studiofs upgrade

@@ -2,6 +2,7 @@
 
 use anyhow::{Context, bail};
 use std::time::Duration;
+use studiofs_meta::MetaError;
 use studiofs_meta::trash::{CompressionPolicy, VolumeSettings};
 
 const SETTINGS_TIMEOUT: Duration = Duration::from_secs(30);
@@ -91,7 +92,7 @@ pub(super) fn read_or_update_shared_settings(
         .context("This volume has no PostgreSQL authority binding")?;
     let (volume, uuid) = (pg.volume_id, format.uuid.clone());
     let runtime = tokio::runtime::Runtime::new()?;
-    runtime
+    let result = runtime
         .block_on(async {
             tokio::time::timeout(
                 SETTINGS_TIMEOUT,
@@ -116,8 +117,18 @@ pub(super) fn read_or_update_shared_settings(
             )
             .await
         })
-        .context("PostgreSQL did not answer in time; nothing is confirmed, retry the command")?
-        .context(unreachable_context)
+        .context("PostgreSQL did not answer in time; nothing is confirmed, retry the command")?;
+    match result {
+        Err(error)
+            if matches!(
+                error.downcast_ref::<MetaError>(),
+                Some(MetaError::UpgradeRequired { .. })
+            ) =>
+        {
+            Err(error)
+        }
+        other => other.context(unreachable_context),
+    }
 }
 
 async fn load_shared_settings(
@@ -136,7 +147,8 @@ async fn load_shared_settings(
     }
     let bytes: Option<Vec<u8>> = row.get(1);
     Ok(bytes
-        .map(|bytes| serde_json::from_slice::<VolumeSettings>(&bytes))
+        .as_deref()
+        .map(VolumeSettings::decode_json)
         .transpose()?
         .unwrap_or_default())
 }

@@ -243,7 +243,9 @@ impl Serialize for VolumeSettings {
 }
 
 impl VolumeSettings {
-    pub(crate) fn decode_json(bytes: &[u8]) -> crate::MetaResult<Self> {
+    /// Decode persisted settings, preserving the upgrade requirement for fields
+    /// or variants this client cannot represent.
+    pub fn decode_json(bytes: &[u8]) -> crate::MetaResult<Self> {
         serde_json::from_slice(bytes).map_err(|error| {
             if error.is_data()
                 && ["unknown field `", "unknown variant `"]

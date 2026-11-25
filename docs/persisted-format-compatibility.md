@@ -295,12 +295,14 @@ that declares support for 0.2.5 (the compiled test successor of
   Settings show the tag-per-version pattern. Tag 19 carries revision and
   trash, tag 20 adds quota, and tag 21 adds compression. The writer selects
   the oldest tag that preserves the requested policy.
-- Unknown wire versions, tags, and legacy ordinals return
-  `UpgradeRequired` with `UnsupportedEventReason`. An unknown PostgreSQL
-  kind is also unsupported. A known kind that disagrees with the tag, a
-  truncated payload, and trailing payload bytes return `Serialization`.
+- Unknown tagged wire versions, tags, and PostgreSQL kinds return
+  `UpgradeRequired` with `UnsupportedEventReason`. An unknown ordinal in the
+  frozen untagged format, a known PostgreSQL kind that disagrees with the
+  tag, malformed or truncated bytes, and trailing payload bytes return
+  `Serialization`.
   Replay decodes the complete page before opening the local apply
-  transaction, so the durable cursor cannot cross a refused event.
+  transaction, so the durable cursor cannot cross a refused event. Snapshot
+  reconstruction reports unsupported events as a permanent upgrade requirement.
 - The compiled test successor reads tag 22 (`set_user_xattr`), an
   unconditional xattr assignment with a name relative to `user.`. The
   ordinary encoder in both builds emits tag 10 for the equivalent mutation.
@@ -348,7 +350,8 @@ that declares support for 0.2.5 (the compiled test successor of
   `off` or `zstd` with level 1–19 (`crates/studiofs-meta/src/trash.rs:105`).
 - Stored settings JSON rejects unknown fields in the settings object, trash
   policy, and compression policy. An unknown field or enum variant returns
-  `UpgradeRequired` before a compare-and-set can rewrite the record.
+  `UpgradeRequired` on CLI reads and before a compare-and-set can rewrite
+  the record.
   Historical missing quota and compression fields still use their defaults.
   Quota-enabled records retain the `quota_v1_revision` spelling.
 - Writers: `studiofs volume` settings commands through `compare_and_set_*`,
