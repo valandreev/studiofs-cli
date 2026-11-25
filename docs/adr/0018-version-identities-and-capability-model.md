@@ -71,20 +71,41 @@ the successor reads. Optional capabilities never block an older binary.
 
 ### Evaluator
 
-One evaluator (SFS-1004) decides every operation. Its inputs are the binary's
-declared capability sets, the volume policy record, the schema components
-present in the shared backend, and the local identities read from redb and the
-payload index. Its output is a decision per operation (read, write, maintain,
-snapshot, dump/load) with a typed reason: `Allowed`, `UpgradeRequired`
-(this binary is too old), `MaintenanceForbidden`, or `LocalUpgradeRequired`
-(a local store needs migration). The evaluator is a pure function so it can be
-tested without a backend. Unknown names in any required set are treated as
-missing; the decision never falls back to `Allowed`.
+One evaluator (SFS-1004, `crates/studiofs-meta/src/compat.rs`) decides every
+operation. Its inputs are the binary's declared capability sets
+(`ClientCapabilities`), the volume requirements (`VolumeRequirements`: shared
+format, the three required sets, optional capabilities in use, the schema
+components present in the shared backend, and the latest checkpoint
+descriptor), and the local identities read from redb and the payload index. The
+inputs hold no PostgreSQL types, so the 0.2.7 backend reuses them. The
+evaluator is a pure function so it can be tested without a backend and adds no
+round trip to a hot path.
+
+It assesses each operation (bootstrap, replay, publication, checkpoint,
+maintenance) and reports one overall class: `CompatibleRW`, `CompatibleRO`
+(publication refused), `NeedsMigration` (the volume, its shared schema or a
+local store must be migrated, for example a format 5 or 6 volume that
+`studiofs upgrade` adopts), `UpgradeRequired` (this binary is too old), or
+`Incompatible` (no supported path). Every refusal carries a stable
+machine-readable reason code (for example `event_kind_unknown`,
+`write_capability_missing`, `maintenance_capability_missing`) and a human
+action. A refused maintenance operation is reported per operation with
+`maintenance_capability_missing` or `schema_component_newer`; it does not
+change the overall class. Unknown names in any required set are treated as
+missing, and write authority comes only from the declared write set, never
+from a version range.
+
+Payload object formats (`payload.stfs.v3`, `payload.sfec.v1`) are read
+capabilities, so a binary learns about an unsupported payload format before it
+reads one. Names in the `event.`, `payload.` and `checkpoint.` namespaces are
+safety-critical: an unknown one is refused wherever the volume declares it,
+including the optional set.
 
 Boundary decoders report their own typed errors (an unknown event tag, an
 unknown checkpoint format, an unsupported dump version, an unknown
-`FormatInfo` field); these map into the evaluator's `UpgradeRequired`. A refusal
-of the local redb or payload index format maps into `LocalUpgradeRequired`.
+`FormatInfo` field); these map into the evaluator's `UpgradeRequired`. A local
+redb or payload index newer than the binary maps into `UpgradeRequired`; an
+older one that the binary cannot open maps into `NeedsMigration`.
 
 ### Per-volume policy and policy epoch
 

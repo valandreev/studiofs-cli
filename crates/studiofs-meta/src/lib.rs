@@ -15,6 +15,8 @@ pub(crate) mod allocator_state;
 pub mod async_engine;
 /// Platform-neutral invalidation intents for committed local metadata views.
 pub mod coherence;
+/// Pure capability evaluator deciding per-operation volume compatibility.
+pub mod compat;
 /// Fast Contract/Core fixtures and invariant checks for local tests.
 pub mod contract_harness;
 /// Backend-agnostic metadata contracts shared by all metadata engines.
