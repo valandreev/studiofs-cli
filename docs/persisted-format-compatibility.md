@@ -552,7 +552,8 @@ behavior. It never changes a baseline encoder.
 `studiofs internal version-identities` prints the identities from
 `version::IDENTITIES` and the declared changes as JSON. An identity that a
 successor change bumps must appear in that list. `baseline` 0 marks an
-identity that the baseline does not report.
+identity that the baseline does not report. Each identity has at most one
+bump; changes that share an identity declare one combined bump.
 `python tools/test_successor/build.py` builds the baseline and the successor
 (`target/test-successor/`). It diffs both reports and fails unless every
 `current` difference is a declared bump and every `min_supported` value is
@@ -567,6 +568,7 @@ Release builds cannot contain the successor. The feature raises a
 that refusal. `tools/release/package.py` also rejects a binary that embeds the
 successor marker `STUDIOFS-TEST-SUCCESSOR-BUILD`.
 
+### Pending local writes
 
 Local writer state can be newer than shared state. A compatibility refusal
 never deletes, resets or rewrites the local journal, the redb metadata, or

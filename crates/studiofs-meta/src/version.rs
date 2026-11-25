@@ -118,7 +118,7 @@ pub const SERVING_CHECKPOINT_SCHEMA: VersionIdentity = VersionIdentity {
 };
 
 /// Every identity owned by this crate, in report order.
-pub const IDENTITIES: [VersionIdentity; 6] = [
+pub const IDENTITIES: &[VersionIdentity] = &[
     SHARED_VOLUME_FORMAT,
     POSTGRES_PAYLOAD_GC_SCHEMA,
     LOCAL_METADATA_LAYOUT,

@@ -78,7 +78,7 @@ class VerifyTests(unittest.TestCase):
         report = successor([identity("serving checkpoint format", 4, min_supported=2)], [])
         errors = build.verify(BASELINE, report)
         self.assertIn("successor dropped identity event codec wire", errors)
-        self.assertIn("identity serving checkpoint format: min_supported changed without a declaration", errors)
+        self.assertIn("identity serving checkpoint format: min_supported must not change", errors)
 
     def test_bump_of_unreported_identity_fails(self) -> None:
         changes = [change("c", "local_format", "irreversible", ("local payload index", 2, 3))]

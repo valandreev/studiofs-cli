@@ -57,7 +57,7 @@ def verify(baseline: dict, successor: dict, *, require_complete: bool = False) -
         if found != declared:
             errors.append(f"identity {name}: reported {found[0]} -> {found[1]}, declared {declared[0]} -> {declared[1]}")
         if name in base and base[name]["min_supported"] != succ[name]["min_supported"]:
-            errors.append(f"identity {name}: min_supported changed without a declaration")
+            errors.append(f"identity {name}: min_supported must not change")
     for name in sorted(bumps):
         errors.append(f"declared bump of unknown identity {name}")
 
