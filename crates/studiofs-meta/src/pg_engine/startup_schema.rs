@@ -4,9 +4,9 @@
 //! `studiofs_schema_components` rows, plus the tables and columns its
 //! bootstrap, replication and publication paths touch. Optional features
 //! (snapshot creation, policies, artifacts, snapshot mounts, Janitor sweeps)
-//! are not checked here: a missing object fails that feature's own statement
-//! with a non-retryable storage error and leaves the mount serving. A newer
-//! component version or an unknown component is additive for a mount; the
+//! check their own objects when used. Missing snapshot objects surface as
+//! redacted retryable backend errors and leave the mount serving. A newer
+//! component version or an unknown component is additive for a mount. The
 //! Janitor still requires its exact `payload_gc` version before deleting.
 
 use std::collections::BTreeMap;
@@ -41,6 +41,8 @@ const MOUNT_COMPONENTS: [MountComponent; 2] = [
             "bootstrap_checkpoint_leases",
             "acl_rules",
             "file_lock_leases",
+            "trash_entry_authority",
+            "trash_publication_receipts",
             "snapshot_catalog",
             "snapshot_source_checkpoints",
         ],
@@ -122,6 +124,7 @@ fn required_objects() -> [Vec<String>; 3] {
 /// an object; `None` when the mount can serve. `recorded` maps component rows
 /// to versions; `missing` holds `component:object` entries.
 fn mount_schema_refusal(recorded: &BTreeMap<String, i32>, missing: &[String]) -> Option<String> {
+    let mut repair_requirements = Vec::new();
     let problems: Vec<String> = MOUNT_COMPONENTS
         .iter()
         .filter_map(|component| {
@@ -138,10 +141,15 @@ fn mount_schema_refusal(recorded: &BTreeMap<String, i32>, missing: &[String]) ->
                 ),
                 // A newer version is additive for a mount; only missing objects refuse it.
                 Some(_) if lacks.is_empty() => return None,
-                Some(&found) => (
-                    ReasonCode::SchemaComponentOutdated,
-                    format!("{} {found} lacks {}", id.name, lacks.join(", ")),
-                ),
+                Some(&found) => {
+                    if found > i32::from(id.current) {
+                        repair_requirements.push(format!("{} {found} or newer", id.name));
+                    }
+                    (
+                        ReasonCode::SchemaComponentOutdated,
+                        format!("{} {found} lacks {}", id.name, lacks.join(", ")),
+                    )
+                }
             };
             Some(format!(
                 "{} ({subject}): {}",
@@ -151,8 +159,13 @@ fn mount_schema_refusal(recorded: &BTreeMap<String, i32>, missing: &[String]) ->
         })
         .collect();
     (!problems.is_empty()).then(|| {
+        let mut repair = "stop mounts and janitors first, then run `studiofs upgrade --repair-schema` to restore dropped objects".to_owned();
+        if !repair_requirements.is_empty() {
+            repair.push_str(" with a binary that supports ");
+            repair.push_str(&repair_requirements.join(" and "));
+        }
         format!(
-            "postgres schema cannot serve this mount: {}; stop mounts and janitors first, and add `--repair-schema` to restore a dropped object",
+            "postgres schema cannot serve this mount: {}; {repair}",
             problems.join("; ")
         )
     })
@@ -299,6 +312,10 @@ mod tests {
             message.contains(
                 "PostgreSQL core schema 9 lacks file_lock_leases, metadata_state.checkpoint_sha256"
             ),
+            "{message}"
+        );
+        assert!(
+            message.contains("with a binary that supports PostgreSQL core schema 9 or newer"),
             "{message}"
         );
     }

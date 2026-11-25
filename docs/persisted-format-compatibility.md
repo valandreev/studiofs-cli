@@ -150,8 +150,10 @@ that declares support for 0.2.5 (the compiled test successor of
   against one global list of tables. `MOUNT_COMPONENTS` names the components
   a mount uses and the objects it touches:
   - `core`: the bootstrap, replay, publication, checkpoint and file-lock
-    tables, `snapshot_catalog` and `snapshot_source_checkpoints` (event log
-    prune floor), and the `metadata_state` checkpoint and prune columns.
+    tables, `trash_entry_authority` and `trash_publication_receipts` for
+    retained-entry publication and recovery, `snapshot_catalog` and
+    `snapshot_source_checkpoints` (event log prune floor), and the
+    `metadata_state` checkpoint and prune columns.
   - `payload_gc`: the payload upload and reachability ledger that publication
     writes.
 
@@ -159,7 +161,10 @@ that declares support for 0.2.5 (the compiled test successor of
   its `min_supported`. A newer version or an unknown component is additive for
   a mount and is accepted. A missing object refuses the mount as
   `schema_component_outdated` naming the object, even under a newer version.
-  A missing registry or row refuses it as `schema_component_missing`. These
+  If an object is missing and its recorded component is newer than the
+  running binary, use a binary that supports that version or newer when
+  running `studiofs upgrade --repair-schema`.
+  A missing registry or row refuses the mount as `schema_component_missing`. These
   refusals reuse the `compat::ReasonCode` codes and actions and are permanent
   `Storage` errors. Only an unreachable PostgreSQL or a bounded timeout falls
   back to local-first startup; a rejected probe statement fails startup.
