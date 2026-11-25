@@ -53,9 +53,14 @@ def verify(baseline: dict, successor: dict, *, require_complete: bool = False) -
     for name in sorted(succ.keys()):
         found = (base.get(name, {}).get("current", 0), succ[name]["current"])
         bump = bumps.pop(name, None)
-        declared = (bump["baseline"], bump["successor"]) if bump else (found[0], found[0])
-        if found != declared:
-            errors.append(f"identity {name}: reported {found[0]} -> {found[1]}, declared {declared[0]} -> {declared[1]}")
+        if bump is not None and bump["baseline"] == bump["successor"]:
+            errors.append(f"identity {name}: declared bump must change version ({bump['baseline']} -> {bump['successor']})")
+        elif name not in base and bump is None:
+            errors.append(f"successor added undeclared identity {name}")
+        else:
+            declared = (bump["baseline"], bump["successor"]) if bump else (found[0], found[0])
+            if found != declared:
+                errors.append(f"identity {name}: reported {found[0]} -> {found[1]}, declared {declared[0]} -> {declared[1]}")
         if name in base and base[name]["min_supported"] != succ[name]["min_supported"]:
             errors.append(f"identity {name}: min_supported must not change")
     for name in sorted(bumps):
@@ -72,7 +77,9 @@ def verify(baseline: dict, successor: dict, *, require_complete: bool = False) -
 
 
 def run(args: list[str], repo: Path) -> str:
-    return subprocess.run(args, cwd=repo, check=True, text=True, stdout=subprocess.PIPE).stdout
+    return subprocess.run(
+        args, cwd=repo, check=True, text=True, encoding="utf-8", stdout=subprocess.PIPE
+    ).stdout
 
 
 def build(repo: Path, target_dir: Path, features: list[str]) -> Path:

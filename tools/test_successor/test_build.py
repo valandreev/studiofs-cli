@@ -98,6 +98,26 @@ class VerifyTests(unittest.TestCase):
         errors = build.verify(BASELINE, successor(BASELINE["identities"], []), require_complete=True)
         self.assertEqual(len(errors), 6)
 
+    def test_noop_bump_and_undeclared_zero_identity_fail(self) -> None:
+        noop = [change("c", "event_kind", "reversible", ("event codec wire", 1, 1))]
+        errors = build.verify(BASELINE, successor(BASELINE["identities"], noop))
+        self.assertEqual(errors, ["identity event codec wire: declared bump must change version (1 -> 1)"])
+
+        added_zero = [*BASELINE["identities"], identity("new format", 0)]
+        errors = build.verify(BASELINE, successor(added_zero, []))
+        self.assertEqual(errors, ["successor added undeclared identity new format"])
+
+    def test_marker_matches_rust_and_release_packager(self) -> None:
+        repo = Path(__file__).resolve().parents[2]
+        rust_src = (repo / "crates" / "studiofs-meta" / "src" / "test_successor.rs").read_text(encoding="utf-8")
+        self.assertIn(f'pub const BUILD_MARKER: &str = "{build.MARKER}";', rust_src)
+
+        pkg_spec = importlib.util.spec_from_file_location("release_package", repo / "tools" / "release" / "package.py")
+        pkg = importlib.util.module_from_spec(pkg_spec)
+        assert pkg_spec.loader is not None
+        pkg_spec.loader.exec_module(pkg)
+        self.assertEqual(pkg.TEST_SUCCESSOR_MARKER, build.MARKER.encode("ascii"))
+
 
 if __name__ == "__main__":
     unittest.main()
