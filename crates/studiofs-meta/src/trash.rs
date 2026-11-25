@@ -73,6 +73,7 @@ pub struct TrashPolicy {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct TrashPolicyFields {
     days: u32,
     last_positive_days: u32,
@@ -121,6 +122,7 @@ pub struct CompressionPolicy {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CompressionPolicyFields {
     mode: CompressionMode,
     #[serde(default = "default_zstd_compression_level")]
@@ -206,6 +208,7 @@ impl std::fmt::Display for CompressionPolicy {
 
 /// Mutable shared volume settings, separate from immutable storage identity.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct VolumeSettings {
     /// Monotonic revision used for atomic compare-and-set updates.
     #[serde(alias = "quota_v1_revision")]
@@ -240,6 +243,26 @@ impl Serialize for VolumeSettings {
 }
 
 impl VolumeSettings {
+    pub(crate) fn decode_json(bytes: &[u8]) -> crate::MetaResult<Self> {
+        serde_json::from_slice(bytes).map_err(|error| {
+            if error.is_data()
+                && ["unknown field `", "unknown variant `"]
+                    .iter()
+                    .any(|prefix| error.to_string().starts_with(prefix))
+            {
+                crate::MetaError::UpgradeRequired {
+                    reason: crate::UpgradeRequiredReason::VolumeSettingsUnknown,
+                }
+            } else {
+                crate::MetaError::Serialization(format!(
+                    "invalid volume settings JSON at line {}, column {}",
+                    error.line(),
+                    error.column()
+                ))
+            }
+        })
+    }
+
     /// Replica ordering of volume settings: a higher revision replaces `self`,
     /// an equal revision must be identical, and an older one is ignored.
     pub fn is_superseded_by(&self, next: &Self) -> crate::MetaResult<bool> {

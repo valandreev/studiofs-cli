@@ -608,8 +608,7 @@ impl RedbMetaEngine {
                     {
                         crate::decode_local_format_info(format)?;
                     }
-                    serde_json::from_slice::<crate::trash::VolumeSettings>(v)
-                        .map_err(|error| MetaError::Serialization(error.to_string()))?;
+                    crate::trash::VolumeSettings::decode_json(v)?;
                 }
                 table
                     .insert(k.as_str(), v.as_slice())

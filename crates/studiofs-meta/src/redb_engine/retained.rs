@@ -286,9 +286,8 @@ impl RedbMetaEngine {
             table
                 .get(super::volume_settings::VOLUME_SETTINGS_KEY)?
                 .or(table.get(super::volume_settings::BASE_VOLUME_SETTINGS_KEY)?)
-                .map(|value| serde_json::from_slice::<VolumeSettings>(value.value()))
-                .transpose()
-                .map_err(|error| MetaError::Serialization(error.to_string()))?
+                .map(|value| VolumeSettings::decode_json(value.value()))
+                .transpose()?
                 .unwrap_or_default()
         })
     }

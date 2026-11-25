@@ -10,7 +10,7 @@ After this milestone, every data format a successor might change has its own ver
 
 ## Progress
 
-- [ ] SFS-1009: version MetaEvent codecs, keep tags 1–21 decoding, return a typed error for unknown tags and wire versions, and gate new payload object formats on activated capabilities.
+- [x] (2026-11-25) SFS-1009: register baseline and test-successor MetaEvent codecs, refuse unsupported events before replay advances, and guard settings rewrites.
 - [ ] SFS-1010: negotiate event publication and replay against the active volume protocol.
 - [ ] SFS-1011: support multiple checkpoint formats with safe bootstrap and pruning.
 - [ ] SFS-1012: crash-safe local redb and payload-index format migration and recovery.
@@ -21,8 +21,8 @@ After this milestone, every data format a successor might change has its own ver
 
 - Observation: the payload index reports an unknown entry encoding as `Corruption`, the same class used for real damage.
   Evidence: `crates/studiofs-cache/src/payload_index.rs:1790`.
-- Observation: `VolumeSettings` has no `deny_unknown_fields`; quota is protected only by the `quota_v1_revision` rename trick.
-  Evidence: `crates/studiofs-meta/src/trash.rs:209`, `crates/studiofs-meta/src/trash.rs:224`.
+- Observation: the stored settings JSON previously accepted unknown fields, including fields nested in the trash and compression policies. Shared and local compare-and-set operations could drop those fields.
+  Evidence: the settings compare-and-set regression in `crates/studiofs-meta/src/redb_engine/volume_settings.rs` verifies byte and journal preservation.
 
 ## Decision Log
 
@@ -33,9 +33,13 @@ After this milestone, every data format a successor might change has its own ver
   Rationale: preflight decision of 2026-11-25.
   Date/Author: 2026-11-25, project preflight.
 
+- Decision: the test-successor tag 22 encodes an unconditional assignment to a user xattr and normalizes to the existing replay mutation. It declares a read capability only.
+  Rationale: the fixture exercises a new shared kind while the regular journal and publication encoders keep producing their baseline tags. A persisted tag 22 requires the successor to replay it, so the manifest declares it irreversible.
+  Date/Author: 2026-11-25, SFS-1009.
+
 ## Outcomes & Retrospective
 
-Not started.
+SFS-1009 preserves every baseline event byte fixture and keeps tag 22 confined to the test-successor reader. An isolated PostgreSQL 18 test proved that the unknown event refused a whole replay page before any settings or cursor changes. The valid prefix applied on its own, and a retry kept the durable cursor at the last accepted batch. The redb settings regression proved that a failed rewrite preserves the original JSON and appends no event.
 
 ## Context and Orientation
 
@@ -45,13 +49,19 @@ Events are encoded in `crates/studiofs-meta/src/events.rs` with the magic `SFS-E
 
 ## Plan of Work
 
-SFS-1009 introduces a typed unsupported-event error and a capability check before a writer emits a new tag or a new payload object format. SFS-1010 makes publication choose the encoding the volume protocol allows and makes replay stop, without advancing the cursor, at the first event it cannot decode. SFS-1011 adds a format identity to the serving checkpoint and keeps, during pruning, the newest checkpoint each supported reader can decode. SFS-1012 adds explicit local identities and a crash-safe migration with a recorded step marker; a newer local format returns `LocalUpgradeRequired` and never deletes dirty entries. SFS-1013 applies the same checks to discover, snapshot mounts and dump/load, before any write or DDL. SFS-1132 extends the upgrade command so 5→6→7 runs as one retryable chain under the existing Janitor advisory lock and deletion-owner checks. The format 7 bump must also update `studiofs_fence_legacy_deletion_claim` (`crates/studiofs-meta/src/pg_engine/schema.rs:569`): it compares `studiofs.deletion_format` with the constant `'6'` on any volume at format 6 or later, so a 0.2.3 or 0.2.4 Janitor passes it on a format 7 volume. The trigger must compare the GUC with the volume's current format (or, with SFS-1016, its maintenance capability).
+SFS-1009 registers the baseline codecs, returns typed unsupported-event errors before applying the selected page, and refuses to rewrite unknown settings fields. The baseline STFS v2/v3 and SFEC v1 writers and capability declarations are already present. Any future payload format requires an activated capability and an encoder selected under that policy. SFS-1010 owns the choice of event encoding from the active volume protocol. SFS-1011 adds a format identity to the serving checkpoint and keeps, during pruning, the newest checkpoint each supported reader can decode. SFS-1012 adds explicit local identities and a crash-safe migration with a recorded step marker; a newer local format returns `LocalUpgradeRequired` and never deletes dirty entries. SFS-1013 applies the same checks to discover, snapshot mounts and dump/load, before any write or DDL. SFS-1132 extends the upgrade command so 5→6→7 runs as one retryable chain under the existing Janitor advisory lock and deletion-owner checks. The format 7 bump must also update `studiofs_fence_legacy_deletion_claim` (`crates/studiofs-meta/src/pg_engine/schema.rs:569`): it compares `studiofs.deletion_format` with the constant `'6'` on any volume at format 6 or later, so a 0.2.3 or 0.2.4 Janitor passes it on a format 7 volume. The trigger must compare the GUC with the volume's current format (or, with SFS-1016, its maintenance capability).
 
 ## Concrete Steps
 
 From the repository root:
 
-    cargo test -p studiofs-meta --lib events
+    cargo test -p studiofs-meta --lib events::tests
+    cargo test -p studiofs-meta --lib --features test-successor events::tests
+    cargo test -p studiofs-meta --lib baseline_fixtures::baseline_events_decode_one_per_tag
+    cargo test -p studiofs-meta --lib --features test-successor test_successor::tests
+    cargo test -p studiofs-meta --lib future_volume_settings_are_not_rewritten
+    cargo test -p studiofs-meta --lib unknown_required_capabilities_never_grant_write_authority
+    cargo test -p studiofs-meta --lib pg_unsupported_event_stops_replay_before_durable_cursor_advance -- --ignored
     cargo test -p studiofs-meta --lib snapshot
     cargo test -p studiofs-cache --lib payload_index
     cargo test -p studiofs --bin studiofs upgrade
@@ -59,7 +69,7 @@ From the repository root:
 
 ## Validation and Acceptance
 
-Feeding an event with an unknown tag to replay returns the typed error and leaves the local version unchanged. Bootstrap with only a newer checkpoint available falls back to a supported checkpoint plus replay, or refuses with a typed reason. Killing the process at each step of a local migration and reopening yields either the old or the new format with all dirty payloads intact. Upgrading a format 5 and a format 6 fixture volume reaches format 7, a retried upgrade is a no-op, and a 0.2.4-style publication with format 6 is rejected by the publication predicate.
+With a dedicated PostgreSQL test instance configured in `STUDIOFS_TEST_PG_DSN`, fetch a page with a baseline event followed by an unsupported tag. The engine returns `UpgradeRequired`, and neither the settings nor the durable cursor changes. The known prefix applies when fetched alone, and retrying the unsupported batch leaves the new cursor intact. Bootstrap with only a newer checkpoint available falls back to a supported checkpoint plus replay, or refuses with a typed reason. Killing the process at each step of a local migration and reopening yields either the old or the new format with all dirty payloads intact. Upgrading a format 5 and a format 6 fixture volume reaches format 7, a retried upgrade is a no-op, and a 0.2.4-style publication with format 6 is rejected by the publication predicate.
 
 ## Idempotence and Recovery
 
@@ -72,3 +82,5 @@ Issues: https://linear.app/valandreev/issue/SFS-1009, https://linear.app/valandr
 ## Interfaces and Dependencies
 
 Event and checkpoint codecs stay backend-neutral. The local migration must follow the lock order in `crates/studiofs-vfs/src/lock_order.rs` when it runs inside a mount.
+
+Revision note (2026-11-25). SFS-1009 records the codec and replay boundary, the successor fixture, and the scope of capability-gated format selection.

@@ -1,10 +1,14 @@
-use crate::engine::{MetaError, MetaResult};
+use crate::engine::{MetaError, MetaResult, UpgradeRequiredReason};
 use crate::types::{DirEntryValue, InodeAttr};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
+/// Stable prefix for a one-byte wire version, one-byte tag, and postcard payload.
 const META_EVENT_WIRE_MAGIC: [u8; 7] = *b"SFS-EVT";
-pub(crate) const META_EVENT_WIRE_VERSION: u8 = 1;
+/// Envelope versions readable by this binary. Legacy ordinals have no envelope.
+pub const META_EVENT_READ_VERSIONS: &[u8] = &[1];
+/// Envelope version emitted by the normal journal and publication encoders.
+pub const META_EVENT_WRITE_VERSION: u8 = 1;
 const TAG_SET_ATTR: u8 = 1;
 const TAG_REMOVE_ATTR: u8 = 2;
 const TAG_ADD_ENTRY: u8 = 3;
@@ -25,9 +29,98 @@ const TAG_REMOVE_LOCAL_ENTRY: u8 = 18;
 const TAG_SET_VOLUME_SETTINGS: u8 = 19;
 const TAG_SET_VOLUME_SETTINGS_V2: u8 = 20;
 const TAG_SET_VOLUME_SETTINGS_V3: u8 = 21;
+#[cfg(feature = "test-successor")]
+const TAG_SET_USER_XATTR: u8 = 22;
 
-// These tag values are part of the persisted format: append new values, never
-// reorder or reuse an existing value.
+// Append only. Each tag fixes a postcard layout and its apply semantics.
+// A change in layout or meaning needs a new tag and a required capability.
+// Tags 19-21 show how to add fields without changing older layouts.
+// Before enabling publication, define replay semantics, rollback behavior, and
+// golden fixtures. A reader may normalize a new encoding to an existing mutation
+// only when that mutation represents the full meaning of the new encoding.
+// None marks a local-journal-only tag.
+const EVENT_CODECS: &[(u8, Option<&str>)] = &[
+    (TAG_SET_ATTR, Some("set_attr")),
+    (TAG_REMOVE_ATTR, Some("remove_attr")),
+    (TAG_ADD_ENTRY, Some("add_entry")),
+    (TAG_REMOVE_ENTRY, Some("remove_entry")),
+    (TAG_RENAME_ENTRY, Some("rename_entry")),
+    (
+        TAG_REMOVE_REGULAR_FILE_GRAPH,
+        Some("remove_regular_file_graph"),
+    ),
+    (
+        TAG_SET_REGULAR_FILE_OVERLAY_SLICES,
+        Some("set_regular_file_overlay_slices"),
+    ),
+    (
+        TAG_PUBLISH_REGULAR_FILE_BASE_SLICES,
+        Some("publish_regular_file_base_slices"),
+    ),
+    (TAG_SET_SYMLINK_TARGET, Some("set_symlink_target")),
+    (TAG_SET_XATTR, Some("set_xattr")),
+    (TAG_REMOVE_XATTR, Some("remove_xattr")),
+    (TAG_SET_ACL_RULE, Some("set_acl_rule")),
+    (TAG_REMOVE_ACL_RULE, Some("remove_acl_rule")),
+    (TAG_ADD_PENDING_DELETION, Some("add_pending_deletion")),
+    (TAG_REMOVE_PENDING_DELETION, Some("remove_pending_deletion")),
+    (TAG_REMOVE_LOCAL_ENTRY, None),
+    (TAG_SET_VOLUME_SETTINGS, Some("set_volume_settings")),
+    (TAG_SET_VOLUME_SETTINGS_V2, Some("set_volume_settings")),
+    (TAG_SET_VOLUME_SETTINGS_V3, Some("set_volume_settings")),
+    #[cfg(feature = "test-successor")]
+    (TAG_SET_USER_XATTR, Some("set_user_xattr")),
+];
+
+const _: () = {
+    let mut previous = 0;
+    let mut index = 0;
+    while index < EVENT_CODECS.len() {
+        let tag = EVENT_CODECS[index].0;
+        assert!(tag > previous && tag != 16 && tag != 17);
+        previous = tag;
+        index += 1;
+    }
+};
+
+/// A well-framed event uses an identity this binary cannot interpret.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum UnsupportedEventReason {
+    /// The tagged envelope uses a newer or otherwise unsupported wire version.
+    #[error("unsupported MetaEvent wire version {0}")]
+    WireVersion(u8),
+    /// The tag is unassigned, reserved, or absent in this build.
+    #[error("unknown MetaEvent wire kind tag {0}")]
+    Tag(u8),
+    /// The untagged postcard event uses an unsupported ordinal.
+    #[error("unknown legacy MetaEvent ordinal {0}")]
+    LegacyOrdinal(u32),
+    /// The PostgreSQL kind is absent from the shared codec registry.
+    #[error("unknown PostgreSQL MetaEvent type")]
+    PostgresType,
+}
+
+impl UnsupportedEventReason {
+    /// Compatibility evaluator category for an unsupported persisted event.
+    pub fn reason_code(&self) -> crate::compat::ReasonCode {
+        crate::compat::ReasonCode::EventKindUnknown
+    }
+}
+
+impl From<UnsupportedEventReason> for MetaError {
+    fn from(reason: UnsupportedEventReason) -> Self {
+        Self::UpgradeRequired {
+            reason: UpgradeRequiredReason::UnsupportedEvent(reason),
+        }
+    }
+}
+
+fn event_codec(tag: u8) -> MetaResult<Option<&'static str>> {
+    EVENT_CODECS
+        .binary_search_by_key(&tag, |&(registered, _)| registered)
+        .map(|index| EVENT_CODECS[index].1)
+        .map_err(|_| UnsupportedEventReason::Tag(tag).into())
+}
 
 /// Represents a single mutation to the metadata state.
 /// These events are appended to a local journal and eventually pushed to S3
@@ -379,41 +472,20 @@ pub(crate) fn decode_event(bytes: &[u8]) -> MetaResult<MetaEvent> {
 }
 
 pub(crate) fn decode_event_with_type(event_type: &str, bytes: &[u8]) -> MetaResult<MetaEvent> {
-    let expected_tag = wire_tag_for_kind(event_type).ok_or_else(|| {
-        MetaError::Serialization(format!("unknown PostgreSQL MetaEvent type `{event_type}`"))
-    })?;
     let (tag, payload) = decode_event_wire_parts(bytes)?;
-    let tag_matches = tag == expected_tag
-        || (expected_tag == TAG_SET_VOLUME_SETTINGS_V3
-            && matches!(tag, TAG_SET_VOLUME_SETTINGS | TAG_SET_VOLUME_SETTINGS_V2));
-    if !tag_matches {
+    let kind = event_codec(tag)?;
+    if kind != Some(event_type) {
+        if !EVENT_CODECS
+            .iter()
+            .any(|&(_, kind)| kind == Some(event_type))
+        {
+            return Err(UnsupportedEventReason::PostgresType.into());
+        }
         return Err(MetaError::Serialization(format!(
-            "PostgreSQL MetaEvent type `{event_type}` does not match decoded wire tag {tag}"
+            "PostgreSQL MetaEvent type does not match decoded wire tag {tag}"
         )));
     }
     decode_tagged_event(tag, payload)
-}
-
-fn wire_tag_for_kind(kind: &str) -> Option<u8> {
-    match kind {
-        "set_volume_settings" => Some(TAG_SET_VOLUME_SETTINGS_V3),
-        "set_attr" => Some(TAG_SET_ATTR),
-        "remove_attr" => Some(TAG_REMOVE_ATTR),
-        "add_entry" => Some(TAG_ADD_ENTRY),
-        "remove_entry" => Some(TAG_REMOVE_ENTRY),
-        "rename_entry" => Some(TAG_RENAME_ENTRY),
-        "remove_regular_file_graph" => Some(TAG_REMOVE_REGULAR_FILE_GRAPH),
-        "set_regular_file_overlay_slices" => Some(TAG_SET_REGULAR_FILE_OVERLAY_SLICES),
-        "publish_regular_file_base_slices" => Some(TAG_PUBLISH_REGULAR_FILE_BASE_SLICES),
-        "set_symlink_target" => Some(TAG_SET_SYMLINK_TARGET),
-        "set_xattr" => Some(TAG_SET_XATTR),
-        "remove_xattr" => Some(TAG_REMOVE_XATTR),
-        "set_acl_rule" => Some(TAG_SET_ACL_RULE),
-        "remove_acl_rule" => Some(TAG_REMOVE_ACL_RULE),
-        "add_pending_deletion" => Some(TAG_ADD_PENDING_DELETION),
-        "remove_pending_deletion" => Some(TAG_REMOVE_PENDING_DELETION),
-        _ => None,
-    }
 }
 
 fn decode_event_wire_parts(bytes: &[u8]) -> MetaResult<(u8, &[u8])> {
@@ -430,10 +502,8 @@ fn decode_event_wire_parts(bytes: &[u8]) -> MetaResult<(u8, &[u8])> {
             ));
         }
         let version = bytes[META_EVENT_WIRE_MAGIC.len()];
-        if version != META_EVENT_WIRE_VERSION {
-            return Err(MetaError::Serialization(format!(
-                "unsupported MetaEvent wire version {version}, expected {META_EVENT_WIRE_VERSION}"
-            )));
+        if !META_EVENT_READ_VERSIONS.contains(&version) {
+            return Err(UnsupportedEventReason::WireVersion(version).into());
         }
         let tag = bytes[META_EVENT_WIRE_MAGIC.len() + 1];
         return Ok((tag, &bytes[header_len..]));
@@ -458,17 +528,18 @@ fn decode_event_wire_parts(bytes: &[u8]) -> MetaResult<(u8, &[u8])> {
         12 => TAG_REMOVE_ACL_RULE,
         13 => TAG_ADD_PENDING_DELETION,
         14 => TAG_REMOVE_PENDING_DELETION,
-        _ => {
-            return Err(MetaError::Serialization(format!(
-                "unknown legacy MetaEvent ordinal {ordinal}"
-            )));
-        }
+        _ => return Err(UnsupportedEventReason::LegacyOrdinal(ordinal).into()),
     };
     Ok((tag, payload))
 }
 
 fn encode_event_envelope<T: Serialize>(tag: u8, payload: &T) -> MetaResult<Vec<u8>> {
-    let envelope = (META_EVENT_WIRE_MAGIC, META_EVENT_WIRE_VERSION, tag, payload);
+    let envelope = (
+        META_EVENT_WIRE_MAGIC,
+        META_EVENT_WRITE_VERSION,
+        tag,
+        payload,
+    );
     postcard::to_stdvec(&envelope).map_err(|error| {
         MetaError::Serialization(format!("MetaEvent envelope encode failed: {error}"))
     })
@@ -614,9 +685,24 @@ fn decode_tagged_event(tag: u8, payload: &[u8]) -> MetaResult<MetaEvent> {
         TAG_REMOVE_PENDING_DELETION => Ok(MetaEvent::RemovePendingDeletion {
             object_id: decode_event_payload(tag, payload)?,
         }),
-        _ => Err(MetaError::Serialization(format!(
-            "unknown MetaEvent wire kind tag {tag}"
-        ))),
+        #[cfg(feature = "test-successor")]
+        TAG_SET_USER_XATTR => {
+            let (ino, suffix, value): (u64, Vec<u8>, Vec<u8>) = decode_event_payload(tag, payload)?;
+            if suffix.is_empty() || suffix.len() > 250 || suffix.contains(&0) {
+                return Err(MetaError::Serialization(
+                    "invalid user xattr name in successor MetaEvent".into(),
+                ));
+            }
+            let mut name = b"user.".to_vec();
+            name.extend(suffix);
+            Ok(MetaEvent::SetXattr {
+                ino,
+                name,
+                value,
+                flags: 0,
+            })
+        }
+        _ => Err(UnsupportedEventReason::Tag(tag).into()),
     }
 }
 
@@ -1107,26 +1193,85 @@ mod tests {
         );
     }
 
+    fn assert_unsupported(result: MetaResult<MetaEvent>, expected: UnsupportedEventReason) {
+        assert!(matches!(
+            result,
+            Err(MetaError::UpgradeRequired {
+                reason: UpgradeRequiredReason::UnsupportedEvent(reason),
+            }) if reason == expected
+        ));
+    }
+
     #[test]
     fn unknown_wire_version_is_rejected() {
-        let error = decode_event(b"SFS-EVT\x02\x02\x2a").expect_err("unknown version");
-
-        assert!(
-            error
-                .to_string()
-                .contains("unsupported MetaEvent wire version")
-        );
+        let fixture = b"SFS-EVT\x02\x02\x2a";
+        let reason = UnsupportedEventReason::WireVersion(2);
+        assert_unsupported(decode_event(fixture), reason.clone());
+        assert_unsupported(decode_event_with_type("remove_attr", fixture), reason);
     }
 
     #[test]
     fn unknown_wire_tag_is_rejected() {
-        let error = decode_event(b"SFS-EVT\x01\xff\x00").expect_err("unknown tag");
+        for tag in [16, 17, 255] {
+            let mut fixture = *b"SFS-EVT\x01\xff\x00";
+            fixture[8] = tag;
+            let reason = UnsupportedEventReason::Tag(tag);
+            assert_unsupported(decode_event(&fixture), reason.clone());
+            assert_unsupported(decode_event_with_type("remove_attr", &fixture), reason);
+        }
+    }
 
-        assert!(
-            error
-                .to_string()
-                .contains("unknown MetaEvent wire kind tag")
-        );
+    #[test]
+    fn malformed_or_truncated_wire_is_serialization_error() {
+        let fixture = b"SFS-EVT\x01\x02\x2a";
+        for len in 0..fixture.len() {
+            assert!(matches!(
+                decode_event(&fixture[..len]),
+                Err(MetaError::Serialization(_))
+            ));
+        }
+        assert!(matches!(
+            decode_event(b"SFS-BAD\x01\x02\x2a"),
+            Err(MetaError::Serialization(_))
+        ));
+    }
+
+    #[test]
+    fn successor_user_xattr_golden_fixture() {
+        let fixture = b"SFS-EVT\x01\x16\x2a\x04note\x02hi";
+        let result = decode_event_with_type("set_user_xattr", fixture);
+        #[cfg(not(feature = "test-successor"))]
+        assert_unsupported(result, UnsupportedEventReason::Tag(22));
+        #[cfg(feature = "test-successor")]
+        {
+            let expected = MetaEvent::SetXattr {
+                ino: 42,
+                name: b"user.note".to_vec(),
+                value: b"hi".to_vec(),
+                flags: 0,
+            };
+            assert_eq!(result.unwrap(), expected);
+            assert_eq!(
+                encode_event_envelope(
+                    TAG_SET_USER_XATTR,
+                    &(42_u64, b"note".as_slice(), b"hi".as_slice())
+                )
+                .unwrap(),
+                fixture,
+            );
+            assert_eq!(
+                encode_event(&expected).unwrap(),
+                b"SFS-EVT\x01\x0a\x2a\x09user.note\x02hi\x00",
+            );
+            assert!(matches!(
+                decode_event(&fixture[..fixture.len() - 1]),
+                Err(MetaError::Serialization(_))
+            ));
+            assert!(matches!(
+                decode_event(b"SFS-EVT\x01\x16\x2a\x00\x02hi"),
+                Err(MetaError::Serialization(_))
+            ));
+        }
     }
 
     #[test]
@@ -1143,12 +1288,9 @@ mod tests {
     fn postgres_event_type_must_match_decoded_payload() {
         let encoded = encode_event(&MetaEvent::RemoveAttr { ino: 42 }).expect("encode event");
 
-        let unknown = decode_event_with_type("future_event", &encoded)
-            .expect_err("unknown PostgreSQL event type");
-        assert!(
-            unknown
-                .to_string()
-                .contains("unknown PostgreSQL MetaEvent type")
+        assert_unsupported(
+            decode_event_with_type("future_event", &encoded),
+            UnsupportedEventReason::PostgresType,
         );
 
         let mismatch = decode_event_with_type("set_attr", &encoded)

@@ -18,10 +18,7 @@ impl RedbMetaEngine {
         }
         let current = table
             .get(key)?
-            .map(|entry| {
-                serde_json::from_slice::<VolumeSettings>(entry.value())
-                    .map_err(|error| MetaError::Serialization(error.to_string()))
-            })
+            .map(|entry| VolumeSettings::decode_json(entry.value()))
             .transpose()?
             .unwrap_or_default();
         if !current.is_superseded_by(settings)? {
@@ -46,10 +43,7 @@ impl MetaVolumeSettings for RedbMetaEngine {
         table
             .get(VOLUME_SETTINGS_KEY)?
             .or(table.get(BASE_VOLUME_SETTINGS_KEY)?)
-            .map(|entry| {
-                serde_json::from_slice(entry.value())
-                    .map_err(|error| MetaError::Serialization(error.to_string()))
-            })
+            .map(|entry| VolumeSettings::decode_json(entry.value()))
             .transpose()
             .map(Option::unwrap_or_default)
     }
@@ -100,10 +94,7 @@ impl RedbMetaEngine {
             table
                 .get(VOLUME_SETTINGS_KEY)?
                 .or(table.get(BASE_VOLUME_SETTINGS_KEY)?)
-                .map(|entry| {
-                    serde_json::from_slice::<VolumeSettings>(entry.value())
-                        .map_err(|e| MetaError::Serialization(e.to_string()))
-                })
+                .map(|entry| VolumeSettings::decode_json(entry.value()))
                 .transpose()?
                 .unwrap_or_default()
         };
@@ -183,6 +174,35 @@ mod tests {
         assert_eq!(engine.read_events_range(0, u64::MAX).unwrap(), journal);
         assert_eq!(engine.get_format_info().unwrap().format_version, 6);
         assert!(engine.export_serving_checkpoint_bytes().is_ok());
+    }
+
+    #[test]
+    fn future_volume_settings_are_not_rewritten() {
+        let temp = studiofs_test_support::workspace_target_tempdir("future-volume-settings-");
+        let engine = RedbMetaEngine::open(temp.path().join("meta.redb")).unwrap();
+        for bytes in [
+            br#"{"revision":0,"trash":{"days":0,"last_positive_days":0},"future_policy":true}"#.as_slice(),
+            br#"{"revision":0,"trash":{"days":0,"last_positive_days":0,"future_policy":true}}"#.as_slice(),
+            br#"{"revision":0,"trash":{"days":0,"last_positive_days":0},"compression":{"mode":"future"}}"#.as_slice(),
+        ] {
+            let txn = engine.begin_write_txn().unwrap();
+            txn.open_table(SETTINGS_TABLE)
+                .unwrap()
+                .insert(VOLUME_SETTINGS_KEY, bytes)
+                .unwrap();
+            txn.commit().unwrap();
+
+            assert!(matches!(
+                engine.compare_and_set_trash_days(0, 7),
+                Err(MetaError::UpgradeRequired {
+                    reason: crate::UpgradeRequiredReason::VolumeSettingsUnknown
+                })
+            ));
+            let txn = engine.begin_read_txn().unwrap();
+            let table = txn.open_table(SETTINGS_TABLE).unwrap();
+            assert_eq!(table.get(VOLUME_SETTINGS_KEY).unwrap().unwrap().value(), bytes);
+            assert!(engine.read_events_range(0, u64::MAX).unwrap().is_empty());
+        }
     }
 
     #[test]

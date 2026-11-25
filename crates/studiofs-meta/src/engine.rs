@@ -197,6 +197,12 @@ impl BootstrapCheckpointDescriptor {
 /// or a redaction marker; diagnostics omit the contents of malformed fields.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum UpgradeRequiredReason {
+    /// A metadata event uses an identity this binary cannot interpret.
+    #[error(transparent)]
+    UnsupportedEvent(crate::events::UnsupportedEventReason),
+    /// A persisted settings record uses fields or variants this writer cannot preserve.
+    #[error("unknown volume settings field or variant")]
+    VolumeSettingsUnknown,
     /// `FormatInfo` (or a nested config) has a field this binary does not know.
     #[error("unknown FormatInfo field `{field}`")]
     UnknownFormatInfoField {
