@@ -1,7 +1,8 @@
 //! Central capability evaluator (ADR 0018, SFS-1004).
 //!
-//! [`evaluate`] is a pure function of the binary's declared
-//! [`ClientCapabilities`], the volume's [`VolumeRequirements`] and the
+//! [`evaluate`](crate::compat::evaluate) is a pure function of the binary's
+//! declared [`ClientCapabilities`](crate::compat::ClientCapabilities), the
+//! volume's [`VolumeRequirements`](crate::compat::VolumeRequirements) and the
 //! identities found in the local stores. It performs no I/O, so callers can
 //! run it on a cached policy without a backend round trip. The inputs hold no
 //! PostgreSQL types; the 0.2.7 Redis-compatible backend (SFS-1034) reuses them.
