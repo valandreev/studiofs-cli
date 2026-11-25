@@ -52,11 +52,13 @@ pub async fn upgrade_shared_format5(
             return Err(MetaError::Storage("format upgrade header identity mismatch".into()));
         }
         format.validate_format_contract()?;
+        let session = super::client_sessions::PublicationSession::begin(&tx, volume).await?;
         format.format_version = 6;
         let bytes = serde_json::to_vec(&format)
             .map_err(|error| MetaError::Serialization(error.to_string()))?;
         tx.execute("UPDATE metadata_state SET metadata_format_version=6, format_info=$2 WHERE vol=$1", &[&volume, &bytes]).await
             .map_err(|error| PgMetaEngine::classify_pg_error("upgrade shared format", error))?;
+        session.finish(&tx, volume).await?;
         tx.commit().await.map_err(|error| PgMetaEngine::classify_pg_error("commit format upgrade", error))
     }).await.map_err(|_| MetaError::Storage("format upgrade timed out".into()))?
 }

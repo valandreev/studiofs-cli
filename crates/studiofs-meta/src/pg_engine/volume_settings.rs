@@ -111,46 +111,76 @@ impl PgMetaEngine {
     fn change_mounted_settings(
         &self,
         expected_revision: u64,
-        update: impl FnOnce(&mut VolumeSettings) + Send + 'static,
+        mut update: impl FnOnce(&mut VolumeSettings) + Send + 'static,
     ) -> MetaResult<Option<VolumeSettings>> {
         self.ensure_remote_format_validated()?;
-        let session = self.refresh_client_session()?;
-        let pool = self.command_pool.clone();
-        let timeout = self.command_timeout;
-        let volume = self.volume_id;
+        let mut session = self.acquire_publication_session()?;
         let client_id = self.current_client_id()?;
-        let now_ms = Self::now_millis();
-        let accepted = self.run_async(async move {
-            Self::with_postgres_client_timeout(
-                pool,
-                timeout,
-                "update volume settings",
-                move |client| {
-                    Box::pin(async move {
-                        let tx = client.transaction().await.map_err(|error| {
-                            Self::classify_pg_error("begin volume settings", error)
-                        })?;
-                        session.stamp(&tx, volume).await?;
-                        let accepted = update_volume_settings_in_tx(
-                            &tx,
-                            volume,
-                            Some(expected_revision),
-                            &client_id,
-                            now_ms,
-                            update,
-                        )
-                        .await?;
-                        if accepted.is_some() {
-                            tx.commit().await.map_err(|error| {
-                                Self::classify_pg_error("commit volume settings", error)
-                            })?;
-                        }
-                        Ok(accepted)
-                    })
-                },
-            )
-            .await
-        })?;
+        let mut attempt = 0_u8;
+        let accepted = loop {
+            let pool = self.command_pool.clone();
+            let timeout = self.command_timeout;
+            let volume = self.volume_id;
+            let current_client_id = client_id.clone();
+            let now_ms = Self::now_millis();
+            let current_session = session.clone();
+            let current_update = update;
+            let outcome =
+                self.run_async(async move {
+                    Self::with_postgres_client_timeout(
+                        pool,
+                        timeout,
+                        "update volume settings",
+                        move |client| {
+                            Box::pin(async move {
+                                let tx = client.transaction().await.map_err(|error| {
+                                    Self::classify_pg_error("begin volume settings", error)
+                                })?;
+                                match current_session.stamp_checked(&tx, volume).await {
+                                Ok(()) => {}
+                                Err(error @ (super::client_sessions::StampError::SessionInactive
+                                    | super::client_sessions::StampError::PolicyStale)) => {
+                                    drop(tx);
+                                    return Ok(Err((error, current_update)));
+                                }
+                                Err(super::client_sessions::StampError::Other(error)) => {
+                                    return Err(error);
+                                }
+                            }
+                                let accepted = update_volume_settings_in_tx(
+                                    &tx,
+                                    volume,
+                                    Some(expected_revision),
+                                    &current_client_id,
+                                    now_ms,
+                                    current_update,
+                                )
+                                .await?;
+                                if accepted.is_some() {
+                                    tx.commit().await.map_err(|error| {
+                                        Self::classify_pg_error("commit volume settings", error)
+                                    })?;
+                                }
+                                Ok(Ok(accepted))
+                            })
+                        },
+                    )
+                    .await
+                });
+            match outcome {
+                Ok(Ok(accepted)) => break accepted,
+                Ok(Err((stamp_error, returned_update))) => {
+                    if attempt == 0 {
+                        attempt += 1;
+                        update = returned_update;
+                        session = self.force_refresh_publication_session(&session)?;
+                        continue;
+                    }
+                    return Err(stamp_error.into_meta_error());
+                }
+                Err(error) => return Err(error),
+            }
+        };
         if let Some(settings) = accepted {
             let events = [MetaEvent::SetVolumeSettings { settings }];
             self.local.apply_replica_events_to_base(&events)?;

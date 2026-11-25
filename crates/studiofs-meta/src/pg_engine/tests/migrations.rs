@@ -112,16 +112,22 @@ fn migration_registry_applies_resumes_and_refuses_drift_on_live_postgres() {
 
         // A verified schema gets no DDL from either path.
         let lock_table = "SELECT count(*) FROM pg_class WHERE relname = 'file_lock_leases' AND relnamespace = current_schema()::regnamespace";
+        let sessions_table = "SELECT count(*) FROM pg_class WHERE relname = 'client_sessions' AND relnamespace = current_schema()::regnamespace";
         client
-            .batch_execute("DROP TABLE file_lock_leases")
+            .batch_execute("DROP TABLE file_lock_leases; DROP TABLE client_sessions")
             .await
             .map_err(|e| MetaError::Storage(pg_err(e)))?;
         ensure_in_tx(client, MIGRATIONS).await?;
         assert!(migrate_with(client, MIGRATIONS, false).await?.is_empty());
         assert_eq!(scalar(client, lock_table).await, 0);
-        // `--repair-schema` re-applies the verified baseline once.
-        assert_eq!(migrate_with(client, MIGRATIONS, true).await?, [MIGRATIONS[0]]);
+        assert_eq!(scalar(client, sessions_table).await, 0);
+        // `--repair-schema` re-applies the verified baseline and client_sessions once.
+        assert_eq!(
+            migrate_with(client, MIGRATIONS, true).await?,
+            [MIGRATIONS[0], *sessions]
+        );
         assert_eq!(scalar(client, lock_table).await, 1);
+        assert_eq!(scalar(client, sessions_table).await, 1);
         client
             .batch_execute("DROP TABLE file_lock_leases")
             .await

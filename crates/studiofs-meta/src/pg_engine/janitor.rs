@@ -1,4 +1,4 @@
-use super::client_sessions::{HEARTBEAT_INTERVAL, SessionLease, SessionOwner};
+use super::client_sessions::{HEARTBEAT_INTERVAL, HeartbeatError, SessionOwner, SessionRole};
 use super::runtime::PgConnectionPool;
 use super::{PgMetaEngine, PgTimeoutContext};
 use crate::engine::{MetaError, MetaResult};
@@ -70,7 +70,7 @@ pub(crate) struct PgJanitorSession {
     runtime: Option<Runtime>,
     client: Option<Client>,
     connection_task: Option<JoinHandle<()>>,
-    session_heartbeat: Option<(CancellationToken, JoinHandle<SessionLease>)>,
+    session_heartbeat: Option<(CancellationToken, JoinHandle<SessionOwner>)>,
     /// Statements prepared on `client`, keyed by SQL; cleared with the connection.
     statements: HashMap<String, Statement>,
 }
@@ -416,18 +416,22 @@ impl PgJanitorSession {
                 "janitor PostgreSQL session was not initialized".into(),
             ));
         };
-        let owner = SessionOwner::new();
+        let mut owner = SessionOwner::new();
         let volume = self.volume_id;
         let timeout = self.command_timeout;
-        let mut lease = runtime.block_on(async {
-            tokio::time::timeout(timeout, owner.heartbeat(client, volume, None))
-                .await
-                .map_err(|_| {
-                    PgMetaEngine::pg_timeout_error(
-                        PgTimeoutContext::Command("register janitor session"),
-                        timeout,
-                    )
-                })?
+        let (lease, _) = runtime.block_on(async {
+            tokio::time::timeout(
+                timeout,
+                owner.heartbeat(client, volume, None, SessionRole::Maintenance),
+            )
+            .await
+            .map_err(|_| {
+                PgMetaEngine::pg_timeout_error(
+                    PgTimeoutContext::Command("register janitor session"),
+                    timeout,
+                )
+            })?
+            .map_err(HeartbeatError::into_meta_error)
         })?;
         // The advisory-lock connection runs pipelined transactions. A separate,
         // lazy connection keeps heartbeats outside those transactions.
@@ -444,20 +448,47 @@ impl PgJanitorSession {
             loop {
                 let refresh = async {
                     tokio::time::sleep(HEARTBEAT_INTERVAL).await;
-                    owner
-                        .heartbeat_on_pool(pool.clone(), timeout, volume, expected_token)
+                    match owner
+                        .heartbeat_on_pool(
+                            pool.clone(),
+                            timeout,
+                            volume,
+                            expected_token,
+                            SessionRole::Maintenance,
+                        )
                         .await
+                    {
+                        Ok((renewed, _)) => Ok((owner.clone(), renewed)),
+                        Err(HeartbeatError::Fenced) => {
+                            // Generation diverged after an ambiguous renewal; close
+                            // the old owner and rotate to a fresh session identity.
+                            let _ = owner.close_on_pool(pool.clone(), timeout, volume).await;
+                            let rotated = SessionOwner::new();
+                            let (renewed, _) = rotated
+                                .heartbeat_on_pool(
+                                    pool.clone(),
+                                    timeout,
+                                    volume,
+                                    None,
+                                    SessionRole::Maintenance,
+                                )
+                                .await
+                                .map_err(HeartbeatError::into_meta_error)?;
+                            Ok((rotated, renewed))
+                        }
+                        Err(HeartbeatError::Other(error)) => Err(error),
+                    }
                 };
                 tokio::select! {
                     biased;
-                    _ = shutdown.cancelled() => return lease,
+                    _ = shutdown.cancelled() => return owner,
                     result = refresh => match result {
-                        Ok(renewed) => {
+                        Ok((active_owner, renewed)) => {
+                            owner = active_owner;
                             expected_token = Some(renewed.token());
-                            lease = renewed;
                         }
                         Err(error) => {
-                            expected_token = None;
+                            // Keep expected_token fenced; never fall back to unfenced None.
                             tracing::debug!(%error, "janitor session heartbeat deferred");
                         }
                     }
@@ -559,8 +590,8 @@ impl PgJanitorSession {
                 let volume = self.volume_id;
                 let timeout = self.command_timeout;
                 runtime.block_on(async {
-                    if let Ok(lease) = task.await {
-                        let _ = tokio::time::timeout(timeout, lease.release(client, volume)).await;
+                    if let Ok(owner) = task.await {
+                        let _ = tokio::time::timeout(timeout, owner.close(client, volume)).await;
                     }
                 });
             }

@@ -252,7 +252,6 @@ pub struct PgMetaEngine {
     checkpoint_freshness_policy: checkpoint_freshness::CheckpointFreshnessPolicy,
     checkpoint_freshness_state: Mutex<checkpoint_freshness::CheckpointFreshnessState>,
     pg_sync_progress_state: Mutex<PgSyncProgressState>,
-    client_session_owner: client_sessions::SessionOwner,
     client_session_state: Mutex<client_sessions::ClientSessionState>,
     checkpoint_coordinator_state: checkpoint_coordinator::CheckpointCoordinatorState,
     checkpoint_single_flight: Mutex<()>,
@@ -511,9 +510,9 @@ struct ClaimedPendingBatch {
 
 #[path = "pg_engine/checkpoint_coordinator.rs"]
 mod checkpoint_coordinator;
-mod client_sessions;
 #[path = "pg_engine/checkpoint_freshness.rs"]
 mod checkpoint_freshness;
+mod client_sessions;
 #[path = "pg_engine/engine_core.rs"]
 mod engine_core;
 #[path = "pg_engine/event_log_pruning.rs"]
@@ -1684,8 +1683,7 @@ impl PgMetaEngine {
                 checkpoint_freshness::CheckpointFreshnessState::new(&checkpoint_freshness_policy),
             ),
             pg_sync_progress_state: Mutex::new(PgSyncProgressState::default()),
-            client_session_owner: client_sessions::SessionOwner::new(),
-            client_session_state: Mutex::default(),
+            client_session_state: Mutex::new(client_sessions::ClientSessionState::new()),
             checkpoint_coordinator_state: checkpoint_coordinator::CheckpointCoordinatorState::new(),
             checkpoint_single_flight: Mutex::new(()),
             command_pool: Arc::new(runtime::PgConnectionPool::new(

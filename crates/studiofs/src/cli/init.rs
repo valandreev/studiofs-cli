@@ -477,7 +477,7 @@ fn seed_pg_metadata_state(
         let tx = client.transaction().await?;
         let session = studiofs_meta::pg_engine::PublicationSession::begin(&tx, volume_id).await?;
         tx.execute(
-                r#"
+            r#"
                 INSERT INTO metadata_state (
                     vol,
                     metadata_format_version,
@@ -492,17 +492,17 @@ fn seed_pg_metadata_state(
                 VALUES ($1, $2, $3, $3, $4, $5, $6, 'published', 1)
                 ON CONFLICT (vol) DO NOTHING
                 "#,
-                &[
-                    &volume_id,
-                    &metadata_format_version,
-                    &INITIAL_METADATA_STATE_VERSION,
-                    &checkpoint_bytes,
-                    &checkpoint_sha256.as_slice(),
-                    &format_info_bytes,
-                ],
-            )
-            .await
-            .map_err(|e| anyhow::anyhow!("failed to seed metadata_state: {e}"))?;
+            &[
+                &volume_id,
+                &metadata_format_version,
+                &INITIAL_METADATA_STATE_VERSION,
+                &checkpoint_bytes,
+                &checkpoint_sha256.as_slice(),
+                &format_info_bytes,
+            ],
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to seed metadata_state: {e}"))?;
         session.finish(&tx, volume_id).await?;
         tx.commit().await?;
         Ok(())

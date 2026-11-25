@@ -520,65 +520,105 @@ impl PgMetaEngine {
         lease: CheckpointLease,
         version: i64,
         total_event_payload_bytes: i64,
-        checkpoint: BuiltCheckpoint,
+        mut checkpoint: BuiltCheckpoint,
     ) -> MetaResult<Option<super::metadata_io::CheckpointFreshnessObservation>> {
-        let command_pool = Arc::clone(&self.command_pool);
-        let command_timeout = self.command_timeout;
-        let volume_id = self.volume_id;
-        let owner = owner.to_string();
-        let fencing_token = lease.fencing_token;
-        let session = self.refresh_client_session()?;
-        let result = self.run_async(async move {
-            Self::with_postgres_client_timeout(
-                command_pool,
-                command_timeout,
-                "publish fenced bootstrap checkpoint",
-                move |client| {
-                    Box::pin(async move {
-                        let sha_slice: &[u8] = &checkpoint.checkpoint_sha256;
-                        let tx = client.transaction().await.map_err(|error| {
-                            Self::classify_pg_error("begin bootstrap checkpoint publication", error)
-                        })?;
-                        session.stamp(&tx, volume_id).await?;
-                        let row = tx
-                            .query_opt(
-                                sql::UPSERT_FENCED_METADATA_CHECKPOINT,
-                                &[
-                                    &volume_id,
-                                    &checkpoint.metadata_format_version,
-                                    &version,
-                                    &version,
-                                    &total_event_payload_bytes,
-                                    &checkpoint.payload,
-                                    &sha_slice,
-                                    &checkpoint.format_info,
-                                    &owner,
-                                    &fencing_token,
-                                ],
-                            )
-                            .await
-                            .map_err(|error| {
-                                Self::classify_pg_error(
-                                    "postgres fenced checkpoint upsert failed",
-                                    error,
-                                )
-                            })?;
-                        let observation = row
-                            .as_ref()
-                            .map(super::metadata_io::checkpoint_freshness_observation_from_row)
-                            .transpose()?;
-                        tx.commit().await.map_err(|error| {
-                            Self::classify_pg_error(
-                                "commit bootstrap checkpoint publication",
-                                error,
-                            )
-                        })?;
-                        Ok(observation)
-                    })
-                },
-            )
-            .await
-        });
+        let mut session = match self.acquire_publication_session() {
+            Ok(session) => session,
+            Err(error) => return self.record_remote_operation_result(Err(error)),
+        };
+        let mut attempt = 0_u8;
+        let result = loop {
+            let command_pool = Arc::clone(&self.command_pool);
+            let command_timeout = self.command_timeout;
+            let volume_id = self.volume_id;
+            let owner = owner.to_string();
+            let fencing_token = lease.fencing_token;
+            let current_session = session.clone();
+            let current_checkpoint = checkpoint;
+            let outcome =
+                self.run_async(async move {
+                    Self::with_postgres_client_timeout(
+                        command_pool,
+                        command_timeout,
+                        "publish fenced bootstrap checkpoint",
+                        move |client| {
+                            Box::pin(async move {
+                                let tx = client.transaction().await.map_err(|error| {
+                                    Self::classify_pg_error(
+                                        "begin bootstrap checkpoint publication",
+                                        error,
+                                    )
+                                })?;
+                                match current_session.stamp_checked(&tx, volume_id).await {
+                                Ok(()) => {}
+                                Err(error @ (super::client_sessions::StampError::SessionInactive
+                                    | super::client_sessions::StampError::PolicyStale)) => {
+                                    drop(tx);
+                                    return Ok(Err((error, current_checkpoint)));
+                                }
+                                Err(super::client_sessions::StampError::Other(error)) => {
+                                    return Err(error);
+                                }
+                            }
+                                let sha_slice: &[u8] = &current_checkpoint.checkpoint_sha256;
+                                let row = tx
+                                    .query_opt(
+                                        sql::UPSERT_FENCED_METADATA_CHECKPOINT,
+                                        &[
+                                            &volume_id,
+                                            &current_checkpoint.metadata_format_version,
+                                            &version,
+                                            &version,
+                                            &total_event_payload_bytes,
+                                            &current_checkpoint.payload,
+                                            &sha_slice,
+                                            &current_checkpoint.format_info,
+                                            &owner,
+                                            &fencing_token,
+                                        ],
+                                    )
+                                    .await
+                                    .map_err(|error| {
+                                        Self::classify_pg_error(
+                                            "postgres fenced checkpoint upsert failed",
+                                            error,
+                                        )
+                                    })?;
+                                let observation = row
+                                .as_ref()
+                                .map(super::metadata_io::checkpoint_freshness_observation_from_row)
+                                .transpose()?;
+                                tx.commit().await.map_err(|error| {
+                                    Self::classify_pg_error(
+                                        "commit bootstrap checkpoint publication",
+                                        error,
+                                    )
+                                })?;
+                                Ok(Ok(observation))
+                            })
+                        },
+                    )
+                    .await
+                });
+            match outcome {
+                Ok(Ok(observation)) => break Ok(observation),
+                Ok(Err((stamp_error, returned_checkpoint))) => {
+                    if attempt == 0 {
+                        attempt += 1;
+                        checkpoint = returned_checkpoint;
+                        match self.force_refresh_publication_session(&session) {
+                            Ok(refreshed) => {
+                                session = refreshed;
+                                continue;
+                            }
+                            Err(error) => break Err(error),
+                        }
+                    }
+                    break Err(stamp_error.into_meta_error());
+                }
+                Err(error) => break Err(error),
+            }
+        };
         self.record_remote_operation_result(result)
     }
 }

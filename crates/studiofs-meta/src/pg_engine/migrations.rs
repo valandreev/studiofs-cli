@@ -32,6 +32,9 @@ pub const SCHEMA_ADVISORY_LOCK: i64 = 902_202_603;
 /// Database-wide component that the baseline and its successors version.
 pub const CORE_COMPONENT: &str = "core";
 
+/// Database-wide additive component for per-volume client session leases (SFS-1008).
+pub const CLIENT_SESSIONS_COMPONENT: &str = "client_sessions";
+
 /// Recorded by the baseline itself and checked exactly by the CLI Janitor.
 const PAYLOAD_GC_COMPONENT: &str = "payload_gc";
 
@@ -98,7 +101,7 @@ const BASELINE: Migration = Migration {
 };
 
 const CLIENT_SESSIONS: Migration = Migration {
-    component: "client_sessions",
+    component: CLIENT_SESSIONS_COMPONENT,
     version: 1,
     name: "per-volume client session leases",
     phase: MigrationPhase::Additive,
@@ -390,17 +393,30 @@ pub async fn migrate_registered_schema(
     migrate_with(client, MIGRATIONS, repair_baseline).await
 }
 
-/// Puts the baseline first when a repair was asked for and nothing is built on it.
+/// Puts idempotent version-1 component migrations first when a repair was asked
+/// for, nothing is built above them, and they were not already applied in this
+/// run.
 fn with_repair(
     recorded: &[RecordedComponent],
     mut pending: Vec<Migration>,
+    applied: &[Migration],
     repair: bool,
 ) -> Vec<Migration> {
-    let at_baseline = recorded
-        .iter()
-        .any(|row| row.component == CORE_COMPONENT && row.version == BASELINE.version);
-    if repair && at_baseline && !pending.contains(&BASELINE) {
-        pending.insert(0, BASELINE);
+    if !repair {
+        return pending;
+    }
+    let mut repairs = Vec::new();
+    for step in [BASELINE, CLIENT_SESSIONS] {
+        let at_v1 = recorded
+            .iter()
+            .any(|row| row.component == step.component && row.version == step.version);
+        if at_v1 && !pending.contains(&step) && !applied.contains(&step) {
+            repairs.push(step);
+        }
+    }
+    if !repairs.is_empty() {
+        repairs.extend(pending);
+        pending = repairs;
     }
     pending
 }
@@ -408,7 +424,7 @@ fn with_repair(
 pub(crate) async fn migrate_with(
     client: &mut tokio_postgres::Client,
     registry: &[Migration],
-    mut repair_baseline: bool,
+    repair_baseline: bool,
 ) -> MetaResult<Vec<Migration>> {
     let mut applied: Vec<Migration> = Vec::new();
     loop {
@@ -421,7 +437,7 @@ pub(crate) async fn migrate_with(
             .map_err(|error| pg_failure("start schema migration", &error))?;
         let recorded = lock_and_read(&tx).await?;
         let pending = plan(&recorded, registry, true)?;
-        let next = with_repair(&recorded, pending, std::mem::take(&mut repair_baseline))
+        let next = with_repair(&recorded, pending, &applied, repair_baseline)
             .into_iter()
             .next();
         let Some(step) = next else {
@@ -453,7 +469,7 @@ where
 {
     let (recorded, _) = read_recorded(client).await?;
     let pending = plan(&recorded, MIGRATIONS, true)?;
-    let pending = with_repair(&recorded, pending, repair_baseline);
+    let pending = with_repair(&recorded, pending, &[], repair_baseline);
     Ok((recorded, pending))
 }
 
@@ -491,21 +507,34 @@ mod tests {
 
     #[test]
     fn registry_is_ordered_contiguous_and_matches_the_core_identity() {
-        let versions: Vec<i32> = MIGRATIONS
-            .iter()
-            .filter(|step| step.component == CORE_COMPONENT)
-            .map(|step| step.version)
-            .collect();
-        assert_eq!(versions.len(), MIGRATIONS.len(), "only core is registered");
-        assert!(
-            versions
-                .iter()
-                .zip(1..)
-                .all(|(version, expected)| *version == expected)
+        let mut by_component: std::collections::BTreeMap<&str, Vec<i32>> =
+            std::collections::BTreeMap::new();
+        for step in MIGRATIONS {
+            by_component
+                .entry(step.component)
+                .or_default()
+                .push(step.version);
+        }
+        assert_eq!(
+            by_component.keys().copied().collect::<Vec<_>>(),
+            vec![CLIENT_SESSIONS_COMPONENT, CORE_COMPONENT]
         );
+        for (component, versions) in &by_component {
+            assert!(
+                versions
+                    .iter()
+                    .zip(1..)
+                    .all(|(version, expected)| *version == expected),
+                "component {component} versions must be 1..=N: {versions:?}"
+            );
+        }
         assert_eq!(
             latest_version(MIGRATIONS, CORE_COMPONENT),
             i32::from(crate::version::POSTGRES_CORE_SCHEMA.current)
+        );
+        assert_eq!(
+            latest_version(MIGRATIONS, CLIENT_SESSIONS_COMPONENT),
+            i32::from(crate::version::POSTGRES_CLIENT_SESSIONS_SCHEMA.current)
         );
         assert_eq!(MIGRATIONS[0], BASELINE);
     }
@@ -598,7 +627,7 @@ mod tests {
                 checksum: Some(vec![0; 32]),
                 ..row(CORE_COMPONENT, 1, MIGRATIONS)
             },
-            payload_gc,
+            payload_gc.clone(),
         ];
         assert!(matches!(
             plan(&stale, MIGRATIONS, false),
@@ -606,9 +635,27 @@ mod tests {
         ));
         assert_eq!(plan(&stale, MIGRATIONS, true).unwrap()[0], BASELINE);
         // An explicit repair re-lists a verified baseline exactly once.
-        let repaired = with_repair(&verified, plan(&verified, MIGRATIONS, true).unwrap(), true);
+        let repaired = with_repair(
+            &verified,
+            plan(&verified, MIGRATIONS, true).unwrap(),
+            &[],
+            true,
+        );
         assert_eq!((repaired[0], repaired.len()), (BASELINE, later + 1));
-        let reconciled = with_repair(&stale, plan(&stale, MIGRATIONS, true).unwrap(), true);
+        let full_recorded = [
+            row(CORE_COMPONENT, 1, MIGRATIONS),
+            row(CLIENT_SESSIONS_COMPONENT, 1, MIGRATIONS),
+            payload_gc.clone(),
+        ];
+        let full_repaired = with_repair(
+            &full_recorded,
+            plan(&full_recorded, MIGRATIONS, true).unwrap(),
+            &[],
+            true,
+        );
+        assert_eq!(full_repaired[0], BASELINE);
+        assert!(full_repaired.contains(&CLIENT_SESSIONS));
+        let reconciled = with_repair(&stale, plan(&stale, MIGRATIONS, true).unwrap(), &[], true);
         assert_eq!(
             reconciled.iter().filter(|step| **step == BASELINE).count(),
             1

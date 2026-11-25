@@ -478,6 +478,24 @@ fn apply_dump(postgres_address: &str, dump: &MetadataDump) -> DumpLoadResult<i64
                 });
             }
 
+            // An existing metadata row may belong to a legacy volume awaiting
+            // explicit adoption. Inspect and preserve its policy and write
+            // requirement before stamping the publication session and clearing
+            // publication-state tables.
+            let previous_state = tx
+                .query_opt(
+                    "SELECT write_requirement FROM metadata_state WHERE vol = $1",
+                    &[&target_vol],
+                )
+                .await
+                .map_err(|source| postgres_operation("read metadata_state write_requirement", source))?;
+            if previous_state.is_none() {
+                studiofs_meta::pg_engine::insert_initial_volume_protocol(&tx, target_vol, "studiofs load")
+                    .await?;
+            }
+            let write_requirement: i16 = previous_state.map_or(1, |row| row.get(0));
+            let session =
+                studiofs_meta::pg_engine::PublicationSession::begin(&tx, target_vol).await?;
             // The volume row lock blocks new FK-backed rows, so the guarded
             // snapshot and accounting tables stay empty until commit.
             tx.execute("DELETE FROM counters WHERE vol = $1", &[&target_vol])
@@ -486,22 +504,9 @@ fn apply_dump(postgres_address: &str, dump: &MetadataDump) -> DumpLoadResult<i64
             tx.execute("DELETE FROM event_log WHERE vol = $1", &[&target_vol])
                 .await
                 .map_err(|source| postgres_operation("clear event log", source))?;
-            // An existing metadata row may belong to a legacy volume awaiting
-            // explicit adoption. Preserve its policy and write requirement.
-            let previous_state = tx
-                .query_opt(
-                    "DELETE FROM metadata_state WHERE vol = $1 RETURNING write_requirement",
-                    &[&target_vol],
-                )
+            tx.execute("DELETE FROM metadata_state WHERE vol = $1", &[&target_vol])
                 .await
                 .map_err(|source| postgres_operation("clear metadata_state", source))?;
-            if previous_state.is_none() {
-                studiofs_meta::pg_engine::insert_initial_volume_protocol(&tx, target_vol, "studiofs load")
-                    .await?;
-            }
-            let write_requirement: i16 = previous_state.map_or(1, |row| row.get(0));
-            let session =
-                studiofs_meta::pg_engine::PublicationSession::begin(&tx, target_vol).await?;
             tx.execute(
                 "INSERT INTO metadata_state (vol, metadata_format_version, version, checkpoint_version, snapshot, checkpoint_sha256, format_info, checkpoint_publication_state, checkpoint_generation, write_requirement) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
                 &[

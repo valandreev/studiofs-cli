@@ -16,7 +16,10 @@ use super::{PgMetaEngine, PgTimeoutContext, StartupSchemaValidation};
 use crate::compat::ReasonCode;
 use crate::engine::{MetaError, MetaResult};
 use crate::pg_transport::connect_studiofs_postgres;
-use crate::version::{POSTGRES_CORE_SCHEMA, POSTGRES_PAYLOAD_GC_SCHEMA, VersionIdentity};
+use crate::version::{
+    POSTGRES_CLIENT_SESSIONS_SCHEMA, POSTGRES_CORE_SCHEMA, POSTGRES_PAYLOAD_GC_SCHEMA,
+    VersionIdentity,
+};
 
 /// One schema component a mount uses, with the objects it relies on.
 struct MountComponent {
@@ -27,7 +30,7 @@ struct MountComponent {
     columns: &'static [(&'static str, &'static str)],
 }
 
-const MOUNT_COMPONENTS: [MountComponent; 2] = [
+const MOUNT_COMPONENTS: [MountComponent; 3] = [
     // Bootstrap, replay, publication, checkpoints, file locks and the event
     // log prune floor, which reads the snapshot source fences.
     MountComponent {
@@ -76,6 +79,17 @@ const MOUNT_COMPONENTS: [MountComponent; 2] = [
             "snapshot_artifact_payload_proofs",
         ],
         columns: &[],
+    },
+    // Mounts register leases and stamp publication transactions against this registry.
+    MountComponent {
+        name: super::migrations::CLIENT_SESSIONS_COMPONENT,
+        identity: POSTGRES_CLIENT_SESSIONS_SCHEMA,
+        tables: &["client_sessions"],
+        columns: &[
+            ("client_sessions", "policy_epoch"),
+            ("client_sessions", "fencing_token"),
+            ("client_sessions", "lease_expires_at"),
+        ],
     },
 ];
 
@@ -274,7 +288,11 @@ mod tests {
     use super::*;
 
     fn baseline() -> BTreeMap<String, i32> {
-        BTreeMap::from([("core".to_owned(), 1), ("payload_gc".to_owned(), 2)])
+        BTreeMap::from([
+            ("core".to_owned(), 1),
+            ("payload_gc".to_owned(), 2),
+            ("client_sessions".to_owned(), 1),
+        ])
     }
 
     #[test]
@@ -283,6 +301,7 @@ mod tests {
         let mut successor = baseline();
         successor.insert("core".to_owned(), 7);
         successor.insert("payload_gc".to_owned(), 3);
+        successor.insert("client_sessions".to_owned(), 2);
         assert_eq!(mount_schema_refusal(&successor, &[]), None);
     }
 
@@ -291,6 +310,7 @@ mod tests {
         let absent = mount_schema_refusal(&BTreeMap::new(), &[]).unwrap();
         assert!(absent.contains("schema_component_missing (PostgreSQL core schema)"));
         assert!(absent.contains("schema_component_missing (PostgreSQL payload GC schema)"));
+        assert!(absent.contains("schema_component_missing (PostgreSQL client sessions schema)"));
         assert!(absent.contains("studiofs upgrade"));
 
         let mut outdated = baseline();
@@ -346,8 +366,12 @@ mod tests {
         ] {
             assert!(!tables.iter().any(|table| table == optional), "{optional}");
         }
-        // Every required object is created by the baseline DDL.
-        let ddl = super::super::schema::studiofs_pg_schema_sql();
+        // Every required table is created by the registered schema migrations.
+        let ddl: String = super::super::migrations::MIGRATIONS
+            .iter()
+            .map(|step| step.sql)
+            .collect::<Vec<_>>()
+            .join("\n");
         for table in &tables {
             assert!(
                 ddl.contains(&format!("CREATE TABLE IF NOT EXISTS {table} ")),
