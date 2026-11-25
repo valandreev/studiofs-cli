@@ -4299,6 +4299,29 @@ mod tests {
         let meta_dir = temp.path().join("meta");
         let db_path = create_postgres_metadata_fixture(&meta_dir, &endpoint, &postgres_url);
         let before = std::fs::read(&db_path).unwrap();
+        if hold_lock {
+            // The lock holder registers a maintenance client session, which needs
+            // the deployed schema and a row for the fixture volume.
+            let (mut client, connection) =
+                tokio_postgres::connect(&postgres_url, tokio_postgres::NoTls)
+                    .await
+                    .unwrap();
+            let connection_task = tokio::spawn(connection);
+            studiofs_meta::pg_engine::schema::ensure_studiofs_pg_schema_committed(&mut client)
+                .await
+                .unwrap();
+            client
+                .execute(
+                    "INSERT INTO volumes (vol, name, uuid, block_size) \
+                     VALUES (966, 'janitor-fixture-966', 'janitor-fixture-966', 8192) \
+                     ON CONFLICT DO NOTHING",
+                    &[],
+                )
+                .await
+                .unwrap();
+            drop(client);
+            let _ = connection_task.await;
+        }
         let run_db_path = db_path.clone();
         let result = tokio::task::spawn_blocking(move || {
             let mut holder = hold_lock.then(|| {

@@ -584,10 +584,6 @@ impl PgMetaEngine {
         self.ensure_remote_format_validated()?;
 
         let client_id = self.current_client_id()?;
-        let mut session = match self.acquire_publication_session() {
-            Ok(session) => session,
-            Err(error) => return self.record_remote_operation_result(Err(error)),
-        };
         let retained_digest = super::retained::publication_digest(&client_id, &events)?;
         let mut batches = Self::split_projected_event_batches(
             events,
@@ -599,6 +595,11 @@ impl PgMetaEngine {
         // make the published journal durable first. A recovered image then
         // holds every event peers can see and stays this client's authority.
         self.local.sync_local_metadata()?;
+        // Local rejections (oversized event, failed fence) must win before PostgreSQL is contacted.
+        let mut session = match self.acquire_publication_session() {
+            Ok(session) => session,
+            Err(error) => return self.record_remote_operation_result(Err(error)),
+        };
         let expected_metadata_format_version = i16::try_from(SHARED_VOLUME_FORMAT.current)
             .map_err(|_| {
                 MetaError::Storage(
