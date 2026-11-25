@@ -1,7 +1,7 @@
 //! Live PostgreSQL/S3 acceptance for the standalone janitor CLI.
 //!
 //! Uses `STUDIOFS_TEST_PG_DSN` and `STUDIOFS_S3_*` from the environment or workspace
-//! `.env`. Each test isolates itself with a fresh volume row and a unique bucket prefix.
+//! `.env`. Each test uses a fresh PostgreSQL schema and a unique bucket prefix.
 
 use super::*;
 use opendal::Operator;
@@ -12,7 +12,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 struct LiveStack {
     artifact_root: PathBuf,
-    postgres_url: String,
+    postgres: PgTestSchema,
     endpoint: String,
     bucket: String,
     access_key: String,
@@ -34,8 +34,7 @@ impl LiveStack {
             .join(&run_id);
         std::fs::create_dir_all(&artifact_root)?;
         Ok(Self {
-            postgres_url: test_env("STUDIOFS_TEST_PG_DSN")
-                .context("STUDIOFS_TEST_PG_DSN must be set (environment or workspace .env)")?,
+            postgres: live_postgres_schema()?,
             endpoint: env("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:9000"),
             bucket: env("STUDIOFS_S3_BUCKET", "studiofs-test"),
             access_key: env("STUDIOFS_S3_ACCESS_KEY", "studiofs"),
@@ -232,7 +231,7 @@ async fn connection(
     tokio::task::JoinHandle<Result<(), tokio_postgres::Error>>,
 )> {
     let (client, connection) =
-        tokio_postgres::connect(&stack.postgres_url, tokio_postgres::NoTls).await?;
+        tokio_postgres::connect(stack.postgres.dsn(), tokio_postgres::NoTls).await?;
     Ok((client, tokio::spawn(connection)))
 }
 
@@ -327,7 +326,7 @@ async fn live_cli_disposable_adversarial_protection_cleanup_dry_run_and_budget()
     let client_root = stack.root.join("matrix");
     let meta_dir = client_root.join("meta/janitor-live");
     let (volume_id, db_path, _) =
-        create_live_postgres_janitor_fixture(&stack.postgres_url, &s3, &meta_dir, base).await?;
+        create_live_postgres_janitor_fixture(stack.postgres.dsn(), &s3, &meta_dir, base).await?;
     let engine = RedbMetaEngine::open(&db_path)?;
     engine.set_counter("pgLastAppliedBatchVersion", 6)?;
     drop(engine);
@@ -472,7 +471,7 @@ async fn live_cli_disposable_retires_abandoned_upload_but_protects_delayed_publi
     let janitor_root = stack.root.join("abandoned-upload-janitor");
     let meta_dir = writer_root.join("meta/janitor-live");
     let (volume_id, db_path, _) =
-        create_live_postgres_janitor_fixture(&stack.postgres_url, &s3, &meta_dir, abandoned)
+        create_live_postgres_janitor_fixture(stack.postgres.dsn(), &s3, &meta_dir, abandoned)
             .await?;
     let (client, task) = connection(&stack).await?;
     client
