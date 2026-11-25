@@ -220,6 +220,21 @@ pub enum UpgradeRequiredReason {
         /// Highest version this binary knows.
         known: i32,
     },
+    /// The volume's write requirement was raised above what this binary can
+    /// publish (SFS-1007); reads keep working, publication is refused.
+    #[error("volume write requirement is {found}, this binary publishes up to {supported}")]
+    WriteRequirementNewer {
+        /// Stored `write_requirement`.
+        found: u16,
+        /// [`crate::version::SHARED_WRITE_REQUIREMENT`] of this binary.
+        supported: u16,
+    },
+    /// The volume protocol policy has a field or feature state this binary does not know.
+    #[error("unknown volume protocol policy: {detail}")]
+    VolumeProtocolUnknown {
+        /// Decoder diagnostic; holds only capability and field names.
+        detail: String,
+    },
 }
 
 #[derive(Debug, Clone, thiserror::Error)]
@@ -438,6 +453,10 @@ pub enum MetaError {
         /// `additive`, `backfill` or `contract`.
         phase: &'static str,
     },
+
+    /// A volume protocol policy change was rejected (SFS-1007).
+    #[error("volume protocol change rejected: {0}")]
+    VolumeProtocolRejected(#[from] crate::volume_protocol::ProtocolRejection),
 
     /// An xattr write exceeded the backend-supported value size limit.
     #[error("xattr value too large: actual={actual} bytes, limit={limit} bytes")]

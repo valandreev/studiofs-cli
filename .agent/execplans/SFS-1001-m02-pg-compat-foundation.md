@@ -12,7 +12,7 @@ The shared PostgreSQL database holds the schema that every StudioFS client and m
 
 - [x] SFS-1005: explicit, resumable PostgreSQL schema migration registry and CLI, extending `studiofs_schema_components` (2026-11-25; `pg_engine/migrations.rs`, `studiofs upgrade --dry-run`).
 - [ ] SFS-1006: replace the global table check with capability-scoped schema validation.
-- [ ] SFS-1007: persist per-volume protocol requirements (read, write, maintenance sets) and the policy epoch.
+- [x] SFS-1007: persist per-volume protocol requirements (read, write, maintenance sets) and the policy epoch (2026-11-25; `volume_protocol.rs`, `pg_engine/volume_protocol.rs`, `metadata_state.write_requirement`).
 - [ ] SFS-1008: track active client sessions, capabilities and expired leases.
 
 ## Surprises & Discoveries
@@ -24,6 +24,16 @@ The shared PostgreSQL database holds the schema that every StudioFS client and m
   Evidence: `dump_load_rejects_accounting_row_committed_while_load_waits` failed at its second lock wait until `ensure` stopped re-applying a verified baseline.
 
 ## Decision Log
+
+- Decision: SFS-1007 extends the `core` 1 baseline instead of registering `core` 2, and re-pins its checksum.
+  Rationale: 0.2.5 is unreleased and ships the policy, so it belongs to its baseline. A `core` 2 would leave every new database above the baseline, where `--repair-schema` and baseline reconciliation never apply. Development databases recorded with the old checksum get `RepairRequired` until `studiofs upgrade` reconciles them.
+  Date/Author: 2026-11-25, SFS-1007.
+- Decision: the write requirement is an integer in `metadata_state` (`SHARED_WRITE_REQUIREMENT`), not a capability set; the policy record is a separate `volume_protocol` row.
+  Rationale: publication already updates `metadata_state`, so `write_requirement <= $4` adds no lock or round trip (SFS-1014 preflight); comparing sets would need the policy row on every publication. `check_update` ties the two: adding a write capability must raise the integer.
+  Date/Author: 2026-11-25, SFS-1007.
+- Decision: `load` keeps the target's write requirement and existing policy; it writes the baseline policy only when none exists.
+  Rationale: a load replaces volume data, not the protocol; resetting the requirement would re-admit writers a successor fenced.
+  Date/Author: 2026-11-25, SFS-1007.
 
 - Decision: no entry point runs DDL against a verified schema. `init`/`load` refuse a differing baseline; `studiofs upgrade` reconciles it, and `--repair-schema` re-applies a verified baseline to restore dropped objects, both only while nothing is recorded above it.
   Rationale: implicit DDL blocked behind live writers, and an unconditional re-apply in `upgrade` deadlocked with concurrent writers (`snapshot_cli_test` failed 2/3 runs; 1/3 on `main`, which re-ran the batch too). Re-applying is unsafe once later steps exist, because the baseline's `CREATE OR REPLACE FUNCTION` would revert their function bodies.

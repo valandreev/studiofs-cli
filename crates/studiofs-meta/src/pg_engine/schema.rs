@@ -901,6 +901,40 @@ pub const fn studiofs_pg_schema_sql() -> &'static str {
             INCLUDE (next_attempt_at)
             WHERE acknowledged_at IS NULL;
 
+        -- Per-volume protocol policy (SFS-1007). Publication checks
+        -- `write_requirement` in its version-bump UPDATE; Activate raises it
+        -- together with the policy epoch, and never touches the
+        -- `metadata_format_version` read gate. Volumes without a policy get
+        -- the baseline policy that `init` and `load` write.
+        ALTER TABLE metadata_state
+            ADD COLUMN IF NOT EXISTS write_requirement SMALLINT NOT NULL DEFAULT 1
+                CHECK (write_requirement >= 1);
+        CREATE TABLE IF NOT EXISTS volume_protocol (
+            vol BIGINT PRIMARY KEY REFERENCES volumes(vol) ON DELETE CASCADE,
+            policy_epoch BIGINT NOT NULL CHECK (policy_epoch >= 1),
+            requirements JSONB NOT NULL,
+            updated_by TEXT NOT NULL,
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        );
+        CREATE TABLE IF NOT EXISTS volume_protocol_history (
+            vol BIGINT NOT NULL REFERENCES volumes(vol) ON DELETE CASCADE,
+            policy_epoch BIGINT NOT NULL CHECK (policy_epoch >= 1),
+            write_requirement SMALLINT NOT NULL CHECK (write_requirement >= 1),
+            requirements JSONB NOT NULL,
+            changed_by TEXT NOT NULL,
+            changed_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+            PRIMARY KEY (vol, policy_epoch)
+        );
+        INSERT INTO volume_protocol (vol, policy_epoch, requirements, updated_by)
+            SELECT vol, 1, '{"read":["event.codec.v1","payload.sfec.v1","payload.stfs.v2","payload.stfs.v3"],"write":["event.codec.v1","payload.sfec.v1","payload.stfs.v3"],"maintain":["maintenance.payload_gc.v2"],"features":{"event.codec.v1":"required","maintenance.payload_gc.v2":"required","payload.sfec.v1":"required","payload.stfs.v2":"required","payload.stfs.v3":"required"}}'::JSONB, 'schema baseline'
+            FROM metadata_state
+            ON CONFLICT (vol) DO NOTHING;
+        INSERT INTO volume_protocol_history (vol, policy_epoch, write_requirement, requirements, changed_by)
+            SELECT vol, policy_epoch, 1, requirements, updated_by
+            FROM volume_protocol
+            WHERE policy_epoch = 1
+            ON CONFLICT (vol, policy_epoch) DO NOTHING;
+
         CREATE TABLE IF NOT EXISTS studiofs_schema_components (
             component TEXT PRIMARY KEY,
             version INTEGER NOT NULL CHECK (version > 0),
@@ -960,6 +994,16 @@ pub async fn ensure_studiofs_pg_schema_committed(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Volumes provisioned before the policy existed get exactly the policy
+    /// `init` writes (SFS-1007).
+    #[test]
+    fn schema_backfills_the_baseline_volume_protocol() {
+        let json = crate::volume_protocol::VolumeProtocol::baseline()
+            .encode_requirements()
+            .unwrap();
+        assert!(studiofs_pg_schema_sql().contains(&format!("'{json}'::JSONB")));
+    }
 
     #[test]
     fn payload_gc_version_marker_is_the_last_statement_and_never_downgrades() {

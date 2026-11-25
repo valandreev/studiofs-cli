@@ -486,11 +486,20 @@ fn apply_dump(postgres_address: &str, dump: &MetadataDump) -> DumpLoadResult<i64
             tx.execute("DELETE FROM event_log WHERE vol = $1", &[&target_vol])
                 .await
                 .map_err(|source| postgres_operation("clear event log", source))?;
-            tx.execute("DELETE FROM metadata_state WHERE vol = $1", &[&target_vol])
+            // A load replaces volume data, not its protocol policy: keep the
+            // write requirement and write the baseline policy only when none exists.
+            let write_requirement: i16 = tx
+                .query_opt(
+                    "DELETE FROM metadata_state WHERE vol = $1 RETURNING write_requirement",
+                    &[&target_vol],
+                )
                 .await
-                .map_err(|source| postgres_operation("clear metadata_state", source))?;
+                .map_err(|source| postgres_operation("clear metadata_state", source))?
+                .map_or(1, |row| row.get(0));
+            studiofs_meta::pg_engine::insert_initial_volume_protocol(&tx, target_vol, "studiofs load")
+                .await?;
             tx.execute(
-                "INSERT INTO metadata_state (vol, metadata_format_version, version, checkpoint_version, snapshot, checkpoint_sha256, format_info, checkpoint_publication_state, checkpoint_generation) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+                "INSERT INTO metadata_state (vol, metadata_format_version, version, checkpoint_version, snapshot, checkpoint_sha256, format_info, checkpoint_publication_state, checkpoint_generation, write_requirement) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
                 &[
                     &target_vol,
                     &dump.metadata_state_format_version,
@@ -501,6 +510,7 @@ fn apply_dump(postgres_address: &str, dump: &MetadataDump) -> DumpLoadResult<i64
                     &format_info_bytes,
                     &dump.metadata_state_publication_state,
                     &dump.metadata_state_generation,
+                    &write_requirement,
                 ],
             )
             .await

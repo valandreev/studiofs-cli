@@ -1664,7 +1664,7 @@ fn test_format6_upgrade_fences_old_publication_and_deletion_claims() {
             .map_err(|error| MetaError::Storage(error.to_string()))?;
         super::super::format_upgrade::upgrade_shared_format5(&mut client, volume_id, &volume_uuid).await?;
         super::super::format_upgrade::upgrade_shared_format5(&mut client, volume_id, &volume_uuid).await?;
-        assert!(client.query_opt(sql::BUMP_METADATA_VERSION, &[&volume_id, &5_i16, &0_i64]).await
+        assert!(client.query_opt(sql::BUMP_METADATA_VERSION, &[&volume_id, &5_i16, &0_i64, &1_i16]).await
             .map_err(|error| MetaError::Storage(error.to_string()))?.is_none());
         assert!(client.execute("UPDATE snapshot_payload_upload_objects SET reconcile_owner='old-owner',reconcile_fence=2 WHERE vol=$1 AND object_id=7001", &[&volume_id]).await.is_err());
         let tx = client.transaction().await.map_err(|error| MetaError::Storage(error.to_string()))?;
@@ -7192,6 +7192,7 @@ fn checkpoint_freshness_sql_uses_persisted_scalar_bookkeeping() {
 
     let bump = super::sql::BUMP_METADATA_VERSION;
     assert!(bump.contains("total_event_payload_bytes = total_event_payload_bytes + $3"));
+    assert!(bump.contains("AND write_requirement <= $4"));
     assert!(bump.contains("RETURNING"));
     assert!(bump.contains("checkpoint_total_event_bytes"));
 

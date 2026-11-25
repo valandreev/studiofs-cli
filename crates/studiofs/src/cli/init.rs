@@ -449,6 +449,13 @@ fn init_pg_schema_and_volume(
 
             tx.execute(init_pg_counter_seed_sql(), &[&volume_id])
                 .await?;
+            // Baseline policy only; provisioning never activates a feature.
+            studiofs_meta::pg_engine::insert_initial_volume_protocol(
+                &tx,
+                volume_id,
+                "studiofs init",
+            )
+            .await?;
 
             tx.commit().await?;
             Ok(volume_id)

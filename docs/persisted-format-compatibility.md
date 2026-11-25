@@ -174,9 +174,12 @@ that declares support for 0.2.5 (the compiled test successor of
 - Migration registry (SFS-1005,
   `crates/studiofs-meta/src/pg_engine/migrations.rs`): `MIGRATIONS` lists
   numbered steps per component, each `additive`, `backfill` or `contract`.
-  The `core` component's version 1 is the frozen 0.2.5 baseline
-  (`studiofs_pg_schema_sql`, checksum pinned by a unit test); every later
-  schema change is a new step, and `POSTGRES_CORE_SCHEMA` tracks the latest
+  The `core` component's version 1 is the 0.2.5 baseline
+  (`studiofs_pg_schema_sql`, checksum pinned by a unit test). It freezes at the
+  0.2.5 release; until then 0.2.5 issues extend it (SFS-1007 added the volume
+  protocol policy), and a development database recorded with an older baseline
+  checksum is reconciled by `studiofs upgrade`. Every schema change after the
+  release is a new step, and `POSTGRES_CORE_SCHEMA` tracks the latest
   `core` version. Each `studiofs_schema_components` row also stores a SHA-256
   chained over the component's steps, and a recorded history that differs
   from the registry is refused as `RepairRequired`. A recorded version newer
@@ -228,9 +231,15 @@ that declares support for 0.2.5 (the compiled test successor of
   (`crates/studiofs-meta/src/pg_engine/janitor.rs:571`) require exact
   equality. Raising it would lock out 0.2.5 readers, so a successor must not
   raise it at Activate. From format 7 on it stays fixed (ADR 0018).
-- Successor may change: `BUMP_METADATA_VERSION` is the template. SFS-1007 adds
-  a separate per-volume write-requirement field that publication checks in the
-  same UPDATE. Activate raises that field, which fences 0.2.5 writers and
+- Write requirement (SFS-1007): `metadata_state.write_requirement SMALLINT`,
+  value 1 (`SHARED_WRITE_REQUIREMENT`). `BUMP_METADATA_VERSION` also requires
+  `write_requirement <= $4`, where `$4` is the publisher's
+  `SHARED_WRITE_REQUIREMENT.current`. Event and volume-settings publication
+  both reread the two gates when no row matches and report
+  `UnsupportedFormatVersion` or `UpgradeRequired`
+  (`write_requirement_newer`) instead of a generic PostgreSQL error
+  (`crates/studiofs-meta/src/pg_engine/volume_protocol.rs`).
+- Successor may change: Activate raises the write requirement, which fences 0.2.5 writers and
   leaves 0.2.5 readers working when the capability is read-compatible. The
   check runs inside the publication transaction, so a writer that reconnects
   is re-checked on its next publication.
@@ -452,7 +461,8 @@ Later issues must build on these instead of adding parallel mechanisms:
 |---|---|---|
 | `studiofs_schema_components` with monotonic marker (SFS-980) | `crates/studiofs-meta/src/pg_engine/schema.rs:903` | SFS-1005, SFS-1006 |
 | `studiofs upgrade` (format 5→6) | `crates/studiofs/src/cli/upgrade.rs:15`, `crates/studiofs-meta/src/pg_engine/format_upgrade.rs:10` | SFS-1132 |
-| `BUMP_METADATA_VERSION` format predicate on publication | `crates/studiofs-meta/src/pg_engine/sql.rs:51` | SFS-1007, SFS-1014 |
+| `BUMP_METADATA_VERSION` format and write-requirement predicates on publication | `crates/studiofs-meta/src/pg_engine/sql.rs:51` | SFS-1014 |
+| Per-volume policy record `volume_protocol` with epoch, audit history and `check_update` transition rules | `crates/studiofs-meta/src/volume_protocol.rs`, `crates/studiofs-meta/src/pg_engine/volume_protocol.rs` | SFS-1008, SFS-1015, SFS-1017, SFS-1132 |
 | `studiofs_fence_legacy_deletion_claim` trigger with `studiofs.deletion_format` GUC | `crates/studiofs-meta/src/pg_engine/schema.rs:569`, `crates/studiofs-meta/src/pg_engine/janitor.rs:1089` | SFS-1014, SFS-1016 |
 | `bootstrap_checkpoint_leases` (server-clock expiry, fencing token) | `crates/studiofs-meta/src/pg_engine/schema.rs:158`, `crates/studiofs-meta/src/pg_engine/sql.rs:158` | SFS-1008, SFS-1011 |
 | VolumeSettings tag-per-version events (19, 20, 21) | `crates/studiofs-meta/src/events.rs:25` | SFS-1009 |
@@ -487,8 +497,8 @@ successor can fence it safely. "Current state" is what `main` does today.
 
 | Obligation | Current state | Owner |
 |---|---|---|
-| Publication checks a per-volume field that a successor can raise at Activate, in the same UPDATE as the version bump. | Partial: `BUMP_METADATA_VERSION` checks `metadata_format_version` (`crates/studiofs-meta/src/pg_engine/sql.rs:56`), but that field is also the read gate, so raising it locks out readers. A separate write-requirement field is missing. | [SFS-1007](https://linear.app/valandreev/issue/SFS-1007) |
-| A refused volume-settings publication reports a typed reason, like event publication. | Missing: `query_one` plus `classify_pg_error("order volume settings")` turns a format mismatch into a generic PostgreSQL error (`crates/studiofs-meta/src/pg_engine/volume_settings.rs:339`); event publication re-reads the format and returns `UnsupportedFormatVersion` (`crates/studiofs-meta/src/pg_engine/metadata_io.rs:671`). | [SFS-1007](https://linear.app/valandreev/issue/SFS-1007) |
+| Publication checks a per-volume field that a successor can raise at Activate, in the same UPDATE as the version bump. | Present (SFS-1007): `BUMP_METADATA_VERSION` checks `write_requirement <= SHARED_WRITE_REQUIREMENT.current` beside the format predicate (`crates/studiofs-meta/src/pg_engine/sql.rs`); the read gate `metadata_format_version` is separate. | [SFS-1007](https://linear.app/valandreev/issue/SFS-1007) |
+| A refused volume-settings publication reports a typed reason, like event publication. | Present (SFS-1007): both paths call `refused_publication` (`crates/studiofs-meta/src/pg_engine/volume_protocol.rs`), which returns `UnsupportedFormatVersion` or `UpgradeRequired` (`write_requirement_newer`). | [SFS-1007](https://linear.app/valandreev/issue/SFS-1007) |
 | Every publication stamps its session and policy epoch (GUC or column) so a later trigger can reject it. | Missing: publication sets no GUC; `event_log.client_id` exists (`crates/studiofs-meta/src/pg_engine/schema.rs:57`) but there is no session or epoch. | [SFS-1014](https://linear.app/valandreev/issue/SFS-1014), [SFS-1008](https://linear.app/valandreev/issue/SFS-1008) |
 | Destructive maintenance sets a maintenance capability GUC before deleting. | Partial: Janitor claims set `studiofs.deletion_format` (`crates/studiofs-meta/src/pg_engine/janitor.rs:1089`); snapshot cleanup, event-log pruning and checkpoint pruning set none. | [SFS-1016](https://linear.app/valandreev/issue/SFS-1016) |
 | Unknown required capabilities fail closed with a typed reason. | Present in the pure evaluator (SFS-1004): `compat::evaluate` refuses unknown required capabilities, unknown safety-critical optional ones, unknown events and payload formats with stable reason codes. Not wired into mount, replay or publication until the volume policy and enforcement land. | [SFS-1004](https://linear.app/valandreev/issue/SFS-1004) |
@@ -497,7 +507,7 @@ successor can fence it safely. "Current state" is what `main` does today.
 | Unknown payload object formats fail closed with a typed reason. | Present: `UnsupportedVersion` and `UnsupportedCodec` (`crates/studiofs-data/src/object.rs:325`, `crates/studiofs-data/src/object.rs:160`); SFEC version and flags are strict. | [SFS-1009](https://linear.app/valandreev/issue/SFS-1009) (write gating) |
 | Unknown local formats fail closed with a typed reason. | Partial: payload index format is typed (`crates/studiofs-cache/src/payload_index.rs:1299`), entry encoding is `Corruption` (`crates/studiofs-cache/src/payload_index.rs:1790`); redb has no own identity. | [SFS-1012](https://linear.app/valandreev/issue/SFS-1012), [SFS-1003](https://linear.app/valandreev/issue/SFS-1003) |
 | Additive PG objects are tolerated when declared capabilities allow it. | Partial: extra tables are ignored by `validate_postgres_schema`, but the required list is global and not capability-scoped (`crates/studiofs-meta/src/pg_engine.rs:1314`). DDL from `init`/`load`/`upgrade` goes through the SFS-1005 migration registry, which refuses newer or unknown components before any DDL. | [SFS-1006](https://linear.app/valandreev/issue/SFS-1006) |
-| Policy epoch is revalidated after reconnect. | Partial: the format predicate is re-evaluated in every publication transaction; no policy epoch exists. | [SFS-1015](https://linear.app/valandreev/issue/SFS-1015), [SFS-1007](https://linear.app/valandreev/issue/SFS-1007) |
+| Policy epoch is revalidated after reconnect. | Partial: the format and write-requirement predicates are re-evaluated in every publication transaction; the policy epoch exists (`volume_protocol.policy_epoch`, SFS-1007) but no client caches or compares it yet. | [SFS-1015](https://linear.app/valandreev/issue/SFS-1015), [SFS-1007](https://linear.app/valandreev/issue/SFS-1007) |
 | Unknown `MetadataBackend` variant or unknown `FormatInfo` field fails closed with typed `UpgradeRequired`. | Present (SFS-1003): `decode_format_info` returns `MetaError::UpgradeRequired` naming the field or variant, including nested configs, and the bootstrap descriptor keeps it instead of reporting an invalid checkpoint. | [SFS-1003](https://linear.app/valandreev/issue/SFS-1003) |
 | 0.2.x volumes adopt the baseline by `studiofs upgrade` to format 7. | Missing: upgrade handles 5→6 only (`crates/studiofs-meta/src/pg_engine/format_upgrade.rs:35`). | [SFS-1132](https://linear.app/valandreev/issue/SFS-1132) |
 

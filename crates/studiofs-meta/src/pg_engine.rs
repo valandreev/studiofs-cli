@@ -566,6 +566,7 @@ mod snapshot_policy;
 pub(crate) mod snapshot_reachability;
 #[path = "pg_engine/sql.rs"]
 mod sql;
+mod volume_protocol;
 mod volume_settings;
 pub use format_upgrade::upgrade_shared_format5;
 use janitor::PgJanitorLock;
@@ -576,6 +577,9 @@ use remote_apply::{
     RemoteReplayApplyOutcome, RemoteReplayExecution,
 };
 pub use retained::{RetainedLifecycleSweep, seed_retained_authority};
+pub use volume_protocol::{
+    insert_initial_volume_protocol, read_volume_protocol, update_volume_protocol,
+};
 pub use volume_settings::{
     S3VolumeSettingsUpdate, set_shared_compression, set_shared_initial_volume_settings,
     set_shared_logical_quota_bytes, set_shared_trash_days, update_shared_s3_settings,

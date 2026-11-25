@@ -646,6 +646,7 @@ impl PgMetaEngine {
                                     &volume_id,
                                     &expected_metadata_format_version,
                                     &batch.payload_bytes,
+                                    &super::volume_protocol::PUBLICATION_WRITE_REQUIREMENT,
                                 ],
                             )
                             .await
@@ -656,23 +657,7 @@ impl PgMetaEngine {
                                 )
                             })?;
                         let Some(batch_version_row) = batch_version_row else {
-                            let format_row = tx
-                                .query_opt(sql::SELECT_METADATA_FORMAT_VERSION, &[&volume_id])
-                                .await
-                                .map_err(|e| {
-                                    Self::classify_pg_error(
-                                        "postgres metadata format revalidation failed",
-                                        e,
-                                    )
-                                })?;
-                            let found = format_row
-                                .as_ref()
-                                .and_then(|row| row.get::<_, Option<i16>>(0));
-                            crate::ensure_supported_pg_sync_format_version(found)?;
-                            return Err(MetaError::Storage(
-                                "postgres metadata version bump did not update the current-format row"
-                                    .to_string(),
-                            ));
+                            return Err(super::volume_protocol::refused_publication(&tx, volume_id).await);
                         };
                         let batch_version = row_i64(
                             &batch_version_row,

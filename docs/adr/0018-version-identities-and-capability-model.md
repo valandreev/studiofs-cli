@@ -36,7 +36,7 @@ identity it touches.
 |---|---|---|
 | Client release | binary version, not persisted | SFS-1003 |
 | Shared metadata schema (backend schema components) | `studiofs_schema_components`, only `payload_gc` | SFS-1005 |
-| Volume protocol (what writers must speak) | shared `metadata_format_version` | SFS-1003, SFS-1007 |
+| Volume protocol (what writers must speak) | `volume_protocol` policy record plus `metadata_state.write_requirement` (SFS-1007) | SFS-1003, SFS-1007 |
 | Local metadata (redb layout) | shared format number | SFS-1003, SFS-1012 |
 | Event codec | wire version 1 plus append-only tags | SFS-1009 |
 | Checkpoint | serving checkpoint format 4, schema 1 | SFS-1011 |
@@ -113,8 +113,15 @@ older one that the binary cannot open maps into `NeedsMigration`.
 ### Per-volume policy and policy epoch
 
 Each volume has one policy record in the shared backend holding the three
-required sets and a policy epoch, a counter that increases on every change
-(SFS-1007). Changing the record is the Activate step of an
+required sets, the activation state of every feature (`available`,
+`compatible`, `required`, `retired`) and a policy epoch, a counter that
+increases on every change (SFS-1007, `crates/studiofs-meta/src/volume_protocol.rs`).
+`init`, `load` and the schema baseline write the same baseline policy and
+never activate a feature. A change moves a feature one lifecycle step
+(`required` returns only to `compatible`; `retired` is terminal), may only
+require capabilities the acting binary declares, and raises the write
+requirement whenever it adds a write capability. Every change appends an
+audit row. Changing the record is the Activate step of an
 Expand–Migrate–Activate–Contract cutover (SFS-1017):
 
 1. Expand adds optional schema objects and capabilities. Older binaries keep

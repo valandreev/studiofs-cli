@@ -336,12 +336,20 @@ async fn update_volume_settings_in_tx(
     let format = i16::try_from(crate::version::SHARED_VOLUME_FORMAT.current)
         .map_err(|_| MetaError::Storage("metadata format exceeds SMALLINT".into()))?;
     let row = tx
-        .query_one(
+        .query_opt(
             sql::BUMP_METADATA_VERSION,
-            &[&volume, &format, &payload_bytes],
+            &[
+                &volume,
+                &format,
+                &payload_bytes,
+                &super::volume_protocol::PUBLICATION_WRITE_REQUIREMENT,
+            ],
         )
         .await
         .map_err(|error| PgMetaEngine::classify_pg_error("order volume settings", error))?;
+    let Some(row) = row else {
+        return Err(super::volume_protocol::refused_publication(tx, volume).await);
+    };
     let version: i64 = row.get(0);
     tx.execute(
         sql::INSERT_EVENT_LOG_BATCH,

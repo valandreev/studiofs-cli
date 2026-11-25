@@ -8,8 +8,9 @@
 //! PostgreSQL types; the 0.2.7 Redis-compatible backend (SFS-1034) reuses them.
 //!
 //! The evaluator is not wired into mount, replay or publication yet: those
-//! paths keep their existing exact-format checks (fail closed) until the
-//! volume policy (SFS-1007) and its enforcement (SFS-1015) land.
+//! paths keep their existing exact-format checks (fail closed) until policy
+//! enforcement (SFS-1015) lands. The volume policy (SFS-1007) feeds it through
+//! [`VolumeProtocol::apply_to`](crate::volume_protocol::VolumeProtocol::apply_to).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::RangeInclusive;
