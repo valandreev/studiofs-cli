@@ -436,8 +436,22 @@ mod tests {
 
     #[test]
     fn format_info_decode_reports_unknown_field_as_upgrade_required() {
-        for pointer in ["", "/metadata", "/metadata/postgres", "/encryption"] {
-            let mut json = baseline_format_info_json();
+        let mut baseline = baseline_format_info_json();
+        baseline["metadata"]["remote"] = serde_json::json!({
+            "endpoint": "http://127.0.0.1:9000",
+            "bucket": "metadata",
+            "access_key": "fixture-access",
+            "secret_key": "sfs-fixture-secret",
+            "region": "us-east-1",
+        });
+        for pointer in [
+            "",
+            "/metadata",
+            "/metadata/remote",
+            "/metadata/postgres",
+            "/encryption",
+        ] {
+            let mut json = baseline.clone();
             json.pointer_mut(pointer)
                 .and_then(serde_json::Value::as_object_mut)
                 .unwrap_or_else(|| panic!("object at {pointer:?}"))
@@ -500,37 +514,39 @@ mod tests {
     }
 
     #[test]
-    fn local_layout_and_shared_format_are_judged_by_separate_identities() {
-        let bytes = serde_json::to_vec(&baseline_format_info_json()).unwrap();
-        let bumped = |identity: version::VersionIdentity| version::VersionIdentity {
-            current: identity.current + 1,
-            min_supported: identity.current + 1,
-            ..identity
-        };
+    fn persisted_version_gates_distinguish_volume_and_checkpoint_fields() {
+        use crate::snapshot::ServingCheckpoint;
 
-        // A local layout bump refuses the local header only.
+        // A newer serving checkpoint format is still outside the serving schema
+        // range, and a shared volume's version is outside both checkpoint ranges.
+        let checkpoint_format = ServingCheckpoint::FORMAT_VERSION;
+        let checkpoint_schema = ServingCheckpoint::SCHEMA_VERSION;
+        let info = baseline_fixtures::fixture_format_info();
+        let volume_format = i16::try_from(info.format_version).unwrap();
+        assert!(ServingCheckpoint::supports_format_version(
+            checkpoint_format
+        ));
+        assert!(ServingCheckpoint::supports_schema_version(
+            checkpoint_schema
+        ));
+        assert!(!ServingCheckpoint::supports_schema_version(
+            checkpoint_format
+        ));
+        assert!(!ServingCheckpoint::supports_format_version(volume_format));
+        assert!(!ServingCheckpoint::supports_schema_version(volume_format));
+
+        let dir = studiofs_test_support::workspace_target_tempdir("version-gates-");
+        let path = dir.path().join("metadata.redb");
+        let redb = RedbMetaEngine::open(&path).unwrap();
+        redb.set_format_info(&info).unwrap();
+        drop(redb);
+        let local = RedbMetaEngine::read_format_info_readonly(&path).unwrap();
+        assert_eq!(local.format_version, info.format_version);
+        ensure_supported_pg_sync_format_version(Some(volume_format)).unwrap();
         assert!(matches!(
-            decode_format_info_as(&bytes, bumped(version::LOCAL_METADATA_LAYOUT)),
-            Err(MetaError::UnsupportedFormatVersion {
-                found: 6,
-                expected: 7
-            })
+            ensure_supported_pg_sync_format_version(Some(checkpoint_format)),
+            Err(MetaError::UnsupportedFormatVersion { .. })
         ));
-        assert!(decode_format_info(&bytes).is_ok());
-        assert!(ensure_supported_pg_sync_format_version(Some(6)).is_ok());
-
-        // A shared format bump does not change the local layout check.
-        assert!(decode_format_info_as(&bytes, bumped(version::SHARED_VOLUME_FORMAT)).is_err());
-        assert!(decode_format_info_as(&bytes, version::LOCAL_METADATA_LAYOUT).is_ok());
-
-        // Neither identity governs the checkpoint ranges.
-        assert!(crate::snapshot::ServingCheckpoint::supports_format_version(
-            1
-        ));
-        assert!(crate::snapshot::ServingCheckpoint::supports_schema_version(
-            1
-        ));
-        assert!(!crate::snapshot::ServingCheckpoint::supports_schema_version(2));
     }
 
     #[test]

@@ -82,13 +82,19 @@ pub const POSTGRES_PAYLOAD_GC_SCHEMA: VersionIdentity = VersionIdentity {
 };
 
 /// Local redb metadata layout, recorded in the redb `SETTINGS_TABLE["format"]`
-/// header. It shares the header field with the shared format today but is
-/// judged separately, so a local layout change never bumps the shared format.
+/// header. Both checks use `FormatInfo.format_version` until SFS-1012 adds a
+/// dedicated local layout marker, so their supported ranges must agree.
 pub const LOCAL_METADATA_LAYOUT: VersionIdentity = VersionIdentity {
     name: "local redb metadata layout",
     current: 6,
     min_supported: 6,
 };
+
+const _: () = assert!(
+    LOCAL_METADATA_LAYOUT.current == SHARED_VOLUME_FORMAT.current
+        && LOCAL_METADATA_LAYOUT.min_supported == SHARED_VOLUME_FORMAT.min_supported,
+    "redb and the shared volume use the same format field until SFS-1012"
+);
 
 /// `MetaEvent` wire envelope version (`SFS-EVT`); tags are append-only.
 pub const EVENT_CODEC_WIRE: VersionIdentity = VersionIdentity {

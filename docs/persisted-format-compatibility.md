@@ -500,13 +500,13 @@ the compiled test successor
 The identities live in `crates/studiofs-meta/src/version.rs` (SFS-1003). Each
 is a `VersionIdentity` with the version this binary writes (`current`) and the
 oldest it reads (`min_supported`); `check` refuses anything outside that range
-with the typed `UnsupportedFormatVersion`. Bump only the identity whose bytes
-change:
+with the typed `UnsupportedFormatVersion`. The version to change depends on the
+persisted boundary:
 
 | Change | Identity to bump | Not bumped |
 |---|---|---|
-| Shared volume layout or the `metadata_state` protocol all writers must speak (only the SFS-1132 6→7 adoption; from format 7 on, use capabilities) | `SHARED_VOLUME_FORMAT` (`FormatInfo.format_version`, `metadata_format_version`) | local layout, codecs |
-| Key or value encoding of an existing local redb table | `LOCAL_METADATA_LAYOUT` (with the SFS-1012 local migration) | shared format |
+| Shared volume layout or the `metadata_state` protocol all writers must speak (only the SFS-1132 6→7 adoption; from format 7 on, use capabilities) | `SHARED_VOLUME_FORMAT` (`FormatInfo.format_version`, `metadata_format_version`). Keep `LOCAL_METADATA_LAYOUT` in sync while both use that field. | codecs |
+| Key or value encoding of an existing local redb table | With the dedicated marker and migration from SFS-1012, bump `LOCAL_METADATA_LAYOUT`. Before that, defer an independent local layout change. | shared format once the local marker exists |
 | New `MetaEvent` wire envelope | `EVENT_CODEC_WIRE`; a new event kind is a new append-only tag instead | shared format |
 | New serving checkpoint suffix | `SERVING_CHECKPOINT_FORMAT` (keep older formats in range) | shared format |
 | Serving-state schema change | `SERVING_CHECKPOINT_SCHEMA` | checkpoint format |
@@ -514,22 +514,22 @@ change:
 | Payload index, snapshot artifact, dump, STFS, SFEC | the owner constant listed in `version.rs` | every identity above |
 
 Today the local redb header is still the `FormatInfo` copy in
-`SETTINGS_TABLE["format"]`, so both identities read the same field; the checks
-are routed separately (local opens use `LOCAL_METADATA_LAYOUT`, shared
-`FormatInfo`, the descriptor, `ensure_supported_pg_sync_format_version` and the
-publication predicate use `SHARED_VOLUME_FORMAT`). A dedicated local layout
-marker belongs to SFS-1012.
+`SETTINGS_TABLE["format"]`, so both checks read `FormatInfo.format_version`.
+Local header reads use `LOCAL_METADATA_LAYOUT`. Shared `FormatInfo`, the
+descriptor, `ensure_supported_pg_sync_format_version`, and publication use
+`SHARED_VOLUME_FORMAT`. A compile-time assertion keeps both current versions
+and minimum supported versions equal until SFS-1012 adds a dedicated marker.
 
 `CLIENT_RELEASE` (the binary's `CARGO_PKG_VERSION`) is informative only. It
 appears in diagnostics and, later, in session records; it is never a storage
 compatibility gate.
 
-`FormatInfo` rule: `FormatInfo`, `MetadataConfig`, `PostgresConfig` and
-`EncryptionConfig` keep `deny_unknown_fields`, and `decode_format_info` reports
+`FormatInfo`, `MetadataConfig`, `PostgresConfig`, `RemoteStoreConfig`, and
+`EncryptionConfig` keep `deny_unknown_fields`. `decode_format_info` reports
 an unknown field or enum variant (for example a new `MetadataBackend`) as
 `MetaError::UpgradeRequired` with the schema identifier when it meets the
-diagnostic redaction rules. A new
-optional field must use `#[serde(default, skip_serializing_if = ...)]` so a
+diagnostic redaction rules. Invalid types and malformed values are decoding
+errors. A new optional field must use `#[serde(default, skip_serializing_if = ...)]` so a
 volume that does not use it keeps byte-identical `FormatInfo` and stays
 readable by 0.2.5. A field or variant that a volume needs (such as the 0.2.7
 Redis backend) is a required capability: writing it fences 0.2.5 readers with

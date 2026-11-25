@@ -193,8 +193,8 @@ impl BootstrapCheckpointDescriptor {
     }
 }
 
-/// Why persisted state needs a newer binary. Names only schema identifiers,
-/// never stored values, so it is safe to render.
+/// Why persisted state needs a newer binary. The decoder reports schema names
+/// or a redaction marker; diagnostics omit the contents of malformed fields.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum UpgradeRequiredReason {
     /// `FormatInfo` (or a nested config) has a field this binary does not know.
