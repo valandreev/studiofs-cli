@@ -730,6 +730,48 @@ mod tests {
         ));
     }
 
+    /// SFS-1002 baseline: raw STFS v2 object sealed in SFEC v1 with 1 MiB frames.
+    /// Sealed with the test-only `MASTER_KEY`; nonces are random, so a
+    /// regeneration changes the bytes and must be recorded in the manifest.
+    const STFS_V2_BASELINE_FIXTURE: &[u8] =
+        include_bytes!("../tests/fixtures/stfs-v2-sfec-1mib.bin");
+
+    fn stfs_v2_baseline_plaintext() -> Bytes {
+        (0..3000_u32).map(|offset| (offset % 251) as u8).collect()
+    }
+
+    #[test]
+    #[ignore = "rewrites pinned fixtures; set STUDIOFS_REGENERATE_BASELINE_FIXTURES=1"]
+    fn regenerate_stfs_v2_baseline_fixture() {
+        if std::env::var_os("STUDIOFS_REGENERATE_BASELINE_FIXTURES").is_none() {
+            return;
+        }
+        let object = crate::object::create_object_buffer(stfs_v2_baseline_plaintext())
+            .unwrap()
+            .to_bytes();
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/stfs-v2-sfec-1mib.bin");
+        std::fs::write(path, encrypt(&object, OBJECT_KEY)).unwrap();
+    }
+
+    #[test]
+    fn stfs_v2_baseline_fixture_decodes_with_current_binary() {
+        let fixture = Bytes::from_static(STFS_V2_BASELINE_FIXTURE);
+        let envelope = SfecEnvelope::parse(fixture.clone()).unwrap();
+        assert_eq!(
+            envelope.header().frame_size(),
+            DEFAULT_ENCRYPTION_FRAME_SIZE as u32
+        );
+        assert_eq!(envelope.header().frame_count(), 1);
+        let object = cipher().decrypt_object(fixture, OBJECT_KEY, 1).unwrap();
+        assert_eq!(
+            crate::object::read_header(&object).unwrap().version,
+            crate::object::VERSION
+        );
+        let (payload, _checksum) = crate::object::read_object_with_checksum(object).unwrap();
+        assert_eq!(payload, stfs_v2_baseline_plaintext());
+    }
+
     #[test]
     fn sfec_frame_size_decrypts_legacy_fixture() {
         // Generated on origin/main with the test master key and 0x39 for the

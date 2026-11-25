@@ -686,20 +686,7 @@ pub fn load(input: &Path, postgres_address: &str) -> DumpLoadResult<()> {
     let bytes = std::fs::read(input).map_err(|e| {
         DumpLoadError::Message(format!("failed to read dump {}: {e}", input.display()))
     })?;
-    let header: DumpHeader = serde_json::from_slice(&bytes).map_err(|e| {
-        DumpLoadError::Message(format!("failed to parse dump {}: {e}", input.display()))
-    })?;
-
-    if header.dump_version != 4 {
-        return Err(DumpLoadError::Message(format!(
-            "unsupported dump version: {}",
-            header.dump_version
-        )));
-    }
-
-    let dump: MetadataDump = serde_json::from_slice(&bytes).map_err(|e| {
-        DumpLoadError::Message(format!("failed to parse dump {}: {e}", input.display()))
-    })?;
+    let dump = parse_dump(input, &bytes)?;
     let volume_name = dump.volume.name.as_str();
 
     validate_dump(&dump)?;
@@ -712,10 +699,118 @@ pub fn load(input: &Path, postgres_address: &str) -> DumpLoadResult<()> {
     Ok(())
 }
 
+fn parse_dump(input: &Path, bytes: &[u8]) -> DumpLoadResult<MetadataDump> {
+    let header: DumpHeader = serde_json::from_slice(bytes).map_err(|e| {
+        DumpLoadError::Message(format!("failed to parse dump {}: {e}", input.display()))
+    })?;
+
+    if header.dump_version != 4 {
+        return Err(DumpLoadError::Message(format!(
+            "unsupported dump version: {}",
+            header.dump_version
+        )));
+    }
+
+    serde_json::from_slice(bytes).map_err(|e| {
+        DumpLoadError::Message(format!("failed to parse dump {}: {e}", input.display()))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use sha2::{Digest, Sha256};
+
+    /// SFS-1002 baseline: a version-4 dump built from the pinned studiofs-meta
+    /// 0.2.5 fixtures, with a published checkpoint at version 4 and a replay
+    /// tail of batches 5..=7.
+    fn baseline_dump_fixture() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/dump-v4-0.2.5.json")
+    }
+
+    fn meta_baseline_fixture(name: &str) -> Vec<u8> {
+        std::fs::read(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../studiofs-meta/tests/fixtures/baseline-0.2.5")
+                .join(name),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    #[ignore = "rewrites pinned fixtures; set STUDIOFS_REGENERATE_BASELINE_FIXTURES=1"]
+    fn regenerate_baseline_dump_fixture() {
+        if std::env::var_os("STUDIOFS_REGENERATE_BASELINE_FIXTURES").is_none() {
+            return;
+        }
+        let format_info = meta_baseline_fixture("format-info.json");
+        let info = decode_format_info(&format_info).unwrap();
+        let checkpoint = meta_baseline_fixture("serving-checkpoint.bin");
+        let event = |batch_version, event_type: &str, file: &str| DumpEvent {
+            batch_version,
+            event_type: event_type.to_string(),
+            event_payload: meta_baseline_fixture(&format!("events/{file}")),
+            client_id: Some("baseline-fixture-client".to_string()),
+            client_timestamp: Some(1_764_000_000_000),
+        };
+        let dump = MetadataDump {
+            dump_version: 4,
+            volume: DumpVolume {
+                vol: 1,
+                name: info.name.clone(),
+                uuid: info.uuid.clone(),
+                block_size: i32::try_from(info.block_size).unwrap(),
+            },
+            metadata_state_format_version: 6,
+            metadata_state_version: 7,
+            metadata_state_checkpoint_version: 4,
+            metadata_state_checkpoint_sha256: Sha256::digest(&checkpoint).to_vec(),
+            metadata_state_snapshot: checkpoint,
+            metadata_state_format_info: format_info,
+            metadata_state_publication_state: "published".to_string(),
+            metadata_state_generation: 2,
+            counters: vec![DumpCounter {
+                name: "nextInode".to_string(),
+                value: 12,
+            }],
+            event_log: vec![
+                event(
+                    5,
+                    "set_volume_settings",
+                    "tag-21-set-volume-settings-v3.bin",
+                ),
+                event(6, "set_xattr", "tag-10-set-xattr.bin"),
+                event(7, "add_entry", "tag-03-add-entry.bin"),
+            ],
+        };
+        write_dump_output(&baseline_dump_fixture(), &dump).unwrap();
+    }
+
+    #[test]
+    fn baseline_dump_fixture_decodes_with_current_binary() {
+        let path = baseline_dump_fixture();
+        let dump = parse_dump(&path, &std::fs::read(&path).unwrap()).unwrap();
+        validate_dump(&dump).unwrap();
+        assert_eq!(dump.dump_version, 4);
+        assert_eq!(
+            (
+                dump.metadata_state_checkpoint_version,
+                dump.metadata_state_version
+            ),
+            (4, 7)
+        );
+        assert_eq!(
+            dump.event_log
+                .iter()
+                .map(|event| event.batch_version)
+                .collect::<Vec<_>>(),
+            vec![5, 6, 7]
+        );
+        assert_eq!(
+            dump.metadata_state_snapshot,
+            meta_baseline_fixture("serving-checkpoint.bin")
+        );
+    }
 
     #[test]
     fn dump_parses_name_and_output_path() {

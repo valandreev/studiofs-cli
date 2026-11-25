@@ -2,3 +2,8 @@
 *.ps1 text eol=crlf
 *.redb binary
 Cargo.lock text eol=lf
+# SFS-1002 pinned fixtures are hashed byte for byte; never convert line endings.
+crates/studiofs-meta/tests/fixtures/baseline-0.2.5/** -text
+crates/studiofs-meta/tests/fixtures/published-v*/** -text
+crates/*/tests/fixtures/**/*.bin binary
+crates/studiofs/tests/fixtures/*.json -text

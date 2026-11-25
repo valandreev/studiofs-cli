@@ -1,0 +1,7 @@
+[
+  {
+    "batch_version": 1,
+    "event_type": "set_volume_settings",
+    "event_payload_hex": "5346532d4556540115010000000103"
+  }
+]

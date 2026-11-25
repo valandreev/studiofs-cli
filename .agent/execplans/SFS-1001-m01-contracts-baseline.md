@@ -13,7 +13,7 @@ After this milestone, the repository has a written contract that splits that num
 ## Progress
 
 - [x] (2026-11-25) SFS-1001: wrote the persisted-format audit `docs/persisted-format-compatibility.md`, ADR 0018, the forward-compatibility rows in `docs/local-first-validation-matrix.md`, and these five milestone plans.
-- [ ] SFS-1002: pin the 0.2.5 baseline fixtures (FormatInfo JSON, serving checkpoint bytes, one event per tag, STFS v2 and v3 objects, payload index file, snapshot artifact, dump file) and the test-successor fixtures.
+- [x] (2026-11-25) SFS-1002: pinned the provisional 0.2.5 baseline fixtures (FormatInfo JSON, `VolumeSettings` with compression, serving checkpoint bytes, one event per tag, STFS v2 in 1 MiB SFEC frames, the reused STFS v3 fixture, payload index, snapshot artifact, clean and dirty local caches, version-4 dump) and captured format 5 (v0.2.2) and format 6 (v0.2.4) volumes from the published binaries. Manifest and drift test: `crates/studiofs-meta/tests/fixtures/baseline-0.2.5/manifest.json`, `crates/studiofs-meta/tests/baseline_fixture_manifest.rs`. Successor fixtures moved to SFS-1131 (scope decision of 2026-11-25).
 - [ ] SFS-1131: define the test-successor build, its manifest of declared capabilities, and the release guard that keeps it out of shipped artifacts.
 - [ ] SFS-1003: split the client, shared schema, volume protocol, redb, event and checkpoint identities in code; make unknown `FormatInfo` fields and unknown `MetadataBackend` variants return typed `UpgradeRequired`.
 - [ ] SFS-1004: implement the central capability evaluator with deterministic decisions.
@@ -24,6 +24,10 @@ After this milestone, the repository has a written contract that splits that num
   Evidence: `crates/studiofs-meta/src/lib.rs:103` and `crates/studiofs-meta/src/engine.rs:162`.
 - Observation: the serving checkpoint stored in `metadata_state` has no format column; only snapshot source checkpoints record `checkpoint_format_version`.
   Evidence: `crates/studiofs-meta/src/pg_engine/schema.rs:327` versus `crates/studiofs-meta/src/engine.rs:141`.
+- Observation: a v0.2.4 `init` publishes the serving checkpoint at version 0 with default settings and the volume's compression policy as event batch 1 (tag 21); a v0.2.2 `init` writes no event rows.
+  Evidence: `crates/studiofs-meta/tests/fixtures/published-v0.2.4/event-log.json` and `metadata-state.json`.
+- Observation: an active lease cannot be pinned as offline bytes; lease liveness is a PostgreSQL row evaluated against the server clock. The manifest records it under `not_representable`.
+  Evidence: `crates/studiofs-meta/src/pg_engine/sql.rs:158`.
 
 ## Decision Log
 
@@ -33,6 +37,9 @@ After this milestone, the repository has a written contract that splits that num
 - Decision: format 7 is the last bump of the shared format number; later changes move separate identities.
   Rationale: preflight decision of 2026-11-25; 0.2.x volumes join the baseline through `studiofs upgrade` chaining to format 7 (SFS-1132).
   Date/Author: 2026-11-25, project preflight.
+- Decision: SFS-1002 pins baseline fixtures only; successor fixtures come from the SFS-1131 test-successor build. One JSON manifest next to the studiofs-meta fixtures lists every pinned file by workspace-relative path, so fixtures stay in their owning crate and the existing STFS v3 fixture is reused.
+  Rationale: Linear scope decision of 2026-11-25; extends the existing `include_bytes!` fixture convention instead of adding a parallel mechanism.
+  Date/Author: 2026-11-25, SFS-1002 implementer.
 
 ## Outcomes & Retrospective
 
