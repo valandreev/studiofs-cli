@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest as _, Sha256};
 
+use super::types::{Scenario, ScenarioContext, ScenarioDefinition, ScenarioError};
 #[cfg(test)]
 use crate::client::ClientControllerConfig;
 use crate::client::{
@@ -240,8 +241,6 @@ const INVALIDATION_DROPOUT_BASELINE_FILE: &str = "baseline.txt";
 const INVALIDATION_DROPOUT_TARGET_FILE: &str = "fallback-target.txt";
 const INVALIDATION_DROPOUT_DELETE_TARGET: &str = "delete-target.txt";
 
-use super::types::{Scenario, ScenarioContext, ScenarioDefinition, ScenarioError};
-
 mod actions;
 mod advanced_mounted;
 mod assertions;
@@ -254,6 +253,7 @@ mod logical_quota;
 mod macos_mmap_exec;
 mod namespace_collision;
 mod posix_acl_xattr;
+pub(super) mod published_volume_capture;
 mod random_write_packing;
 mod recoverable_trash;
 mod recoverable_trash_durability;

@@ -124,8 +124,13 @@ fn run_scenario_selection_expands_comma_separated_numbers() {
 }
 
 /// Registered scenarios deliberately left out of the full mounted gate.
-/// The gate runs on Linux, while `mounted-macos-mmap-exec` covers macFUSE page-ins.
-const FULL_E2E_OPT_IN_SCENARIOS: &[&str] = &["mounted-macos-mmap-exec", "janitor-live-benchmark"];
+/// The gate runs on Linux, while `mounted-macos-mmap-exec` covers macFUSE page-ins;
+/// `published-volume-fixture-capture` needs a published release binary (SFS-1002).
+const FULL_E2E_OPT_IN_SCENARIOS: &[&str] = &[
+    "mounted-macos-mmap-exec",
+    "janitor-live-benchmark",
+    "published-volume-fixture-capture",
+];
 
 #[test]
 fn full_e2e_selects_every_registered_scenario() {

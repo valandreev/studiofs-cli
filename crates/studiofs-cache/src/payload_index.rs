@@ -2252,6 +2252,75 @@ mod tests {
             .expect("upsert scratch payload object");
     }
 
+    /// SFS-1002 baseline: index format 2, entry encoding 3, with a dirty, an
+    /// uploading and an uploaded (evictable) payload.
+    fn baseline_payload_index_fixture() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/payload-index-0.2.5.redb")
+    }
+
+    #[test]
+    #[ignore = "rewrites pinned fixtures; set STUDIOFS_REGENERATE_BASELINE_FIXTURES=1"]
+    fn regenerate_baseline_payload_index_fixture() {
+        if std::env::var_os("STUDIOFS_REGENERATE_BASELINE_FIXTURES").is_none() {
+            return;
+        }
+        let path = baseline_payload_index_fixture();
+        let _ = std::fs::remove_file(&path);
+        {
+            let index = open_index(&path);
+            upsert_dirty(&index, 41, 19);
+            upsert_dirty(&index, 43, 23);
+            index.mark_uploading(43).unwrap();
+            upsert_uploaded(&index, 42, 50);
+        }
+        let mut db = Database::open(&path).unwrap();
+        while db.compact().unwrap() {}
+    }
+
+    #[test]
+    fn baseline_payload_index_fixture_decodes_with_current_binary() {
+        let temp = studiofs_test_support::workspace_target_tempdir("test-baseline-payload-index-");
+        let path = temp.path().join("cache.redb");
+        studiofs_test_support::copy_file_contents(baseline_payload_index_fixture(), &path).unwrap();
+        {
+            let db = Database::open(&path).unwrap();
+            let txn = db.begin_read().unwrap();
+            let counters = txn.open_table(COUNTERS_TABLE).unwrap();
+            let format = counters.get(COUNTER_INDEX_FORMAT).unwrap().unwrap().value();
+            assert_eq!(format, INDEX_FORMAT_VERSION);
+            let objects = txn.open_table(PAYLOAD_OBJECTS_TABLE).unwrap();
+            for id in [41, 42, 43] {
+                let row = objects.get(id).unwrap().unwrap();
+                assert_eq!(row.value()[0], ENTRY_ENCODING_VERSION, "entry {id}");
+            }
+        }
+        let index = open_index(&path);
+        let dirty = index.get_entry(41).unwrap().unwrap();
+        assert_eq!(dirty.lifecycle, LocalPayloadLifecycleState::Dirty);
+        assert_eq!(dirty.upload_state, LocalPayloadUploadState::Pending);
+        let uploading = index.get_entry(43).unwrap().unwrap();
+        assert_eq!(uploading.lifecycle, LocalPayloadLifecycleState::Uploading);
+        let uploaded = index.get_entry(42).unwrap().unwrap();
+        assert_eq!(uploaded.lifecycle, LocalPayloadLifecycleState::Uploaded);
+        assert!(uploaded.evictable);
+        let stats = index.stats().unwrap();
+        assert_eq!(
+            (
+                stats.current_bytes,
+                stats.dirty_bytes,
+                stats.evictable_bytes
+            ),
+            (92, 42, 50)
+        );
+        let replay: Vec<u64> = index
+            .dirty_uploading_entries()
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.object_id)
+            .collect();
+        assert_eq!(replay, vec![41, 43]);
+    }
+
     #[test]
     fn cache_index_opens_redb_4_1_database_and_preserves_rows() {
         check_cache_index_fixture("4.1");

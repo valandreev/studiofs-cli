@@ -6,6 +6,7 @@ use super::types::{Scenario, ScenarioDefinition};
 use super::workloads::cache_scrub::MountedCacheScrub;
 use super::workloads::compression::MountedCompression;
 use super::workloads::janitor_cli::{JanitorLiveBenchmark, JanitorPostgresRestart};
+use super::workloads::published_volume_capture::PublishedVolumeFixtureCapture;
 use super::workloads::scratch_auto_promote::{SCRATCH_AUTO_PROMOTE, ScratchAutoPromote};
 use super::workloads::scratch_demote::{SCRATCH_DEMOTE, ScratchDemote};
 use super::workloads::scratch_e2e::{
@@ -80,6 +81,7 @@ pub fn available_scenarios() -> &'static [ScenarioDefinition] {
             MountedCompression.definition(),
             JanitorPostgresRestart.definition(),
             JanitorLiveBenchmark.definition(),
+            PublishedVolumeFixtureCapture.definition(),
         ]
     })
 }
@@ -90,6 +92,7 @@ pub(crate) fn resolve_scenario(name: &str) -> Option<Box<dyn Scenario>> {
         "mounted-compression" => Some(Box::new(MountedCompression)),
         "janitor-postgres-restart-recovery" => Some(Box::new(JanitorPostgresRestart)),
         "janitor-live-benchmark" => Some(Box::new(JanitorLiveBenchmark)),
+        "published-volume-fixture-capture" => Some(Box::new(PublishedVolumeFixtureCapture)),
         "mounted-recoverable-trash-two-client" => Some(Box::new(RecoverableTrash)),
         "mounted-logical-quota" => Some(Box::new(LogicalQuota)),
         "mounted-cache-scrub" => Some(Box::new(MountedCacheScrub)),

@@ -325,6 +325,9 @@ fn mark_unclean_pg_local_graph(redb: &RedbMetaEngine) -> MetaResult<()> {
 }
 
 #[cfg(test)]
+mod baseline_fixtures;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

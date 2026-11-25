@@ -1,0 +1,17 @@
+{
+  "bootstrap_checkpoint_lease_rows": 0,
+  "checkpoint_generation": 1,
+  "checkpoint_publication_state": "published",
+  "checkpoint_sha256": "2d0ccc9349b5375bfcdddfc96822af78010f67127d50295c28a1e3e1d24d4981",
+  "checkpoint_version": 0,
+  "event_log_prune_floor": 0,
+  "event_log_rows": 0,
+  "metadata_format_version": 5,
+  "schema_components": [
+    {
+      "component": "payload_gc",
+      "version": 1
+    }
+  ],
+  "version": 0
+}
