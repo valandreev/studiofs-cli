@@ -175,7 +175,10 @@ that declares support for 0.2.5 (the compiled test successor of
   `MaintenanceForbidden` (Janitor); no DDL from an older binary. Owner:
   [SFS-1005](https://linear.app/valandreev/issue/SFS-1005) (migration registry)
   and [SFS-1006](https://linear.app/valandreev/issue/SFS-1006)
-  (capability-scoped validation).
+  (capability-scoped validation). A missing PostgreSQL column reaches the
+  capability evaluator only as `schema_component_missing` or
+  `schema_component_outdated` for its component, produced by SFS-1006 schema
+  validation; the evaluator never inspects columns.
 
 ### 4. Shared metadata state and publication
 
@@ -466,7 +469,7 @@ successor can fence it safely. "Current state" is what `main` does today.
 | A refused volume-settings publication reports a typed reason, like event publication. | Missing: `query_one` plus `classify_pg_error("order volume settings")` turns a format mismatch into a generic PostgreSQL error (`crates/studiofs-meta/src/pg_engine/volume_settings.rs:339`); event publication re-reads the format and returns `UnsupportedFormatVersion` (`crates/studiofs-meta/src/pg_engine/metadata_io.rs:671`). | [SFS-1007](https://linear.app/valandreev/issue/SFS-1007) |
 | Every publication stamps its session and policy epoch (GUC or column) so a later trigger can reject it. | Missing: publication sets no GUC; `event_log.client_id` exists (`crates/studiofs-meta/src/pg_engine/schema.rs:57`) but there is no session or epoch. | [SFS-1014](https://linear.app/valandreev/issue/SFS-1014), [SFS-1008](https://linear.app/valandreev/issue/SFS-1008) |
 | Destructive maintenance sets a maintenance capability GUC before deleting. | Partial: Janitor claims set `studiofs.deletion_format` (`crates/studiofs-meta/src/pg_engine/janitor.rs:1089`); snapshot cleanup, event-log pruning and checkpoint pruning set none. | [SFS-1016](https://linear.app/valandreev/issue/SFS-1016) |
-| Unknown required capabilities fail closed with a typed reason. | Missing: no capability set exists. | [SFS-1004](https://linear.app/valandreev/issue/SFS-1004) |
+| Unknown required capabilities fail closed with a typed reason. | Present in the pure evaluator (SFS-1004): `compat::evaluate` refuses unknown required capabilities, unknown safety-critical optional ones, unknown events and payload formats with stable reason codes. Not wired into mount, replay or publication until the volume policy and enforcement land. | [SFS-1004](https://linear.app/valandreev/issue/SFS-1004) |
 | Unknown event tags fail closed with a typed reason. | Partial: fails closed as `Serialization` (`crates/studiofs-meta/src/events.rs:617`). | [SFS-1009](https://linear.app/valandreev/issue/SFS-1009) |
 | Unknown checkpoint formats fail closed with a typed reason. | Missing typed reason: snapshot sources fail closed, but one untyped `snapshot source checkpoint is invalid` covers unknown format, checksum mismatch and schema mismatch (`crates/studiofs-meta/src/pg_engine/snapshot_control.rs:360`). The serving checkpoint has no format field of its own and relies on `metadata_format_version`. | [SFS-1011](https://linear.app/valandreev/issue/SFS-1011) |
 | Unknown payload object formats fail closed with a typed reason. | Present: `UnsupportedVersion` and `UnsupportedCodec` (`crates/studiofs-data/src/object.rs:325`, `crates/studiofs-data/src/object.rs:160`); SFEC version and flags are strict. | [SFS-1009](https://linear.app/valandreev/issue/SFS-1009) (write gating) |
@@ -482,6 +485,13 @@ Rows are release pairs: the first release owns the persisted state or has
 activated the volume; the second is the binary acting on it. "Successor" is
 the compiled test successor
 ([SFS-1131](https://linear.app/valandreev/issue/SFS-1131)) or 0.2.7.
+
+Outcome names map onto the capability evaluator
+(`crates/studiofs-meta/src/compat.rs`): `MaintenanceForbidden` is a refused
+maintenance operation (reason `maintenance_capability_missing`,
+`schema_component_newer` or `schema_component_unknown`). `LocalUpgradeRequired` is `UpgradeRequired` with
+`local_format_newer` or `local_format_unknown`, or `NeedsMigration` with
+`local_format_outdated` for a local store older than the binary opens.
 
 | Pair | Read / mount | Write / publish | Maintenance, GC, Janitor | Snapshot | Dump / load | Offline client with pending local writes | Rollback |
 |---|---|---|---|---|---|---|---|
