@@ -969,13 +969,7 @@ impl StudioVfs {
             self.release_ignored_entry(ino);
         } else if entry.attr.kind == FileType::RegularFile
             && !(entry.view.is_none()
-                && (self.is_macos_trash_metadata_entry(entry.parent, &entry.name)
-                    || matches!(
-                        self.trash_container_role(entry.parent),
-                        Ok(Some(super::retained_views::TrashContainerRole::LinuxInfo(
-                            _
-                        )))
-                    )))
+                && self.keeps_local_trash_name_after_release(entry.parent, &entry.name))
         {
             self.detach_ignored_entry_name(ino);
         }

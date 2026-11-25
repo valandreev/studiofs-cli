@@ -1712,6 +1712,16 @@ impl StudioVfs {
         }
     }
 
+    /// Local trash files whose name must survive last-handle release because
+    /// the OS rereads them later: Linux `info/` drafts and macOS `.DS_Store`.
+    pub(super) fn keeps_local_trash_name_after_release(&self, parent: Ino, name: &[u8]) -> bool {
+        match self.trash_container_role(parent) {
+            Ok(Some(TrashContainerRole::LinuxInfo(_))) => true,
+            Ok(Some(TrashContainerRole::MacOsUser(_))) => name == b".DS_Store",
+            _ => false,
+        }
+    }
+
     pub(super) fn is_macos_trash_metadata_entry(&self, parent: Ino, name: &[u8]) -> bool {
         name == b".DS_Store"
             && matches!(
