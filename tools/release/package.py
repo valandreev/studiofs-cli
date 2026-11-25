@@ -33,6 +33,8 @@ ASSETS = (
     ("docs/legal/platform-distribution.md", "PLATFORM-DISTRIBUTION.md"),
 )
 PACKAGED_MARKDOWN = {"INSTALL.md", "PLATFORM-DISTRIBUTION.md"}
+# Embedded only by the test-only `test-successor` feature (SFS-1131).
+TEST_SUCCESSOR_MARKER = b"STUDIOFS-TEST-SUCCESSOR-BUILD"
 MARKDOWN_LINK = re.compile(r"(?<!!)\[([^\]]*)\]\(([^)\s]+)([^)]*)\)")
 
 
@@ -106,6 +108,9 @@ def create_package(
     for path, _ in inputs:
         if not path.is_file():
             raise ValueError(f"required release input is missing: {path}")
+    binary_bytes = binary.read_bytes()
+    if TEST_SUCCESSOR_MARKER in binary_bytes:
+        raise ValueError("release blocked: binary was built with the test-successor feature")
 
     inventory = json.loads(inventory_path.read_text(encoding="utf-8"))
     counts = inventory.get("package_counts")
@@ -125,7 +130,7 @@ def create_package(
         "source_commit": source_commit,
         "build_command": f"cargo build -p studiofs --release --locked --target {target}",
         "rustc_version": rustc_version,
-        "binary_sha256": sha256(binary.read_bytes()),
+        "binary_sha256": sha256(binary_bytes),
         "cargo_lock_sha256": current_lock_hash,
     }
     # Public asset names drop the redundant "-msvc"/"-unknown" triple parts; BUILD-INFO keeps the full triple.

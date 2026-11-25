@@ -46,6 +46,10 @@ pub mod types;
 /// Typed version identities of the persisted boundaries.
 pub mod version;
 
+/// Test-only successor change registry (SFS-1131).
+#[cfg(feature = "test-successor")]
+pub mod test_successor;
+
 use sha2::{Digest, Sha256};
 use std::path::Path;
 use std::sync::Arc;

@@ -155,6 +155,12 @@ class ReleasePackageTests(unittest.TestCase):
             self.assertEqual(binary.mode & 0o777, 0o755)
             self.assertEqual(archive.extractfile(binary).read(), self.binary.read_bytes())
 
+    def test_test_successor_binary_blocks_packaging(self) -> None:
+        self.binary.write_bytes(b"prefix " + package.TEST_SUCCESSOR_MARKER + b" suffix")
+        with self.assertRaisesRegex(ValueError, "test-successor feature"):
+            self.package()
+        self.assertFalse(self.output.exists())
+
     def test_unresolved_inventory_evidence_blocks_packaging(self) -> None:
         inventory_path = self.notices / "rust-dependency-inventory.json"
         inventory = json.loads(inventory_path.read_text(encoding="utf-8"))

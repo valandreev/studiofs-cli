@@ -25,7 +25,7 @@ use crate::engine::{MetaError, MetaResult};
 pub const CLIENT_RELEASE: &str = env!("CARGO_PKG_VERSION");
 
 /// One persisted boundary's version identity and the range this binary reads.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub struct VersionIdentity {
     /// Boundary name used in diagnostics.
     pub name: &'static str,
@@ -117,6 +117,36 @@ pub const SERVING_CHECKPOINT_SCHEMA: VersionIdentity = VersionIdentity {
     min_supported: 1,
 };
 
+/// Every identity owned by this crate, in report order.
+pub const IDENTITIES: [VersionIdentity; 6] = [
+    SHARED_VOLUME_FORMAT,
+    POSTGRES_PAYLOAD_GC_SCHEMA,
+    LOCAL_METADATA_LAYOUT,
+    EVENT_CODEC_WIRE,
+    SERVING_CHECKPOINT_FORMAT,
+    SERVING_CHECKPOINT_SCHEMA,
+];
+
+/// Machine-readable report of this binary's identities, printed by
+/// `studiofs internal version-identities` and diffed by
+/// `tools/test_successor/build.py` (SFS-1131).
+#[must_use]
+pub fn identity_report() -> serde_json::Value {
+    let report = serde_json::json!({
+        "client_release": CLIENT_RELEASE,
+        "identities": IDENTITIES,
+        "successor_changes": [],
+    });
+    #[cfg(feature = "test-successor")]
+    let report = {
+        let mut report = report;
+        report["successor_build"] = crate::test_successor::BUILD_MARKER.into();
+        report["successor_changes"] = serde_json::json!(crate::test_successor::CHANGES);
+        report
+    };
+    report
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -154,5 +184,19 @@ mod tests {
             crate::snapshot::ServingCheckpoint::FORMAT_VERSION
         );
         assert!(!CLIENT_RELEASE.is_empty());
+    }
+
+    #[test]
+    fn identity_report_lists_every_identity_with_its_range() {
+        let report = identity_report();
+        let identities = report["identities"].as_array().unwrap();
+        assert_eq!(identities.len(), IDENTITIES.len());
+        assert_eq!(identities[0]["name"], SHARED_VOLUME_FORMAT.name);
+        assert_eq!(identities[4]["current"], SERVING_CHECKPOINT_FORMAT.current);
+        assert_eq!(identities[4]["min_supported"], 1);
+        assert_eq!(
+            report.get("successor_build").is_some(),
+            cfg!(feature = "test-successor")
+        );
     }
 }

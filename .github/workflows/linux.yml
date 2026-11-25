@@ -49,6 +49,13 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: cargo clippy (all features)
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - name: Test-successor release guard
+        # SFS-1131: a release profile must refuse the test-only feature.
+        run: |
+          python3 tools/test_successor/test_build.py
+          python3 tools/release/test_package.py
+          cargo check -p studiofs-meta --release --features test-successor 2>&1 \
+            | grep -F 'the test-successor feature is test-only'
       - name: cargo doc
         run: cargo doc --workspace --no-deps
         env:

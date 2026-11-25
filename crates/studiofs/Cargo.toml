@@ -13,6 +13,10 @@ workspace = true
 name = "studiofs"
 path = "src/main.rs"
 
+[features]
+# Test-only successor build (SFS-1131); refused by release profiles.
+test-successor = ["studiofs-meta/test-successor"]
+
 [build-dependencies]
 toml = "1.0.7"
 

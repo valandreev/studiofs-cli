@@ -535,7 +535,38 @@ readable by 0.2.5. A field or variant that a volume needs (such as the 0.2.7
 Redis backend) is a required capability: writing it fences 0.2.5 readers with
 `UpgradeRequired`, which is the intended outcome.
 
-### Pending local writes
+### Test successor
+
+The compiled test successor (SFS-1131) is `studiofs` built with the
+test-only `test-successor` Cargo feature. It plays the newer release in the
+forward-compatibility matrix (SFS-1019, SFS-1020). Each format issue adds its
+change in the owning code behind `#[cfg(feature = "test-successor")]` and
+registers one `SuccessorChange` in `CHANGES` in
+`crates/studiofs-meta/src/test_successor.rs`. The entry records the change
+kind (`postgres_migration`, `event_kind`, `checkpoint_format`, or
+`local_format`), the rollback class (`reversible` or `irreversible`), and the
+identity bump, if any. A crate other than `studiofs-meta` forwards the feature
+from its own manifest and the `studiofs` feature list. The successor only adds
+behavior. It never changes a baseline encoder.
+
+`studiofs internal version-identities` prints the identities from
+`version::IDENTITIES` and the declared changes as JSON. An identity that a
+successor change bumps must appear in that list. `baseline` 0 marks an
+identity that the baseline does not report.
+`python tools/test_successor/build.py` builds the baseline and the successor
+(`target/test-successor/`). It diffs both reports and fails unless every
+`current` difference is a declared bump and every `min_supported` value is
+unchanged. It writes `target/test-successor/manifest.json` with the source
+commit, both binary SHA-256 values, both identity lists, and the declared
+changes. `--require-complete` also requires one change of each kind, plus
+one reversible change and one irreversible change. SFS-1019 runs that check
+before the matrix.
+
+Release builds cannot contain the successor. The feature raises a
+`compile_error!` without `debug_assertions`, and the Linux quality gate checks
+that refusal. `tools/release/package.py` also rejects a binary that embeds the
+successor marker `STUDIOFS-TEST-SUCCESSOR-BUILD`.
+
 
 Local writer state can be newer than shared state. A compatibility refusal
 never deletes, resets or rewrites the local journal, the redb metadata, or
