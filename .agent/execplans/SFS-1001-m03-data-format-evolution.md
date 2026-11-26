@@ -11,7 +11,7 @@ After this milestone, every data format a successor might change has its own ver
 ## Progress
 
 - [x] (2026-11-25) SFS-1009: register baseline and test-successor MetaEvent codecs, refuse unsupported events before replay advances, and guard settings rewrites.
-- [x] (2026-11-26) SFS-1010: publication negotiates each event encoding against the stamped volume policy and refuses, keeping the journal, when a reader may not decode it; replay keeps decoding the whole page before the redb apply.
+- [x] (2026-11-26) SFS-1010: publication negotiates each event encoding against the stamped volume policy and refuses, keeping the journal, when a reader may not decode it; replay keeps decoding the whole page before the redb apply. A refusal is a sticky `PublicationBlocked` sync failure, warned once with the event kind and capability, that survives successful polls, does not invalidate remote identity validation, and clears on the next successful publication.
 - [ ] SFS-1011: support multiple checkpoint formats with safe bootstrap and pruning.
 - [ ] SFS-1012: crash-safe local redb and payload-index format migration and recovery.
 - [ ] SFS-1013: version-aware discovery, snapshot mounts and dump/load restore.

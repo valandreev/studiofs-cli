@@ -994,6 +994,9 @@ pub enum PgSyncFailure {
     LifecycleFatal,
     /// A local or backend storage operation failed.
     Storage,
+    /// Pending local events need a reader capability the volume protocol does
+    /// not require, so they stay unpublished until the policy carries them.
+    PublicationBlocked,
     /// A synchronization failure did not match a more specific safe category.
     Other,
 }
@@ -1051,6 +1054,9 @@ impl PgSyncFailure {
             MetaError::UpgradeRequired { .. } => Self::UpgradeRequired,
             MetaError::UuidMismatch { .. } => Self::UuidMismatch,
             MetaError::LifecycleFatal => Self::LifecycleFatal,
+            MetaError::VolumeProtocolRejected(
+                crate::volume_protocol::ProtocolRejection::EventNotRepresentable { .. },
+            ) => Self::PublicationBlocked,
             MetaError::EventTooLarge { .. }
             | MetaError::RepairRequired(_)
             | MetaError::Serialization(_)
@@ -1133,6 +1139,9 @@ impl std::fmt::Display for PgSyncFailure {
             Self::UuidMismatch => formatter.write_str("volume UUID mismatch"),
             Self::LifecycleFatal => formatter.write_str("fatal synchronization lifecycle"),
             Self::Storage => formatter.write_str("metadata storage error"),
+            Self::PublicationBlocked => formatter.write_str(
+                "publication blocked: pending events need a reader capability the volume protocol does not require",
+            ),
             Self::Other => formatter.write_str("other synchronization error"),
         }
     }

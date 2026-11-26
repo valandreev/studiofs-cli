@@ -510,6 +510,14 @@ fn pending_events_stay_unpublished_while_the_policy_cannot_represent_them() {
     assert_eq!(pg.flushed_event_seq.load(Ordering::SeqCst), cursor);
     assert_eq!(pg.replication_backlog().pending_ops, pending);
     assert_eq!(pg.lookup(ROOT_INO, b"draft").unwrap().ino, draft.ino);
+    // The refusal stays visible: a successful poll does not clear it, and it
+    // does not invalidate the validated remote identity.
+    let blocked = Some(crate::engine::PgSyncFailure::PublicationBlocked);
+    assert_eq!(pg.pg_sync_progress_snapshot().last_sync_error, blocked);
+    assert!(pg.remote_identity_validated.load(Ordering::Acquire));
+    pg.sync_metadata_with_source(crate::pg_engine::MetadataSyncSource::FallbackPoll)
+        .expect("poll while publication is blocked");
+    assert_eq!(pg.pg_sync_progress_snapshot().last_sync_error, blocked);
 
     // Online settings changes negotiate against the same policy.
     let settings = run_async({
@@ -545,6 +553,7 @@ fn pending_events_stay_unpublished_while_the_policy_cannot_represent_them() {
     pg.flush_pending_claimed_batch_with_restore(batch)
         .expect("publish retained journal");
     assert_eq!(pg.replication_backlog().pending_ops, 0);
+    assert_eq!(pg.pg_sync_progress_snapshot().last_sync_error, None);
     assert!(sql_i64(&schema.dsn, events, vol, None).unwrap() > 0);
     pg.prepare_for_close().expect("close writer");
 }

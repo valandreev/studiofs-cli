@@ -885,12 +885,25 @@ impl PgMetaEngine {
         let allocator_retry_suppressed =
             self.lock_allocator_bootstrap_retry_state().retry_suppressed;
         if let Ok(mut progress) = self.pg_sync_progress_state.lock() {
-            if !allocator_retry_suppressed {
+            // A refused publication stays visible until a publication succeeds.
+            if !allocator_retry_suppressed
+                && progress.last_sync_error != Some(PgSyncFailure::PublicationBlocked)
+            {
                 progress.last_sync_error = None;
             }
             if self.current_pg_sync_lifecycle() != PgSyncLifecycle::Degraded {
                 progress.rebootstrap_required = false;
             }
+        }
+    }
+
+    /// Clears a sticky [`PgSyncFailure::PublicationBlocked`] once a batch publishes.
+    pub(super) fn record_publication_success(&self) {
+        if let Ok(mut progress) = self.pg_sync_progress_state.lock()
+            && progress.last_sync_error == Some(PgSyncFailure::PublicationBlocked)
+        {
+            progress.last_sync_error = None;
+            tracing::info!(volume_id = self.volume_id, "event publication resumed");
         }
     }
 
@@ -903,7 +916,23 @@ impl PgMetaEngine {
             ) {
                 progress.rebootstrap_required = true;
             }
-            progress.last_sync_error = Some(PgSyncFailure::from_error(error));
+            let failure = PgSyncFailure::from_error(error);
+            if let MetaError::VolumeProtocolRejected(
+                crate::volume_protocol::ProtocolRejection::EventNotRepresentable {
+                    kind,
+                    capability,
+                },
+            ) = error
+                && progress.last_sync_error != Some(failure)
+            {
+                warn!(
+                    volume_id = self.volume_id,
+                    kind,
+                    capability,
+                    "event publication blocked: the volume protocol does not require the reader capability; pending events stay local"
+                );
+            }
+            progress.last_sync_error = Some(failure);
         }
     }
 
@@ -1467,9 +1496,14 @@ impl PgMetaEngine {
                 .remote_transport_unavailable
                 .store(false, Ordering::Release),
             Err(error) => {
+                // A protocol refusal of publication says nothing about remote identity.
                 if !matches!(
                     error,
-                    MetaError::CatchUpCancelled | MetaError::CatchUpDeadlineExceeded
+                    MetaError::CatchUpCancelled
+                        | MetaError::CatchUpDeadlineExceeded
+                        | MetaError::VolumeProtocolRejected(
+                            crate::volume_protocol::ProtocolRejection::EventNotRepresentable { .. }
+                        )
                 ) {
                     self.invalidate_remote_validation();
                 }

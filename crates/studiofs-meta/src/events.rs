@@ -186,7 +186,8 @@ fn negotiate_wire_tag(event: &MetaEvent, protocol: &VolumeProtocol) -> MetaResul
 /// Checks a publication batch against the volume's active protocol before
 /// any event is written. A refusal leaves the batch, which the caller keeps
 /// as unpublished local work; events authored before a policy change are
-/// re-encoded here, so they publish only where the encoding is identical.
+/// checked against the current policy, so they publish only where it still
+/// admits their encoding.
 ///
 /// # Errors
 ///
