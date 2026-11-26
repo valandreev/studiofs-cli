@@ -724,7 +724,9 @@ fn initialize_discovered_postgres_checkpoint_rejects_invalid_root_and_bytes() {
     let malformed_target = RedbMetaEngine::open(empty_dir.path().join("malformed.db")).unwrap();
     assert!(matches!(
         malformed_target.initialize_discovered_postgres_checkpoint(&format_info, b"invalid", 42),
-        Err(MetaError::Serialization(_))
+        Err(MetaError::InvalidCheckpointDescriptor {
+            reason: CheckpointDescriptorFailure::CheckpointBytes
+        })
     ));
 
     let wrong_root_dir = studiofs_test_support::workspace_target_tempdir("discovered-root-");
