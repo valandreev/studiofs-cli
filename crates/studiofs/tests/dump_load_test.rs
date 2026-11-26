@@ -474,12 +474,14 @@ async fn dump_load_restores_volume_and_discovery_reads_data() {
         "dry run must not write local metadata"
     );
     let report = String::from_utf8_lossy(&dry_run.stdout);
+    let current = studiofs_meta::schema::CURRENT_FORMAT_VERSION;
+    let format_line = format!("Volume format: local {current}, shared {current}");
     for expected in [
         "Dry run: nothing was changed.",
         "  core = 1\n",
         "  payload_gc = 2\n",
         "Schema migrations to apply:\n  none\n",
-        "Volume format: local 6, shared 6",
+        format_line.as_str(),
         "back up the database",
     ] {
         assert!(
