@@ -119,22 +119,106 @@ pub(super) async fn read_bootstrap_checkpoint_and_decode_with_pool(
     volume_id: i64,
     command_timeout: std::time::Duration,
 ) -> MetaResult<(BootstrapCheckpointDescriptor, ServingCheckpoint)> {
+    PgMetaEngine::with_postgres_client_timeout(
+        command_pool,
+        command_timeout,
+        "bootstrap checkpoint descriptor",
+        |client| {
+            Box::pin(async move {
+                let tx = client
+                    .build_transaction()
+                    .isolation_level(tokio_postgres::IsolationLevel::RepeatableRead)
+                    .read_only(true)
+                    .start()
+                    .await
+                    .map_err(descriptor_row_error)?;
+                let read = async {
+                    let (descriptor, checkpoint) = read_checkpoint(&tx, volume_id).await?;
+                    super::check_volume_read_policy(&tx, volume_id, Some(&descriptor)).await?;
+                    Ok((descriptor, checkpoint))
+                }
+                .await;
+                runtime::finish_pooled_transaction(
+                    tx,
+                    read,
+                    |error| {
+                        matches!(
+                            error,
+                            MetaError::InvalidCheckpointDescriptor { .. }
+                                | MetaError::BootstrapCheckpointDescriptorMissing
+                                | MetaError::NeedCompatibleCheckpoint { .. }
+                                | MetaError::UnsupportedCheckpointEncoding { .. }
+                        ) || super::volume_protocol::is_volume_read_policy_rejection(error)
+                    },
+                    descriptor_row_error,
+                )
+                .await
+            })
+        },
+    )
+    .await?
+}
+
+/// Select and validate a serving checkpoint using the caller's PostgreSQL snapshot.
+pub async fn read_compatible_checkpoint<C: tokio_postgres::GenericClient + Sync>(
+    client: &C,
+    volume_id: i64,
+) -> MetaResult<BootstrapCheckpointDescriptor> {
+    let (descriptor, _) = read_checkpoint(client, volume_id).await?;
+    super::check_volume_read_policy(client, volume_id, Some(&descriptor)).await?;
+    Ok(descriptor)
+}
+
+/// Validate the frozen replay tail without advancing any local cursor.
+pub async fn validate_checkpoint_replay(
+    client: &tokio_postgres::Transaction<'_>,
+    descriptor: &BootstrapCheckpointDescriptor,
+) -> MetaResult<()> {
+    let mut cursor = descriptor.checkpoint_version;
+    let target = descriptor.remote_head_version;
+    while cursor < target {
+        let page = PgMetaEngine::query_foreign_event_page(
+            client,
+            descriptor.volume_id,
+            cursor,
+            target,
+            64,
+            8 * 1024 * 1024,
+        )
+        .await?;
+        let batches = super::RemoteApplyCoordinator::decode_event_rows(page.rows, "")?;
+        let Some(last) = batches.last() else {
+            return Err(MetaError::ReplayGap {
+                local_version: cursor,
+                first_available_version: cursor,
+                target_version: target,
+            });
+        };
+        super::RemoteApplyCoordinator::validate_decoded_batch_continuity(cursor, &batches, target)?;
+        cursor = last.batch_version;
+    }
+    Ok(())
+}
+
+async fn read_checkpoint<C: tokio_postgres::GenericClient + Sync>(
+    client: &C,
+    volume_id: i64,
+) -> MetaResult<(BootstrapCheckpointDescriptor, ServingCheckpoint)> {
+    let has_encodings: bool = client
+        .query_one(sql::CHECKPOINT_ENCODINGS_AVAILABLE, &[])
+        .await
+        .map_err(descriptor_row_error)?
+        .get(0);
     let mut excluded = Vec::new();
     loop {
-        let selection = if excluded.len() < MAX_ALTERNATIVE_CHECKPOINT_RETRIES {
+        let selection = if has_encodings && excluded.len() < MAX_ALTERNATIVE_CHECKPOINT_RETRIES {
             CheckpointSelection::Compatible {
                 excluded: &excluded,
             }
         } else {
             CheckpointSelection::BaselineOnly
         };
-        let descriptor = select_bootstrap_checkpoint(
-            Arc::clone(&command_pool),
-            volume_id,
-            command_timeout,
-            selection,
-        )
-        .await?;
+        let descriptor = select_bootstrap_checkpoint(client, volume_id, selection).await?;
         match descriptor.validate_and_decode() {
             Err(
                 MetaError::InvalidCheckpointDescriptor {
@@ -155,12 +239,10 @@ pub(super) async fn read_bootstrap_checkpoint_and_decode_with_pool(
                         continue;
                     }
                 }
-                // Re-read the baseline with its current head and prune floor. It
-                // may have advanced since the alternate artifact was selected.
+                // The baseline and alternatives share the caller's read snapshot.
                 let baseline = select_bootstrap_checkpoint(
-                    command_pool,
+                    client,
                     volume_id,
-                    command_timeout,
                     CheckpointSelection::BaselineOnly,
                 )
                 .await?;
@@ -172,59 +254,39 @@ pub(super) async fn read_bootstrap_checkpoint_and_decode_with_pool(
     }
 }
 
-async fn select_bootstrap_checkpoint(
-    command_pool: Arc<runtime::PgConnectionPool>,
+async fn select_bootstrap_checkpoint<C: tokio_postgres::GenericClient + Sync>(
+    client: &C,
     volume_id: i64,
-    command_timeout: std::time::Duration,
     selection: CheckpointSelection<'_>,
 ) -> MetaResult<BootstrapCheckpointDescriptor> {
-    let excluded: Option<(Vec<i16>, Vec<i16>, Vec<i64>)> = match selection {
-        CheckpointSelection::Compatible { excluded } => Some((
-            excluded.iter().map(|item| item.encoding.format).collect(),
-            excluded.iter().map(|item| item.encoding.schema).collect(),
-            excluded.iter().map(|item| item.version).collect(),
-        )),
-        CheckpointSelection::BaselineOnly => None,
-    };
-    let row = PgMetaEngine::with_postgres_client_timeout(
-        command_pool,
-        command_timeout,
-        "bootstrap checkpoint descriptor",
-        move |client| {
-            Box::pin(async move {
-                if let Some((excluded_formats, excluded_schemas, excluded_versions)) = excluded {
-                    match client
-                        .query_opt(
-                            sql::SELECT_COMPATIBLE_CHECKPOINT_DESCRIPTOR,
-                            &[
-                                &volume_id,
-                                &(SERVING_CHECKPOINT_FORMAT.min_supported as i16),
-                                &ServingCheckpoint::FORMAT_VERSION,
-                                &(SERVING_CHECKPOINT_SCHEMA.min_supported as i16),
-                                &ServingCheckpoint::SCHEMA_VERSION,
-                                &excluded_formats,
-                                &excluded_schemas,
-                                &excluded_versions,
-                            ],
-                        )
-                        .await
-                    {
-                        // Allow discovery before the additive migration.
-                        Err(error)
-                            if error.code()
-                                == Some(&tokio_postgres::error::SqlState::UNDEFINED_TABLE) => {}
-                        result => return checked_bootstrap_row(result),
-                    }
-                }
-                checked_bootstrap_row(
-                    client
-                        .query_opt(sql::SELECT_BOOTSTRAP_CHECKPOINT_DESCRIPTOR, &[&volume_id])
-                        .await,
+    let row = checked_bootstrap_row(
+        if let CheckpointSelection::Compatible { excluded } = selection {
+            let excluded_formats: Vec<_> =
+                excluded.iter().map(|item| item.encoding.format).collect();
+            let excluded_schemas: Vec<_> =
+                excluded.iter().map(|item| item.encoding.schema).collect();
+            let excluded_versions: Vec<_> = excluded.iter().map(|item| item.version).collect();
+            client
+                .query_opt(
+                    sql::SELECT_COMPATIBLE_CHECKPOINT_DESCRIPTOR,
+                    &[
+                        &volume_id,
+                        &(SERVING_CHECKPOINT_FORMAT.min_supported as i16),
+                        &ServingCheckpoint::FORMAT_VERSION,
+                        &(SERVING_CHECKPOINT_SCHEMA.min_supported as i16),
+                        &ServingCheckpoint::SCHEMA_VERSION,
+                        &excluded_formats,
+                        &excluded_schemas,
+                        &excluded_versions,
+                    ],
                 )
-            })
+                .await
+        } else {
+            client
+                .query_opt(sql::SELECT_BOOTSTRAP_CHECKPOINT_DESCRIPTOR, &[&volume_id])
+                .await
         },
-    )
-    .await?;
+    )?;
     let descriptor = try_descriptor_from_row(&row)?;
     let replay_floor: i64 = row
         .try_get("event_log_prune_floor")

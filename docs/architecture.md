@@ -66,8 +66,8 @@ E2E validation.
 `PgMetaEngine` keeps a local metadata view and a replication path:
 
 - a valid local `redb` view becomes serving-ready before remote catch-up
-- a fresh client bootstraps from the latest published checkpoint in
-  `metadata_state`
+- a fresh client selects a compatible published checkpoint with a replayable
+  tail
 - bounded steady-state sync exchanges ordered delta pages through `event_log`
   toward a frozen target version
 - local reads resolve against local `redb` only, then converge toward newer

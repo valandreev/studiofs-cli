@@ -231,6 +231,27 @@ impl RedbMetaEngine {
         Self::read_format_info_from_read_txn(&txn)
     }
 
+    /// Read the actual persisted layout revision of a closed, formatted redb store.
+    pub fn read_local_revision(path: impl AsRef<Path>) -> MetaResult<u16> {
+        let txn = Self::open_readonly(path)?
+            .begin_read()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Self::read_format_info_from_read_txn(&txn)?;
+        let settings = txn
+            .open_table(SETTINGS_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let entry = settings.get("format")?.ok_or(MetaError::NotFormatted)?;
+        let header: serde_json::Value = serde_json::from_slice(entry.value())
+            .map_err(|error| crate::invalid_format_info_json(&error))?;
+        header.get(crate::LOCAL_REDB_REVISION).map_or(
+            Ok(crate::version::LOCAL_METADATA_LAYOUT.min_supported),
+            |revision| {
+                serde_json::from_value(revision.clone())
+                    .map_err(|error| crate::invalid_format_info_json(&error))
+            },
+        )
+    }
+
     /// Like [`Self::format_info_for_upgrade`], read-only and without
     /// creating tables, for `studiofs upgrade --dry-run`.
     pub fn read_format_info_for_upgrade_readonly(path: impl AsRef<Path>) -> MetaResult<FormatInfo> {

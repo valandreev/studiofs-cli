@@ -1,12 +1,22 @@
 //! `studiofs dump` / `studiofs load` — PostgreSQL metadata manifest backup/restore.
 
 use clap::Args;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
-use studiofs_meta::pg_engine::schema::ensure_studiofs_pg_schema;
+use studiofs_meta::compat::{CheckpointDescriptor, Operation, VolumeRequirements};
+use studiofs_meta::pg_engine::{
+    migrations::{ensure_registered_schema, recorded_schema_revisions, validate_restore_revisions},
+    read_volume_protocol, validate_event_batch_client,
+};
+use studiofs_meta::version::{
+    EVENT_CODEC_WIRE, LOCAL_METADATA_LAYOUT, SERVING_CHECKPOINT_FORMAT, SERVING_CHECKPOINT_SCHEMA,
+};
+use studiofs_meta::volume_protocol::VolumeProtocol;
 use studiofs_meta::{
-    MetaError, connect_studiofs_postgres, decode_format_info, ensure_studiofs_database,
+    BootstrapCheckpointDescriptor, CheckpointEncoding, MetaError, RedbMetaEngine,
+    connect_studiofs_postgres, decode_format_info, ensure_studiofs_database,
     ensure_supported_pg_sync_format_version, open_meta_engine, validate_checkpoint_descriptor,
 };
 use thiserror::Error;
@@ -34,10 +44,25 @@ struct DumpEvent {
     client_timestamp: Option<i64>,
 }
 
+/// First dump version written by StudioFS 0.2.5; older dumps are refused.
+const DUMP_VERSION: u16 = 5;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DumpManifest {
+    schema_revisions: BTreeMap<String, i32>,
+    volume_protocol: VolumeProtocol,
+    /// Encoding of the published baseline checkpoint in `metadata_state_snapshot`.
+    checkpoint: CheckpointEncoding,
+    event_codec_revisions: BTreeSet<u8>,
+    source_local_redb_revision: u16,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct MetadataDump {
     dump_version: u16,
+    manifest: DumpManifest,
     volume: DumpVolume,
     metadata_state_format_version: i16,
     metadata_state_version: i64,
@@ -100,11 +125,10 @@ pub enum DumpValidationError {
 pub enum DumpLoadError {
     #[error("input/output error: {0}")]
     Io(#[from] std::io::Error),
-    #[error("postgres operation '{operation}' failed: {source}")]
+    #[error("postgres operation '{operation}' failed ({diagnostic})")]
     PostgresOperation {
         operation: String,
-        #[source]
-        source: tokio_postgres::Error,
+        diagnostic: String,
     },
     #[error("metadata operation failed: {0}")]
     Meta(#[from] MetaError),
@@ -133,6 +157,30 @@ pub enum DumpLoadError {
         #[source]
         source: anyhow::Error,
     },
+    #[error(
+        "dump version {found} was written by StudioFS 0.2.4 or earlier; load it with the 0.2.4 binary, run `studiofs upgrade`, then dump again with StudioFS 0.2.5 or later"
+    )]
+    LegacyDump { found: u16 },
+    #[error(
+        "dump {identity} {found} is newer than this binary supports ({newest}); upgrade studiofs"
+    )]
+    ComponentNewer {
+        identity: &'static str,
+        found: u16,
+        newest: u16,
+    },
+    #[error(
+        "dump {identity} {found} is older than this binary supports ({oldest}); upgrade the source volume with `studiofs upgrade` and dump it again"
+    )]
+    ComponentOlder {
+        identity: &'static str,
+        found: u16,
+        oldest: u16,
+    },
+    #[error(
+        "volume {volume} has no published checkpoint yet (state: {state}); mount the volume read-write until the checkpoint coordinator publishes a baseline checkpoint, then retry the dump"
+    )]
+    CheckpointNotPublished { volume: i64, state: String },
     #[error("{0}")]
     Message(String),
 }
@@ -169,7 +217,10 @@ fn postgres_operation(
 ) -> DumpLoadError {
     DumpLoadError::PostgresOperation {
         operation: operation.into(),
-        source,
+        diagnostic: source.code().map_or_else(
+            || "connection error".to_owned(),
+            |code| format!("SQLSTATE {}", code.code()),
+        ),
     }
 }
 
@@ -211,7 +262,11 @@ impl LoadArgs {
     }
 }
 
-fn load_remote_dump(meta_dsn: &str, volume_id: i64) -> DumpLoadResult<MetadataDump> {
+fn load_remote_dump(
+    meta_dsn: &str,
+    volume_id: i64,
+    local_revision: u16,
+) -> DumpLoadResult<MetadataDump> {
     crate::runtime_bridge::block_on(async move {
         let metadata_dsn = ensure_studiofs_database(meta_dsn).await?.metadata_dsn;
         let (mut client, connection) = connect_studiofs_postgres(&metadata_dsn).await?;
@@ -231,7 +286,6 @@ fn load_remote_dump(meta_dsn: &str, volume_id: i64) -> DumpLoadResult<MetadataDu
                 .query_opt(
                     r#"
             SELECT
-                v.vol,
                 v.name,
                 v.uuid,
                 v.block_size,
@@ -250,27 +304,29 @@ fn load_remote_dump(meta_dsn: &str, volume_id: i64) -> DumpLoadResult<MetadataDu
                     &[&volume_id],
                 )
                 .await
-                .map_err(|source| postgres_operation("query metadata_state", source))?;
-
-            let row = row.ok_or_else(|| {
-                DumpLoadError::Message(format!("volume {volume_id} not found in postgres"))
-            })?;
-
+                .map_err(|source| postgres_operation("query metadata_state", source))?
+                .ok_or_else(|| {
+                    DumpLoadError::Message(format!("volume {volume_id} not found in postgres"))
+                })?;
             let decode_state_row = |source| postgres_operation("decode metadata_state row", source);
+            let publication_state: String = row.try_get(9).map_err(decode_state_row)?;
+            // Alternate serving encodings are coordinator caches; only the
+            // published baseline slot is authoritative backup content.
+            if publication_state != "published" {
+                return Err(DumpLoadError::CheckpointNotPublished {
+                    volume: volume_id,
+                    state: publication_state,
+                });
+            }
             let volume = DumpVolume {
-                vol: row.try_get(0).map_err(decode_state_row)?,
-                name: row.try_get(1).map_err(decode_state_row)?,
-                uuid: row.try_get(2).map_err(decode_state_row)?,
-                block_size: row.try_get(3).map_err(decode_state_row)?,
+                vol: volume_id,
+                name: row.try_get(0).map_err(decode_state_row)?,
+                uuid: row.try_get(1).map_err(decode_state_row)?,
+                block_size: row.try_get(2).map_err(decode_state_row)?,
             };
-            let state_format_version: i16 = row.try_get(4).map_err(decode_state_row)?;
-            let state_version: i64 = row.try_get(5).map_err(decode_state_row)?;
-            let state_checkpoint_version: i64 = row.try_get(6).map_err(decode_state_row)?;
-            let state_snapshot: Vec<u8> = row.try_get(7).map_err(decode_state_row)?;
-            let state_checkpoint_sha256: Vec<u8> = row.try_get(8).map_err(decode_state_row)?;
-            let state_format_info: Vec<u8> = row.try_get(9).map_err(decode_state_row)?;
-            let state_publication_state: String = row.try_get(10).map_err(decode_state_row)?;
-            let state_generation: i64 = row.try_get(11).map_err(decode_state_row)?;
+            let state_checkpoint_version: i64 = row.try_get(5).map_err(decode_state_row)?;
+            let volume_protocol = read_volume_protocol(&transaction, volume_id).await?;
+            let schema_revisions = recorded_schema_revisions(&transaction).await?;
 
             let counter_rows = transaction
                 .query(
@@ -316,20 +372,32 @@ fn load_remote_dump(meta_dsn: &str, volume_id: i64) -> DumpLoadResult<MetadataDu
                 .collect::<Result<Vec<_>, tokio_postgres::Error>>()
                 .map_err(|source| postgres_operation("decode event_log rows", source))?;
 
-            let dump = MetadataDump {
-                dump_version: 4,
+            let mut dump = MetadataDump {
+                dump_version: DUMP_VERSION,
+                manifest: DumpManifest {
+                    schema_revisions,
+                    volume_protocol,
+                    // Filled from the validated checkpoint bytes below.
+                    checkpoint: CheckpointEncoding {
+                        format: 0,
+                        schema: 0,
+                    },
+                    event_codec_revisions: dump_event_revisions(&event_log)?,
+                    source_local_redb_revision: local_revision,
+                },
                 volume,
-                metadata_state_format_version: state_format_version,
-                metadata_state_version: state_version,
+                metadata_state_format_version: row.try_get(3).map_err(decode_state_row)?,
+                metadata_state_version: row.try_get(4).map_err(decode_state_row)?,
                 metadata_state_checkpoint_version: state_checkpoint_version,
-                metadata_state_snapshot: state_snapshot,
-                metadata_state_checkpoint_sha256: state_checkpoint_sha256,
-                metadata_state_format_info: state_format_info,
-                metadata_state_publication_state: state_publication_state,
-                metadata_state_generation: state_generation,
+                metadata_state_snapshot: row.try_get(6).map_err(decode_state_row)?,
+                metadata_state_checkpoint_sha256: row.try_get(7).map_err(decode_state_row)?,
+                metadata_state_format_info: row.try_get(8).map_err(decode_state_row)?,
+                metadata_state_publication_state: publication_state,
+                metadata_state_generation: row.try_get(10).map_err(decode_state_row)?,
                 counters,
                 event_log,
             };
+            dump.manifest.checkpoint = dump_checkpoint(&dump).validated_encoding()?;
             transaction
                 .commit()
                 .await
@@ -376,8 +444,12 @@ pub fn dump(name: &str, meta_dir: &Path, output: &Path) -> DumpLoadResult<()> {
         .as_ref()
         .ok_or_else(|| DumpLoadError::Message("volume is not postgres-backed".to_string()))?;
 
-    let dump = load_remote_dump(&pg.url, pg.volume_id)?;
+    meta.prepare_for_close()?;
+    drop(meta);
+    let local_revision = RedbMetaEngine::read_local_revision(&db_path)?;
+    let dump = load_remote_dump(&pg.url, pg.volume_id, local_revision)?;
     validate_dump(&dump)?;
+    validate_manifest(&dump, false)?;
 
     write_dump_output(output, &dump)?;
 
@@ -415,7 +487,7 @@ fn apply_dump(postgres_address: &str, dump: &MetadataDump) -> DumpLoadResult<i64
                 .transaction()
                 .await
                 .map_err(|source| postgres_operation("start schema transaction", source))?;
-            ensure_studiofs_pg_schema(&schema_tx).await?;
+            ensure_registered_schema(&schema_tx).await?;
             schema_tx
                 .commit()
                 .await
@@ -454,13 +526,22 @@ fn apply_dump(postgres_address: &str, dump: &MetadataDump) -> DumpLoadResult<i64
                 .map_err(|source| postgres_operation("lock load target volume", source))?;
             let previous_state = tx
                 .query_opt(
-                    "SELECT write_requirement, metadata_format_version FROM metadata_state WHERE vol = $1",
+                    "SELECT metadata_format_version FROM metadata_state WHERE vol = $1 FOR UPDATE",
                     &[&target_vol],
                 )
                 .await
-                .map_err(|source| postgres_operation("read load target format", source))?;
+                .map_err(|source| postgres_operation("lock load target format", source))?;
+            let protocol = &dump.manifest.volume_protocol;
             if let Some(row) = &previous_state {
-                ensure_supported_pg_sync_format_version(row.get(1))?;
+                ensure_supported_pg_sync_format_version(row.get(0))?;
+                let target = read_volume_protocol(&tx, target_vol).await?;
+                if target.requirements != protocol.requirements
+                    || target.write_requirement != protocol.write_requirement
+                {
+                    return Err(DumpLoadError::Message(
+                        "restore policy conflicts with the destination volume; use an empty metadata database".into()
+                    ));
+                }
             }
             let format_info_bytes =
                 rebind_postgres_volume_id(&dump.metadata_state_format_info, target_vol)?;
@@ -488,12 +569,12 @@ fn apply_dump(postgres_address: &str, dump: &MetadataDump) -> DumpLoadResult<i64
                 });
             }
 
-            // Preserve the existing policy and write requirement.
             if previous_state.is_none() {
-                studiofs_meta::pg_engine::insert_initial_volume_protocol(&tx, target_vol, "studiofs load")
-                    .await?;
+                studiofs_meta::pg_engine::insert_restored_volume_protocol(
+                    &tx, target_vol, protocol, "studiofs load",
+                ).await?;
             }
-            let write_requirement: i16 = previous_state.map_or(1, |row| row.get(0));
+            let write_requirement = protocol.write_requirement as i16;
             let session =
                 studiofs_meta::pg_engine::PublicationSession::begin(&tx, target_vol).await?;
             // The volume row lock blocks new FK-backed rows, so the guarded
@@ -508,7 +589,7 @@ fn apply_dump(postgres_address: &str, dump: &MetadataDump) -> DumpLoadResult<i64
                 .await
                 .map_err(|source| postgres_operation("clear metadata_state", source))?;
             tx.execute(
-                "INSERT INTO metadata_state (vol, metadata_format_version, version, checkpoint_version, snapshot, checkpoint_sha256, format_info, checkpoint_publication_state, checkpoint_generation, write_requirement) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+                "INSERT INTO metadata_state (vol, metadata_format_version, version, checkpoint_version, snapshot, checkpoint_sha256, format_info, checkpoint_publication_state, checkpoint_generation, write_requirement, event_log_prune_floor) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $4)",
                 &[
                     &target_vol,
                     &dump.metadata_state_format_version,
@@ -524,6 +605,17 @@ fn apply_dump(postgres_address: &str, dump: &MetadataDump) -> DumpLoadResult<i64
             )
             .await
             .map_err(|source| postgres_operation("insert metadata_state", source))?;
+
+            // A previously interrupted initialization can leave a policy without
+            // a metadata_state row. Verify that the inserted state uses that policy
+            // only when the backup requires the same capabilities.
+            if previous_state.is_none()
+                && read_volume_protocol(&tx, target_vol).await?.requirements != protocol.requirements
+            {
+                return Err(DumpLoadError::Message(
+                    "restore policy conflicts with the destination volume; use an empty metadata database".into()
+                ));
+            }
 
             for counter in &dump.counters {
                 tx.execute(
@@ -632,6 +724,117 @@ async fn tables_with_volume_rows(
     Ok(populated)
 }
 
+fn dump_event_revisions(events: &[DumpEvent]) -> DumpLoadResult<BTreeSet<u8>> {
+    events
+        .iter()
+        .map(|event| {
+            studiofs_meta::events::persisted_event_revision(&event.event_type, &event.event_payload)
+                .map_err(DumpLoadError::from)
+        })
+        .collect()
+}
+
+fn dump_checkpoint(dump: &MetadataDump) -> BootstrapCheckpointDescriptor {
+    BootstrapCheckpointDescriptor {
+        volume_id: dump.volume.vol,
+        volume_uuid: dump.volume.uuid.clone(),
+        format_info_bytes: dump.metadata_state_format_info.clone(),
+        metadata_format_version: dump.metadata_state_format_version as u16,
+        remote_head_version: dump.metadata_state_version,
+        checkpoint_version: dump.metadata_state_checkpoint_version,
+        checkpoint_encoding: None,
+        checkpoint_bytes: dump.metadata_state_snapshot.clone(),
+        checkpoint_sha256: dump.metadata_state_checkpoint_sha256.clone(),
+        publication_state: dump.metadata_state_publication_state.clone(),
+        publication_generation: dump.metadata_state_generation,
+    }
+}
+
+fn check_manifest_version(
+    identity: studiofs_meta::version::VersionIdentity,
+    found: u16,
+) -> DumpLoadResult<()> {
+    if found > identity.current {
+        return Err(DumpLoadError::ComponentNewer {
+            identity: identity.name,
+            found,
+            newest: identity.current,
+        });
+    }
+    if !identity.supports(found) {
+        return Err(DumpLoadError::ComponentOlder {
+            identity: identity.name,
+            found,
+            oldest: identity.min_supported,
+        });
+    }
+    Ok(())
+}
+
+/// Checks every version the manifest records, then that the payload matches it.
+fn validate_manifest(dump: &MetadataDump, for_restore: bool) -> DumpLoadResult<()> {
+    let manifest = &dump.manifest;
+    // Declared versions come first so a newer dump names the component that
+    // needs an upgrade instead of failing later while decoding its payload.
+    validate_restore_revisions(&manifest.schema_revisions)?;
+    // A negative PostgreSQL smallint is corrupt; report it as unsupported.
+    let checkpoint = CheckpointDescriptor {
+        format: u16::try_from(manifest.checkpoint.format).unwrap_or(0),
+        schema: u16::try_from(manifest.checkpoint.schema).unwrap_or(0),
+    };
+    check_manifest_version(SERVING_CHECKPOINT_FORMAT, checkpoint.format)?;
+    check_manifest_version(SERVING_CHECKPOINT_SCHEMA, checkpoint.schema)?;
+    for &revision in &manifest.event_codec_revisions {
+        // Revision 0 is the legacy postcard event encoding.
+        if revision != 0 {
+            check_manifest_version(EVENT_CODEC_WIRE, u16::from(revision))?;
+        }
+    }
+    check_manifest_version(LOCAL_METADATA_LAYOUT, manifest.source_local_redb_revision)?;
+    if manifest.volume_protocol.epoch == 0 || i64::try_from(manifest.volume_protocol.epoch).is_err()
+    {
+        return Err(DumpLoadError::Message(
+            "invalid volume protocol epoch in dump".into(),
+        ));
+    }
+    let mut requirements = VolumeRequirements::baseline();
+    requirements.format = dump.metadata_state_format_version as u16;
+    let payload_gc = studiofs_meta::version::POSTGRES_PAYLOAD_GC_SCHEMA;
+    requirements.schema_components.insert(
+        payload_gc.name.to_owned(),
+        manifest.schema_revisions["payload_gc"] as u16,
+    );
+    let mut operations = vec![Operation::Bootstrap, Operation::Replay];
+    if for_restore {
+        operations.push(Operation::Publication);
+        let required_checkpoint = manifest.volume_protocol.requirements.checkpoint;
+        check_manifest_version(SERVING_CHECKPOINT_FORMAT, required_checkpoint.format)?;
+        check_manifest_version(SERVING_CHECKPOINT_SCHEMA, required_checkpoint.schema)?;
+    }
+    let local_revisions = BTreeMap::from([(
+        LOCAL_METADATA_LAYOUT.name.to_owned(),
+        manifest.source_local_redb_revision,
+    )]);
+    manifest.volume_protocol.check_operations(
+        requirements,
+        Some(checkpoint),
+        &local_revisions,
+        &operations,
+    )?;
+
+    if dump_checkpoint(dump).validated_encoding()? != manifest.checkpoint {
+        return Err(DumpLoadError::Message(
+            "dump manifest checkpoint does not match the checkpoint payload".into(),
+        ));
+    }
+    if dump_event_revisions(&dump.event_log)? != manifest.event_codec_revisions {
+        return Err(DumpLoadError::Message(
+            "dump event codec revisions do not match its event log".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn validate_dump(dump: &MetadataDump) -> DumpLoadResult<()> {
     ensure_supported_pg_sync_format_version(Some(dump.metadata_state_format_version))?;
     decode_format_info(&dump.metadata_state_format_info)?;
@@ -660,6 +863,7 @@ fn validate_dump(dump: &MetadataDump) -> DumpLoadResult<()> {
     }
 
     let mut last_event_version = None;
+    let mut batch_client = None;
     let mut contiguous_through = checkpoint_version;
     for event in &dump.event_log {
         let batch_version = event.batch_version;
@@ -675,7 +879,12 @@ fn validate_dump(dump: &MetadataDump) -> DumpLoadResult<()> {
             }
             .into());
         }
-        last_event_version = Some(batch_version);
+        if last_event_version == Some(batch_version) {
+            validate_event_batch_client(batch_client, event.client_id.as_deref())?;
+        } else {
+            batch_client = event.client_id.as_deref();
+            last_event_version = Some(batch_version);
+        }
 
         if batch_version <= checkpoint_version {
             continue;
@@ -718,6 +927,8 @@ pub fn load(input: &Path, postgres_address: &str) -> DumpLoadResult<()> {
     let dump = parse_dump(input, &bytes)?;
     let volume_name = dump.volume.name.as_str();
 
+    // Validate the whole dump before any PostgreSQL transaction opens.
+    validate_manifest(&dump, true)?;
     validate_dump(&dump)?;
 
     apply_dump(postgres_address, &dump)?;
@@ -733,11 +944,17 @@ fn parse_dump(input: &Path, bytes: &[u8]) -> DumpLoadResult<MetadataDump> {
         DumpLoadError::Message(format!("failed to parse dump {}: {e}", input.display()))
     })?;
 
-    if header.dump_version != 4 {
-        return Err(DumpLoadError::Message(format!(
-            "unsupported dump version: {}",
-            header.dump_version
-        )));
+    if header.dump_version < DUMP_VERSION {
+        return Err(DumpLoadError::LegacyDump {
+            found: header.dump_version,
+        });
+    }
+    if header.dump_version > DUMP_VERSION {
+        return Err(DumpLoadError::ComponentNewer {
+            identity: "version",
+            found: header.dump_version,
+            newest: DUMP_VERSION,
+        });
     }
 
     serde_json::from_slice(bytes).map_err(|e| {
@@ -750,9 +967,7 @@ mod tests {
     use super::*;
     use sha2::{Digest, Sha256};
 
-    /// SFS-1002 baseline: a version-4 dump built from the pinned studiofs-meta
-    /// 0.2.5 fixtures, with a published checkpoint at version 4 and a replay
-    /// tail of batches 5..=7.
+    /// Pinned version 4 dump in the pre-0.2.5 layout; `load` must refuse it.
     fn baseline_dump_fixture() -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/dump-v4-0.2.5.json")
     }
@@ -767,89 +982,16 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "rewrites pinned fixtures; set STUDIOFS_REGENERATE_BASELINE_FIXTURES=1"]
-    fn regenerate_baseline_dump_fixture() {
-        if std::env::var_os("STUDIOFS_REGENERATE_BASELINE_FIXTURES").is_none() {
-            return;
+    fn load_refuses_v4_dump_with_upgrade_instruction() {
+        let error = load(&baseline_dump_fixture(), "postgres://unused").unwrap_err();
+        assert!(
+            matches!(error, DumpLoadError::LegacyDump { found: 4 }),
+            "{error:?}"
+        );
+        let message = error.to_string();
+        for step in ["0.2.4 binary", "studiofs upgrade", "0.2.5 or later"] {
+            assert!(message.contains(step), "{message}");
         }
-        let format_info = meta_baseline_fixture("format-info.json");
-        let info = decode_format_info(&format_info).unwrap();
-        let checkpoint = meta_baseline_fixture("serving-checkpoint.bin");
-        let event = |batch_version, event_type: &str, file: &str| DumpEvent {
-            batch_version,
-            event_type: event_type.to_string(),
-            event_payload: meta_baseline_fixture(&format!("events/{file}")),
-            client_id: Some("baseline-fixture-client".to_string()),
-            client_timestamp: Some(1_764_000_000_000),
-        };
-        let dump = MetadataDump {
-            dump_version: 4,
-            volume: DumpVolume {
-                vol: 1,
-                name: info.name.clone(),
-                uuid: info.uuid.clone(),
-                block_size: i32::try_from(info.block_size).unwrap(),
-            },
-            metadata_state_format_version: studiofs_meta::schema::CURRENT_FORMAT_VERSION as i16,
-            metadata_state_version: 7,
-            metadata_state_checkpoint_version: 4,
-            metadata_state_checkpoint_sha256: Sha256::digest(&checkpoint).to_vec(),
-            metadata_state_snapshot: checkpoint,
-            metadata_state_format_info: format_info,
-            metadata_state_publication_state: "published".to_string(),
-            metadata_state_generation: 2,
-            counters: vec![DumpCounter {
-                name: "nextInode".to_string(),
-                value: 12,
-            }],
-            event_log: vec![
-                event(
-                    5,
-                    "set_volume_settings",
-                    "tag-21-set-volume-settings-v3.bin",
-                ),
-                event(6, "set_xattr", "tag-10-set-xattr.bin"),
-                event(7, "add_entry", "tag-03-add-entry.bin"),
-            ],
-        };
-        write_dump_output(&baseline_dump_fixture(), &dump).unwrap();
-    }
-
-    #[test]
-    fn baseline_dump_fixture_decodes_with_current_binary() {
-        let path = baseline_dump_fixture();
-        let mut dump = parse_dump(&path, &std::fs::read(&path).unwrap()).unwrap();
-        // The pinned dump predates adoption: load refuses its format-6 volume.
-        assert!(matches!(
-            validate_dump(&dump),
-            Err(DumpLoadError::Meta(MetaError::NeedsMigration { found: 6 }))
-        ));
-        let current = studiofs_meta::schema::CURRENT_FORMAT_VERSION;
-        let mut header: studiofs_meta::schema::FormatInfo =
-            serde_json::from_slice(&dump.metadata_state_format_info).unwrap();
-        header.format_version = current;
-        dump.metadata_state_format_info = serde_json::to_vec(&header).unwrap();
-        dump.metadata_state_format_version = i16::try_from(current).unwrap();
-        validate_dump(&dump).unwrap();
-        assert_eq!(dump.dump_version, 4);
-        assert_eq!(
-            (
-                dump.metadata_state_checkpoint_version,
-                dump.metadata_state_version
-            ),
-            (4, 7)
-        );
-        assert_eq!(
-            dump.event_log
-                .iter()
-                .map(|event| event.batch_version)
-                .collect::<Vec<_>>(),
-            vec![5, 6, 7]
-        );
-        assert_eq!(
-            dump.metadata_state_snapshot,
-            meta_baseline_fixture("serving-checkpoint.bin")
-        );
     }
 
     #[test]
@@ -907,13 +1049,20 @@ mod tests {
     #[test]
     fn load_rejects_legacy_dump_before_full_deserialization() {
         let input = tempfile::NamedTempFile::new().unwrap();
-        std::fs::write(input.path(), br#"{"dump_version":3}"#).unwrap();
-
-        let err = load(input.path(), "postgres://unused").unwrap_err();
+        for found in [3, 4] {
+            std::fs::write(input.path(), format!(r#"{{"dump_version":{found}}}"#)).unwrap();
+            assert!(matches!(
+                load(input.path(), "postgres://unused"),
+                Err(DumpLoadError::LegacyDump { found: actual }) if actual == found
+            ));
+        }
+        std::fs::write(input.path(), r#"{"dump_version":6}"#).unwrap();
+        let error = load(input.path(), "postgres://unused").unwrap_err();
         assert!(matches!(
-            err,
-            DumpLoadError::Message(message) if message.contains("unsupported dump version: 3")
+            error,
+            DumpLoadError::ComponentNewer { found: 6, .. }
         ));
+        assert!(error.to_string().contains("upgrade studiofs"), "{error}");
     }
 
     #[test]
@@ -936,8 +1085,36 @@ mod tests {
     fn test_dump() -> MetadataDump {
         // An empty serving checkpoint: six empty postcard sequences.
         let snapshot = vec![0; 6];
-        MetadataDump {
-            dump_version: 4,
+        let mut format_info = studiofs_meta::FormatInfo::new(
+            "test".to_string(),
+            "test".to_string(),
+            studiofs_meta::FormatInfoDataStore {
+                endpoint: "http://localhost:9000".to_string(),
+                bucket: "test-bucket".to_string(),
+                access_key: "test".to_string(),
+                secret_key: "test".to_string(),
+                region: "us-east-1".to_string(),
+            },
+            4,
+        )
+        .unwrap();
+        format_info.metadata.backend = studiofs_meta::MetadataBackend::Postgres;
+        format_info.metadata.postgres = Some(studiofs_meta::PostgresConfig {
+            url: "postgres://localhost".to_string(),
+            volume_id: 1,
+        });
+        let mut dump = MetadataDump {
+            dump_version: DUMP_VERSION,
+            manifest: DumpManifest {
+                schema_revisions: BTreeMap::from([("core".into(), 1), ("payload_gc".into(), 2)]),
+                volume_protocol: VolumeProtocol::baseline(),
+                checkpoint: CheckpointEncoding {
+                    format: 0,
+                    schema: 0,
+                },
+                event_codec_revisions: BTreeSet::new(),
+                source_local_redb_revision: LOCAL_METADATA_LAYOUT.min_supported,
+            },
             volume: DumpVolume {
                 vol: 1,
                 name: "test".to_string(),
@@ -949,27 +1126,20 @@ mod tests {
             metadata_state_checkpoint_version: 1,
             metadata_state_snapshot: snapshot.clone(),
             metadata_state_checkpoint_sha256: Sha256::digest(&snapshot).to_vec(),
-            metadata_state_format_info: serde_json::to_vec(
-                &studiofs_meta::FormatInfo::new(
-                    "test".to_string(),
-                    "test-uuid".to_string(),
-                    studiofs_meta::FormatInfoDataStore {
-                        endpoint: "http://localhost:9000".to_string(),
-                        bucket: "test-bucket".to_string(),
-                        access_key: "test".to_string(),
-                        secret_key: "test".to_string(),
-                        region: "us-east-1".to_string(),
-                    },
-                    4,
-                )
-                .unwrap(),
-            )
-            .unwrap(),
+            metadata_state_format_info: serde_json::to_vec(&format_info).unwrap(),
             metadata_state_publication_state: "published".to_string(),
             metadata_state_generation: 1,
             counters: Vec::new(),
             event_log: Vec::new(),
-        }
+        };
+        refresh_manifest(&mut dump);
+        dump
+    }
+
+    /// Recompute the manifest fields that describe the checkpoint and event payloads.
+    fn refresh_manifest(dump: &mut MetadataDump) {
+        dump.manifest.checkpoint = dump_checkpoint(dump).validated_encoding().unwrap();
+        dump.manifest.event_codec_revisions = dump_event_revisions(&dump.event_log).unwrap();
     }
 
     #[test]
@@ -1182,6 +1352,353 @@ mod tests {
     #[test]
     fn valid_dump_passes_manifest_validation() {
         validate_dump(&test_dump()).expect("valid dump should pass manifest validation");
+    }
+
+    #[test]
+    fn dump_validation_rejects_mixed_client_identities() {
+        let mut dump = test_dump();
+        let version = dump.metadata_state_checkpoint_version + 1;
+        dump.metadata_state_version = version;
+        let mut identified = test_event(version);
+        identified.client_id = Some("writer".into());
+        let mut anonymous = test_event(version);
+        anonymous.client_id = None;
+        dump.event_log = vec![identified, anonymous];
+        refresh_manifest(&mut dump);
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("dump.json");
+        write_dump_output(&input, &dump).unwrap();
+
+        let error = load(&input, "invalid PostgreSQL DSN").unwrap_err();
+        assert!(
+            error.to_string().contains("mixed client identities"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn dump_validation_rejects_an_unsupported_event_before_restore() {
+        let mut dump = test_dump();
+        let version = dump.metadata_state_checkpoint_version + 1;
+        dump.metadata_state_version = version;
+        let mut event = test_event(version);
+        event.event_payload[7] = 255;
+        dump.event_log.push(event);
+        assert!(matches!(
+            validate_manifest(&dump, true),
+            Err(DumpLoadError::Meta(MetaError::UpgradeRequired { .. }))
+        ));
+    }
+
+    #[test]
+    fn manifest_accepts_supported_versions_and_rejects_mismatched_bytes() {
+        let mut dump = test_dump();
+        validate_manifest(&dump, true).unwrap();
+        let actual = dump.manifest.checkpoint;
+        dump.manifest.checkpoint.format =
+            studiofs_meta::version::BASELINE_SERVING_CHECKPOINT_FORMAT as i16;
+        assert_ne!(dump.manifest.checkpoint, actual);
+        assert!(
+            validate_manifest(&dump, true)
+                .unwrap_err()
+                .to_string()
+                .contains("does not match")
+        );
+        let mut dump = test_dump();
+        dump.manifest.event_codec_revisions.insert(1);
+        assert!(
+            validate_manifest(&dump, true)
+                .unwrap_err()
+                .to_string()
+                .contains("do not match")
+        );
+    }
+
+    #[test]
+    fn manifest_rejects_future_and_older_local_formats() {
+        for revision in [
+            LOCAL_METADATA_LAYOUT.min_supported - 1,
+            LOCAL_METADATA_LAYOUT.current + 1,
+        ] {
+            let mut dump = test_dump();
+            dump.manifest.source_local_redb_revision = revision;
+            let error = validate_manifest(&dump, true).unwrap_err();
+            assert!(error.to_string().contains(LOCAL_METADATA_LAYOUT.name));
+        }
+    }
+
+    #[test]
+    fn manifest_uses_required_capabilities_to_gate_restore() {
+        let mut dump = test_dump();
+        let cap = "event.required_future_capability";
+        let requirements = &mut dump.manifest.volume_protocol.requirements;
+        requirements.read.insert(cap.to_owned());
+        requirements.features.insert(
+            cap.to_owned(),
+            studiofs_meta::volume_protocol::FeatureState::Required,
+        );
+        let error = validate_manifest(&dump, true).unwrap_err();
+        assert!(matches!(
+            error,
+            DumpLoadError::Meta(MetaError::UpgradeRequired { .. })
+        ));
+        assert!(error.to_string().contains(cap));
+    }
+
+    #[test]
+    fn manifest_refuses_newer_components_with_upgrade_instruction() {
+        type Mutation = fn(&mut DumpManifest);
+        let cases: [(&str, Mutation); 4] = [
+            (SERVING_CHECKPOINT_FORMAT.name, |manifest| {
+                manifest.checkpoint.format = SERVING_CHECKPOINT_FORMAT.current as i16 + 1;
+            }),
+            (SERVING_CHECKPOINT_SCHEMA.name, |manifest| {
+                manifest.checkpoint.schema = SERVING_CHECKPOINT_SCHEMA.current as i16 + 1;
+            }),
+            (EVENT_CODEC_WIRE.name, |manifest| {
+                let revision = u8::try_from(EVENT_CODEC_WIRE.current + 1).unwrap();
+                manifest.event_codec_revisions.insert(revision);
+            }),
+            (LOCAL_METADATA_LAYOUT.name, |manifest| {
+                manifest.source_local_redb_revision = LOCAL_METADATA_LAYOUT.current + 1;
+            }),
+        ];
+        for (component, mutate) in cases {
+            let mut dump = test_dump();
+            mutate(&mut dump.manifest);
+            let error = validate_manifest(&dump, true).unwrap_err();
+            assert!(
+                matches!(&error, DumpLoadError::ComponentNewer { identity, .. } if *identity == component),
+                "{error:?}"
+            );
+            let message = error.to_string();
+            assert!(message.contains(component), "{message}");
+            assert!(message.contains("upgrade studiofs"), "{message}");
+        }
+
+        let mut dump = test_dump();
+        dump.manifest
+            .schema_revisions
+            .insert("core".into(), i32::MAX);
+        let error = validate_manifest(&dump, true).unwrap_err();
+        assert!(
+            matches!(
+                error,
+                DumpLoadError::Meta(MetaError::UpgradeRequired { .. })
+            ),
+            "{error:?}"
+        );
+        let message = error.to_string();
+        assert!(message.contains("`core`"), "{message}");
+        assert!(
+            message.contains("install a newer StudioFS release"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires the PostgreSQL test database"]
+    fn dump_load_roundtrip_restores_the_published_baseline() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let dsn = test_pg_dsn().expect("STUDIOFS_TEST_PG_DSN is required");
+        let dsn = rt
+            .block_on(ensure_studiofs_database(&dsn))
+            .unwrap()
+            .metadata_dsn;
+        let source = crate::cli::pg_test_schema::PgTestSchema::new(&dsn).unwrap();
+        let mut dump = test_dump();
+        dump.metadata_state_snapshot = meta_baseline_fixture("serving-checkpoint.bin");
+        dump.metadata_state_checkpoint_sha256 =
+            Sha256::digest(&dump.metadata_state_snapshot).to_vec();
+        dump.metadata_state_version = 2;
+        dump.event_log = vec![test_event(2)];
+        refresh_manifest(&mut dump);
+        let source_vol = apply_dump(source.dsn(), &dump).unwrap();
+
+        let captured =
+            load_remote_dump(source.dsn(), source_vol, LOCAL_METADATA_LAYOUT.current).unwrap();
+        validate_dump(&captured).unwrap();
+        validate_manifest(&captured, true).unwrap();
+        assert_eq!(captured.dump_version, DUMP_VERSION);
+        assert_eq!(captured.manifest.checkpoint, dump.manifest.checkpoint);
+        assert_eq!(
+            captured.manifest.event_codec_revisions,
+            dump.manifest.event_codec_revisions
+        );
+        assert!(captured.manifest.schema_revisions.contains_key("core"));
+        assert_eq!(
+            captured.metadata_state_snapshot,
+            dump.metadata_state_snapshot
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("dump.json");
+        write_dump_output(&input, &captured).unwrap();
+
+        let target = crate::cli::pg_test_schema::PgTestSchema::new(&dsn).unwrap();
+        // Reserve volume ID 1 so load must rebind the restored FormatInfo to ID 2.
+        rt.block_on(async {
+            let (mut client, connection) = connect_studiofs_postgres(target.dsn()).await.unwrap();
+            let task = tokio::spawn(connection);
+            let tx = client.transaction().await.unwrap();
+            ensure_registered_schema(&tx).await.unwrap();
+            tx.query_one("SELECT nextval('volumes_vol_seq')", &[])
+                .await
+                .unwrap();
+            tx.commit().await.unwrap();
+            drop(client);
+            task.await.unwrap().unwrap();
+        });
+        load(&input, target.dsn()).unwrap();
+
+        let restored = load_remote_dump(target.dsn(), 2, LOCAL_METADATA_LAYOUT.current).unwrap();
+        let format_info = decode_format_info(&restored.metadata_state_format_info).unwrap();
+        assert_eq!(format_info.metadata.postgres.unwrap().volume_id, 2);
+        assert_eq!(restored.metadata_state_publication_state, "published");
+        assert_eq!(
+            restored.metadata_state_snapshot,
+            captured.metadata_state_snapshot
+        );
+        assert_eq!(restored.manifest.checkpoint, captured.manifest.checkpoint);
+        assert_eq!(
+            restored.manifest.volume_protocol,
+            captured.manifest.volume_protocol
+        );
+        assert_eq!(
+            (
+                restored.metadata_state_checkpoint_version,
+                restored.metadata_state_version
+            ),
+            (1, 2)
+        );
+        assert_eq!(restored.event_log.len(), 1);
+        assert_eq!(
+            restored.event_log[0].event_payload,
+            captured.event_log[0].event_payload
+        );
+    }
+
+    #[test]
+    #[ignore = "requires the PostgreSQL test database"]
+    fn dump_refuses_a_volume_without_a_published_checkpoint() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let dsn = test_pg_dsn().expect("STUDIOFS_TEST_PG_DSN is required");
+        let dsn = rt
+            .block_on(ensure_studiofs_database(&dsn))
+            .unwrap()
+            .metadata_dsn;
+        let schema = crate::cli::pg_test_schema::PgTestSchema::new(&dsn).unwrap();
+        let vol = apply_dump(schema.dsn(), &test_dump()).unwrap();
+        rt.block_on(async {
+            let (client, connection) = connect_studiofs_postgres(schema.dsn()).await.unwrap();
+            let task = tokio::spawn(connection);
+            client
+                .execute(
+                    "UPDATE metadata_state SET checkpoint_publication_state = 'pending' WHERE vol = $1",
+                    &[&vol],
+                )
+                .await
+                .unwrap();
+            drop(client);
+            task.await.unwrap().unwrap();
+        });
+
+        let error = load_remote_dump(schema.dsn(), vol, LOCAL_METADATA_LAYOUT.current).unwrap_err();
+        assert!(
+            matches!(
+                &error,
+                DumpLoadError::CheckpointNotPublished { volume, state }
+                    if *volume == vol && state == "pending"
+            ),
+            "{error:?}"
+        );
+        assert!(error.to_string().contains("mount the volume"), "{error}");
+    }
+
+    #[test]
+    #[ignore = "requires the PostgreSQL test database"]
+    fn discovery_refuses_unsupported_replay_before_installing_local_metadata() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let dsn = test_pg_dsn().expect("STUDIOFS_TEST_PG_DSN is required");
+        let dsn = rt
+            .block_on(ensure_studiofs_database(&dsn))
+            .unwrap()
+            .metadata_dsn;
+        let schema = crate::cli::pg_test_schema::PgTestSchema::new(&dsn).unwrap();
+        let mut dump = test_dump();
+        dump.metadata_state_snapshot = meta_baseline_fixture("serving-checkpoint.bin");
+        dump.metadata_state_checkpoint_sha256 =
+            Sha256::digest(&dump.metadata_state_snapshot).to_vec();
+        let vol = apply_dump(schema.dsn(), &dump).unwrap();
+        let mut event = test_event(dump.metadata_state_checkpoint_version + 1);
+        event.event_payload[7] = 255;
+        rt.block_on(async {
+            let (mut client, connection) = connect_studiofs_postgres(schema.dsn()).await.unwrap();
+            let task = tokio::spawn(connection);
+            let tx = client.transaction().await.unwrap();
+            tx.execute(
+                "UPDATE metadata_state SET version = $2 WHERE vol = $1",
+                &[&vol, &event.batch_version],
+            ).await.unwrap();
+            tx.execute(
+                "INSERT INTO event_log (vol, batch_version, event_type, event_payload) VALUES ($1, $2, $3, $4)",
+                &[&vol, &event.batch_version, &event.event_type, &event.event_payload],
+            ).await.unwrap();
+            tx.commit().await.unwrap();
+            drop(client);
+            task.await.unwrap().unwrap();
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let error = crate::cli::discovery::run(&dump.volume.name, schema.dsn(), directory.path())
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            crate::cli::discovery::DiscoveryError::Meta(MetaError::UpgradeRequired { .. })
+        ));
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    #[ignore = "requires the PostgreSQL test database"]
+    fn failed_load_rolls_back_all_volume_metadata_and_allows_retry() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let dsn = test_pg_dsn().expect("STUDIOFS_TEST_PG_DSN is required");
+        let dsn = rt
+            .block_on(ensure_studiofs_database(&dsn))
+            .unwrap()
+            .metadata_dsn;
+        let schema = crate::cli::pg_test_schema::PgTestSchema::new(&dsn).unwrap();
+        let mut dump = test_dump();
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("dump.json");
+        dump.counters = vec![
+            DumpCounter {
+                name: "duplicate".into(),
+                value: 1
+            };
+            2
+        ];
+        write_dump_output(&input, &dump).unwrap();
+        assert!(
+            matches!(load(&input, schema.dsn()), Err(DumpLoadError::PostgresOperation { operation, .. }) if operation == "insert counter 'duplicate'")
+        );
+
+        rt.block_on(async {
+            let (client, connection) = connect_studiofs_postgres(schema.dsn()).await.unwrap();
+            let task = tokio::spawn(connection);
+            let row = client.query_one(
+                "SELECT (SELECT count(*) FROM volumes), (SELECT count(*) FROM metadata_state), (SELECT count(*) FROM volume_protocol), (SELECT count(*) FROM counters)",
+                &[],
+            ).await.unwrap();
+            for column in 0..4 {
+                assert_eq!(row.get::<_, i64>(column), 0);
+            }
+            drop(client);
+            task.await.unwrap().unwrap();
+        });
+
+        dump.counters.pop();
+        write_dump_output(&input, &dump).unwrap();
+        load(&input, schema.dsn()).unwrap();
     }
 
     #[test]
@@ -1415,6 +1932,7 @@ mod tests {
         dump.event_log = vec![test_event(99), test_event(101)];
         let mut format_info =
             decode_format_info(&dump.metadata_state_format_info).expect("test format info");
+        format_info.uuid.clone_from(&dump.volume.uuid);
         format_info.metadata.backend = studiofs_meta::MetadataBackend::Postgres;
         format_info.metadata.postgres = Some(studiofs_meta::PostgresConfig {
             url: "test-postgres-dsn".to_string(),
@@ -1452,7 +1970,7 @@ mod tests {
 
             let loader_dsn = metadata_dsn.clone();
             cleanup.loader = Some(std::thread::spawn(move || {
-                load_remote_dump(&loader_dsn, volume_id)
+                load_remote_dump(&loader_dsn, volume_id, LOCAL_METADATA_LAYOUT.min_supported)
             }));
             let wait_for_counter_query = tokio::time::timeout(Duration::from_secs(10), async {
                 loop {
@@ -1593,6 +2111,7 @@ mod tests {
         dump.volume.name = format!("sfs-1054-load-{id}");
         dump.volume.uuid = id;
         let mut format_info = decode_format_info(&dump.metadata_state_format_info).unwrap();
+        format_info.uuid.clone_from(&dump.volume.uuid);
         format_info.metadata.backend = studiofs_meta::MetadataBackend::Postgres;
         format_info.metadata.postgres = Some(studiofs_meta::PostgresConfig {
             url: "test-postgres-dsn".to_string(),

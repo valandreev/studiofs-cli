@@ -196,6 +196,9 @@ fn insert_pg_volume(dsn: &str, name: &str) -> (i64, String) {
             .await
             .expect("insert volume");
         let vol: i64 = row.get(0);
+        studiofs_meta::pg_engine::insert_initial_volume_protocol(&client, vol, "test fixture")
+            .await
+            .expect("insert volume protocol");
         let metadata_format_version =
             i16::try_from(CURRENT_FORMAT_VERSION).expect("current format fits PostgreSQL SMALLINT");
         let empty_checkpoint = Vec::<u8>::new();

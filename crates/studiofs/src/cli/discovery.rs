@@ -3,7 +3,7 @@
 use clap::Args;
 use std::path::Path;
 use studiofs_meta::{
-    FormatInfo, MetaError, PgSnapshotBackend, RedbMetaEngine, connect_studiofs_postgres,
+    FormatInfo, RedbMetaEngine, connect_studiofs_postgres,
     decode_format_info as decode_persisted_format_info, ensure_studiofs_database,
 };
 use thiserror::Error;
@@ -25,11 +25,11 @@ pub type DiscoveryResult<T> = std::result::Result<T, DiscoveryError>;
     about = "Discover an existing PostgreSQL-backed volume and create local metadata for this client"
 )]
 #[command(long_about = "\
-Download the latest PostgreSQL checkpoint for an existing shared volume and \
+Download a compatible PostgreSQL checkpoint for an existing shared volume and \
 create the local metadata cache for this client.
 
 Use this on additional machines or user profiles after the volume was created \
-with `studiofs init`. Discovery installs one validated local checkpoint; runtime \
+with `studiofs init`. Discovery checks the replay tail and installs one validated local checkpoint; runtime \
 convergence starts later when the local metadata engine is mounted.")]
 #[command(after_help = "\
 EXAMPLES:
@@ -71,23 +71,33 @@ const FETCH_REMOTE_VOLUME_ID_QUERY: &str = r#"
     "#;
 
 fn load_remote_discovery_state(name: &str, meta_dsn: &str) -> DiscoveryResult<DiscoveredState> {
-    let (postgres_dsn, volume_id) = crate::runtime_bridge::block_on(async move {
+    let (postgres_dsn, descriptor) = crate::runtime_bridge::block_on(async move {
         let postgres_dsn = ensure_studiofs_database(meta_dsn).await?.metadata_dsn;
-        let volume_id = fetch_remote_volume_id(name, &postgres_dsn).await?;
-        Ok::<_, DiscoveryError>((postgres_dsn, volume_id))
+        let (mut client, connection) = connect_studiofs_postgres(&postgres_dsn).await?;
+        let conn_task = tokio::spawn(connection);
+        let result = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            let tx = client
+                .build_transaction()
+                .isolation_level(tokio_postgres::IsolationLevel::RepeatableRead)
+                .read_only(true)
+                .start()
+                .await
+                .map_err(discovery_query_error)?;
+            let volume_id = fetch_remote_volume_id(name, &tx).await?;
+            let descriptor =
+                studiofs_meta::pg_engine::read_compatible_checkpoint(&tx, volume_id).await?;
+            studiofs_meta::pg_engine::validate_checkpoint_replay(&tx, &descriptor).await?;
+            tx.commit().await.map_err(discovery_query_error)?;
+            Ok::<_, DiscoveryError>(descriptor)
+        })
+        .await;
+        drop(client);
+        conn_task.abort();
+        let _ = conn_task.await;
+        let descriptor =
+            result.map_err(|_| DiscoveryError::Message("discovery timed out".into()))??;
+        Ok::<_, DiscoveryError>((postgres_dsn, descriptor))
     })?;
-
-    let backend = PgSnapshotBackend::open(&postgres_dsn, volume_id)?;
-    let descriptor = backend
-        .read_bootstrap_checkpoint()
-        .map_err(|error| match error {
-            MetaError::BootstrapCheckpointDescriptorMissing => {
-                DiscoveryError::Message(format!(
-                    "volume '{name}' not found or not initialized in metadata_state (run init + first sync)"
-                ))
-            }
-            other => DiscoveryError::Meta(other),
-        })?;
     let mut format_info = decode_persisted_format_info(&descriptor.format_info_bytes)?;
     let pg = format_info.metadata.postgres.as_mut().ok_or_else(|| {
         DiscoveryError::Message("discovered format is not postgres-backed".to_string())
@@ -102,34 +112,27 @@ fn load_remote_discovery_state(name: &str, meta_dsn: &str) -> DiscoveryResult<Di
     })
 }
 
-async fn fetch_remote_volume_id(name: &str, postgres_dsn: &str) -> DiscoveryResult<i64> {
-    let (client, connection) = connect_studiofs_postgres(postgres_dsn).await?;
-    let conn_task = tokio::spawn(connection);
+fn discovery_query_error(error: tokio_postgres::Error) -> DiscoveryError {
+    let code = error
+        .code()
+        .map_or("connection error", |state| state.code());
+    DiscoveryError::Message(format!("discover query failed ({code})"))
+}
 
-    let result = tokio::time::timeout(std::time::Duration::from_secs(10), async {
-        let row = client
-            .query_opt(FETCH_REMOTE_VOLUME_ID_QUERY, &[&name])
-            .await
-            .map_err(|e| DiscoveryError::Message(format!("discover query failed: {e}")))?;
-
-        let row = row.ok_or_else(|| {
-            DiscoveryError::Message(format!(
-                "volume '{name}' not found or not initialized in metadata_state (run init + first sync)"
-            ))
-        })?;
-
-        row.try_get::<_, i64>("vol").map_err(|error| {
-            DiscoveryError::Message(format!("discover volume id row parse failed: {error}"))
-        })
-    })
-    .await
-    .map_err(|_| DiscoveryError::Message("discovery volume query timed out".to_string()))
-    .flatten();
-
-    drop(client);
-    conn_task.abort();
-    let _ = conn_task.await;
-    result
+async fn fetch_remote_volume_id(
+    name: &str,
+    tx: &tokio_postgres::Transaction<'_>,
+) -> DiscoveryResult<i64> {
+    let row = tx
+        .query_opt(FETCH_REMOTE_VOLUME_ID_QUERY, &[&name])
+        .await
+        .map_err(discovery_query_error)?;
+    let row = row.ok_or_else(|| {
+        DiscoveryError::Message(format!(
+            "volume '{name}' not found or not initialized in metadata_state (run init + first sync)"
+        ))
+    })?;
+    row.try_get("vol").map_err(discovery_query_error)
 }
 
 fn install_staged_database(staged_db_path: &Path, active_db_path: &Path) -> DiscoveryResult<()> {

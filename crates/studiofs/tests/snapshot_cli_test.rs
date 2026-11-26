@@ -96,6 +96,9 @@ async fn insert_pg_volume(client: &tokio_postgres::Client, name: &str) -> (i64, 
         .await
         .expect("insert PostgreSQL volume");
     let volume_id = row.get::<_, i64>(0);
+    studiofs_meta::pg_engine::insert_initial_volume_protocol(client, volume_id, "test fixture")
+        .await
+        .expect("insert PostgreSQL volume protocol");
     (volume_id, uuid)
 }
 
