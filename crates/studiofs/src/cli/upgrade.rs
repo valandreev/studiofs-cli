@@ -101,7 +101,7 @@ impl UpgradeArgs {
         finish_local_upgrade(&local, &format, &shared, &layout.redb_index_path)
             .context("Shared format is upgraded; local completion failed. Keep this cache and retry upgrade; do not reinitialize or clear it")?;
         println!(
-            "Volume '{}' uses format {}. Repeat upgrade on every other stopped cache before remounting.",
+            "Volume '{}' now uses format {}. Repeat upgrade on every other stopped cache before remounting.",
             self.name, shared.format_version
         );
         Ok(())

@@ -291,8 +291,8 @@ fn decode_upgrade_header(header: &serde_json::Value) -> MetaResult<FormatInfo> {
 fn verify_shared_header(local: &FormatInfo, shared: &FormatInfo) -> MetaResult<()> {
     // Fields that legitimately differ are not identity: `discover` stores this
     // client's own DSN, and shared S3 settings may change while this cache is
-    // stopped (the PostgreSQL engine refreshes them on open). The local header
-    // keeps its values.
+    // stopped (the PostgreSQL engine refreshes them on open). Only this
+    // comparison copy takes the shared values; the stored local header keeps its own.
     let mut local = local.clone();
     local.endpoint.clone_from(&shared.endpoint);
     local.bucket.clone_from(&shared.bucket);
