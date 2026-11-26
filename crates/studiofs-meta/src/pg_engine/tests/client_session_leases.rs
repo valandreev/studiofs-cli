@@ -597,6 +597,7 @@ fn client_session_leases_stamp_shared_format5_upgrade_without_policy() {
         let mut fmt5 = volume.format_info();
         fmt5.format_version = 5;
         let fmt5_bytes = serde_json::to_vec(&fmt5).expect("encode format 5");
+        drop_volume_protocol(&client, vol).await?;
         client
             .execute(
                 "UPDATE metadata_state SET metadata_format_version = 5, format_info = $2 WHERE vol = $1",
@@ -655,6 +656,7 @@ fn published_format_adoption_retries_and_fences_legacy_publication() {
             let mut header = volume.format_info();
             header.format_version = u16::try_from(initial).unwrap();
             let bytes = serde_json::to_vec(&header).unwrap();
+            drop_volume_protocol(&client, vol).await?;
             client.execute(
                 "UPDATE metadata_state SET metadata_format_version=$2, format_info=$3 WHERE vol=$1",
                 &[&vol, &initial, &bytes],

@@ -13,6 +13,50 @@ use crate::snapshot_ports::{SnapshotMountStore, SnapshotPortError};
 use chrono::{TimeZone, Utc};
 
 #[test]
+#[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
+fn missing_snapshot_does_not_discard_healthy_pool_connection() {
+    let dsn = pg_dsn().expect("STUDIOFS_TEST_PG_DSN is required");
+    let schema = IsolatedPgSchema::new(&dsn);
+    let volume = PgTestVolume::new(&schema.dsn, "snapshot-mount-pool");
+    let dir = studiofs_test_support::workspace_target_tempdir("snapshot-mount-pool-");
+    let db = dir.path().join("meta.redb");
+    seed_local(&db, &volume.format_info());
+    let engine = PgMetaEngine::open_with_options(
+        &db,
+        PgOpenOptions {
+            background_poll: false,
+            fresh_client: false,
+            ..Default::default()
+        },
+    )
+    .expect("open PostgreSQL metadata engine");
+
+    let snapshot_id = SnapshotId::from_cut(&volume.name, Utc::now()).expect("valid snapshot ID");
+    let before = engine.command_pool_stats();
+    let error = run_async(async {
+        Ok::<_, MetaError>(
+            engine
+                .acquire(
+                    &snapshot_id,
+                    "mount-owner",
+                    &volume.uuid,
+                    &SnapshotSha256::from_bytes([0x31; 32]),
+                    Duration::from_secs(60),
+                )
+                .await,
+        )
+    })
+    .expect("run mount lease acquisition")
+    .expect_err("missing snapshot must be rejected");
+
+    assert_eq!(
+        error,
+        SnapshotPortError::permanent("snapshot_not_found", "snapshot does not exist")
+    );
+    assert_eq!(engine.command_pool_stats().discarded - before.discarded, 0);
+}
+
+#[test]
 fn snapshot_schema_v2_replaces_legacy_snapshot_schema() {
     let ddl = crate::pg_engine::schema::studiofs_pg_schema_sql();
 
@@ -445,6 +489,7 @@ fn mount_renewal_is_fenced_by_active_cleanup_claim() {
     })
     .expect("insert active cleanup claim");
 
+    let before = engine.command_pool_stats();
     let renewal = run_async(async {
         Ok::<_, MetaError>(engine.renew(&mount_lease, Duration::from_secs(60)).await)
     })
@@ -454,6 +499,20 @@ fn mount_renewal_is_fenced_by_active_cleanup_claim() {
         renewal,
         SnapshotPortError::Permanent { code, .. } if code.as_str() == "stale_lease"
     ));
+    assert_eq!(engine.command_pool_stats().discarded, before.discarded);
+
+    let fenced_lease = crate::snapshot::SnapshotMountLease {
+        fencing_token: -1,
+        ..mount_lease
+    };
+    let release = run_async(async { Ok::<_, MetaError>(engine.release(&fenced_lease).await) })
+        .expect("run mount lease release")
+        .expect_err("mismatched fencing token must reject mount release");
+    assert!(matches!(
+        release,
+        SnapshotPortError::Permanent { code, .. } if code.as_str() == "stale_lease"
+    ));
+    assert_eq!(engine.command_pool_stats().discarded, before.discarded);
 }
 
 #[test]

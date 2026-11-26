@@ -1,3 +1,4 @@
+use super::{runtime::finish_pooled_transaction, volume_protocol::is_volume_read_policy_rejection};
 use crate::engine::MetaError;
 use crate::snapshot::{SnapshotId, SnapshotMountLease, SnapshotSha256};
 use crate::snapshot_ports::{SnapshotMountStore, SnapshotPortError, SnapshotPortFuture};
@@ -32,12 +33,23 @@ fn map_error(operation: &'static str, error: MetaError) -> SnapshotPortError {
         MetaError::Storage(message) if message == SNAPSHOT_NOT_READY => {
             SnapshotPortError::permanent("snapshot_not_ready", "snapshot is not ready")
         }
+        MetaError::UpgradeRequired { .. } | MetaError::NeedsMigration { .. } => {
+            SnapshotPortError::permanent("volume_incompatible", &error.to_string())
+        }
         _ => SnapshotPortError::from_backend(operation, &error.to_string()),
     }
 }
 
 fn pg_failure(operation: &'static str) -> MetaError {
     MetaError::RemoteUnavailable(format!("snapshot PostgreSQL operation failed: {operation}"))
+}
+
+fn is_mount_lease_rejection(error: &MetaError) -> bool {
+    matches!(
+        error,
+        MetaError::Storage(message)
+            if matches!(message.as_str(), STALE_LEASE | SNAPSHOT_NOT_FOUND | SNAPSHOT_NOT_READY)
+    ) || is_volume_read_policy_rejection(error)
 }
 
 fn lease_from_row(
@@ -95,77 +107,84 @@ impl SnapshotMountStore for super::PgMetaEngine {
                             .transaction()
                             .await
                             .map_err(|_| pg_failure("begin mount lease acquisition"))?;
-                        let catalog = tx
-                            .query_opt(
-                                "SELECT lifecycle, (expires_at IS NULL OR expires_at > clock_timestamp())
-                                 FROM snapshot_catalog
-                                 WHERE vol = $1 AND id = $2
-                                 FOR UPDATE",
-                                &[&volume_id, &snapshot_id_text],
-                            )
-                            .await
-                            .map_err(|_| pg_failure("load mount snapshot catalog"))?;
-                        let Some(catalog) = catalog else {
-                            return Err(MetaError::Storage(SNAPSHOT_NOT_FOUND.to_string()));
-                        };
-                        let lifecycle: String = catalog.get(0);
-                        let unexpired: bool = catalog.get(1);
-                        if lifecycle != "ready" || !unexpired {
-                            return Err(MetaError::Storage(SNAPSHOT_NOT_READY.to_string()));
-                        }
+                        let acquisition = async {
+                            super::check_volume_read_policy(&tx, volume_id, None).await?;
+                            let catalog = tx
+                                .query_opt(
+                                    "SELECT lifecycle, (expires_at IS NULL OR expires_at > clock_timestamp())
+                                     FROM snapshot_catalog
+                                     WHERE vol = $1 AND id = $2
+                                     FOR UPDATE",
+                                    &[&volume_id, &snapshot_id_text],
+                                )
+                                .await
+                                .map_err(|_| pg_failure("load mount snapshot catalog"))?;
+                            let Some(catalog) = catalog else {
+                                return Err(MetaError::Storage(SNAPSHOT_NOT_FOUND.to_string()));
+                            };
+                            let lifecycle: String = catalog.get(0);
+                            let unexpired: bool = catalog.get(1);
+                            if lifecycle != "ready" || !unexpired {
+                                return Err(MetaError::Storage(SNAPSHOT_NOT_READY.to_string()));
+                            }
 
-                        let inserted = tx
-                            .query_opt(
-                                "INSERT INTO snapshot_mount_leases
-                                    (vol, snapshot_id, owner, cache_volume_uuid, cache_sha256,
-                                     lease_expires_at, heartbeat_at)
-                                 SELECT c.vol, c.id, $3, $4, $5,
-                                        clock_timestamp() + ($6::double precision * interval '1 millisecond'),
-                                        clock_timestamp()
-                                 FROM snapshot_catalog AS c
-                                 WHERE c.vol = $1
-                                   AND c.id = $2
-                                   AND c.lifecycle = 'ready'
-                                   AND (c.expires_at IS NULL OR c.expires_at > clock_timestamp())
-                                 RETURNING lease_id",
-                                &[
-                                    &volume_id,
-                                    &snapshot_id_text,
-                                    &owner,
-                                    &cache_volume_uuid,
-                                    &cache_sha256.as_bytes().as_slice(),
-                                    &lease_ms,
-                                ],
-                            )
-                            .await
-                            .map_err(|_| pg_failure("insert mount lease"))?
-                            .ok_or_else(|| MetaError::Storage(SNAPSHOT_NOT_READY.to_string()))?;
-                        let lease_id: i64 = inserted.get(0);
-                        let row = tx
-                            .query_one(
-                                "UPDATE snapshot_mount_leases
-                                 SET fencing_token = lease_id
-                                 WHERE lease_id = $1
-                                 RETURNING lease_id, lease_expires_at, heartbeat_at, fencing_token",
-                                &[&lease_id],
-                            )
-                            .await
-                            .map_err(|_| pg_failure("fence mount lease"))?;
-                        tx.commit()
-                            .await
-                            .map_err(|_| pg_failure("commit mount lease acquisition"))?;
-                        Ok(lease_from_row(
-                            &row,
-                            snapshot_id,
-                            owner,
-                            cache_volume_uuid,
-                            cache_sha256,
-                        ))
+                            let inserted = tx
+                                .query_opt(
+                                    "INSERT INTO snapshot_mount_leases
+                                        (vol, snapshot_id, owner, cache_volume_uuid, cache_sha256,
+                                         lease_expires_at, heartbeat_at)
+                                     SELECT c.vol, c.id, $3, $4, $5,
+                                            clock_timestamp() + ($6::double precision * interval '1 millisecond'),
+                                            clock_timestamp()
+                                     FROM snapshot_catalog AS c
+                                     WHERE c.vol = $1
+                                       AND c.id = $2
+                                       AND c.lifecycle = 'ready'
+                                       AND (c.expires_at IS NULL OR c.expires_at > clock_timestamp())
+                                     RETURNING lease_id",
+                                    &[
+                                        &volume_id,
+                                        &snapshot_id_text,
+                                        &owner,
+                                        &cache_volume_uuid,
+                                        &cache_sha256.as_bytes().as_slice(),
+                                        &lease_ms,
+                                    ],
+                                )
+                                .await
+                                .map_err(|_| pg_failure("insert mount lease"))?
+                                .ok_or_else(|| MetaError::Storage(SNAPSHOT_NOT_READY.to_string()))?;
+                            let lease_id: i64 = inserted.get(0);
+                            let row = tx
+                                .query_one(
+                                    "UPDATE snapshot_mount_leases
+                                     SET fencing_token = lease_id
+                                     WHERE lease_id = $1
+                                     RETURNING lease_id, lease_expires_at, heartbeat_at, fencing_token",
+                                    &[&lease_id],
+                                )
+                                .await
+                                .map_err(|_| pg_failure("fence mount lease"))?;
+                            Ok(lease_from_row(
+                                &row,
+                                snapshot_id,
+                                owner,
+                                cache_volume_uuid,
+                                cache_sha256,
+                            ))
+                        }
+                        .await;
+                        finish_pooled_transaction(tx, acquisition, is_mount_lease_rejection, |_| {
+                            pg_failure("finish mount lease acquisition")
+                        })
+                        .await
                     })
                 },
             )
             .await;
-            result.map_err(|error| map_error("acquire snapshot mount lease", error))
+            result
+                .flatten()
+                .map_err(|error| map_error("acquire snapshot mount lease", error))
         })
     }
 
@@ -187,91 +206,96 @@ impl SnapshotMountStore for super::PgMetaEngine {
                 "renew snapshot mount lease",
                 |client| {
                     Box::pin(async move {
-                        let snapshot_id = lease.snapshot_id.as_str();
                         let tx = client
                             .transaction()
                             .await
                             .map_err(|_| pg_failure("begin mount lease renewal"))?;
-                        let catalog = tx
-                            .query_opt(
-                                "SELECT lifecycle
-                                 FROM snapshot_catalog
-                                 WHERE vol = $1 AND id = $2
-                                 FOR UPDATE",
-                                &[&volume_id, &snapshot_id],
-                            )
-                            .await
-                            .map_err(|_| pg_failure("load mount catalog for renewal"))?;
-                        let Some(catalog) = catalog else {
-                            return Err(MetaError::Storage(SNAPSHOT_NOT_FOUND.to_string()));
-                        };
-                        let lifecycle: String = catalog.get(0);
-                        if !matches!(lifecycle.as_str(), "ready" | "deleting") {
-                            return Err(MetaError::Storage(STALE_LEASE.to_string()));
+                        let renewal = async {
+                            let snapshot_id = lease.snapshot_id.as_str();
+                            let catalog = tx
+                                .query_opt(
+                                    "SELECT lifecycle
+                                     FROM snapshot_catalog
+                                     WHERE vol = $1 AND id = $2
+                                     FOR UPDATE",
+                                    &[&volume_id, &snapshot_id],
+                                )
+                                .await
+                                .map_err(|_| pg_failure("load mount catalog for renewal"))?;
+                            let Some(catalog) = catalog else {
+                                return Err(MetaError::Storage(SNAPSHOT_NOT_FOUND.to_string()));
+                            };
+                            let lifecycle: String = catalog.get(0);
+                            if !matches!(lifecycle.as_str(), "ready" | "deleting") {
+                                return Err(MetaError::Storage(STALE_LEASE.to_string()));
+                            }
+                            let cleanup_claimed: bool = tx
+                                .query_one(
+                                    "SELECT EXISTS (
+                                        SELECT 1
+                                        FROM snapshot_cleanup_leases
+                                        WHERE vol = $1
+                                          AND snapshot_id = $2
+                                          AND owner <> ''
+                                          AND lease_expires_at > clock_timestamp()
+                                    )",
+                                    &[&volume_id, &snapshot_id],
+                                )
+                                .await
+                                .map_err(|_| pg_failure("check cleanup claim for mount renewal"))?
+                                .get(0);
+                            if cleanup_claimed {
+                                return Err(MetaError::Storage(STALE_LEASE.to_string()));
+                            }
+                            let updated = tx
+                                .query_opt(
+                                    "UPDATE snapshot_mount_leases
+                                     SET lease_expires_at = clock_timestamp() + ($8::double precision * interval '1 millisecond'),
+                                         heartbeat_at = clock_timestamp()
+                                     WHERE lease_id = $1
+                                       AND vol = $2
+                                       AND snapshot_id = $3
+                                       AND owner = $4
+                                       AND cache_volume_uuid = $5
+                                       AND cache_sha256 = $6
+                                       AND fencing_token = $7
+                                       AND released_at IS NULL
+                                       AND lease_expires_at > clock_timestamp()
+                                     RETURNING lease_id, lease_expires_at, heartbeat_at, fencing_token",
+                                    &[
+                                        &lease.lease_id,
+                                        &volume_id,
+                                        &snapshot_id,
+                                        &lease.owner,
+                                        &lease.cache_volume_uuid,
+                                        &&cache_sha256[..],
+                                        &lease.fencing_token,
+                                        &lease_ms,
+                                    ],
+                                )
+                                .await
+                                .map_err(|_| pg_failure("renew mount lease"))?
+                                .ok_or_else(|| MetaError::Storage(STALE_LEASE.to_string()))?;
+                            Ok(lease_from_row(
+                                &updated,
+                                lease.snapshot_id,
+                                lease.owner,
+                                lease.cache_volume_uuid,
+                                lease.cache_sha256,
+                            ))
                         }
-                        let cleanup_claimed: bool = tx
-                            .query_one(
-                                "SELECT EXISTS (
-                                    SELECT 1
-                                    FROM snapshot_cleanup_leases
-                                    WHERE vol = $1
-                                      AND snapshot_id = $2
-                                      AND owner <> ''
-                                      AND lease_expires_at > clock_timestamp()
-                                )",
-                                &[&volume_id, &snapshot_id],
-                            )
-                            .await
-                            .map_err(|_| pg_failure("check cleanup claim for mount renewal"))?
-                            .get(0);
-                        if cleanup_claimed {
-                            return Err(MetaError::Storage(STALE_LEASE.to_string()));
-                        }
-                        let updated = tx
-                            .query_opt(
-                                "UPDATE snapshot_mount_leases
-                                 SET lease_expires_at = clock_timestamp() + ($8::double precision * interval '1 millisecond'),
-                                     heartbeat_at = clock_timestamp()
-                                 WHERE lease_id = $1
-                                   AND vol = $2
-                                   AND snapshot_id = $3
-                                   AND owner = $4
-                                   AND cache_volume_uuid = $5
-                                   AND cache_sha256 = $6
-                                   AND fencing_token = $7
-                                   AND released_at IS NULL
-                                   AND lease_expires_at > clock_timestamp()
-                                 RETURNING lease_id, lease_expires_at, heartbeat_at, fencing_token",
-                                &[
-                                    &lease.lease_id,
-                                    &volume_id,
-                                    &snapshot_id,
-                                    &lease.owner,
-                                    &lease.cache_volume_uuid,
-                                    &&cache_sha256[..],
-                                    &lease.fencing_token,
-                                    &lease_ms,
-                                ],
-                            )
-                            .await
-                            .map_err(|_| pg_failure("renew mount lease"))?
-                            .ok_or_else(|| MetaError::Storage(STALE_LEASE.to_string()))?;
-                        let renewed = lease_from_row(
-                            &updated,
-                            lease.snapshot_id,
-                            lease.owner,
-                            lease.cache_volume_uuid,
-                            lease.cache_sha256,
-                        );
-                        tx.commit()
-                            .await
-                            .map_err(|_| pg_failure("commit mount lease renewal"))?;
-                        Ok(renewed)
+                        .await;
+                        finish_pooled_transaction(tx, renewal, is_mount_lease_rejection, |_| {
+                            pg_failure("finish mount lease renewal")
+                        })
+                        .await
                     })
                 },
             )
             .await;
-            result.map_err(|error| map_error("renew snapshot mount lease", error))
+            result
+                .flatten()
+                .map_err(|error| map_error("renew snapshot mount lease", error))
         })
     }
 
@@ -289,7 +313,7 @@ impl SnapshotMountStore for super::PgMetaEngine {
                 |client| {
                     Box::pin(async move {
                         let snapshot_id = lease.snapshot_id.as_str();
-                        let updated = client
+                        client
                             .execute(
                                 "UPDATE snapshot_mount_leases
                                  SET released_at = clock_timestamp(),
@@ -313,16 +337,20 @@ impl SnapshotMountStore for super::PgMetaEngine {
                                 ],
                             )
                             .await
-                            .map_err(|_| pg_failure("release mount lease"))?;
-                        if updated == 0 {
-                            return Err(MetaError::Storage(STALE_LEASE.to_string()));
-                        }
-                        Ok(())
+                            .map_err(|_| pg_failure("release mount lease"))
                     })
                 },
             )
             .await;
-            result.map_err(|error| map_error("release snapshot mount lease", error))
+            let updated =
+                result.map_err(|error| map_error("release snapshot mount lease", error))?;
+            if updated == 0 {
+                return Err(map_error(
+                    "release snapshot mount lease",
+                    MetaError::Storage(STALE_LEASE.to_string()),
+                ));
+            }
+            Ok(())
         })
     }
 

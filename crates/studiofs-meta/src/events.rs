@@ -551,6 +551,14 @@ pub(crate) fn decode_event(bytes: &[u8]) -> MetaResult<MetaEvent> {
     decode_tagged_event(tag, payload)
 }
 
+/// Encoding revision of a validated event. Zero denotes the legacy postcard encoding.
+pub fn persisted_event_revision(event_type: &str, bytes: &[u8]) -> MetaResult<u8> {
+    decode_event_with_type(event_type, bytes)?;
+    Ok(bytes
+        .strip_prefix(&META_EVENT_WIRE_MAGIC)
+        .map_or(0, |header| header[0]))
+}
+
 pub(crate) fn decode_event_with_type(event_type: &str, bytes: &[u8]) -> MetaResult<MetaEvent> {
     let (tag, payload) = decode_event_wire_parts(bytes)?;
     let kind = event_codec(tag)?;

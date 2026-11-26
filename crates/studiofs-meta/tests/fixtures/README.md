@@ -34,10 +34,9 @@ candidate. Regenerate only with the baseline encoder, never a successor build:
 
 - Baseline: `STUDIOFS_REGENERATE_BASELINE_FIXTURES=1 cargo test -p <crate>
   <generator> -- --ignored`. Generators are `#[ignore]` and also skip without
-  the variable, so normal and `--ignored` runs never rewrite fixtures. Run the
-  `studiofs-meta` generator first: the `studiofs` dump generator
-  (`regenerate_baseline_dump_fixture`) reads the meta format-info, checkpoint
-  and event fixtures.
+  the variable, so normal and `--ignored` runs never rewrite fixtures. The
+  pinned `studiofs` version 4 dump (`dump-v4-0.2.5.json`) has no generator; it
+  stays only as the input that `load` must refuse.
 - Published v0.2.2 / v0.2.4 volumes: `pwsh
   tools/fixtures/capture-published-volume-fixtures.ps1`. It downloads and
   verifies the release binary, runs the opt-in `studiofs-e2e` scenario

@@ -811,6 +811,7 @@ fn setup_pg_volume(dsn: &str, name: &str, uuid: &str, block_size: u32) -> MetaRe
                 MetaError::Storage(format!("postgres volume upsert failed: {}", pg_err(e)))
             })?;
         let volume_id: i64 = row.get(0);
+        crate::pg_engine::insert_initial_volume_protocol(&tx, volume_id, "test fixture").await?;
 
         let empty_checkpoint = postcard::to_stdvec(&crate::snapshot::ServingCheckpoint::default())
             .map_err(|e| MetaError::Serialization(format!("snapshot encode failed: {e}")))?;
@@ -856,6 +857,18 @@ fn setup_pg_volume(dsn: &str, name: &str, uuid: &str, block_size: u32) -> MetaRe
         conn_task.abort();
         Ok(volume_id)
     })
+}
+
+/// Turns a fixture volume back into a pre-policy one. Format 5/6 volumes have no
+/// policy row, and the SFS-1132 fence refuses a downgrade while one exists.
+async fn drop_volume_protocol(client: &tokio_postgres::Client, volume: i64) -> MetaResult<()> {
+    client
+        .batch_execute(&format!(
+            "DELETE FROM volume_protocol_history WHERE vol = {volume};
+             DELETE FROM volume_protocol WHERE vol = {volume};"
+        ))
+        .await
+        .map_err(|e| MetaError::Storage(pg_err(e)))
 }
 
 fn format_info(name: &str, uuid: &str, dsn: &str, volume_id: i64) -> FormatInfo {

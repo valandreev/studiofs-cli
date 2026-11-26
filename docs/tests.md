@@ -155,6 +155,18 @@ cargo test -p studiofs-meta pg_engine::tests:: --lib -- --ignored --test-threads
 cargo test -p studiofs --bin studiofs cli:: -- --ignored --test-threads=1 --nocapture
 ```
 
+The `cli::dump_load::tests` PostgreSQL cases cover the SFS-1013 dump/load
+contract: a 0.2.5+ dump round-trips through a different volume ID, `dump`
+refuses a volume whose baseline checkpoint is not published, and a failed load
+rolls back every row. Unit cases refuse a version 4 (0.2.4) dump with the
+upgrade instruction, refuse a manifest with a newer component, and reject a
+mixed `client_id` batch before PostgreSQL is contacted. Take a backup before
+you run `load` against anything but a disposable test database.
+
+```bash
+cargo test -p studiofs --bin studiofs cli::dump_load::tests -- --include-ignored --test-threads=1
+```
+
 ### SFS-772 Live S3 and Combined S3/PostgreSQL CI Gate
 
 The automatic Linux gate in `.github/workflows/linux.yml` starts the

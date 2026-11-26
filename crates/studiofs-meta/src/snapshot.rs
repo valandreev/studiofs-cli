@@ -408,6 +408,24 @@ impl ServingCheckpoint {
         bytes
     }
 
+    pub(crate) fn published_encoding(bytes: &[u8]) -> crate::MetaResult<crate::CheckpointEncoding> {
+        let corrupt = || crate::MetaError::InvalidCheckpointDescriptor {
+            reason: crate::CheckpointDescriptorFailure::CheckpointBytes,
+        };
+        if let Some(envelope) = bytes.strip_prefix(CHECKPOINT_ENVELOPE_MAGIC) {
+            let [a, b, c, d] = *envelope.first_chunk::<4>().ok_or_else(corrupt)?;
+            return Ok(crate::CheckpointEncoding {
+                format: i16::from_be_bytes([a, b]),
+                schema: i16::from_be_bytes([c, d]),
+            });
+        }
+        let (_, format) = Self::decode_legacy(bytes).map_err(|_| corrupt())?;
+        Ok(crate::CheckpointEncoding {
+            format,
+            schema: Self::BASELINE_SCHEMA_VERSION,
+        })
+    }
+
     pub(crate) fn check_encoding(encoding: crate::CheckpointEncoding) -> crate::MetaResult<()> {
         if !Self::supports_format_version(encoding.format)
             || !Self::supports_schema_version(encoding.schema)

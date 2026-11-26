@@ -77,7 +77,8 @@ pub struct ProtocolRequirements {
 }
 
 /// One volume's protocol policy.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct VolumeProtocol {
     /// Increases by one on every change.
     pub epoch: u64,
@@ -229,6 +230,48 @@ impl VolumeProtocol {
             .filter(|(_, state)| **state == FeatureState::Compatible)
             .map(|(name, _)| name.clone())
             .collect();
+    }
+
+    /// Returns a refusal for a read or write operation against this policy.
+    pub fn check_operations(
+        &self,
+        mut volume: VolumeRequirements,
+        actual_checkpoint: Option<CheckpointDescriptor>,
+        local: &BTreeMap<String, u16>,
+        operations: &[crate::compat::Operation],
+    ) -> crate::MetaResult<()> {
+        use crate::{MetaError, UpgradeRequiredReason};
+        self.validate()?;
+        self.apply_to(&mut volume);
+        volume.checkpoint = actual_checkpoint;
+        for &operation in operations {
+            if operation == crate::compat::Operation::Publication
+                && self.write_requirement > SHARED_WRITE_REQUIREMENT.current
+            {
+                return Err(MetaError::UpgradeRequired {
+                    reason: UpgradeRequiredReason::WriteRequirementNewer {
+                        found: self.write_requirement,
+                        supported: SHARED_WRITE_REQUIREMENT.current,
+                    },
+                });
+            }
+        }
+        let decision = crate::compat::evaluate(&ClientCapabilities::current(), &volume, local);
+        for &operation in operations {
+            if let Some(refusal) = decision.refusal(operation) {
+                return Err(MetaError::UpgradeRequired {
+                    reason: UpgradeRequiredReason::VolumeProtocolUnknown {
+                        detail: format!(
+                            "{} ({}). {}",
+                            refusal.reason.as_str(),
+                            refusal.subject,
+                            refusal.reason.action()
+                        ),
+                    },
+                });
+            }
+        }
+        Ok(())
     }
 
     /// Encodes the persisted requirements.
