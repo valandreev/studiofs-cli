@@ -6,9 +6,11 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use studiofs_meta::compat::{CheckpointDescriptor, Operation, VolumeRequirements};
+#[cfg(all(test, feature = "test-successor"))]
+use studiofs_meta::pg_engine::read_policy_checkpoint;
 use studiofs_meta::pg_engine::{
     migrations::{ensure_registered_schema, recorded_schema_revisions, validate_restore_revisions},
-    read_policy_checkpoint, read_volume_protocol, validate_event_batch_client,
+    read_policy_checkpoint_set, read_volume_protocol, validate_event_batch_client,
 };
 use studiofs_meta::version::{EVENT_CODEC_WIRE, LOCAL_METADATA_LAYOUT};
 use studiofs_meta::volume_protocol::VolumeProtocol;
@@ -50,9 +52,18 @@ const MANIFEST_DUMP_VERSION: u16 = 5;
 struct DumpManifest {
     schema_revisions: BTreeMap<String, i32>,
     volume_protocol: VolumeProtocol,
-    checkpoint: CheckpointEncoding,
+    checkpoints: Vec<CheckpointEncoding>,
     event_codec_revisions: BTreeSet<u8>,
     source_local_redb_revision: u16,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DumpCheckpointEncoding {
+    encoding: CheckpointEncoding,
+    snapshot: Vec<u8>,
+    checkpoint_sha256: Vec<u8>,
+    publication_generation: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -70,6 +81,8 @@ struct MetadataDump {
     metadata_state_format_info: Vec<u8>,
     metadata_state_publication_state: String,
     metadata_state_generation: i64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    checkpoint_encodings: Vec<DumpCheckpointEncoding>,
     counters: Vec<DumpCounter>,
     event_log: Vec<DumpEvent>,
 }
@@ -268,13 +281,31 @@ fn load_remote_dump(
                 .map_err(|source| postgres_operation("start dump snapshot transaction", source))?;
 
             let volume_protocol = read_volume_protocol(&transaction, volume_id).await?;
-            let descriptor = read_policy_checkpoint(
+            let checkpoint_set = read_policy_checkpoint_set(
                 &transaction,
                 volume_id,
                 volume_protocol.requirements.checkpoint,
             )
             .await?;
-            let checkpoint = descriptor.validated_encoding()?;
+            let mut checkpoints = Vec::new();
+            if let Some(baseline) = &checkpoint_set.baseline {
+                checkpoints.push(baseline.validated_encoding()?);
+            }
+            let mut checkpoint_encodings =
+                Vec::with_capacity(checkpoint_set.alternate_encodings.len());
+            for descriptor in checkpoint_set.alternate_encodings {
+                let encoding = descriptor.validated_encoding()?;
+                if !checkpoints.contains(&encoding) {
+                    checkpoints.push(encoding);
+                }
+                checkpoint_encodings.push(DumpCheckpointEncoding {
+                    encoding,
+                    snapshot: descriptor.checkpoint_bytes,
+                    checkpoint_sha256: descriptor.checkpoint_sha256,
+                    publication_generation: descriptor.publication_generation,
+                });
+            }
+            let descriptor = checkpoint_set.primary;
             let schema_revisions = recorded_schema_revisions(&transaction).await?;
             let row = transaction
                 .query_one(
@@ -336,12 +367,32 @@ fn load_remote_dump(
                 .map_err(|source| postgres_operation("decode event_log rows", source))?;
 
             let event_codec_revisions = dump_event_revisions(&event_log)?;
+            let (
+                metadata_state_snapshot,
+                metadata_state_checkpoint_sha256,
+                metadata_state_publication_state,
+                metadata_state_generation,
+            ) = if let Some(baseline) = checkpoint_set.baseline {
+                (
+                    baseline.checkpoint_bytes,
+                    baseline.checkpoint_sha256,
+                    baseline.publication_state,
+                    baseline.publication_generation,
+                )
+            } else {
+                (
+                    Vec::new(),
+                    vec![0_u8; 32],
+                    "pending".to_owned(),
+                    descriptor.publication_generation,
+                )
+            };
             let dump = MetadataDump {
                 dump_version: MANIFEST_DUMP_VERSION,
                 manifest: Some(DumpManifest {
                     schema_revisions,
                     volume_protocol,
-                    checkpoint,
+                    checkpoints,
                     event_codec_revisions,
                     source_local_redb_revision: local_revision,
                 }),
@@ -349,11 +400,12 @@ fn load_remote_dump(
                 metadata_state_format_version: descriptor.metadata_format_version as i16,
                 metadata_state_version: descriptor.remote_head_version,
                 metadata_state_checkpoint_version: state_checkpoint_version,
-                metadata_state_snapshot: descriptor.checkpoint_bytes,
-                metadata_state_checkpoint_sha256: descriptor.checkpoint_sha256,
+                metadata_state_snapshot,
+                metadata_state_checkpoint_sha256,
                 metadata_state_format_info: descriptor.format_info_bytes,
-                metadata_state_publication_state: descriptor.publication_state,
-                metadata_state_generation: descriptor.publication_generation,
+                metadata_state_publication_state,
+                metadata_state_generation,
+                checkpoint_encodings,
                 counters,
                 event_log,
             };
@@ -550,13 +602,16 @@ fn apply_dump(postgres_address: &str, dump: &MetadataDump) -> DumpLoadResult<i64
             let write_requirement = protocol.write_requirement as i16;
             let session =
                 studiofs_meta::pg_engine::PublicationSession::begin(&tx, target_vol).await?;
-            let alternate = dump.manifest.as_ref().map(|manifest| manifest.checkpoint)
-                .filter(|encoding| encoding.format as u16 > studiofs_meta::version::BASELINE_SERVING_CHECKPOINT_FORMAT);
+            let has_baseline = !dump_has_pending_baseline(dump);
             let empty_checksum = [0_u8; 32];
-            let (snapshot, checksum, publication_state) = if alternate.is_some() {
-                (&[][..], empty_checksum.as_slice(), "pending")
+            let (snapshot, checksum, publication_state) = if has_baseline {
+                (
+                    dump.metadata_state_snapshot.as_slice(),
+                    dump.metadata_state_checkpoint_sha256.as_slice(),
+                    "published",
+                )
             } else {
-                (dump.metadata_state_snapshot.as_slice(), dump.metadata_state_checkpoint_sha256.as_slice(), "published")
+                (&[][..], empty_checksum.as_slice(), "pending")
             };
             // The volume row lock blocks new FK-backed rows, so the guarded
             // snapshot and accounting tables stay empty until commit.
@@ -647,10 +702,20 @@ fn apply_dump(postgres_address: &str, dump: &MetadataDump) -> DumpLoadResult<i64
                     )
                 })
                 .collect::<Vec<_>>();
-            let checkpoint = studiofs_meta::pg_engine::restore_checkpoint_encoding(
-                &tx, dump.volume.vol, target_vol, dump.metadata_state_checkpoint_version,
-                &dump.metadata_state_snapshot, alternate,
-            ).await?;
+            let alternates = dump
+                .checkpoint_encodings
+                .iter()
+                .map(|entry| (entry.encoding, entry.snapshot.as_slice()))
+                .collect::<Vec<_>>();
+            let checkpoint = studiofs_meta::pg_engine::restore_checkpoint_encodings(
+                &tx,
+                dump.volume.vol,
+                target_vol,
+                dump.metadata_state_checkpoint_version,
+                has_baseline.then_some(dump.metadata_state_snapshot.as_slice()),
+                &alternates,
+            )
+            .await?;
             studiofs_meta::pg_engine::seed_retained_authority(
                 &tx,
                 target_vol,
@@ -719,7 +784,21 @@ fn dump_event_revisions(events: &[DumpEvent]) -> DumpLoadResult<BTreeSet<u8>> {
         .collect()
 }
 
-fn dump_checkpoint(dump: &MetadataDump) -> BootstrapCheckpointDescriptor {
+fn dump_has_pending_baseline(dump: &MetadataDump) -> bool {
+    dump.manifest.is_some()
+        && dump.metadata_state_publication_state == "pending"
+        && dump.metadata_state_snapshot.is_empty()
+        && !dump.checkpoint_encodings.is_empty()
+}
+
+fn dump_checkpoint(
+    dump: &MetadataDump,
+    encoding: Option<CheckpointEncoding>,
+    snapshot: &[u8],
+    sha256: &[u8],
+    publication_state: &str,
+    publication_generation: i64,
+) -> BootstrapCheckpointDescriptor {
     BootstrapCheckpointDescriptor {
         volume_id: dump.volume.vol,
         volume_uuid: dump.volume.uuid.clone(),
@@ -727,11 +806,11 @@ fn dump_checkpoint(dump: &MetadataDump) -> BootstrapCheckpointDescriptor {
         metadata_format_version: dump.metadata_state_format_version as u16,
         remote_head_version: dump.metadata_state_version,
         checkpoint_version: dump.metadata_state_checkpoint_version,
-        checkpoint_encoding: dump.manifest.as_ref().map(|manifest| manifest.checkpoint),
-        checkpoint_bytes: dump.metadata_state_snapshot.clone(),
-        checkpoint_sha256: dump.metadata_state_checkpoint_sha256.clone(),
-        publication_state: dump.metadata_state_publication_state.clone(),
-        publication_generation: dump.metadata_state_generation,
+        checkpoint_encoding: encoding,
+        checkpoint_bytes: snapshot.to_vec(),
+        checkpoint_sha256: sha256.to_vec(),
+        publication_state: publication_state.to_owned(),
+        publication_generation,
     }
 }
 
@@ -750,9 +829,58 @@ fn check_manifest_version(
     })
 }
 
+fn check_supported_checkpoint_encoding(encoding: CheckpointEncoding) -> DumpLoadResult<()> {
+    let format_ok = u16::try_from(encoding.format)
+        .is_ok_and(|value| studiofs_meta::version::SERVING_CHECKPOINT_FORMAT.supports(value));
+    let schema_ok = u16::try_from(encoding.schema)
+        .is_ok_and(|value| studiofs_meta::version::SERVING_CHECKPOINT_SCHEMA.supports(value));
+    if !format_ok || !schema_ok {
+        return Err(MetaError::UnsupportedCheckpointEncoding {
+            format: encoding.format,
+            schema: encoding.schema,
+        }
+        .into());
+    }
+    Ok(())
+}
+
 fn validate_manifest(dump: &MetadataDump, for_restore: bool) -> DumpLoadResult<()> {
-    let descriptor = dump_checkpoint(dump);
-    let encoding = descriptor.validated_encoding()?;
+    let mut actual_encodings = Vec::new();
+    if !dump_has_pending_baseline(dump) {
+        let baseline = dump_checkpoint(
+            dump,
+            None,
+            &dump.metadata_state_snapshot,
+            &dump.metadata_state_checkpoint_sha256,
+            &dump.metadata_state_publication_state,
+            dump.metadata_state_generation,
+        );
+        let encoding = baseline.validated_encoding()?;
+        if encoding.format as u16 > studiofs_meta::version::BASELINE_SERVING_CHECKPOINT_FORMAT {
+            return Err(DumpLoadError::Message(
+                "non-baseline checkpoint encoding must be stored in checkpoint_encodings".into(),
+            ));
+        }
+        actual_encodings.push(encoding);
+    }
+    for entry in &dump.checkpoint_encodings {
+        let descriptor = dump_checkpoint(
+            dump,
+            Some(entry.encoding),
+            &entry.snapshot,
+            &entry.checkpoint_sha256,
+            "published",
+            entry.publication_generation,
+        );
+        let encoding = descriptor.validated_encoding()?;
+        if actual_encodings.contains(&encoding) {
+            return Err(DumpLoadError::Message(format!(
+                "duplicate checkpoint encoding (format {}, schema {}) in dump",
+                encoding.format, encoding.schema
+            )));
+        }
+        actual_encodings.push(encoding);
+    }
     let events = dump_event_revisions(&dump.event_log)?;
     let Some(manifest) = &dump.manifest else {
         if dump.dump_version != BASELINE_DUMP_VERSION {
@@ -760,9 +888,9 @@ fn validate_manifest(dump: &MetadataDump, for_restore: bool) -> DumpLoadResult<(
                 "version 5 dump is missing its manifest".into(),
             ));
         }
-        if encoding.format as u16 > studiofs_meta::version::BASELINE_SERVING_CHECKPOINT_FORMAT {
+        if !dump.checkpoint_encodings.is_empty() {
             return Err(DumpLoadError::Message(
-                "checkpoint encoding requires a versioned dump manifest".into(),
+                "unexpected checkpoint_encodings in version 4 dump".into(),
             ));
         }
         return Ok(());
@@ -770,6 +898,31 @@ fn validate_manifest(dump: &MetadataDump, for_restore: bool) -> DumpLoadResult<(
     if dump.dump_version != MANIFEST_DUMP_VERSION {
         return Err(DumpLoadError::Message(
             "unexpected manifest in version 4 dump".into(),
+        ));
+    }
+    if manifest.checkpoints.is_empty() {
+        return Err(DumpLoadError::Message(
+            "dump manifest must declare at least one checkpoint encoding".into(),
+        ));
+    }
+    let mut declared_encodings = Vec::with_capacity(manifest.checkpoints.len());
+    for &encoding in &manifest.checkpoints {
+        check_supported_checkpoint_encoding(encoding)?;
+        if declared_encodings.contains(&encoding) {
+            return Err(DumpLoadError::Message(format!(
+                "duplicate checkpoint encoding (format {}, schema {}) in dump manifest",
+                encoding.format, encoding.schema
+            )));
+        }
+        declared_encodings.push(encoding);
+    }
+    let mut sorted_declared = declared_encodings;
+    let mut sorted_actual = actual_encodings;
+    sorted_declared.sort_by_key(|encoding| (encoding.format, encoding.schema));
+    sorted_actual.sort_by_key(|encoding| (encoding.format, encoding.schema));
+    if sorted_declared != sorted_actual {
+        return Err(DumpLoadError::Message(
+            "dump manifest checkpoints do not match the checkpoint payloads".into(),
         ));
     }
     for &revision in &manifest.event_codec_revisions {
@@ -785,7 +938,7 @@ fn validate_manifest(dump: &MetadataDump, for_restore: bool) -> DumpLoadResult<(
     validate_restore_revisions(&manifest.schema_revisions)?;
     check_manifest_version(LOCAL_METADATA_LAYOUT, manifest.source_local_redb_revision)?;
     let mut requirements = VolumeRequirements::baseline();
-    requirements.format = descriptor.metadata_format_version;
+    requirements.format = dump.metadata_state_format_version as u16;
     let payload_gc = studiofs_meta::version::POSTGRES_PAYLOAD_GC_SCHEMA;
     requirements.schema_components.insert(
         payload_gc.name.to_owned(),
@@ -810,30 +963,43 @@ fn validate_manifest(dump: &MetadataDump, for_restore: bool) -> DumpLoadResult<(
             "invalid volume protocol epoch in dump".into(),
         ));
     }
-    manifest.volume_protocol.check_operations(
-        requirements,
-        Some(CheckpointDescriptor {
-            format: manifest.checkpoint.format as u16,
-            schema: manifest.checkpoint.schema as u16,
-        }),
-        &BTreeMap::from([(
-            LOCAL_METADATA_LAYOUT.name.to_owned(),
-            manifest.source_local_redb_revision,
-        )]),
-        &operations,
-    )?;
+    let local_revisions = BTreeMap::from([(
+        LOCAL_METADATA_LAYOUT.name.to_owned(),
+        manifest.source_local_redb_revision,
+    )]);
+    for &encoding in &manifest.checkpoints {
+        manifest.volume_protocol.check_operations(
+            requirements.clone(),
+            Some(CheckpointDescriptor {
+                format: encoding.format as u16,
+                schema: encoding.schema as u16,
+            }),
+            &local_revisions,
+            &operations,
+        )?;
+    }
     Ok(())
 }
 
 fn validate_dump(dump: &MetadataDump) -> DumpLoadResult<()> {
     ensure_supported_pg_sync_format_version(Some(dump.metadata_state_format_version))?;
     decode_format_info(&dump.metadata_state_format_info)?;
-    validate_checkpoint_descriptor(
-        &dump.metadata_state_snapshot,
-        Some(&dump.metadata_state_checkpoint_sha256),
-        Some(&dump.metadata_state_publication_state),
-        Some(dump.metadata_state_generation),
-    )?;
+    if !dump_has_pending_baseline(dump) {
+        validate_checkpoint_descriptor(
+            &dump.metadata_state_snapshot,
+            Some(&dump.metadata_state_checkpoint_sha256),
+            Some(&dump.metadata_state_publication_state),
+            Some(dump.metadata_state_generation),
+        )?;
+    }
+    for entry in &dump.checkpoint_encodings {
+        validate_checkpoint_descriptor(
+            &entry.snapshot,
+            Some(&entry.checkpoint_sha256),
+            Some("published"),
+            Some(entry.publication_generation),
+        )?;
+    }
 
     let checkpoint_version = dump.metadata_state_checkpoint_version;
     let head_version = dump.metadata_state_version;
@@ -1001,6 +1167,7 @@ mod tests {
             metadata_state_format_info: format_info,
             metadata_state_publication_state: "published".to_string(),
             metadata_state_generation: 2,
+            checkpoint_encodings: Vec::new(),
             counters: vec![DumpCounter {
                 name: "nextInode".to_string(),
                 value: 12,
@@ -1175,6 +1342,7 @@ mod tests {
             metadata_state_format_info: serde_json::to_vec(&format_info).unwrap(),
             metadata_state_publication_state: "published".to_string(),
             metadata_state_generation: 1,
+            checkpoint_encodings: Vec::new(),
             counters: Vec::new(),
             event_log: Vec::new(),
         }
@@ -1429,12 +1597,21 @@ mod tests {
 
     fn versioned_dump() -> MetadataDump {
         let mut dump = test_dump();
-        let checkpoint = dump_checkpoint(&dump).validated_encoding().unwrap();
+        let checkpoint = dump_checkpoint(
+            &dump,
+            None,
+            &dump.metadata_state_snapshot,
+            &dump.metadata_state_checkpoint_sha256,
+            &dump.metadata_state_publication_state,
+            dump.metadata_state_generation,
+        )
+        .validated_encoding()
+        .unwrap();
         dump.dump_version = MANIFEST_DUMP_VERSION;
         dump.manifest = Some(DumpManifest {
             schema_revisions: BTreeMap::from([("core".into(), 1), ("payload_gc".into(), 2)]),
             volume_protocol: VolumeProtocol::baseline(),
-            checkpoint,
+            checkpoints: vec![checkpoint],
             event_codec_revisions: BTreeSet::new(),
             source_local_redb_revision: LOCAL_METADATA_LAYOUT.min_supported,
         });
@@ -1445,7 +1622,7 @@ mod tests {
     fn manifest_accepts_supported_versions_and_rejects_mismatched_bytes() {
         let mut dump = versioned_dump();
         validate_manifest(&dump, true).unwrap();
-        dump.manifest.as_mut().unwrap().checkpoint.schema += 1;
+        dump.manifest.as_mut().unwrap().checkpoints[0].schema += 1;
         assert!(matches!(
             validate_manifest(&dump, true),
             Err(DumpLoadError::Meta(
@@ -1566,13 +1743,21 @@ mod tests {
         envelope.extend_from_slice(&dump.volume.vol.to_be_bytes());
         envelope.extend_from_slice(&dump.metadata_state_checkpoint_version.to_be_bytes());
         envelope.extend_from_slice(&baseline);
-        dump.metadata_state_checkpoint_sha256 = Sha256::digest(&envelope).to_vec();
-        dump.metadata_state_snapshot = envelope;
-        let manifest = dump.manifest.as_mut().unwrap();
-        manifest.checkpoint = CheckpointEncoding {
+        let format5 = CheckpointEncoding {
             format: 5,
             schema: 1,
         };
+        dump.metadata_state_snapshot.clear();
+        dump.metadata_state_checkpoint_sha256 = vec![0_u8; 32];
+        dump.metadata_state_publication_state = "pending".to_owned();
+        dump.checkpoint_encodings = vec![DumpCheckpointEncoding {
+            encoding: format5,
+            checkpoint_sha256: Sha256::digest(&envelope).to_vec(),
+            snapshot: envelope,
+            publication_generation: dump.metadata_state_generation,
+        }];
+        let manifest = dump.manifest.as_mut().unwrap();
+        manifest.checkpoints = vec![format5];
         manifest.schema_revisions.insert("core".into(), 2);
         manifest.source_local_redb_revision = LOCAL_METADATA_LAYOUT.current;
         let source_vol = apply_dump(schema.dsn(), &dump).unwrap();
@@ -1585,7 +1770,13 @@ mod tests {
             }) if available == "format 5, schema 1"
         ));
         let dir = tempfile::tempdir().unwrap();
-        let baseline_reader = std::env::var_os("STUDIOFS_TEST_BASELINE_BIN");
+        let baseline_reader = std::env::var_os("STUDIOFS_TEST_BASELINE_BIN")
+            .filter(|value| !value.is_empty())
+            .expect(
+                "STUDIOFS_TEST_BASELINE_BIN must point to a baseline studiofs binary \
+                 (build without `--features test-successor`: `cargo build -p studiofs --bin studiofs`, \
+                 then set STUDIOFS_TEST_BASELINE_BIN=target/debug/studiofs)",
+            );
         let discover = |reader: &std::ffi::OsStr, dsn: &str| {
             std::process::Command::new(reader)
                 .arg("discover")
@@ -1596,13 +1787,11 @@ mod tests {
                 .output()
                 .expect("run baseline StudioFS discovery")
         };
-        if let Some(reader) = &baseline_reader {
-            let output = discover(reader, schema.dsn());
-            assert!(!output.status.success());
-            let diagnostic = String::from_utf8_lossy(&output.stderr);
-            assert!(diagnostic.contains("format 5, schema 1"));
-            assert!(diagnostic.contains("upgrade to a StudioFS client"));
-        }
+        let output = discover(&baseline_reader, schema.dsn());
+        assert!(!output.status.success());
+        let diagnostic = String::from_utf8_lossy(&output.stderr);
+        assert!(diagnostic.contains("format 5, schema 1"));
+        assert!(diagnostic.contains("upgrade to a StudioFS client"));
         rt.block_on(async {
             let (client, connection) = connect_studiofs_postgres(schema.dsn()).await.unwrap();
             let task = tokio::spawn(connection);
@@ -1642,11 +1831,17 @@ mod tests {
         assert_ne!(restored.volume.vol, source_vol);
         assert_ne!(restored.volume.vol, dump.volume.vol);
         assert_eq!(
-            restored.manifest.as_ref().unwrap().checkpoint,
-            CheckpointEncoding {
-                format: 4,
-                schema: 1
-            }
+            restored.manifest.as_ref().unwrap().checkpoints,
+            vec![
+                CheckpointEncoding {
+                    format: 4,
+                    schema: 1
+                },
+                CheckpointEncoding {
+                    format: 5,
+                    schema: 1
+                },
+            ]
         );
         validate_manifest(&restored, true).unwrap();
         rt.block_on(async {
@@ -1661,14 +1856,236 @@ mod tests {
             drop(client);
             task.await.unwrap().unwrap();
         });
-        if let Some(reader) = &baseline_reader {
-            let output = discover(reader, target.dsn());
-            assert!(
-                output.status.success(),
-                "baseline discovery exited with {}",
-                output.status
+        let output = discover(&baseline_reader, target.dsn());
+        assert!(
+            output.status.success(),
+            "baseline discovery exited with {}",
+            output.status
+        );
+    }
+
+    #[cfg(feature = "test-successor")]
+    #[test]
+    #[ignore = "requires the PostgreSQL test database"]
+    fn successor_dump_load_preserves_baseline_and_alternate_checkpoint_encodings() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let dsn = test_pg_dsn().expect("STUDIOFS_TEST_PG_DSN is required");
+        let dsn = rt
+            .block_on(ensure_studiofs_database(&dsn))
+            .unwrap()
+            .metadata_dsn;
+        let source = crate::cli::pg_test_schema::PgTestSchema::new(&dsn).unwrap();
+        let baseline = meta_baseline_fixture("serving-checkpoint.bin");
+        let mut dump = versioned_dump();
+        dump.volume.vol = 1;
+        dump.metadata_state_snapshot = baseline.clone();
+        dump.metadata_state_checkpoint_sha256 = Sha256::digest(&baseline).to_vec();
+        let source_vol = apply_dump(source.dsn(), &dump).unwrap();
+
+        let mut envelope = b"\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xffSFS-CHK".to_vec();
+        envelope.extend_from_slice(&5_i16.to_be_bytes());
+        envelope.extend_from_slice(&1_i16.to_be_bytes());
+        envelope.extend_from_slice(&source_vol.to_be_bytes());
+        envelope.extend_from_slice(&dump.metadata_state_checkpoint_version.to_be_bytes());
+        envelope.extend_from_slice(&baseline);
+        let envelope_sha256 = Sha256::digest(&envelope).to_vec();
+
+        // Upgrade the source volume policy to require format 5 while keeping
+        // the published baseline (format 4) in metadata_state and format 5 in
+        // serving_checkpoint_encodings at the same cut.
+        rt.block_on(async {
+            let (mut client, connection) = connect_studiofs_postgres(source.dsn()).await.unwrap();
+            let task = tokio::spawn(connection);
+            let tx = client.transaction().await.unwrap();
+            tx.execute(
+                "INSERT INTO serving_checkpoint_encodings \
+                 (vol, checkpoint_version, checkpoint_format, checkpoint_schema, publication_generation, snapshot, checkpoint_sha256) \
+                 VALUES ($1, $2, 5, 1, 1, $3, $4)",
+                &[
+                    &source_vol,
+                    &dump.metadata_state_checkpoint_version,
+                    &envelope,
+                    &envelope_sha256,
+                ],
+            )
+            .await
+            .unwrap();
+            let mut protocol = read_volume_protocol(&tx, source_vol).await.unwrap();
+            protocol.epoch += 1;
+            protocol.requirements.checkpoint = CheckpointDescriptor {
+                format: 5,
+                schema: 1,
+            };
+            let encoded = protocol.encode_requirements().unwrap();
+            tx.execute(
+                "UPDATE volume_protocol SET policy_epoch = $2, requirements = $3::TEXT::JSONB WHERE vol = $1",
+                &[&source_vol, &(protocol.epoch as i64), &encoded],
+            )
+            .await
+            .unwrap();
+            tx.commit().await.unwrap();
+            drop(client);
+            task.await.unwrap().unwrap();
+        });
+
+        let captured =
+            load_remote_dump(source.dsn(), source_vol, LOCAL_METADATA_LAYOUT.current).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("dump-multi-encoding.json");
+        write_dump_output(&input, &captured).unwrap();
+
+        let target = crate::cli::pg_test_schema::PgTestSchema::new(&dsn).unwrap();
+        // Reserve volume ID 1 so the restored volume gets ID 2 and exercises envelope rebinding.
+        rt.block_on(async {
+            let (mut client, connection) = connect_studiofs_postgres(target.dsn()).await.unwrap();
+            let task = tokio::spawn(connection);
+            let tx = client.transaction().await.unwrap();
+            ensure_registered_schema(&tx).await.unwrap();
+            tx.query_one("SELECT nextval('volumes_vol_seq')", &[])
+                .await
+                .unwrap();
+            tx.commit().await.unwrap();
+            drop(client);
+            task.await.unwrap().unwrap();
+        });
+
+        load(&input, target.dsn()).unwrap();
+
+        rt.block_on(async {
+            let (client, connection) = connect_studiofs_postgres(target.dsn()).await.unwrap();
+            let task = tokio::spawn(connection);
+            let target_vol: i64 = 2;
+            let row = client
+                .query_one(
+                    "SELECT snapshot, checkpoint_sha256, checkpoint_publication_state, \
+                            checkpoint_generation, format_info, version, checkpoint_version, \
+                            event_log_prune_floor \
+                     FROM metadata_state WHERE vol = $1",
+                    &[&target_vol],
+                )
+                .await
+                .unwrap();
+            let restored_snapshot: Vec<u8> = row.get(0);
+            let restored_sha256: Vec<u8> = row.get(1);
+            let publication_state: String = row.get(2);
+            let generation: i64 = row.get(3);
+            let format_info_bytes: Vec<u8> = row.get(4);
+            let head_version: i64 = row.get(5);
+            let checkpoint_version: i64 = row.get(6);
+            let prune_floor: i64 = row.get(7);
+
+            // Baseline slot must be published so Janitor, event-log pruning, and
+            // format-4 readers all observe a published baseline checkpoint.
+            assert_eq!(publication_state, "published");
+            assert_eq!(restored_snapshot, baseline);
+            assert_eq!(restored_sha256, Sha256::digest(&baseline).as_slice());
+            assert!(generation > 0);
+            assert!(!format_info_bytes.is_empty());
+            assert!(head_version >= 0);
+            assert_eq!(prune_floor, checkpoint_version);
+
+            // Event-log prune precondition selects only published rows.
+            let prune_row = client
+                .query_opt(
+                    "SELECT checkpoint_version, event_log_prune_floor \
+                     FROM metadata_state \
+                     WHERE vol = $1 AND checkpoint_publication_state = 'published'",
+                    &[&target_vol],
+                )
+                .await
+                .unwrap();
+            assert!(prune_row.is_some());
+
+            // Format-5 encoding must also be restored and rebound to target_vol.
+            let descriptor =
+                studiofs_meta::pg_engine::read_compatible_checkpoint(&client, target_vol)
+                    .await
+                    .unwrap();
+            assert_eq!(
+                descriptor.validated_encoding().unwrap(),
+                CheckpointEncoding {
+                    format: 5,
+                    schema: 1,
+                }
             );
-        }
+            let enc_row = client
+                .query_one(
+                    "SELECT checkpoint_format, checkpoint_schema, snapshot \
+                     FROM serving_checkpoint_encodings \
+                     WHERE vol = $1 AND checkpoint_version = $2",
+                    &[&target_vol, &checkpoint_version],
+                )
+                .await
+                .unwrap();
+            assert_eq!(enc_row.get::<_, i16>(0), 5);
+            assert_eq!(enc_row.get::<_, i16>(1), 1);
+            assert_eq!(enc_row.get::<_, Vec<u8>>(2), descriptor.checkpoint_bytes);
+
+            drop(client);
+            task.await.unwrap().unwrap();
+        });
+    }
+
+    #[cfg(feature = "test-successor")]
+    #[test]
+    #[ignore = "requires the PostgreSQL test database"]
+    fn read_policy_checkpoint_fallback_reports_baseline_and_retained_encodings() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let dsn = test_pg_dsn().expect("STUDIOFS_TEST_PG_DSN is required");
+        let dsn = rt
+            .block_on(ensure_studiofs_database(&dsn))
+            .unwrap()
+            .metadata_dsn;
+        let schema = crate::cli::pg_test_schema::PgTestSchema::new(&dsn).unwrap();
+        let baseline = meta_baseline_fixture("serving-checkpoint.bin");
+        let mut dump = versioned_dump();
+        dump.metadata_state_snapshot = baseline.clone();
+        dump.metadata_state_checkpoint_sha256 = Sha256::digest(&baseline).to_vec();
+        let vol = apply_dump(schema.dsn(), &dump).unwrap();
+
+        rt.block_on(async {
+            let (client, connection) = connect_studiofs_postgres(schema.dsn()).await.unwrap();
+            let task = tokio::spawn(connection);
+            let dummy_bytes = b"future-checkpoint".to_vec();
+            let dummy_sha = Sha256::digest(&dummy_bytes).to_vec();
+            client
+                .execute(
+                    "INSERT INTO serving_checkpoint_encodings \
+                     (vol, checkpoint_version, checkpoint_format, checkpoint_schema, publication_generation, snapshot, checkpoint_sha256) \
+                     VALUES ($1, $2, 6, 1, 1, $3, $4)",
+                    &[
+                        &vol,
+                        &dump.metadata_state_checkpoint_version,
+                        &dummy_bytes,
+                        &dummy_sha,
+                    ],
+                )
+                .await
+                .unwrap();
+            let error = read_policy_checkpoint(
+                &client,
+                vol,
+                CheckpointDescriptor {
+                    format: 5,
+                    schema: 1,
+                },
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                matches!(
+                    &error,
+                    MetaError::RequiredCheckpointUnavailable {
+                        format: 5,
+                        schema: 1,
+                        available,
+                    } if available == "format 4, schema 1; format 6, schema 1"
+                ),
+                "unexpected error: {error:?}"
+            );
+            drop(client);
+            task.await.unwrap().unwrap();
+        });
     }
 
     #[test]

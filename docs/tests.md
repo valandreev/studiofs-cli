@@ -155,6 +155,24 @@ cargo test -p studiofs-meta pg_engine::tests:: --lib -- --ignored --test-threads
 cargo test -p studiofs --bin studiofs cli:: -- --ignored --test-threads=1 --nocapture
 ```
 
+For the SFS-1013 cross-binary policy-checkpoint regression, first build a baseline
+`studiofs` binary without `test-successor` and point `STUDIOFS_TEST_BASELINE_BIN`
+at it before running the `test-successor` dump/load tests (the test fails instead
+of skipping when `STUDIOFS_TEST_BASELINE_BIN` is unset):
+
+```bash
+cargo build -p studiofs --bin studiofs
+STUDIOFS_TEST_BASELINE_BIN=target/debug/studiofs cargo test -p studiofs --features test-successor --bin studiofs cli::dump_load::tests -- --ignored --skip regenerate_baseline_dump_fixture --test-threads=1 --nocapture
+```
+
+In PowerShell on Windows:
+
+```powershell
+cargo build -p studiofs --bin studiofs
+$env:STUDIOFS_TEST_BASELINE_BIN = "target\debug\studiofs.exe"
+cargo test -p studiofs --features test-successor --bin studiofs cli::dump_load::tests -- --ignored --skip regenerate_baseline_dump_fixture --test-threads=1 --nocapture
+```
+
 ### SFS-772 Live S3 and Combined S3/PostgreSQL CI Gate
 
 The automatic Linux gate in `.github/workflows/linux.yml` starts the

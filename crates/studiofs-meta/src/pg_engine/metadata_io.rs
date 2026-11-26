@@ -166,6 +166,17 @@ fn policy_checkpoint_formats(required: CheckpointDescriptor) -> std::ops::RangeI
     min..=max
 }
 
+/// Published checkpoint encodings captured at one volume cut for a backup.
+#[derive(Debug, Clone)]
+pub struct PolicyCheckpointSet {
+    /// Policy-selected checkpoint descriptor carrying the cut, head version, and volume metadata.
+    pub primary: BootstrapCheckpointDescriptor,
+    /// Published baseline `metadata_state` slot at `primary.checkpoint_version`, if present.
+    pub baseline: Option<BootstrapCheckpointDescriptor>,
+    /// Supported retained `serving_checkpoint_encodings` rows at `primary.checkpoint_version`.
+    pub alternate_encodings: Vec<BootstrapCheckpointDescriptor>,
+}
+
 /// Select the volume policy's checkpoint for a backup that preserves that policy.
 pub async fn read_policy_checkpoint<C: tokio_postgres::GenericClient + Sync>(
     client: &C,
@@ -185,7 +196,22 @@ pub async fn read_policy_checkpoint<C: tokio_postgres::GenericClient + Sync>(
                 super::check_volume_read_policy(client, volume_id, Some(&descriptor)).await?;
                 return Ok(descriptor);
             }
-            format!("format {}, schema {}", encoding.format, encoding.schema)
+            let replay_floor: i64 = client
+                .query_one(
+                    "SELECT event_log_prune_floor FROM metadata_state WHERE vol = $1",
+                    &[&volume_id],
+                )
+                .await
+                .map_err(descriptor_row_error)?
+                .try_get(0)
+                .map_err(descriptor_row_error)?;
+            let mut encodings =
+                read_retained_checkpoint_encodings(client, volume_id, replay_floor).await?;
+            if !encodings.contains(&encoding) {
+                encodings.push(encoding);
+            }
+            encodings.sort_by_key(|item| (item.format, item.schema));
+            describe_checkpoint_encodings(&encodings)
         }
         Err(MetaError::NeedCompatibleCheckpoint { replay_floor }) => describe_checkpoint_encodings(
             &read_retained_checkpoint_encodings(client, volume_id, replay_floor).await?,
@@ -196,6 +222,74 @@ pub async fn read_policy_checkpoint<C: tokio_postgres::GenericClient + Sync>(
         format: required.format,
         schema: required.schema,
         available,
+    })
+}
+
+/// Select the policy checkpoint and every supported published encoding at its cut.
+pub async fn read_policy_checkpoint_set<C: tokio_postgres::GenericClient + Sync>(
+    client: &C,
+    volume_id: i64,
+    required: CheckpointDescriptor,
+) -> MetaResult<PolicyCheckpointSet> {
+    let primary = read_policy_checkpoint(client, volume_id, required).await?;
+    let cut = primary.checkpoint_version;
+    let baseline = if primary.checkpoint_encoding.is_none() {
+        Some(primary.clone())
+    } else {
+        let candidate =
+            select_bootstrap_checkpoint(client, volume_id, CheckpointSelection::BaselineOnly)
+                .await?;
+        if candidate.publication_state == "published" && candidate.checkpoint_version == cut {
+            candidate.validate_and_decode()?;
+            Some(candidate)
+        } else {
+            None
+        }
+    };
+    let mut alternate_encodings = Vec::new();
+    if !read_retained_checkpoint_encodings(client, volume_id, cut)
+        .await?
+        .is_empty()
+    {
+        let rows = client
+            .query(
+                "SELECT checkpoint_format, checkpoint_schema, publication_generation, snapshot, checkpoint_sha256 \
+                 FROM serving_checkpoint_encodings \
+                 WHERE vol = $1 AND checkpoint_version = $2 \
+                 ORDER BY checkpoint_format, checkpoint_schema",
+                &[&volume_id, &cut],
+            )
+            .await
+            .map_err(descriptor_row_error)?;
+        for row in rows {
+            let encoding = CheckpointEncoding {
+                format: row.try_get(0).map_err(descriptor_row_error)?,
+                schema: row.try_get(1).map_err(descriptor_row_error)?,
+            };
+            if ServingCheckpoint::check_encoding(encoding).is_err() {
+                continue;
+            }
+            let descriptor = BootstrapCheckpointDescriptor {
+                volume_id: primary.volume_id,
+                volume_uuid: primary.volume_uuid.clone(),
+                format_info_bytes: primary.format_info_bytes.clone(),
+                metadata_format_version: primary.metadata_format_version,
+                remote_head_version: primary.remote_head_version,
+                checkpoint_version: cut,
+                checkpoint_encoding: Some(encoding),
+                checkpoint_bytes: row.try_get(3).map_err(descriptor_row_error)?,
+                checkpoint_sha256: row.try_get(4).map_err(descriptor_row_error)?,
+                publication_state: "published".to_owned(),
+                publication_generation: row.try_get(2).map_err(descriptor_row_error)?,
+            };
+            descriptor.validate_and_decode()?;
+            alternate_encodings.push(descriptor);
+        }
+    }
+    Ok(PolicyCheckpointSet {
+        primary,
+        baseline,
+        alternate_encodings,
     })
 }
 
@@ -274,25 +368,35 @@ pub async fn validate_checkpoint_replay(
     Ok(())
 }
 
-/// Rebind the selected checkpoint and write its alternate encoding if needed.
-pub async fn restore_checkpoint_encoding(
+/// Rebind restored checkpoints and replace any `serving_checkpoint_encodings` rows.
+pub async fn restore_checkpoint_encodings(
     tx: &tokio_postgres::Transaction<'_>,
     source_volume: i64,
     target_volume: i64,
     cut: i64,
-    bytes: &[u8],
-    alternate: Option<CheckpointEncoding>,
+    baseline: Option<&[u8]>,
+    alternates: &[(CheckpointEncoding, &[u8])],
 ) -> MetaResult<Vec<u8>> {
     use sha2::{Digest, Sha256};
-    let bytes = ServingCheckpoint::rebind_published(bytes, source_volume, target_volume, cut)?;
     tx.execute(
         "DELETE FROM serving_checkpoint_encodings WHERE vol = $1",
         &[&target_volume],
     )
     .await
     .map_err(descriptor_row_error)?;
-    if let Some(encoding) = alternate {
-        let digest = Sha256::digest(&bytes);
+    let mut authority_bytes = None;
+    if let Some(bytes) = baseline {
+        authority_bytes = Some(ServingCheckpoint::rebind_published(
+            bytes,
+            source_volume,
+            target_volume,
+            cut,
+        )?);
+    }
+    for &(encoding, bytes) in alternates {
+        let rebound =
+            ServingCheckpoint::rebind_published(bytes, source_volume, target_volume, cut)?;
+        let digest = Sha256::digest(&rebound);
         tx.execute(
             sql::INSERT_CHECKPOINT_ENCODING,
             &[
@@ -300,14 +404,17 @@ pub async fn restore_checkpoint_encoding(
                 &cut,
                 &encoding.format,
                 &encoding.schema,
-                &bytes,
+                &rebound,
                 &digest.as_slice(),
             ],
         )
         .await
         .map_err(descriptor_row_error)?;
+        if authority_bytes.is_none() {
+            authority_bytes = Some(rebound);
+        }
     }
-    Ok(bytes)
+    authority_bytes.ok_or(MetaError::BootstrapCheckpointDescriptorMissing)
 }
 
 async fn read_checkpoint<C: tokio_postgres::GenericClient + Sync>(

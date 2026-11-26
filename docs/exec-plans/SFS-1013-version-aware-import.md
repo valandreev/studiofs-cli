@@ -14,16 +14,21 @@ client installs a local database or commits restored volume metadata.
 - [x] (2026-11-26) Reproduce acceptance of an unsupported event, then implement validation.
 - [x] (2026-11-26) Check baseline and test-successor backup restore on PostgreSQL and prove transactional rollback and retry.
 - [x] (2026-11-26) Verify discovery leaves no active database on an unsupported event and a failed fresh-client marker clear leaves the mount read-only.
+- [x] (2026-11-26) Address PR #1065 re-review: carry all published checkpoint encodings at the dumped cut in manifest v5 (`checkpoints` list + `checkpoint_encodings`), require `STUDIOFS_TEST_BASELINE_BIN` in the cross-binary test instead of silently skipping, include retained encodings in `read_policy_checkpoint` fallback diagnostics, and update ExecPlan test commands.
 
 ## Surprises & Discoveries
 
 Discovery selects a compatible checkpoint already. It installs that checkpoint
 and leaves the replay cursor there for mount to catch up. The staging gate now
-validates the tail within the same PostgreSQL read snapshot. A restore that
-uses an alternate checkpoint leaves the baseline slot pending with a 32-byte
-digest placeholder and writes the alternate encoding separately. New dumps
-select the encoding required by the source policy so a baseline-policy volume
-remains bootstrappable after restore.
+validates the tail within the same PostgreSQL read snapshot. A backup now
+captures every published checkpoint encoding at the dumped cut (both the
+baseline `metadata_state` slot when published and any supported
+`serving_checkpoint_encodings` rows at that cut) and restores all of them in one
+transaction, keeping `metadata_state.checkpoint_publication_state = 'published'`
+whenever the source had a published baseline slot (preserving Janitor, event-log
+pruning, and format-4 reader preconditions). A successor-only volume without a
+published baseline slot still restores with `metadata_state` pending and its
+alternate encoding rebound in `serving_checkpoint_encodings`.
 
 ## Decision Log
 
@@ -67,8 +72,9 @@ Run the following from the worktree. For the PostgreSQL tests, import only
 command output.
 
     cargo test -p studiofs --bin studiofs cli::dump_load::tests -- --include-ignored --skip regenerate_baseline_dump_fixture --test-threads=1
-    cargo test -p studiofs --features test-successor --bin studiofs cli::dump_load::tests -- --include-ignored --skip regenerate_baseline_dump_fixture
-    cargo test -p studiofs --features test-successor --bin studiofs successor_restore_preserves_checkpoint_and_rebinds_its_volume_id -- --ignored
+    cargo build -p studiofs --bin studiofs
+    STUDIOFS_TEST_BASELINE_BIN=target/debug/studiofs cargo test -p studiofs --features test-successor --bin studiofs cli::dump_load::tests -- --include-ignored --skip regenerate_baseline_dump_fixture --test-threads=1
+    STUDIOFS_TEST_BASELINE_BIN=target/debug/studiofs cargo test -p studiofs --features test-successor --bin studiofs -- --ignored --test-threads=1 successor_dump_preserves_baseline_policy_checkpoint successor_dump_load_preserves_baseline_and_alternate_checkpoint_encodings read_policy_checkpoint_fallback_reports_baseline_and_retained_encodings
     cargo test -p studiofs --bin studiofs cli::discovery::tests
     cargo test -p studiofs-meta --lib pg_snapshot_backend_reads_a_validated_bootstrap_descriptor -- --ignored
     cargo test -p studiofs-meta --lib fresh_client_marker_clear_failure_keeps_engine_read_only
