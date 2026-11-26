@@ -511,10 +511,15 @@ they change shared objects:
 - Expand that installs or replaces a trigger or function, because the body
   applies to every volume's rows. The trigger body must branch on per-volume
   state (as `studiofs_fence_legacy_deletion_claim` does with
-  `metadata_format_version >= 6`). The registered deletion-fence migration
-  compares the actor's `studiofs.deletion_format` with the current format of
-  the selected volume. A format-6 Janitor then loses deletion admission on
-  a format-7 volume.
+  `metadata_format_version >= 6`). The registered `format_fences` migration
+  (SFS-1132) adds triggers under names the 0.2.x DDL never touches, so an
+  older `init` cannot replace them. `studiofs_deletion_claim_volume_format_fence`
+  compares the actor's `studiofs.deletion_volume_format` with the format of a
+  volume at format 7 or later, so a 0.2.4 Janitor, which sets only
+  `studiofs.deletion_format = '6'`, loses deletion admission there.
+  `studiofs_adopted_format_downgrade_fence` refuses writing a format below 7
+  for a volume that has a `volume_protocol` row, so an older `load` cannot
+  restore a format-6 row over an adopted volume.
 - Contract (dropping a table, column or trigger body branch), which requires
   that no volume in the database still needs it.
 - Raising a database-wide component version that older Janitors check exactly

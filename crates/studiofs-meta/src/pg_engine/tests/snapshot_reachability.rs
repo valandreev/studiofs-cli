@@ -265,7 +265,7 @@ fn pruned_deletion_fences_stay_fenced_below_the_payload_watermark() {
             let connection_task = tokio::spawn(connection);
             // Fixture rows model a current-format claimer.
             client
-                .batch_execute("SELECT set_config('studiofs.deletion_format', '7', false)")
+                .batch_execute("SELECT set_config('studiofs.deletion_format', '6', false), set_config('studiofs.deletion_volume_format', '7', false)")
                 .await
                 .expect("declare current deletion capability");
             client

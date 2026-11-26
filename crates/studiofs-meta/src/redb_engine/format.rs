@@ -289,10 +289,18 @@ fn decode_upgrade_header(header: &serde_json::Value) -> MetaResult<FormatInfo> {
 }
 
 fn verify_shared_header(local: &FormatInfo, shared: &FormatInfo) -> MetaResult<()> {
+    // `discover` stores this client's own DSN; the local header keeps it.
+    let mut local = local.clone();
+    if let (Some(local), Some(shared)) = (
+        local.metadata.postgres.as_mut(),
+        shared.metadata.postgres.as_ref(),
+    ) {
+        local.url.clone_from(&shared.url);
+    }
     let as_json = |format: &FormatInfo| {
         serde_json::to_value(format).map_err(|error| crate::invalid_format_info_json(&error))
     };
-    if as_json(local)? != as_json(shared)? {
+    if as_json(&local)? != as_json(shared)? {
         return Err(MetaError::Storage(
             "local and shared format identity differ; cache was not changed".into(),
         ));

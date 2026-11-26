@@ -3,8 +3,7 @@
 use super::*;
 use crate::pg_engine::migrations::{
     CHECKPOINT_ENCODINGS_COMPONENT, CLIENT_SESSIONS_COMPONENT, CORE_COMPONENT,
-    DELETION_FORMAT_FENCE_COMPONENT, MIGRATIONS, Migration, MigrationPhase, ensure_with,
-    migrate_with,
+    FORMAT_FENCES_COMPONENT, MIGRATIONS, Migration, MigrationPhase, ensure_with, migrate_with,
 };
 
 const fn step(version: i32, phase: MigrationPhase, sql: &'static str) -> Migration {
@@ -113,9 +112,9 @@ fn migration_registry_applies_resumes_and_refuses_drift_on_live_postgres() {
         let migration = |component| *migrations.iter().find(|step| step.component == component).unwrap();
         let sessions = migration(CLIENT_SESSIONS_COMPONENT);
         let encodings = migration(CHECKPOINT_ENCODINGS_COMPONENT);
-        let deletion_fence = migration(DELETION_FORMAT_FENCE_COMPONENT);
+        let format_fences = migration(FORMAT_FENCES_COMPONENT);
         ensure_in_tx(client, &[baseline]).await?;
-        assert_eq!(migrate_with(client, &migrations, false).await?, [sessions, encodings, deletion_fence]);
+        assert_eq!(migrate_with(client, &migrations, false).await?, [sessions, encodings, format_fences]);
         ensure_in_tx(client, &migrations).await?;
         assert_eq!(
             scalar(client, "SELECT count(*) FROM studiofs_schema_components WHERE (component, version) IN (('core', 1), ('payload_gc', 2)) AND (component = 'payload_gc' OR octet_length(checksum) = 32)").await,
@@ -143,8 +142,9 @@ fn migration_registry_applies_resumes_and_refuses_drift_on_live_postgres() {
         assert_eq!(scalar(client, lock_table).await, 1);
         assert_eq!(scalar(client, sessions_table).await, 1);
         assert_eq!(scalar(client, encodings_table).await, 1);
-        let current_fence = "SELECT count(*) WHERE pg_get_functiondef('studiofs_fence_legacy_deletion_claim()'::regprocedure) LIKE '%metadata_format_version::text%'";
-        assert_eq!(scalar(client, current_fence).await, 1);
+        // Baseline DDL (also what a 0.2.x `init` re-applies) must not touch these.
+        let current_fence = "SELECT count(*) FROM pg_trigger WHERE tgname IN ('studiofs_deletion_claim_volume_format_fence', 'studiofs_adopted_format_downgrade_fence') AND tgenabled IN ('O', 'A')";
+        assert_eq!(scalar(client, current_fence).await, 2);
         client
             .batch_execute("DROP TABLE file_lock_leases")
             .await
@@ -159,7 +159,7 @@ fn migration_registry_applies_resumes_and_refuses_drift_on_live_postgres() {
         assert!(matches!(ensure_in_tx(client, &migrations).await, Err(MetaError::RepairRequired(_))));
         assert_eq!(migrate_with(client, &migrations, false).await?, [baseline]);
         assert_eq!(scalar(client, lock_table).await, 1);
-        assert_eq!(scalar(client, current_fence).await, 1);
+        assert_eq!(scalar(client, current_fence).await, 2);
 
         // A newer core is refused before any DDL runs.
         client.batch_execute("DROP TABLE file_lock_leases; UPDATE studiofs_schema_components SET version = 99 WHERE component = 'core'").await.map_err(|e| MetaError::Storage(pg_err(e)))?;

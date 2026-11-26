@@ -79,17 +79,9 @@ impl UpgradeArgs {
         let format = local.format_info_for_upgrade()?;
         let pg = postgres_binding(&format, &self.name)?;
         let settings = super::settings::load_studiofs_config()?;
-        let cache_dir = self
-            .cache_dir
-            .or_else(|| {
-                settings
-                    .cache_dir
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|path| !path.is_empty())
-                    .map(Into::into)
-            })
-            .unwrap_or_else(|| path.with_file_name("cache"));
+        let cache_dir =
+            super::mount::resolve_cache_dir_for_mount(&settings, self.cache_dir.as_deref())
+                .unwrap_or_else(|| path.with_file_name("cache"));
         let layout = studiofs_cache::runtime::LocalPayloadLayout::from_cache_root(
             cache_dir.join(&format.uuid),
         );
@@ -124,6 +116,12 @@ fn finish_local_upgrade(
 ) -> anyhow::Result<()> {
     if index_path.try_exists()? {
         studiofs_cache::runtime::CacheIndex::upgrade_existing(index_path)?;
+    } else {
+        // Opening the cache later migrates the index; say so instead of implying it ran.
+        println!(
+            "No payload index at {}; if mount uses another --cache-dir, it upgrades there on first open.",
+            index_path.display()
+        );
     }
     if previous.format_version == 5 {
         let mut intermediate = shared.clone();

@@ -711,17 +711,37 @@ fn published_format_adoption_retries_and_fences_legacy_publication() {
             };
             assert!(!old_reader.supports_i16(row.get(0)));
             assert_eq!(state(client.query_one(checkpoint_sql, &[&vol]).await.unwrap()), checkpoint);
+            // A 0.2.x `init` re-applies the baseline DDL; it must not lift the fences.
+            client.batch_execute(crate::pg_engine::schema::studiofs_pg_schema_sql()).await.unwrap();
+            // A 0.2.x `load` replaces the row with its own format; refused and rolled back.
+            let tx = client.transaction().await.unwrap();
+            let downgrade = tx.batch_execute(&format!(
+                "CREATE TEMP TABLE sfs1132_row ON COMMIT DROP AS SELECT * FROM metadata_state WHERE vol={vol};
+                 DELETE FROM metadata_state WHERE vol={vol};
+                 UPDATE sfs1132_row SET metadata_format_version=6;
+                 INSERT INTO metadata_state SELECT * FROM sfs1132_row;",
+            )).await.unwrap_err();
+            assert_eq!(
+                downgrade.as_db_error().unwrap().message(),
+                "volume format 7 cannot be replaced by an older format"
+            );
+            drop(tx);
+            let row = client.query_one(
+                "SELECT metadata_format_version FROM metadata_state WHERE vol=$1", &[&vol],
+            ).await.unwrap();
+            assert_eq!(row.get::<_, i16>(0), 7);
             let claim = "INSERT INTO snapshot_payload_upload_objects
                 (vol, object_id, state, reconcile_owner)
                 VALUES ($1, 1132, 'delete_pending', 'sfs1132')";
-            client.query_one("SELECT set_config('studiofs.deletion_format', '6', false)", &[])
+            // A 0.2.4 Janitor declares only the legacy capability.
+            client.query_one("SELECT set_config('studiofs.deletion_format', '6', false), set_config('studiofs.deletion_volume_format', '', false)", &[])
                 .await.unwrap();
             let refused = client.execute(claim, &[&vol]).await.unwrap_err();
             assert_eq!(
                 refused.as_db_error().unwrap().message(),
                 "deletion claim requires current volume format capability"
             );
-            client.query_one("SELECT set_config('studiofs.deletion_format', '7', false)", &[])
+            client.query_one("SELECT set_config('studiofs.deletion_format', '6', false), set_config('studiofs.deletion_volume_format', '7', false)", &[])
                 .await.unwrap();
             assert_eq!(client.execute(claim, &[&vol]).await.unwrap(), 1);
         }
