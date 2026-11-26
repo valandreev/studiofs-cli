@@ -213,6 +213,9 @@ impl BootstrapCheckpointDescriptor {
 /// or a redaction marker; diagnostics omit the contents of malformed fields.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum UpgradeRequiredReason {
+    /// A stopped local redb cache has a staged migration to resume.
+    #[error("local redb upgrade is pending; retry studiofs upgrade --local-only")]
+    LocalRedbUpgradePending,
     /// A metadata event uses an identity this binary cannot interpret.
     #[error(transparent)]
     UnsupportedEvent(crate::events::UnsupportedEventReason),

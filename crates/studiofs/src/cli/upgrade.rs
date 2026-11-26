@@ -20,6 +20,10 @@ pub struct UpgradeArgs {
     /// Re-apply the 0.2.5 baseline schema to restore dropped objects; allowed only while no later schema migration is recorded.
     #[arg(long)]
     pub repair_schema: bool,
+    /// Upgrade only the stopped local metadata database.
+    #[cfg(feature = "test-successor")]
+    #[arg(long, conflicts_with_all = ["repair_schema", "dry_run"])]
+    pub local_only: bool,
 }
 
 impl UpgradeArgs {
@@ -31,6 +35,18 @@ impl UpgradeArgs {
             super::utils::get_default_meta_dir(&self.name)?.join(format!("{}.db", self.name));
         if !path.is_file() {
             bail!("Local volume metadata is missing; discover the volume before upgrading.");
+        }
+        #[cfg(feature = "test-successor")]
+        if self.local_only {
+            let local = RedbMetaEngine::open_for_format_upgrade(&path).context(
+                "Cannot own local metadata; stop every process using this volume and retry",
+            )?;
+            let format = local.format_info_for_upgrade()?;
+            if format.name != self.name {
+                bail!("Local volume name does not match its header; metadata was not changed.");
+            }
+            local.upgrade_local_revision()?;
+            return Ok(());
         }
         let runtime = tokio::runtime::Runtime::new()?;
         if self.dry_run {
@@ -159,6 +175,25 @@ mod tests {
             parse(&["upgrade", "volume", "--repair-schema"])
                 .unwrap()
                 .repair_schema
+        );
+    }
+
+    #[cfg(feature = "test-successor")]
+    #[test]
+    fn local_only_flag_conflicts_with_remote_flags() {
+        assert!(!parse(&["upgrade", "volume"]).unwrap().local_only);
+        assert!(
+            parse(&["upgrade", "volume", "--local-only"])
+                .unwrap()
+                .local_only
+        );
+        assert!(
+            super::super::parse_for_test(&["upgrade", "volume", "--local-only", "--dry-run"])
+                .is_err()
+        );
+        assert!(
+            super::super::parse_for_test(&["upgrade", "volume", "--local-only", "--repair-schema"])
+                .is_err()
         );
     }
 }

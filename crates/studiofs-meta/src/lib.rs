@@ -109,12 +109,29 @@ pub fn decode_format_info(bytes: &[u8]) -> MetaResult<FormatInfo> {
     decode_format_info_as(bytes, version::SHARED_VOLUME_FORMAT)
 }
 
+const LOCAL_REDB_REVISION: &str = "local_redb_revision";
+
 fn decode_local_format_info(bytes: &[u8]) -> MetaResult<FormatInfo> {
-    decode_format_info_as(bytes, version::LOCAL_METADATA_LAYOUT)
+    if !cfg!(feature = "test-successor") {
+        return decode_format_info(bytes);
+    }
+    let mut header: serde_json::Value =
+        serde_json::from_slice(bytes).map_err(|error| invalid_format_info_json(&error))?;
+    if let Some(revision) = header
+        .as_object_mut()
+        .and_then(|object| object.remove(LOCAL_REDB_REVISION))
+    {
+        let revision =
+            serde_json::from_value(revision).map_err(|error| invalid_format_info_json(&error))?;
+        version::LOCAL_METADATA_LAYOUT.check(revision)?;
+        let bytes =
+            serde_json::to_vec(&header).map_err(|error| invalid_format_info_json(&error))?;
+        return decode_format_info(&bytes);
+    }
+    decode_format_info(bytes)
 }
 
-/// [`decode_format_info`] with the version judged by `identity`, so the local
-/// redb header copy and shared `FormatInfo` answer to separate identities.
+/// Validate the header version before decoding fields from its body.
 fn decode_format_info_as(
     bytes: &[u8],
     identity: version::VersionIdentity,
@@ -259,13 +276,6 @@ pub fn ensure_supported_format_version(info: &FormatInfo) -> MetaResult<()> {
     Ok(())
 }
 
-/// Validate a local redb header against the local metadata layout identity.
-fn ensure_supported_local_format_version(info: &FormatInfo) -> MetaResult<()> {
-    version::LOCAL_METADATA_LAYOUT.check(info.format_version)?;
-    info.validate_format_contract()?;
-    Ok(())
-}
-
 /// Validate the PostgreSQL scalar sync-format version stored with a checkpoint.
 ///
 /// PostgreSQL stores this value as `SMALLINT`, so missing, negative, or
@@ -291,7 +301,7 @@ pub fn open_meta_engine_with_options(
     let path = path.as_ref();
     match RedbMetaEngine::read_format_info_readonly(path) {
         Ok(info) if info.metadata.backend == MetadataBackend::Postgres => {
-            ensure_supported_local_format_version(&info)?;
+            ensure_supported_format_version(&info)?;
             let pg = PgMetaEngine::open_with_options(
                 path,
                 PgOpenOptions {
@@ -311,10 +321,10 @@ pub fn open_meta_engine_with_options(
             Ok(pg)
         }
         Ok(info) => {
-            ensure_supported_local_format_version(&info)?;
+            ensure_supported_format_version(&info)?;
             let redb = RedbMetaEngine::open(path)?;
             let redb_info = redb.get_format_info()?;
-            ensure_supported_local_format_version(&redb_info)?;
+            ensure_supported_format_version(&redb_info)?;
             if redb_info.metadata.backend != info.metadata.backend {
                 return Err(MetaError::Storage(
                     "metadata backend switched during RedbMetaEngine open".to_string(),
@@ -339,7 +349,7 @@ pub fn open_meta_engine_with_options(
             let info = {
                 let redb = RedbMetaEngine::open(path)?;
                 let info = redb.get_format_info()?;
-                ensure_supported_local_format_version(&info)?;
+                ensure_supported_format_version(&info)?;
                 if info.metadata.backend == MetadataBackend::Postgres {
                     mark_unclean_pg_local_graph(&redb)?;
                 }

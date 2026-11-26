@@ -51,9 +51,16 @@ impl RedbMetaEngine {
             {
                 check()?;
                 let (k, v) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
-                snapshot
-                    .settings
-                    .push((k.value().to_string(), v.value().to_vec()));
+                if k.value() == super::format::LOCAL_UPGRADE_STAGE {
+                    continue;
+                }
+                let bytes = if cfg!(feature = "test-successor") && k.value() == "format" {
+                    let info = crate::decode_local_format_info(v.value())?;
+                    super::format::local_header(&info, None)?
+                } else {
+                    v.value().to_vec()
+                };
+                snapshot.settings.push((k.value().to_string(), bytes));
             }
         }
         {
@@ -602,10 +609,14 @@ impl RedbMetaEngine {
             let mut table = txn
                 .open_table(SETTINGS_TABLE)
                 .map_err(|e| MetaError::Storage(e.to_string()))?;
+            let previous_format = table.get("format")?.map(|value| value.value().to_vec());
             table
                 .retain(|_, _| false)
                 .map_err(|e| MetaError::Storage(e.to_string()))?;
             for (k, v) in &snapshot.settings {
+                if k == super::format::LOCAL_UPGRADE_STAGE {
+                    continue;
+                }
                 if k == super::volume_settings::VOLUME_SETTINGS_KEY
                     || k == super::volume_settings::BASE_VOLUME_SETTINGS_KEY
                 {
@@ -616,6 +627,15 @@ impl RedbMetaEngine {
                     }
                     crate::trash::VolumeSettings::decode_json(v)?;
                 }
+                let preserved_header;
+                let v = if cfg!(feature = "test-successor") && k == "format" {
+                    let info = crate::decode_local_format_info(v)?;
+                    preserved_header =
+                        super::format::local_header(&info, previous_format.as_deref())?;
+                    &preserved_header
+                } else {
+                    v
+                };
                 table
                     .insert(k.as_str(), v.as_slice())
                     .map_err(|e| MetaError::Storage(e.to_string()))?;

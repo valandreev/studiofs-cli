@@ -270,6 +270,26 @@ impl CacheIndex {
             std::fs::create_dir_all(parent)?;
         }
 
+        if let Ok(readonly) = redb::ReadOnlyDatabase::open(&path) {
+            let txn = readonly.begin_read().map_err(storage_error)?;
+            match txn.open_table(COUNTERS_TABLE) {
+                Ok(counters) => {
+                    if let Some(revision) =
+                        counters.get(COUNTER_INDEX_FORMAT).map_err(storage_error)?
+                    {
+                        let found = revision.value();
+                        if !matches!(found, LEGACY_INDEX_FORMAT_VERSION | INDEX_FORMAT_VERSION) {
+                            return Err(CacheIndexError::UnsupportedFormat {
+                                expected: INDEX_FORMAT_VERSION,
+                                found,
+                            });
+                        }
+                    }
+                }
+                Err(redb::TableError::TableDoesNotExist(_)) => {}
+                Err(error) => return Err(storage_error(error)),
+            }
+        }
         // redb::Database::create() creates a new DB for missing/empty files and
         // opens an existing valid redb file, so this is safe for reopen paths.
         let db = Database::create(&path).map_err(storage_error)?;
@@ -1295,6 +1315,8 @@ impl CacheIndex {
                 .map(|value| value.value());
             if let Some(found) = found_index_format {
                 if found == LEGACY_INDEX_FORMAT_VERSION {
+                    // Format 2 changes index bookkeeping only. Publish the
+                    // revision and bookkeeping in this same redb transaction.
                     counters
                         .insert(COUNTER_INDEX_FORMAT, &INDEX_FORMAT_VERSION)
                         .map_err(storage_error)?;
@@ -2277,6 +2299,78 @@ mod tests {
         }
         let mut db = Database::open(&path).unwrap();
         while db.compact().unwrap() {}
+    }
+
+    #[test]
+    fn baseline_payload_index_fixture_legacy_transition_rolls_back_as_one_transaction() {
+        let temp = studiofs_test_support::workspace_target_tempdir("test-legacy-payload-index-");
+        let path = temp.path().join("cache.redb");
+        studiofs_test_support::copy_file_contents(baseline_payload_index_fixture(), &path).unwrap();
+        let dirty_bytes = {
+            let db = Database::open(&path).unwrap();
+            let txn = db.begin_write().unwrap();
+            let dirty_bytes = {
+                let mut counters = txn.open_table(COUNTERS_TABLE).unwrap();
+                counters
+                    .insert(COUNTER_INDEX_FORMAT, LEGACY_INDEX_FORMAT_VERSION)
+                    .unwrap();
+                counters
+                    .remove(COUNTER_DIRTY_BYTES)
+                    .unwrap()
+                    .unwrap()
+                    .value()
+            };
+            txn.commit().unwrap();
+            dirty_bytes
+        };
+        assert!(matches!(
+            CacheIndex::open(&path),
+            Err(CacheIndexError::Corruption(_))
+        ));
+        {
+            let db = Database::open(&path).unwrap();
+            let txn = db.begin_write().unwrap();
+            {
+                let mut counters = txn.open_table(COUNTERS_TABLE).unwrap();
+                assert_eq!(
+                    counters.get(COUNTER_INDEX_FORMAT).unwrap().unwrap().value(),
+                    LEGACY_INDEX_FORMAT_VERSION
+                );
+                counters.insert(COUNTER_DIRTY_BYTES, dirty_bytes).unwrap();
+            }
+            txn.commit().unwrap();
+        }
+        let index = CacheIndex::open(&path).unwrap();
+        assert_eq!(index.stats().unwrap().dirty_bytes, dirty_bytes);
+        assert_eq!(
+            index.get_entry(43).unwrap().unwrap().upload_state,
+            LocalPayloadUploadState::Uploading
+        );
+    }
+
+    #[test]
+    fn baseline_payload_index_fixture_refuses_newer_revision() {
+        let temp = studiofs_test_support::workspace_target_tempdir("test-newer-payload-index-");
+        let path = temp.path().join("cache.redb");
+        studiofs_test_support::copy_file_contents(baseline_payload_index_fixture(), &path).unwrap();
+        {
+            let db = Database::open(&path).unwrap();
+            let txn = db.begin_write().unwrap();
+            txn.open_table(COUNTERS_TABLE)
+                .unwrap()
+                .insert(COUNTER_INDEX_FORMAT, INDEX_FORMAT_VERSION + 1)
+                .unwrap();
+            txn.commit().unwrap();
+        }
+        let before = std::fs::read(&path).unwrap();
+        assert!(matches!(
+            CacheIndex::open(&path),
+            Err(CacheIndexError::UnsupportedFormat {
+                expected: 2,
+                found: 3
+            })
+        ));
+        assert_eq!(std::fs::read(&path).unwrap(), before);
     }
 
     #[test]
