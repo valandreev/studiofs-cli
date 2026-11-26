@@ -41,7 +41,11 @@ fn output_text(output: &Output) -> String {
 }
 
 fn configured_test_pg_dsn() -> Option<String> {
-    std::env::var("STUDIOFS_TEST_PG_DSN")
+    configured_test_setting("STUDIOFS_TEST_PG_DSN")
+}
+
+fn configured_test_setting(setting: &str) -> Option<String> {
+    std::env::var(setting)
         .ok()
         .filter(|value| !value.trim().is_empty())
         .or_else(|| {
@@ -49,7 +53,7 @@ fn configured_test_pg_dsn() -> Option<String> {
             dotenvy::from_path_iter(workspace_root.join(".env"))
                 .ok()?
                 .find_map(|entry| match entry.ok()? {
-                    (key, value) if key == "STUDIOFS_TEST_PG_DSN" => Some(value),
+                    (key, value) if key == setting => Some(value),
                     _ => None,
                 })
                 .filter(|value| !value.trim().is_empty())
@@ -167,9 +171,40 @@ fn create_local_volume_metadata(
 }
 
 #[test]
-#[ignore = "requires PostgreSQL test service; isolated command upgrade, no S3"]
+#[ignore = "requires the PostgreSQL test service"]
 fn upgrade_cli_restarts_after_shared_success_and_preserves_local_journal() {
+    exercise_upgrade_retry(false);
+}
+
+#[test]
+#[ignore = "requires PostgreSQL and RustFS test services"]
+fn upgrade_cli_preserves_rustfs_payload_checksum() {
+    exercise_upgrade_retry(true);
+}
+
+fn exercise_upgrade_retry(with_rustfs: bool) {
+    use studiofs_data::store::DataError;
+    use studiofs_data::{DataStore, DataStoreConfig};
     use studiofs_meta::{MetaFsOps, MetaInodes};
+
+    struct PayloadCleanup<'a> {
+        runtime: &'a tokio::runtime::Runtime,
+        store: DataStore,
+        object_id: &'a str,
+    }
+
+    impl Drop for PayloadCleanup<'_> {
+        fn drop(&mut self) {
+            if self
+                .runtime
+                .block_on(self.store.delete_object(self.object_id))
+                .is_err()
+            {
+                eprintln!("could not remove the upgrade test payload");
+            }
+        }
+    }
+
     let raw_dsn = configured_test_pg_dsn().expect("configured PostgreSQL test service");
     let runtime = tokio::runtime::Runtime::new().unwrap();
     let dsn = runtime
@@ -195,6 +230,34 @@ fn upgrade_cli_restarts_after_shared_success_and_preserves_local_journal() {
     let (checkpoint, bytes) = create_local_volume_metadata(root.path(), &name, &dsn, id, &uuid);
     runtime.block_on(seed_pg_metadata_state(&client, id, &checkpoint, &bytes));
     let mut legacy: FormatInfo = serde_json::from_slice(&bytes).unwrap();
+    let contents = b"StudioFS format adoption payload fixture".as_slice();
+    let payload = with_rustfs.then(|| {
+        legacy.endpoint = configured_test_setting("STUDIOFS_S3_ENDPOINT").expect("RustFS endpoint");
+        legacy.bucket = configured_test_setting("STUDIOFS_S3_BUCKET").expect("RustFS test bucket");
+        legacy.access_key =
+            configured_test_setting("STUDIOFS_S3_ACCESS_KEY").expect("RustFS access key");
+        legacy.secret_key =
+            configured_test_setting("STUDIOFS_S3_SECRET_KEY").expect("RustFS secret key");
+        if let Some(region) = configured_test_setting("STUDIOFS_S3_REGION") {
+            legacy.region = region;
+        }
+        let store = DataStore::new(&DataStoreConfig::from(&legacy))
+            .unwrap_or_else(|_| panic!("open RustFS test bucket"));
+        let object_id = "1132";
+        runtime
+            .block_on(store.put_object(object_id, contents))
+            .unwrap_or_else(|error| match error {
+                DataError::OpenDal(error) => {
+                    panic!("write RustFS fixture failed: {}", error.kind())
+                }
+                _ => panic!("write RustFS fixture failed"),
+            });
+        PayloadCleanup {
+            runtime: &runtime,
+            store,
+            object_id,
+        }
+    });
     legacy.format_version = 5;
     let bytes = serde_json::to_vec(&legacy).unwrap();
     runtime
@@ -243,12 +306,10 @@ fn upgrade_cli_restarts_after_shared_success_and_preserves_local_journal() {
     drop(local);
     let failed = run();
     assert!(!failed.status.success());
-    assert!(
-        output_text(&failed).contains("Shared format is upgraded"),
-        "{}",
-        output_text(&failed)
-    );
-    assert!(!output_text(&failed).contains(&dsn));
+    let failure = output_text(&failed);
+    assert!(!failure.contains(&dsn));
+    assert!(!failure.contains(&legacy.secret_key));
+    assert!(failure.contains("Shared format is upgraded"));
     assert_eq!(
         runtime
             .block_on(client.query_one(
@@ -257,7 +318,7 @@ fn upgrade_cli_restarts_after_shared_success_and_preserves_local_journal() {
             ))
             .unwrap()
             .get::<_, i16>(0),
-        6
+        i16::try_from(CURRENT_FORMAT_VERSION).unwrap()
     );
     assert!(
         RedbMetaEngine::open(&path).is_err(),
@@ -270,12 +331,21 @@ fn upgrade_cli_restarts_after_shared_success_and_preserves_local_journal() {
     drop(local);
     for _ in 0..2 {
         let output = run();
-        assert!(output.status.success(), "{}", output_text(&output));
+        assert!(output.status.success(), "upgrade retry must succeed");
     }
     let local = RedbMetaEngine::open(&path).unwrap();
-    assert_eq!(local.get_format_info().unwrap().format_version, 6);
+    assert_eq!(
+        local.get_format_info().unwrap().format_version,
+        CURRENT_FORMAT_VERSION
+    );
     assert_eq!(local.get_attr(attr.ino).unwrap(), attr);
     assert_eq!(local.read_events_range(0, u64::MAX).unwrap(), journal);
+    if let Some(payload) = payload {
+        let persisted = runtime
+            .block_on(payload.store.get_object(payload.object_id))
+            .unwrap_or_else(|_| panic!("read existing RustFS object after adoption"));
+        assert_eq!(Sha256::digest(persisted.to_vec()), Sha256::digest(contents));
+    }
     drop(local);
     drop(client);
     let _ = runtime.block_on(connection_task);

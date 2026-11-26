@@ -293,6 +293,18 @@ impl CacheIndex {
         // redb::Database::create() creates a new DB for missing/empty files and
         // opens an existing valid redb file, so this is safe for reopen paths.
         let db = Database::create(&path).map_err(storage_error)?;
+        Self::open_database(path, db)
+    }
+
+    /// Upgrade a stopped, existing index in place without creating a cache.
+    pub fn upgrade_existing(path: impl AsRef<Path>) -> Result<(), CacheIndexError> {
+        let path = path.as_ref().to_path_buf();
+        let db = Database::open(&path).map_err(storage_error)?;
+        Self::open_database(path, db)?;
+        Ok(())
+    }
+
+    fn open_database(path: PathBuf, db: Database) -> Result<Self, CacheIndexError> {
         let index = Self {
             db_path: path,
             db: Arc::new(db),
@@ -2305,6 +2317,8 @@ mod tests {
     fn baseline_payload_index_fixture_legacy_transition_rolls_back_as_one_transaction() {
         let temp = studiofs_test_support::workspace_target_tempdir("test-legacy-payload-index-");
         let path = temp.path().join("cache.redb");
+        assert!(CacheIndex::upgrade_existing(&path).is_err());
+        assert!(!path.exists());
         studiofs_test_support::copy_file_contents(baseline_payload_index_fixture(), &path).unwrap();
         let dirty_bytes = {
             let db = Database::open(&path).unwrap();
@@ -2324,7 +2338,7 @@ mod tests {
             dirty_bytes
         };
         assert!(matches!(
-            CacheIndex::open(&path),
+            CacheIndex::upgrade_existing(&path),
             Err(CacheIndexError::Corruption(_))
         ));
         {
@@ -2340,6 +2354,8 @@ mod tests {
             }
             txn.commit().unwrap();
         }
+        CacheIndex::upgrade_existing(&path).unwrap();
+        CacheIndex::upgrade_existing(&path).unwrap();
         let index = CacheIndex::open(&path).unwrap();
         assert_eq!(index.stats().unwrap().dirty_bytes, dirty_bytes);
         assert_eq!(

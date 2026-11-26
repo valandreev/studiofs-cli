@@ -106,7 +106,12 @@ struct FormatVersionOnly {
 /// or enum variant is a newer writer's addition and returns
 /// [`MetaError::UpgradeRequired`] naming it.
 pub fn decode_format_info(bytes: &[u8]) -> MetaResult<FormatInfo> {
-    decode_format_info_as(bytes, version::SHARED_VOLUME_FORMAT)
+    let version: FormatVersionOnly =
+        serde_json::from_slice(bytes).map_err(|error| invalid_format_info_json(&error))?;
+    check_volume_format(version.format_version)?;
+    let info: FormatInfo = serde_json::from_slice(bytes).map_err(format_info_decode_error)?;
+    info.validate_format_contract()?;
+    Ok(info)
 }
 
 const LOCAL_REDB_REVISION: &str = "local_redb_revision";
@@ -129,19 +134,6 @@ fn decode_local_format_info(bytes: &[u8]) -> MetaResult<FormatInfo> {
         return decode_format_info(&bytes);
     }
     decode_format_info(bytes)
-}
-
-/// Validate the header version before decoding fields from its body.
-fn decode_format_info_as(
-    bytes: &[u8],
-    identity: version::VersionIdentity,
-) -> MetaResult<FormatInfo> {
-    let version: FormatVersionOnly =
-        serde_json::from_slice(bytes).map_err(|error| invalid_format_info_json(&error))?;
-    identity.check(version.format_version)?;
-    let info: FormatInfo = serde_json::from_slice(bytes).map_err(format_info_decode_error)?;
-    info.validate_format_contract()?;
-    Ok(info)
 }
 
 /// Maps serde's unknown field/variant errors to [`MetaError::UpgradeRequired`].
@@ -271,7 +263,7 @@ impl Default for MetaOpenOptions {
 /// Validate shared [`FormatInfo`] against the shared volume format before
 /// opening or importing it.
 pub fn ensure_supported_format_version(info: &FormatInfo) -> MetaResult<()> {
-    version::SHARED_VOLUME_FORMAT.check(info.format_version)?;
+    check_volume_format(info.format_version)?;
     info.validate_format_contract()?;
     Ok(())
 }
@@ -285,6 +277,13 @@ pub fn ensure_supported_pg_sync_format_version(found: Option<i16>) -> MetaResult
     let found = found
         .and_then(|value| u16::try_from(value).ok())
         .unwrap_or_default();
+    check_volume_format(found)
+}
+
+pub(crate) fn check_volume_format(found: u16) -> MetaResult<()> {
+    if compat::MIGRATABLE_VOLUME_FORMATS.contains(&found) {
+        return Err(MetaError::NeedsMigration { found });
+    }
     version::SHARED_VOLUME_FORMAT.check(found)
 }
 
@@ -526,10 +525,7 @@ mod tests {
         json["successor_field"] = serde_json::json!(true);
         assert!(matches!(
             decode_format_info(&serde_json::to_vec(&json).unwrap()),
-            Err(MetaError::UnsupportedFormatVersion {
-                found: 5,
-                expected: 6
-            })
+            Err(MetaError::NeedsMigration { found: 5 })
         ));
     }
 
@@ -565,7 +561,7 @@ mod tests {
         ensure_supported_pg_sync_format_version(Some(volume_format)).unwrap();
         assert!(matches!(
             ensure_supported_pg_sync_format_version(Some(checkpoint_format)),
-            Err(MetaError::UnsupportedFormatVersion { .. })
+            Err(MetaError::UnsupportedFormatVersion { .. } | MetaError::NeedsMigration { .. })
         ));
     }
 

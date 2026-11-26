@@ -1214,7 +1214,7 @@ fn janitor_object_ids<'a>(
 /// Publication bumps `metadata_state` before it records references, so this share
 /// lock, taken before the claim statement starts, makes the claim's reference and pin
 /// checks authoritative.
-pub(super) const CLAIM_PUBLICATION_FENCE_SQL: &str = "SELECT set_config('studiofs.deletion_format', '6', true) FROM metadata_state WHERE vol = $1 FOR SHARE";
+pub(super) const CLAIM_PUBLICATION_FENCE_SQL: &str = "SELECT set_config('studiofs.deletion_format', '7', true) FROM metadata_state WHERE vol = $1 FOR SHARE";
 
 /// Claims every object in `$2` that is neither referenced nor snapshot-pinned, under
 /// its object-level fence, and returns `(object_id, fencing_token)` per claim

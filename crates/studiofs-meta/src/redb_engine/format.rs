@@ -1,6 +1,7 @@
 use super::*;
 
 pub(super) const LOCAL_UPGRADE_STAGE: &str = "local_redb_upgrade_stage";
+pub(super) const LOCAL_ADOPTION_STAGE: &str = "local_volume_adoption_stage";
 
 pub(super) fn local_header(info: &FormatInfo, previous: Option<&[u8]>) -> MetaResult<Vec<u8>> {
     if cfg!(feature = "test-successor")
@@ -21,7 +22,7 @@ pub(super) fn local_header(info: &FormatInfo, previous: Option<&[u8]>) -> MetaRe
 
 impl RedbMetaEngine {
     /// Read a stopped cache's migration header while retaining exclusive database ownership.
-    /// This deliberately accepts only the previous and current format.
+    /// This accepts the published legacy formats and the current format.
     pub fn format_info_for_upgrade(&self) -> MetaResult<FormatInfo> {
         let txn = self.begin_read_txn()?;
         Self::read_format_info_for_upgrade_from_read_txn(&txn)
@@ -38,7 +39,7 @@ impl RedbMetaEngine {
         let bytes = table.get("format")?.ok_or(MetaError::NotFormatted)?;
         let version: crate::FormatVersionOnly = serde_json::from_slice(bytes.value())
             .map_err(|error| crate::invalid_format_info_json(&error))?;
-        if version.format_version != 5 {
+        if !crate::compat::MIGRATABLE_VOLUME_FORMATS.contains(&version.format_version) {
             return crate::decode_local_format_info(bytes.value());
         }
         let info: FormatInfo =
@@ -58,7 +59,26 @@ impl RedbMetaEngine {
         &self,
         checkpoint: impl Fn(u8) -> MetaResult<()>,
     ) -> MetaResult<()> {
+        self.advance_local_upgrade(None, checkpoint)
+    }
+
+    /// Activate the adopted shared format without resetting local serving state.
+    pub fn upgrade_local_format6(&self, shared: &FormatInfo) -> MetaResult<()> {
+        crate::ensure_supported_format_version(shared)?;
+        self.advance_local_upgrade(Some(shared), |_| Ok(()))
+    }
+
+    pub(crate) fn advance_local_upgrade(
+        &self,
+        shared: Option<&FormatInfo>,
+        checkpoint: impl Fn(u8) -> MetaResult<()>,
+    ) -> MetaResult<()> {
         let current_revision = crate::version::LOCAL_METADATA_LAYOUT.current;
+        let stage_key = if shared.is_some() {
+            LOCAL_ADOPTION_STAGE
+        } else {
+            LOCAL_UPGRADE_STAGE
+        };
         checkpoint(0)?;
         loop {
             let txn = self.begin_immediate_write_txn()?;
@@ -68,26 +88,45 @@ impl RedbMetaEngine {
                     .map_err(|error| MetaError::Storage(error.to_string()))?;
                 let mut header: serde_json::Value = {
                     let bytes = table.get("format")?.ok_or(MetaError::NotFormatted)?;
-                    crate::decode_local_format_info(bytes.value())?;
                     serde_json::from_slice(bytes.value())
                         .map_err(|error| crate::invalid_format_info_json(&error))?
                 };
-                let stage = table
-                    .get(LOCAL_UPGRADE_STAGE)?
-                    .map(|stage| stage.value().to_vec());
+                let stage = table.get(stage_key)?.map(|stage| stage.value().to_vec());
                 let revision = header
                     .get(crate::LOCAL_REDB_REVISION)
                     .cloned()
                     .map(serde_json::from_value::<u16>)
                     .transpose()
                     .map_err(|error| crate::invalid_format_info_json(&error))?;
-                let activated = revision == Some(current_revision);
+                let local = decode_upgrade_header(&header)?;
+                let activated = if let Some(shared) = shared {
+                    let mut candidate = local.clone();
+                    candidate.format_version = shared.format_version;
+                    verify_shared_header(&candidate, shared)?;
+                    if !matches!(
+                        local.format_version,
+                        6 | crate::schema::CURRENT_FORMAT_VERSION
+                    ) {
+                        return Err(MetaError::UnsupportedFormatVersion {
+                            found: local.format_version,
+                            expected: 6,
+                        });
+                    }
+                    local.format_version == shared.format_version
+                } else {
+                    crate::ensure_supported_format_version(&local)?;
+                    revision == Some(current_revision)
+                };
                 let next = match (stage.as_deref(), activated) {
                     (None, true) => return Ok(()),
                     (None, false) => 1,
                     (Some([1]), false) => 2,
                     (Some([2]), false) => {
-                        header[crate::LOCAL_REDB_REVISION] = current_revision.into();
+                        if let Some(shared) = shared {
+                            header["format_version"] = shared.format_version.into();
+                        } else {
+                            header[crate::LOCAL_REDB_REVISION] = current_revision.into();
+                        }
                         let bytes = serde_json::to_vec(&header)
                             .map_err(|error| crate::invalid_format_info_json(&error))?;
                         table.insert("format", bytes.as_slice())?;
@@ -95,7 +134,7 @@ impl RedbMetaEngine {
                     }
                     (Some([3]), true) => {
                         checkpoint(4)?;
-                        table.remove(LOCAL_UPGRADE_STAGE)?;
+                        table.remove(stage_key)?;
                         0
                     }
                     _ => {
@@ -105,7 +144,7 @@ impl RedbMetaEngine {
                     }
                 };
                 if next != 0 {
-                    table.insert(LOCAL_UPGRADE_STAGE, [next].as_slice())?;
+                    table.insert(stage_key, [next].as_slice())?;
                 }
                 next
             };
@@ -122,7 +161,12 @@ impl RedbMetaEngine {
     /// upgraded. No journal, accepted payload state, inode or counter is reset.
     /// The caller must supply the format fetched from upgraded shared authority.
     pub fn upgrade_local_format5(&self, shared: &FormatInfo) -> MetaResult<()> {
-        crate::ensure_supported_format_version(shared)?;
+        if shared.format_version != 6 {
+            return Err(MetaError::UnsupportedFormatVersion {
+                found: shared.format_version,
+                expected: 6,
+            });
+        }
         shared.validate_format_contract()?;
         let txn = self.begin_write_txn()?;
         {
@@ -133,7 +177,7 @@ impl RedbMetaEngine {
                 let bytes = table.get("format")?.ok_or(MetaError::NotFormatted)?;
                 let version: crate::FormatVersionOnly = serde_json::from_slice(bytes.value())
                     .map_err(|error| crate::invalid_format_info_json(&error))?;
-                let local: FormatInfo = if version.format_version == 5 {
+                let local: FormatInfo = if matches!(version.format_version, 5 | 6) {
                     serde_json::from_slice(bytes.value())
                         .map_err(crate::format_info_decode_error)?
                 } else {
@@ -148,15 +192,7 @@ impl RedbMetaEngine {
                 });
             }
             local.format_version = 6;
-            if serde_json::to_value(&local)
-                .map_err(|error| MetaError::Serialization(error.to_string()))?
-                != serde_json::to_value(shared)
-                    .map_err(|error| MetaError::Serialization(error.to_string()))?
-            {
-                return Err(MetaError::Storage(
-                    "local and shared format identity differ; cache was not changed".into(),
-                ));
-            }
+            verify_shared_header(&local, shared)?;
             let bytes = local_header(&local, Some(&previous))?;
             table.insert("format", bytes.as_slice())?;
         }
@@ -172,6 +208,9 @@ impl RedbMetaEngine {
             Err(redb::TableError::TableDoesNotExist(_)) => return Err(MetaError::NotFormatted),
             Err(error) => return Err(MetaError::Storage(error.to_string())),
         };
+        if table.get(LOCAL_ADOPTION_STAGE)?.is_some() {
+            return Err(MetaError::LocalAdoptionPending);
+        }
         if cfg!(feature = "test-successor") && table.get(LOCAL_UPGRADE_STAGE)?.is_some() {
             return Err(MetaError::UpgradeRequired {
                 reason: crate::UpgradeRequiredReason::LocalRedbUpgradePending,
@@ -232,6 +271,33 @@ impl RedbMetaEngine {
             .ok_or(MetaError::NotFormatted)?;
         crate::decode_local_format_info(entry.value())
     }
+}
+
+fn decode_upgrade_header(header: &serde_json::Value) -> MetaResult<FormatInfo> {
+    let mut header = header.clone();
+    if let Some(object) = header.as_object_mut()
+        && let Some(revision) = object.remove(crate::LOCAL_REDB_REVISION)
+    {
+        let revision = serde_json::from_value(revision)
+            .map_err(|error| crate::invalid_format_info_json(&error))?;
+        crate::version::LOCAL_METADATA_LAYOUT.check(revision)?;
+    }
+    let info: FormatInfo =
+        serde_json::from_value(header).map_err(crate::format_info_decode_error)?;
+    info.validate_format_contract()?;
+    Ok(info)
+}
+
+fn verify_shared_header(local: &FormatInfo, shared: &FormatInfo) -> MetaResult<()> {
+    let as_json = |format: &FormatInfo| {
+        serde_json::to_value(format).map_err(|error| crate::invalid_format_info_json(&error))
+    };
+    if as_json(local)? != as_json(shared)? {
+        return Err(MetaError::Storage(
+            "local and shared format identity differ; cache was not changed".into(),
+        ));
+    }
+    Ok(())
 }
 
 impl MetaFormat for RedbMetaEngine {

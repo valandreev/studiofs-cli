@@ -576,7 +576,7 @@ mod startup_schema;
 mod volume_protocol;
 mod volume_settings;
 pub use client_sessions::{PublicationSession, read_client_sessions};
-pub use format_upgrade::upgrade_shared_format5;
+pub use format_upgrade::{upgrade_shared_format5, upgrade_shared_format6};
 use janitor::PgJanitorLock;
 #[cfg(test)]
 use remote_apply::DecodedReplayBatch;

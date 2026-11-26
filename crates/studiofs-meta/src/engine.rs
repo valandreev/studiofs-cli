@@ -153,7 +153,7 @@ impl BootstrapCheckpointDescriptor {
                 reason: CheckpointDescriptorFailure::VolumeIdentity,
             });
         }
-        crate::version::SHARED_VOLUME_FORMAT.check(self.metadata_format_version)?;
+        crate::check_volume_format(self.metadata_format_version)?;
         if self.checkpoint_version < 0
             || self.remote_head_version < 0
             || self.checkpoint_version > self.remote_head_version
@@ -172,7 +172,9 @@ impl BootstrapCheckpointDescriptor {
         let format_info = crate::decode_format_info(&self.format_info_bytes).map_err(|error| {
             if matches!(
                 error,
-                MetaError::UnsupportedFormatVersion { .. } | MetaError::UpgradeRequired { .. }
+                MetaError::UnsupportedFormatVersion { .. }
+                    | MetaError::UpgradeRequired { .. }
+                    | MetaError::NeedsMigration { .. }
             ) {
                 error
             } else {
@@ -459,9 +461,24 @@ pub enum MetaError {
     #[error("format info not found — run `studiofs init` first")]
     NotFormatted,
 
+    /// A published 0.2.x volume needs explicit adoption.
+    #[error(
+        "metadata format {found} needs migration; stop mounts and janitors, then run `studiofs upgrade <volume>` on each cache"
+    )]
+    NeedsMigration {
+        /// Legacy volume format.
+        found: u16,
+    },
+
+    /// The local part of volume adoption was interrupted.
+    #[error(
+        "local volume adoption is pending; rerun `studiofs upgrade <volume>` with the same arguments"
+    )]
+    LocalAdoptionPending,
+
     /// A persisted local or PostgreSQL metadata format is unsupported by this binary.
     #[error(
-        "unsupported metadata/PG sync format version: found {found}, expected {expected}; use a matching StudioFS binary. For format 5 to 6, stop mounts and janitors and run `studiofs upgrade NAME` on each cache; preserve accepted local data and never reinitialize it. If the stored state is older than format 5, recreate the incompatible metadata or volume, then run `studiofs discover` for a fresh client"
+        "unsupported metadata/PG sync format version: found {found}, expected {expected}; use a matching StudioFS binary. If the stored state is older than format 5, recreate the incompatible metadata or volume, then run `studiofs discover` for a fresh client"
     )]
     UnsupportedFormatVersion {
         /// Version stored in local or PostgreSQL metadata.
@@ -1095,6 +1112,10 @@ impl PgSyncFailure {
                 }
             }
             MetaError::UnsupportedCheckpointEncoding { .. } => Self::UpgradeRequired,
+            MetaError::NeedsMigration { found } => Self::UnsupportedFormat {
+                found: *found,
+                expected: crate::schema::CURRENT_FORMAT_VERSION,
+            },
             MetaError::UnsupportedFormatVersion { found, expected } => Self::UnsupportedFormat {
                 found: *found,
                 expected: *expected,

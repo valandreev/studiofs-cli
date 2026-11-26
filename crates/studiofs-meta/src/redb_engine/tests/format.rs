@@ -32,8 +32,10 @@ fn check_redb_fixture(version: &str, expected_writer_marker: Option<&[u8]>) {
         let upgrading = RedbMetaEngine::open_for_format_upgrade(&database_path).unwrap();
         let mut shared = upgrading.format_info_for_upgrade().unwrap();
         assert_eq!(shared.format_version, 5);
-        shared.format_version = CURRENT_FORMAT_VERSION;
+        shared.format_version = 6;
         upgrading.upgrade_local_format5(&shared).unwrap();
+        shared.format_version = CURRENT_FORMAT_VERSION;
+        upgrading.upgrade_local_format6(&shared).unwrap();
     }
 
     let probed = RedbMetaEngine::read_format_info_readonly(&database_path).unwrap();
@@ -220,10 +222,7 @@ fn format_info_decode_reports_unsupported_version_before_missing_encryption() {
 
     assert!(matches!(
         err,
-        MetaError::UnsupportedFormatVersion {
-            found,
-            expected
-        } if found == CURRENT_FORMAT_VERSION - 1 && expected == CURRENT_FORMAT_VERSION
+        MetaError::NeedsMigration { found } if found == CURRENT_FORMAT_VERSION - 1
     ));
 }
 

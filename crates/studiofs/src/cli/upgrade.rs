@@ -4,11 +4,11 @@
 use anyhow::{Context, bail};
 use clap::Args;
 use std::time::Duration;
+use studiofs_meta::RedbMetaEngine;
 use studiofs_meta::pg_engine::migrations::{migrate_registered_schema, registered_schema_status};
 use studiofs_meta::schema::{FormatInfo, PostgresConfig};
-use studiofs_meta::{RedbMetaEngine, decode_format_info};
 
-const BACKUP_GUIDANCE: &str = "Before upgrading: stop every mount and janitor of every volume in this PostgreSQL database, back up the database (for example with pg_dump), and run `studiofs dump` for each volume. Schema migrations are database-wide and never move back.";
+const BACKUP_GUIDANCE: &str = "Before upgrading: stop every mount and janitor of every volume in this PostgreSQL database, back up the database (for example with pg_dump), and run `studiofs dump` with the version that last opened each volume. Schema migrations are database-wide and never move back.";
 
 #[derive(Args, Debug)]
 pub struct UpgradeArgs {
@@ -20,6 +20,9 @@ pub struct UpgradeArgs {
     /// Re-apply the 0.2.5 baseline schema to restore dropped objects; allowed only while no later schema migration is recorded.
     #[arg(long)]
     pub repair_schema: bool,
+    /// Cache directory used by mount, when set with its --cache-dir option.
+    #[arg(long)]
+    pub cache_dir: Option<std::path::PathBuf>,
     /// Upgrade only the stopped local metadata database.
     #[cfg(feature = "test-successor")]
     #[arg(long, conflicts_with_all = ["repair_schema", "dry_run"])]
@@ -34,7 +37,9 @@ impl UpgradeArgs {
         let path =
             super::utils::get_default_meta_dir(&self.name)?.join(format!("{}.db", self.name));
         if !path.is_file() {
-            bail!("Local volume metadata is missing; discover the volume before upgrading.");
+            bail!(
+                "Local volume metadata is missing; run upgrade where this volume already has a stopped cache."
+            );
         }
         #[cfg(feature = "test-successor")]
         if self.local_only {
@@ -68,11 +73,26 @@ impl UpgradeArgs {
             return Ok(());
         }
         // redb owns the same exclusive database lock required by mount startup.
-        // Keep it through both commits, including recovery after a lost response.
+        // Keep it through shared and local completion, including retries.
         let local = RedbMetaEngine::open_for_format_upgrade(&path)
             .context("Cannot own local metadata; stop every process using this volume and retry")?;
         let format = local.format_info_for_upgrade()?;
         let pg = postgres_binding(&format, &self.name)?;
+        let settings = super::settings::load_studiofs_config()?;
+        let cache_dir = self
+            .cache_dir
+            .or_else(|| {
+                settings
+                    .cache_dir
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|path| !path.is_empty())
+                    .map(Into::into)
+            })
+            .unwrap_or_else(|| path.with_file_name("cache"));
+        let layout = studiofs_cache::runtime::LocalPayloadLayout::from_cache_root(
+            cache_dir.join(&format.uuid),
+        );
         let uuid = &format.uuid;
         let repair_schema = self.repair_schema;
         let shared = runtime.block_on(async {
@@ -80,20 +100,38 @@ impl UpgradeArgs {
                 for step in migrate_registered_schema(&mut client, repair_schema).await? {
                     println!("Applied schema migration {step}.");
                 }
-                studiofs_meta::pg_engine::upgrade_shared_format5(&mut client, pg.volume_id, uuid).await?;
-                let row = client.query_one("SELECT format_info FROM metadata_state WHERE vol=$1", &[&pg.volume_id]).await?;
-                let bytes: Vec<u8> = row.get(0);
-                Ok(decode_format_info(&bytes)?)
+                if format.format_version == 5 {
+                    studiofs_meta::pg_engine::upgrade_shared_format5(&mut client, pg.volume_id, uuid).await?;
+                }
+                Ok(studiofs_meta::pg_engine::upgrade_shared_format6(&mut client, pg.volume_id, uuid).await?)
             })).await.context("Upgrade timed out; retry the same command to complete safely")?
         }).context("Shared upgrade did not complete locally. Committed schema migrations stay applied and a failed one is rolled back. Stop all volume mounts and janitors, verify database connectivity and schema privileges, then retry this command. Accepted local data is preserved.")?;
-        local.upgrade_local_format5(&shared)
+        finish_local_upgrade(&local, &format, &shared, &layout.redb_index_path)
             .context("Shared format is upgraded; local completion failed. Keep this cache and retry upgrade; do not reinitialize or clear it")?;
         println!(
-            "Volume '{}' uses format 6. Repeat upgrade on every other stopped cache before remounting. Use an updated janitor: payload_gc schema 2 fences older janitors across this database.",
-            self.name
+            "Volume '{}' uses format {}. Repeat upgrade on every other stopped cache before remounting.",
+            self.name, shared.format_version
         );
         Ok(())
     }
+}
+
+fn finish_local_upgrade(
+    local: &RedbMetaEngine,
+    previous: &FormatInfo,
+    shared: &FormatInfo,
+    index_path: &std::path::Path,
+) -> anyhow::Result<()> {
+    if index_path.try_exists()? {
+        studiofs_cache::runtime::CacheIndex::upgrade_existing(index_path)?;
+    }
+    if previous.format_version == 5 {
+        let mut intermediate = shared.clone();
+        intermediate.format_version = 6;
+        local.upgrade_local_format5(&intermediate)?;
+    }
+    local.upgrade_local_format6(shared)?;
+    Ok(())
 }
 
 fn postgres_binding<'a>(format: &'a FormatInfo, name: &str) -> anyhow::Result<&'a PostgresConfig> {

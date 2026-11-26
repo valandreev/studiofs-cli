@@ -35,6 +35,7 @@ pub const CORE_COMPONENT: &str = "core";
 /// Database-wide additive component for per-volume client session leases (SFS-1008).
 pub const CLIENT_SESSIONS_COMPONENT: &str = "client_sessions";
 pub(super) const CHECKPOINT_ENCODINGS_COMPONENT: &str = "checkpoint_encodings";
+pub(super) const DELETION_FORMAT_FENCE_COMPONENT: &str = "deletion_format_fence";
 
 /// Recorded by the baseline itself and checked exactly by the CLI Janitor.
 const PAYLOAD_GC_COMPONENT: &str = "payload_gc";
@@ -126,6 +127,29 @@ const CHECKPOINT_ENCODINGS: Migration = Migration {
           );",
 };
 
+const DELETION_FORMAT_FENCE: Migration = Migration {
+    component: DELETION_FORMAT_FENCE_COMPONENT,
+    version: 1,
+    name: "fence deletion claims by volume format",
+    phase: MigrationPhase::Additive,
+    sql: "CREATE OR REPLACE FUNCTION studiofs_fence_legacy_deletion_claim()
+          RETURNS TRIGGER LANGUAGE plpgsql AS $$
+          BEGIN
+              IF NEW.state = 'delete_pending' AND NEW.reconcile_owner IS NOT NULL
+                 AND (TG_OP = 'INSERT' OR NEW.reconcile_fence IS DISTINCT FROM OLD.reconcile_fence)
+                 AND EXISTS (
+                     SELECT 1 FROM metadata_state
+                     WHERE vol = NEW.vol AND metadata_format_version >= 6
+                       AND current_setting('studiofs.deletion_format', true)
+                           IS DISTINCT FROM metadata_format_version::text
+                 )
+              THEN
+                  RAISE EXCEPTION 'deletion claim requires current volume format capability';
+              END IF;
+              RETURN NEW;
+          END $$;",
+};
+
 /// Test-successor change (SFS-1131): one additive table that 0.2.5 ignores.
 #[cfg(feature = "test-successor")]
 const SUCCESSOR_PROBE: Migration = Migration {
@@ -141,7 +165,12 @@ const SUCCESSOR_PROBE: Migration = Migration {
 
 /// Every migration this binary knows, grouped by component in version order.
 #[cfg(not(feature = "test-successor"))]
-pub const MIGRATIONS: &[Migration] = &[BASELINE, CLIENT_SESSIONS, CHECKPOINT_ENCODINGS];
+pub const MIGRATIONS: &[Migration] = &[
+    BASELINE,
+    CLIENT_SESSIONS,
+    CHECKPOINT_ENCODINGS,
+    DELETION_FORMAT_FENCE,
+];
 /// Every migration this binary knows, grouped by component in version order.
 #[cfg(feature = "test-successor")]
 pub const MIGRATIONS: &[Migration] = &[
@@ -149,6 +178,7 @@ pub const MIGRATIONS: &[Migration] = &[
     SUCCESSOR_PROBE,
     CLIENT_SESSIONS,
     CHECKPOINT_ENCODINGS,
+    DELETION_FORMAT_FENCE,
 ];
 
 /// A `studiofs_schema_components` row.
@@ -470,6 +500,19 @@ pub(crate) async fn migrate_with(
             return Ok(applied);
         };
         apply(&tx, &step, registry).await?;
+        if step == BASELINE
+            && recorded
+                .iter()
+                .any(|row| row.component == DELETION_FORMAT_FENCE_COMPONENT)
+        {
+            // Baseline repair reinstalls the legacy trigger. Restore the
+            // recorded predicate before making the repair visible.
+            tx.batch_execute(DELETION_FORMAT_FENCE.sql)
+                .await
+                .map_err(|error| {
+                    pg_failure("restore the recorded deletion format fence", &error)
+                })?;
+        }
         tx.commit()
             .await
             .map_err(|error| pg_failure("commit schema migration", &error))?;
@@ -543,7 +586,8 @@ mod tests {
             vec![
                 CHECKPOINT_ENCODINGS_COMPONENT,
                 CLIENT_SESSIONS_COMPONENT,
-                CORE_COMPONENT
+                CORE_COMPONENT,
+                DELETION_FORMAT_FENCE_COMPONENT,
             ]
         );
         for (component, versions) in &by_component {

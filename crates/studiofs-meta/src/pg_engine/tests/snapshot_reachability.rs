@@ -263,11 +263,11 @@ fn pruned_deletion_fences_stay_fenced_below_the_payload_watermark() {
                 .await
                 .expect("connect to test postgres");
             let connection_task = tokio::spawn(connection);
-            // Fixture rows model a format-6 claimer, which the legacy-claim fence admits.
+            // Fixture rows model a current-format claimer.
             client
-                .batch_execute("SELECT set_config('studiofs.deletion_format', '6', false)")
+                .batch_execute("SELECT set_config('studiofs.deletion_format', '7', false)")
                 .await
-                .expect("declare format 6 deletion capability");
+                .expect("declare current deletion capability");
             client
                 .execute(&statement, &[&volume_id])
                 .await
