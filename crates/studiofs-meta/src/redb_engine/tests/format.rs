@@ -20,7 +20,7 @@ fn opens_redb_4_3_database_without_studiofs_format_migration() {
 }
 
 #[test]
-fn local_adoption_keeps_the_discovered_postgres_dsn() {
+fn local_adoption_keeps_local_dsn_and_s3_settings() {
     let temp = studiofs_test_support::workspace_target_tempdir("test-adoption-dsn-");
     let database_path = temp.path().join("metadata.redb");
     let fixture_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -33,6 +33,9 @@ fn local_adoption_keeps_the_discovered_postgres_dsn() {
         let mut shared = local.clone();
         shared.format_version = CURRENT_FORMAT_VERSION;
         shared.metadata.postgres.as_mut().unwrap().url = "postgres://creator-host/db".into();
+        // S3 settings rotated in PostgreSQL while this cache was stopped.
+        shared.endpoint = "http://rotated-endpoint:9000".into();
+        shared.secret_key = "rotated-secret".into();
         let mut other_volume = shared.clone();
         other_volume.metadata.postgres.as_mut().unwrap().volume_id += 1;
         assert!(upgrading.upgrade_local_format6(&other_volume).is_err());
@@ -42,6 +45,7 @@ fn local_adoption_keeps_the_discovered_postgres_dsn() {
     let probed = RedbMetaEngine::read_format_info_readonly(&database_path).unwrap();
     assert_eq!(probed.format_version, CURRENT_FORMAT_VERSION);
     assert_eq!(probed.metadata.postgres.unwrap().url, local_url);
+    assert_ne!(probed.endpoint, "http://rotated-endpoint:9000");
 }
 
 fn check_redb_fixture(version: &str, expected_writer_marker: Option<&[u8]>) {

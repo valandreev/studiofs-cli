@@ -301,7 +301,7 @@ fn exercise_upgrade_retry(with_rustfs: bool) {
     );
     // Force server-success/local-completion-failure without a production fault hook.
     let mut mismatched = legacy.clone();
-    mismatched.region = "local-identity-mismatch".into();
+    mismatched.data_prefix = "local-identity-mismatch".into();
     local.set_format_info(&mismatched).unwrap();
     drop(local);
     let failed = run();
