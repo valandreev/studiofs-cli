@@ -34,6 +34,7 @@ pub const CORE_COMPONENT: &str = "core";
 
 /// Database-wide additive component for per-volume client session leases (SFS-1008).
 pub const CLIENT_SESSIONS_COMPONENT: &str = "client_sessions";
+pub(super) const CHECKPOINT_ENCODINGS_COMPONENT: &str = "checkpoint_encodings";
 
 /// Recorded by the baseline itself and checked exactly by the CLI Janitor.
 const PAYLOAD_GC_COMPONENT: &str = "payload_gc";
@@ -108,6 +109,23 @@ const CLIENT_SESSIONS: Migration = Migration {
     sql: super::client_sessions::SCHEMA,
 };
 
+const CHECKPOINT_ENCODINGS: Migration = Migration {
+    component: CHECKPOINT_ENCODINGS_COMPONENT,
+    version: 1,
+    name: "independent serving checkpoint encodings",
+    phase: MigrationPhase::Additive,
+    sql: "CREATE TABLE IF NOT EXISTS serving_checkpoint_encodings (
+              vol BIGINT NOT NULL REFERENCES metadata_state(vol) ON DELETE CASCADE,
+              checkpoint_version BIGINT NOT NULL CHECK (checkpoint_version >= 0),
+              checkpoint_format SMALLINT NOT NULL CHECK (checkpoint_format > 0),
+              checkpoint_schema SMALLINT NOT NULL CHECK (checkpoint_schema > 0),
+              publication_generation BIGINT NOT NULL CHECK (publication_generation > 0),
+              snapshot BYTEA NOT NULL,
+              checkpoint_sha256 BYTEA NOT NULL CHECK (octet_length(checkpoint_sha256) = 32),
+              PRIMARY KEY (vol, checkpoint_format, checkpoint_schema, checkpoint_version)
+          );",
+};
+
 /// Test-successor change (SFS-1131): one additive table that 0.2.5 ignores.
 #[cfg(feature = "test-successor")]
 const SUCCESSOR_PROBE: Migration = Migration {
@@ -123,10 +141,15 @@ const SUCCESSOR_PROBE: Migration = Migration {
 
 /// Every migration this binary knows, grouped by component in version order.
 #[cfg(not(feature = "test-successor"))]
-pub const MIGRATIONS: &[Migration] = &[BASELINE, CLIENT_SESSIONS];
+pub const MIGRATIONS: &[Migration] = &[BASELINE, CLIENT_SESSIONS, CHECKPOINT_ENCODINGS];
 /// Every migration this binary knows, grouped by component in version order.
 #[cfg(feature = "test-successor")]
-pub const MIGRATIONS: &[Migration] = &[BASELINE, SUCCESSOR_PROBE, CLIENT_SESSIONS];
+pub const MIGRATIONS: &[Migration] = &[
+    BASELINE,
+    SUCCESSOR_PROBE,
+    CLIENT_SESSIONS,
+    CHECKPOINT_ENCODINGS,
+];
 
 /// A `studiofs_schema_components` row.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -406,7 +429,7 @@ fn with_repair(
         return pending;
     }
     let mut repairs = Vec::new();
-    for step in [BASELINE, CLIENT_SESSIONS] {
+    for step in [BASELINE, CLIENT_SESSIONS, CHECKPOINT_ENCODINGS] {
         let at_v1 = recorded
             .iter()
             .any(|row| row.component == step.component && row.version == step.version);
@@ -517,7 +540,11 @@ mod tests {
         }
         assert_eq!(
             by_component.keys().copied().collect::<Vec<_>>(),
-            vec![CLIENT_SESSIONS_COMPONENT, CORE_COMPONENT]
+            vec![
+                CHECKPOINT_ENCODINGS_COMPONENT,
+                CLIENT_SESSIONS_COMPONENT,
+                CORE_COMPONENT
+            ]
         );
         for (component, versions) in &by_component {
             assert!(
@@ -535,6 +562,10 @@ mod tests {
         assert_eq!(
             latest_version(MIGRATIONS, CLIENT_SESSIONS_COMPONENT),
             i32::from(crate::version::POSTGRES_CLIENT_SESSIONS_SCHEMA.current)
+        );
+        assert_eq!(
+            latest_version(MIGRATIONS, CHECKPOINT_ENCODINGS_COMPONENT),
+            i32::from(crate::version::POSTGRES_CHECKPOINT_ENCODINGS_SCHEMA.current)
         );
         assert_eq!(MIGRATIONS[0], BASELINE);
     }
@@ -645,6 +676,7 @@ mod tests {
         let full_recorded = [
             row(CORE_COMPONENT, 1, MIGRATIONS),
             row(CLIENT_SESSIONS_COMPONENT, 1, MIGRATIONS),
+            row(CHECKPOINT_ENCODINGS_COMPONENT, 1, MIGRATIONS),
             payload_gc.clone(),
         ];
         let full_repaired = with_repair(
@@ -655,6 +687,7 @@ mod tests {
         );
         assert_eq!(full_repaired[0], BASELINE);
         assert!(full_repaired.contains(&CLIENT_SESSIONS));
+        assert!(full_repaired.contains(&CHECKPOINT_ENCODINGS));
         let reconciled = with_repair(&stale, plan(&stale, MIGRATIONS, true).unwrap(), &[], true);
         assert_eq!(
             reconciled.iter().filter(|step| **step == BASELINE).count(),

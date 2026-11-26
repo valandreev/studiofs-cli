@@ -153,8 +153,8 @@ pub struct VolumeRequirements {
 
 impl CheckpointDescriptor {
     pub(crate) const BASELINE: Self = Self {
-        format: SERVING_CHECKPOINT_FORMAT.current,
-        schema: SERVING_CHECKPOINT_SCHEMA.current,
+        format: crate::version::BASELINE_SERVING_CHECKPOINT_FORMAT,
+        schema: crate::version::BASELINE_SERVING_CHECKPOINT_SCHEMA,
     };
 }
 
@@ -875,7 +875,7 @@ mod tests {
     fn compat_checkpoint_reader_mismatch_refuses_bootstrap_and_checkpoint_only() {
         let mut volume = VolumeRequirements::baseline();
         volume.checkpoint = Some(CheckpointDescriptor {
-            format: 5,
+            format: SERVING_CHECKPOINT_FORMAT.current + 1,
             schema: 1,
         });
         let decision = eval(&volume);

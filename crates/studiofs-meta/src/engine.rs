@@ -83,6 +83,18 @@ pub enum CheckpointDescriptorFailure {
     /// The checkpoint bytes are not a serving checkpoint payload.
     #[error("checkpoint bytes are invalid")]
     CheckpointBytes,
+    /// The envelope identifies a different volume or event-log cut.
+    #[error("checkpoint envelope identity does not match the descriptor")]
+    EnvelopeIdentity,
+}
+
+/// Persisted serving checkpoint byte format and state schema pair.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct CheckpointEncoding {
+    /// Persisted byte format version.
+    pub format: i16,
+    /// Persisted serving-state schema version.
+    pub schema: i16,
 }
 
 /// One self-consistent PostgreSQL record used to bootstrap a fresh client.
@@ -103,6 +115,8 @@ pub struct BootstrapCheckpointDescriptor {
     pub remote_head_version: i64,
     /// Exact event-log version represented by the checkpoint and replay floor.
     pub checkpoint_version: i64,
+    /// Declared checkpoint format and schema, when stored separately from the baseline slot.
+    pub checkpoint_encoding: Option<CheckpointEncoding>,
     /// Serialized remote-visible serving checkpoint.
     pub checkpoint_bytes: Vec<u8>,
     /// SHA-256 digest of `checkpoint_bytes`.
@@ -121,6 +135,7 @@ impl std::fmt::Debug for BootstrapCheckpointDescriptor {
             .field("metadata_format_version", &self.metadata_format_version)
             .field("remote_head_version", &self.remote_head_version)
             .field("checkpoint_version", &self.checkpoint_version)
+            .field("checkpoint_encoding", &self.checkpoint_encoding)
             .field("checkpoint_bytes_len", &self.checkpoint_bytes.len())
             .field("checkpoint_sha256_len", &self.checkpoint_sha256.len())
             .field("format_info_bytes", &"<redacted>")
@@ -180,11 +195,12 @@ impl BootstrapCheckpointDescriptor {
             });
         }
 
-        crate::snapshot::ServingCheckpoint::decode(&self.checkpoint_bytes).map_err(|_| {
-            MetaError::InvalidCheckpointDescriptor {
-                reason: CheckpointDescriptorFailure::CheckpointBytes,
-            }
-        })
+        crate::snapshot::ServingCheckpoint::decode_published(
+            &self.checkpoint_bytes,
+            self.checkpoint_encoding,
+            self.volume_id,
+            self.checkpoint_version,
+        )
     }
 
     /// Validates all identity, version, publication, and payload invariants.
@@ -385,6 +401,24 @@ pub enum MetaError {
     /// PostgreSQL has no initialized bootstrap checkpoint descriptor for the volume.
     #[error("postgres bootstrap checkpoint descriptor is missing")]
     BootstrapCheckpointDescriptorMissing,
+
+    /// No supported checkpoint can reach the current event-log retention floor.
+    #[error(
+        "a compatible serving checkpoint is required at or above event-log version {replay_floor}"
+    )]
+    NeedCompatibleCheckpoint {
+        /// Earliest cursor from which retained events can be replayed.
+        replay_floor: i64,
+    },
+
+    /// A persisted checkpoint declares a format or a serving schema this binary cannot decode.
+    #[error("unsupported serving checkpoint format {format} or schema {schema}")]
+    UnsupportedCheckpointEncoding {
+        /// Persisted byte format.
+        format: i16,
+        /// Persisted serving-state schema.
+        schema: i16,
+    },
 
     /// The metadata backend or remote service could not be reached.
     #[error("remote unavailable: {0}")]
@@ -979,6 +1013,11 @@ pub enum PgSyncFailure {
     },
     /// The remote serving checkpoint could not be used.
     InvalidCheckpoint,
+    /// No compatible checkpoint can reach the retained replay cursor.
+    NeedCompatibleCheckpoint {
+        /// Earliest cursor from which retained events can be replayed.
+        replay_floor: i64,
+    },
     /// The local binary and persisted PostgreSQL metadata use different formats.
     UnsupportedFormat {
         /// Format version found in persisted metadata.
@@ -1047,6 +1086,12 @@ impl PgSyncFailure {
             },
             MetaError::InvalidCheckpointDescriptor { .. }
             | MetaError::BootstrapCheckpointDescriptorMissing => Self::InvalidCheckpoint,
+            MetaError::NeedCompatibleCheckpoint { replay_floor } => {
+                Self::NeedCompatibleCheckpoint {
+                    replay_floor: *replay_floor,
+                }
+            }
+            MetaError::UnsupportedCheckpointEncoding { .. } => Self::UpgradeRequired,
             MetaError::UnsupportedFormatVersion { found, expected } => Self::UnsupportedFormat {
                 found: *found,
                 expected: *expected,
@@ -1131,6 +1176,10 @@ impl std::fmt::Display for PgSyncFailure {
                 PgSyncVersionDisplay(*target_version),
             ),
             Self::InvalidCheckpoint => formatter.write_str("invalid checkpoint"),
+            Self::NeedCompatibleCheckpoint { replay_floor } => write!(
+                formatter,
+                "compatible checkpoint required at or above event-log version {replay_floor}"
+            ),
             Self::UnsupportedFormat { found, expected } => write!(
                 formatter,
                 "unsupported format (found {found}, expected {expected})"

@@ -12,7 +12,7 @@ After this milestone, every data format a successor might change has its own ver
 
 - [x] (2026-11-25) SFS-1009: register baseline and test-successor MetaEvent codecs, refuse unsupported events before replay advances, and guard settings rewrites.
 - [x] (2026-11-26) SFS-1010: publication negotiates each event encoding against the stamped volume policy and refuses, keeping the journal, when a reader may not decode it; replay keeps decoding the whole page before the redb apply. A refusal is a sticky `PublicationBlocked` sync failure, warned once with the event kind and capability, that survives successful polls, does not invalidate remote identity validation, and clears on the next successful publication.
-- [ ] SFS-1011: support multiple checkpoint formats with safe bootstrap and pruning.
+- [x] (2026-11-26) SFS-1011: publish compatible checkpoint encodings at the same cut and retain a baseline prune anchor. [Implementation and focused validation](SFS-1011-checkpoint-formats.md).
 - [ ] SFS-1012: crash-safe local redb and payload-index format migration and recovery.
 - [ ] SFS-1013: version-aware discovery, snapshot mounts and dump/load restore.
 - [ ] SFS-1132: adopt format 5 and 6 volumes into the baseline via `studiofs upgrade`, chaining to format 7.
@@ -96,3 +96,5 @@ Issues: https://linear.app/valandreev/issue/SFS-1009, https://linear.app/valandr
 Event and checkpoint codecs stay backend-neutral. The local migration must follow the lock order in `crates/studiofs-vfs/src/lock_order.rs` when it runs inside a mount.
 
 Revision note (2026-11-25). SFS-1009 records the codec and replay boundary, the successor fixture, and the scope of capability-gated format selection.
+
+Revision note (2026-11-26). SFS-1011 adds a linked plan for checkpoint formats, safe replay, and PostgreSQL validation.

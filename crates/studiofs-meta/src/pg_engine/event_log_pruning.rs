@@ -191,6 +191,10 @@ impl PgMetaEngine {
                             })?
                             .map(|floor| nonnegative(floor, "snapshot source prune floor"))
                             .transpose()?;
+                        // metadata_state always holds the 0.2.5 encoding. A
+                        // successor checkpoint may be older after a baseline
+                        // writer takes over, but every supported decoder can
+                        // rebootstrap from this same pruning anchor.
                         let safe_floor = calculate_safe_prune_floor(
                             checkpoint_version,
                             source_floor,

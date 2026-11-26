@@ -62,19 +62,19 @@ use std::sync::Arc;
 
 pub use async_engine::{SyncMetaEngineAdapter, execute_sync_meta};
 pub use engine::{
-    BootstrapCheckpointDescriptor, CheckpointDescriptorFailure, LocalOutboundAckSnapshot,
-    LocalStorageCompactionResult, LocalStorageCompactionSkipReason, LocalStorageDiagnostics,
-    MetaAcl, MetaEngine, MetaEngineCore, MetaError, MetaFormat, MetaFsOps, MetaGc, MetaInodes,
-    MetaNamespace, MetaPayloadObjects, MetaRecovery, MetaReplication, MetaResult, MetaSymlink,
-    MetaXattr, MetadataBatchWriteObservability, MetadataCheckpointFreshnessDiagnostics,
-    MetadataCheckpointRefreshReason, MetadataCoherenceProgress, MetadataWriteObservability,
-    MetadataWriteStageTiming, NamespaceMutation, OrphanInodeFinalization, PgSyncDiagnostics,
-    PgSyncFailure, PgSyncLifecycle, PgSyncPageDiagnostics, PgSyncStatus,
-    PgSyncWriteAuthorityReason, RegularFileOverlayMutation, ScratchAutoPromoteResult,
-    ScratchAuxTable, ScratchConflictRecord, ScratchConsistencyRepairSummary,
-    ScratchConsistencyReport, ScratchDanglingDentry, ScratchOrphanAuxRow, ScratchOrphanEntry,
-    ScratchOrphanInode, ScratchOrphanRecord, ScratchPayloadObjectRef, ScratchRenameResult,
-    UpgradeRequiredReason,
+    BootstrapCheckpointDescriptor, CheckpointDescriptorFailure, CheckpointEncoding,
+    LocalOutboundAckSnapshot, LocalStorageCompactionResult, LocalStorageCompactionSkipReason,
+    LocalStorageDiagnostics, MetaAcl, MetaEngine, MetaEngineCore, MetaError, MetaFormat, MetaFsOps,
+    MetaGc, MetaInodes, MetaNamespace, MetaPayloadObjects, MetaRecovery, MetaReplication,
+    MetaResult, MetaSymlink, MetaXattr, MetadataBatchWriteObservability,
+    MetadataCheckpointFreshnessDiagnostics, MetadataCheckpointRefreshReason,
+    MetadataCoherenceProgress, MetadataWriteObservability, MetadataWriteStageTiming,
+    NamespaceMutation, OrphanInodeFinalization, PgSyncDiagnostics, PgSyncFailure, PgSyncLifecycle,
+    PgSyncPageDiagnostics, PgSyncStatus, PgSyncWriteAuthorityReason, RegularFileOverlayMutation,
+    ScratchAutoPromoteResult, ScratchAuxTable, ScratchConflictRecord,
+    ScratchConsistencyRepairSummary, ScratchConsistencyReport, ScratchDanglingDentry,
+    ScratchOrphanAuxRow, ScratchOrphanEntry, ScratchOrphanInode, ScratchOrphanRecord,
+    ScratchPayloadObjectRef, ScratchRenameResult, UpgradeRequiredReason,
 };
 pub use events::MetaEvent;
 pub use janitor::{
@@ -571,6 +571,7 @@ mod tests {
             metadata_format_version: version::SHARED_VOLUME_FORMAT.current,
             remote_head_version: 1,
             checkpoint_version: 1,
+            checkpoint_encoding: None,
             checkpoint_sha256: Sha256::digest(&checkpoint_bytes).to_vec(),
             checkpoint_bytes,
             publication_state: "published".to_string(),

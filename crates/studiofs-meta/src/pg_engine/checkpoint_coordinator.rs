@@ -53,6 +53,10 @@ struct BuiltCheckpoint {
     payload: Vec<u8>,
     checkpoint_sha256: [u8; 32],
     format_info: Vec<u8>,
+    #[cfg(feature = "test-successor")]
+    successor: Vec<u8>,
+    #[cfg(feature = "test-successor")]
+    successor_sha256: [u8; 32],
 }
 
 #[derive(Clone, Copy)]
@@ -267,11 +271,29 @@ impl PgMetaEngine {
         let checkpoint_sha256: [u8; 32] = hash.finalize().into();
         check()?;
 
+        #[cfg(feature = "test-successor")]
+        let (successor, successor_sha256) = {
+            let successor = crate::snapshot::ServingCheckpoint::encode_successor(
+                &payload,
+                self.volume_id,
+                version,
+            );
+            let mut hash = Sha256::new();
+            for chunk in successor.chunks(64 * 1024) {
+                check()?;
+                hash.update(chunk);
+            }
+            (successor, hash.finalize().into())
+        };
         let checkpoint = BuiltCheckpoint {
             metadata_format_version,
             payload,
             checkpoint_sha256,
             format_info,
+            #[cfg(feature = "test-successor")]
+            successor,
+            #[cfg(feature = "test-successor")]
+            successor_sha256,
         };
         tracing::debug!(
             volume_id = self.volume_id,
@@ -588,6 +610,16 @@ impl PgMetaEngine {
                                 .as_ref()
                                 .map(super::metadata_io::checkpoint_freshness_observation_from_row)
                                 .transpose()?;
+                                #[cfg(feature = "test-successor")]
+                                if observation.is_some() {
+                                    publish_successor_encoding(
+                                        &tx,
+                                        volume_id,
+                                        version,
+                                        &current_checkpoint,
+                                    )
+                                    .await?;
+                                }
                                 tx.commit().await.map_err(|error| {
                                     Self::classify_pg_error(
                                         "commit bootstrap checkpoint publication",
@@ -621,6 +653,62 @@ impl PgMetaEngine {
         };
         self.record_remote_operation_result(result)
     }
+}
+
+#[cfg(feature = "test-successor")]
+async fn publish_successor_encoding(
+    tx: &tokio_postgres::Transaction<'_>,
+    volume_id: i64,
+    version: i64,
+    checkpoint: &BuiltCheckpoint,
+) -> MetaResult<()> {
+    use crate::snapshot::ServingCheckpoint;
+
+    let classify =
+        |error| PgMetaEngine::classify_pg_error("publish successor checkpoint encoding", error);
+    if !tx
+        .query_one(sql::CHECKPOINT_ENCODINGS_AVAILABLE, &[])
+        .await
+        .map_err(classify)?
+        .try_get::<_, bool>(0)
+        .map_err(classify)?
+    {
+        return Ok(());
+    }
+    let format = ServingCheckpoint::FORMAT_VERSION;
+    let schema = ServingCheckpoint::SCHEMA_VERSION;
+    let checksum = checkpoint.successor_sha256.as_slice();
+    let params: &[&(dyn tokio_postgres::types::ToSql + Sync)] = &[
+        &volume_id,
+        &version,
+        &format,
+        &schema,
+        &checkpoint.successor,
+        &checksum,
+    ];
+    let inserted = tx
+        .execute(sql::INSERT_CHECKPOINT_ENCODING, params)
+        .await
+        .map_err(classify)?;
+    if inserted == 0
+        && !tx
+            .query_one(sql::CHECK_EXISTING_CHECKPOINT_ENCODING, params)
+            .await
+            .map_err(classify)?
+            .try_get::<_, bool>(0)
+            .map_err(classify)?
+    {
+        return Err(MetaError::InvalidCheckpointDescriptor {
+            reason: crate::CheckpointDescriptorFailure::EnvelopeIdentity,
+        });
+    }
+    tx.execute(
+        sql::DELETE_SUPERSEDED_CHECKPOINT_ENCODINGS,
+        &[&volume_id, &version, &format, &schema],
+    )
+    .await
+    .map_err(classify)?;
+    Ok(())
 }
 
 fn checkpoint_source_version_if_stable(observed: i64, current: i64) -> Option<i64> {

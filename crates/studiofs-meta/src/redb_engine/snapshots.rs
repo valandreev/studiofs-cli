@@ -372,12 +372,18 @@ impl RedbMetaEngine {
                 reason: crate::CheckpointDescriptorFailure::FormatInfo,
             });
         }
+        let checkpoint = crate::snapshot::ServingCheckpoint::decode_published(
+            checkpoint_bytes,
+            None,
+            postgres.volume_id,
+            checkpoint_version,
+        )?;
         let checkpoint_version = u64::try_from(checkpoint_version).map_err(|_| {
             MetaError::InvalidCheckpointDescriptor {
                 reason: crate::CheckpointDescriptorFailure::Version,
             }
         })?;
-        self.import_serving_checkpoint_bytes(checkpoint_bytes)?;
+        self.import_serving_checkpoint(&checkpoint)?;
         self.set_format_info(format_info)?;
         let root_attr = self.get_attr(ROOT_INO)?;
         if root_attr.kind != FileType::Directory {

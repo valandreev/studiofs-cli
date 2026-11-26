@@ -409,13 +409,13 @@ flush/pull replication flow as other metadata events.
 
 `event_log` is the runtime delta stream. `metadata_state` stores:
 - the monotonic `version`
-- the latest remote-visible `ServingCheckpoint` and its `checkpoint_version`
+- the latest remote-visible baseline `ServingCheckpoint` and its `checkpoint_version`
 - the inclusive `event_log_prune_floor` and cumulative `event_log_pruned_rows`
   retention diagnostics
 - bounded bootstrap `format_info`, kept separate from serving state
 
 Background PostgreSQL maintenance prunes only complete event batches at or
-below the minimum of the fully published checkpoint and every retained
+below the minimum of the fully published baseline checkpoint and every retained
 Snapshot v2 source's first event version minus one. Creating, ready, failed,
 and deleting source rows remain guards until their immutable source row is
 removed; empty sources do not pin event history. Each transaction removes a bounded
@@ -424,6 +424,12 @@ rows are gone. This work is outside foreground writes, flushes, and startup;
 SFS-711 owns explicit replay-gap/rebootstrap-required reporting for cursors
 below the persisted floor; checkpoint import/rebase recovery consumes this
 signal in SFS-712.
+
+The test successor publishes a tagged encoding alongside the baseline in
+`serving_checkpoint_encodings`. Both copies describe the same cut. Bootstrap
+selects the latest compatible published cut at or above the durable prune
+floor. The baseline slot is readable by every supported client and remains
+the pruning anchor when a baseline writer advances it.
 
 `snapshot_catalog` stores thin lifecycle/control rows. The immutable source
 row stores only the captured serving-checkpoint bytes, checksum, checkpoint

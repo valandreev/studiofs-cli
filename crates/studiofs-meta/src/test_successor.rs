@@ -93,6 +93,17 @@ pub const CHANGES: &[SuccessorChange] = &[
         rollback: Rollback::Irreversible,
         bump: None,
     },
+    SuccessorChange {
+        id: "serving-checkpoint-envelope-v5",
+        issue: "SFS-1011",
+        kind: ChangeKind::CheckpointFormat,
+        rollback: Rollback::Reversible,
+        bump: Some(IdentityBump {
+            identity: crate::version::SERVING_CHECKPOINT_FORMAT.name,
+            baseline: crate::version::BASELINE_SERVING_CHECKPOINT_FORMAT,
+            successor: 5,
+        }),
+    },
 ];
 
 /// Read capability for the successor's namespace-specific xattr event.

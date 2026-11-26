@@ -7049,6 +7049,7 @@ fn valid_bootstrap_checkpoint_descriptor() -> crate::BootstrapCheckpointDescript
         metadata_format_version: CURRENT_FORMAT_VERSION,
         remote_head_version: 3,
         checkpoint_version: 3,
+        checkpoint_encoding: None,
         checkpoint_bytes,
         checkpoint_sha256,
         publication_state: "published".to_string(),
@@ -7349,6 +7350,355 @@ fn pg_snapshot_backend_reads_a_validated_bootstrap_descriptor() {
         descriptor.checkpoint_sha256,
         Sha256::digest(&descriptor.checkpoint_bytes).to_vec()
     );
+}
+
+#[test]
+#[cfg(feature = "test-successor")]
+#[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
+fn pg_checkpoint_encodings_keep_baseline_and_successor_replayable() {
+    use crate::snapshot::ServingCheckpoint;
+
+    let base_dsn = pg_dsn().expect("STUDIOFS_TEST_PG_DSN is required");
+    let schema = IsolatedPgSchema::new(&base_dsn);
+    let dsn = &schema.dsn;
+    let volume = PgTestVolume::new(dsn, "pg-dual-checkpoint");
+    let volume_id = volume.volume_id;
+    let info = volume.format_info();
+    let dir = studiofs_test_support::workspace_target_tempdir("pg-dual-checkpoint-");
+    let writer_path = dir.path().join("writer.redb");
+    seed_local(&writer_path, &info);
+    let writer = retained_test_engine(&writer_path);
+    let backend = writer.snapshot_backend();
+
+    writer.create_dir(ROOT_INO, b"first", 0, 0, 0o700).unwrap();
+    writer.flush_metadata().unwrap();
+    let successor = backend.read_bootstrap_checkpoint().unwrap();
+    let first_cut = successor.checkpoint_version;
+    assert!(first_cut > 0);
+    assert_eq!(
+        successor.checkpoint_encoding,
+        Some(crate::CheckpointEncoding {
+            format: 5,
+            schema: 1,
+        })
+    );
+
+    let baseline_bytes = run_async(with_pg_test_client(dsn, |client| async move {
+        let row = client
+            .query_one(
+                "SELECT checkpoint_version, snapshot, checkpoint_sha256 FROM metadata_state WHERE vol = $1",
+                &[&volume_id],
+            )
+            .await
+            .unwrap();
+        let baseline_bytes: Vec<u8> = row.get(1);
+        assert_eq!(row.get::<_, i64>(0), first_cut);
+        assert_eq!(row.get::<_, Vec<u8>>(2), Sha256::digest(&baseline_bytes).as_slice());
+        let empty_i16: Vec<i16> = Vec::new();
+        let empty_i64: Vec<i64> = Vec::new();
+        let old_client_row = client
+            .query_one(
+                super::sql::SELECT_COMPATIBLE_CHECKPOINT_DESCRIPTOR,
+                &[
+                    &volume_id,
+                    &1_i16,
+                    &4_i16,
+                    &1_i16,
+                    &1_i16,
+                    &empty_i16,
+                    &empty_i16,
+                    &empty_i64,
+                ],
+            )
+            .await
+            .unwrap();
+        assert_eq!(old_client_row.get::<_, Option<i16>>("checkpoint_format"), None);
+        assert_eq!(old_client_row.get::<_, Vec<u8>>("snapshot"), baseline_bytes);
+        Ok(baseline_bytes)
+    }))
+    .unwrap();
+    assert_ne!(baseline_bytes, successor.checkpoint_bytes);
+    assert!(ServingCheckpoint::decode(&successor.checkpoint_bytes).is_err());
+    assert_eq!(
+        ServingCheckpoint::decode(&baseline_bytes).unwrap(),
+        successor.validate_and_decode().unwrap()
+    );
+
+    run_async(with_pg_test_client(dsn, |client| async move {
+        client
+            .execute(
+                "UPDATE metadata_state SET format_info = decode('', 'hex') WHERE vol = $1",
+                &[&volume_id],
+            )
+            .await
+            .unwrap();
+        Ok(())
+    }))
+    .unwrap();
+    writer.write_checkpoint_with_lease().unwrap();
+    let repaired = backend.read_bootstrap_checkpoint().unwrap();
+    assert_eq!(repaired.checkpoint_bytes, successor.checkpoint_bytes);
+    assert_eq!(
+        repaired.publication_generation,
+        successor.publication_generation
+    );
+
+    let corrupt_checksum = vec![0_u8; 32];
+    let baseline_sha = Sha256::digest(&baseline_bytes).to_vec();
+    let baseline_copy = baseline_bytes.clone();
+    let corrupt_copy = corrupt_checksum.clone();
+    run_async(with_pg_test_client(dsn, move |client| async move {
+        client
+            .execute(
+                "UPDATE serving_checkpoint_encodings SET checkpoint_sha256 = $2 WHERE vol = $1",
+                &[&volume_id, &corrupt_copy],
+            )
+            .await
+            .unwrap();
+        // Seed a valid sibling alternate at the same cut while the baseline is
+        // pending so selection proves it tries remaining alternates before failing.
+        client
+            .execute(
+                "INSERT INTO serving_checkpoint_encodings (vol, checkpoint_version, checkpoint_format, checkpoint_schema, publication_generation, snapshot, checkpoint_sha256) VALUES ($1, $2, 4, 1, 1, $3, $4)",
+                &[&volume_id, &first_cut, &baseline_copy, &baseline_sha],
+            )
+            .await
+            .unwrap();
+        client
+            .execute(
+                "UPDATE metadata_state SET checkpoint_publication_state = 'pending' WHERE vol = $1",
+                &[&volume_id],
+            )
+            .await
+            .unwrap();
+        Ok(())
+    }))
+    .unwrap();
+    let sibling = backend.read_bootstrap_checkpoint().unwrap();
+    assert_eq!(
+        sibling.checkpoint_encoding,
+        Some(crate::CheckpointEncoding {
+            format: 4,
+            schema: 1,
+        })
+    );
+    assert_eq!(sibling.checkpoint_bytes, baseline_bytes);
+
+    let corrupt_copy = corrupt_checksum.clone();
+    run_async(with_pg_test_client(dsn, move |client| async move {
+        client
+            .execute(
+                "UPDATE serving_checkpoint_encodings SET checkpoint_sha256 = $2 WHERE vol = $1 AND checkpoint_format = 4",
+                &[&volume_id, &corrupt_copy],
+            )
+            .await
+            .unwrap();
+        Ok(())
+    }))
+    .unwrap();
+    assert!(matches!(
+        backend.read_bootstrap_checkpoint(),
+        Err(MetaError::NeedCompatibleCheckpoint { replay_floor: 0 })
+    ));
+
+    run_async(with_pg_test_client(dsn, move |client| async move {
+        client
+            .execute(
+                "DELETE FROM serving_checkpoint_encodings WHERE vol = $1 AND checkpoint_format = 4",
+                &[&volume_id],
+            )
+            .await
+            .unwrap();
+        client
+            .execute(
+                "UPDATE metadata_state SET checkpoint_publication_state = 'published' WHERE vol = $1",
+                &[&volume_id],
+            )
+            .await
+            .unwrap();
+        Ok(())
+    }))
+    .unwrap();
+    let fallback = backend.read_bootstrap_checkpoint().unwrap();
+    assert_eq!(fallback.checkpoint_encoding, None);
+    assert_eq!(fallback.checkpoint_bytes, baseline_bytes);
+    run_async(with_pg_test_client(dsn, |client| async move {
+        client
+            .execute(
+                "UPDATE serving_checkpoint_encodings SET checkpoint_sha256 = $2 WHERE vol = $1",
+                &[&volume_id, &successor.checkpoint_sha256],
+            )
+            .await
+            .unwrap();
+        Ok(())
+    }))
+    .unwrap();
+
+    let returning_path = dir.path().join("returning.redb");
+    let returning = RedbMetaEngine::open(&returning_path).unwrap();
+    returning
+        .initialize_discovered_postgres_checkpoint(&info, &baseline_bytes, first_cut)
+        .unwrap();
+    drop(returning);
+    let returning = retained_test_engine(&returning_path);
+
+    writer.create_dir(ROOT_INO, b"tail", 0, 0, 0o700).unwrap();
+    publish_and_pull(&writer);
+    let head = writer.remote_metadata_head_version().unwrap();
+    assert!(head > first_cut);
+    assert_eq!(
+        writer
+            .run_event_log_prune_once()
+            .unwrap()
+            .unwrap()
+            .durable_floor,
+        first_cut
+    );
+
+    let fresh_path = dir.path().join("fresh.redb");
+    let fresh_cut = backend.read_bootstrap_checkpoint().unwrap();
+    assert_eq!(fresh_cut.remote_head_version, head);
+    assert_eq!(fresh_cut.checkpoint_version, first_cut);
+    let fresh = RedbMetaEngine::open(&fresh_path).unwrap();
+    fresh
+        .initialize_discovered_postgres_checkpoint(
+            &info,
+            &fresh_cut.checkpoint_bytes,
+            fresh_cut.checkpoint_version,
+        )
+        .unwrap();
+    drop(fresh);
+    let fresh = retained_test_engine(&fresh_path);
+    sync_all_pages(&fresh);
+    assert_eq!(fresh.local_version.load(Ordering::SeqCst), head);
+    assert!(fresh.lookup(ROOT_INO, b"first").is_ok());
+    assert!(fresh.lookup(ROOT_INO, b"tail").is_ok());
+
+    // Simulate a baseline coordinator using the unchanged fenced writer SQL.
+    // It advances the same legacy slot an actual 0.2.5 binary publishes.
+    let format_info = serde_json::to_vec(&info).unwrap();
+    let payload = writer.local.export_serving_checkpoint_bytes().unwrap();
+    let checksum = Sha256::digest(&payload).to_vec();
+    let owner = "baseline-checkpoint-writer";
+    let lease = writer
+        .try_claim_checkpoint_lease(owner, Duration::from_secs(60))
+        .unwrap()
+        .unwrap();
+    run_async(with_pg_test_client(dsn, |client| async move {
+        let row = client
+            .query_opt(
+                super::sql::UPSERT_FENCED_METADATA_CHECKPOINT,
+                &[
+                    &volume_id,
+                    &(CURRENT_FORMAT_VERSION as i16),
+                    &head,
+                    &head,
+                    &0_i64,
+                    &payload,
+                    &checksum,
+                    &format_info,
+                    &owner,
+                    &lease.fencing_token,
+                ],
+            )
+            .await
+            .unwrap();
+        assert!(row.is_some());
+        Ok(())
+    }))
+    .unwrap();
+    writer.release_checkpoint_lease(owner, lease).unwrap();
+    assert_eq!(returning.local_version.load(Ordering::SeqCst), first_cut);
+    assert_eq!(
+        writer
+            .run_event_log_prune_once()
+            .unwrap()
+            .unwrap()
+            .durable_floor,
+        head
+    );
+    let baseline = backend.read_bootstrap_checkpoint().unwrap();
+    assert_eq!(baseline.checkpoint_encoding, None);
+    assert_eq!(baseline.checkpoint_version, head);
+
+    // This client selected the old checkpoint before pruning won the race
+    // against its first replay page. Startup must reselect a retained cut.
+    let raced_path = dir.path().join("raced.redb");
+    let raced = RedbMetaEngine::open(&raced_path).unwrap();
+    raced
+        .initialize_discovered_postgres_checkpoint(
+            &info,
+            &fresh_cut.checkpoint_bytes,
+            fresh_cut.checkpoint_version,
+        )
+        .unwrap();
+    drop(raced);
+    writer
+        .create_dir(ROOT_INO, b"after-prune", 0, 0, 0o700)
+        .unwrap();
+    publish_and_pull(&writer);
+    let raced = retained_test_engine(&raced_path);
+    sync_all_pages(&raced);
+    sync_all_pages(&returning);
+    assert_eq!(
+        returning.local_version.load(Ordering::SeqCst),
+        writer.remote_metadata_head_version().unwrap()
+    );
+    for name in [b"first".as_slice(), b"tail", b"after-prune"] {
+        assert!(raced.lookup(ROOT_INO, name).is_ok());
+        assert!(returning.lookup(ROOT_INO, name).is_ok());
+    }
+
+    writer.flush_metadata().unwrap();
+    let promoted = backend.read_bootstrap_checkpoint().unwrap();
+    let promoted_cut = promoted.checkpoint_version;
+    assert!(promoted_cut > head);
+    assert_eq!(
+        promoted.checkpoint_encoding,
+        Some(crate::CheckpointEncoding {
+            format: 5,
+            schema: 1,
+        })
+    );
+    run_async(with_pg_test_client(dsn, |client| async move {
+        let encodings = client
+            .query(
+                "SELECT checkpoint_version FROM serving_checkpoint_encodings WHERE vol = $1",
+                &[&volume_id],
+            )
+            .await
+            .unwrap();
+        assert_eq!(encodings.len(), 1);
+        assert_eq!(encodings[0].get::<_, i64>(0), promoted_cut);
+        Ok(())
+    }))
+    .unwrap();
+
+    // A missing compatible cut is diagnosed at selection and on returning replay.
+    writer
+        .create_dir(ROOT_INO, b"uncheckpointed", 0, 0, 0o700)
+        .unwrap();
+    publish_and_pull(&writer);
+    run_async(with_pg_test_client(dsn, |client| async move {
+        client
+            .execute(
+                "UPDATE metadata_state SET event_log_prune_floor = version WHERE vol = $1",
+                &[&volume_id],
+            )
+            .await
+            .unwrap();
+        Ok(())
+    }))
+    .unwrap();
+    assert!(matches!(
+        backend.read_bootstrap_checkpoint(),
+        Err(MetaError::NeedCompatibleCheckpoint { replay_floor }) if replay_floor > promoted_cut
+    ));
+    let _guard = returning.replication_lock.lock().unwrap();
+    assert!(matches!(
+        returning.pull_foreign_events_locked(None),
+        Err(MetaError::NeedCompatibleCheckpoint { replay_floor }) if replay_floor > promoted_cut
+    ));
 }
 
 #[test]

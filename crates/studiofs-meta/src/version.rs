@@ -101,6 +101,13 @@ pub const POSTGRES_CLIENT_SESSIONS_SCHEMA: VersionIdentity = VersionIdentity {
     min_supported: 1,
 };
 
+/// Database-wide PostgreSQL `checkpoint_encodings` schema component (SFS-1011).
+pub const POSTGRES_CHECKPOINT_ENCODINGS_SCHEMA: VersionIdentity = VersionIdentity {
+    name: "PostgreSQL checkpoint encodings schema",
+    current: 1,
+    min_supported: 1,
+};
+
 /// Per-volume write requirement (`metadata_state.write_requirement`, SFS-1007).
 /// Publication succeeds only while the volume's value is at most `current`, in
 /// the same UPDATE that bumps the volume version; Activate of a write
@@ -134,19 +141,35 @@ pub const EVENT_CODEC_WIRE: VersionIdentity = VersionIdentity {
     min_supported: crate::events::META_EVENT_READ_VERSIONS[0] as u16,
 };
 
-/// Serving checkpoint byte format (formats 1–4 decode).
+/// The untagged checkpoint encoding retained for 0.2.5 readers.
+pub const BASELINE_SERVING_CHECKPOINT_FORMAT: u16 = 4;
+
+/// Serving checkpoint byte format (formats 1–4 and the test successor decode).
 pub const SERVING_CHECKPOINT_FORMAT: VersionIdentity = VersionIdentity {
     name: "serving checkpoint format",
-    current: 4,
+    current: if cfg!(feature = "test-successor") {
+        5
+    } else {
+        BASELINE_SERVING_CHECKPOINT_FORMAT
+    },
     min_supported: 1,
 };
+
+/// The serving-state schema in the 0.2.5 baseline checkpoint.
+pub const BASELINE_SERVING_CHECKPOINT_SCHEMA: u16 = 1;
 
 /// Serving checkpoint serving-state schema.
 pub const SERVING_CHECKPOINT_SCHEMA: VersionIdentity = VersionIdentity {
     name: "serving checkpoint schema",
-    current: 1,
-    min_supported: 1,
+    current: BASELINE_SERVING_CHECKPOINT_SCHEMA,
+    min_supported: BASELINE_SERVING_CHECKPOINT_SCHEMA,
 };
+
+const _: () = assert!(
+    SERVING_CHECKPOINT_FORMAT.supports(BASELINE_SERVING_CHECKPOINT_FORMAT)
+        && SERVING_CHECKPOINT_SCHEMA.supports(BASELINE_SERVING_CHECKPOINT_SCHEMA),
+    "the baseline checkpoint is the prune anchor for every supported serving reader"
+);
 
 /// Every identity owned by this crate, in report order.
 pub const IDENTITIES: &[VersionIdentity] = &[
@@ -159,6 +182,7 @@ pub const IDENTITIES: &[VersionIdentity] = &[
     POSTGRES_CORE_SCHEMA,
     SHARED_WRITE_REQUIREMENT,
     POSTGRES_CLIENT_SESSIONS_SCHEMA,
+    POSTGRES_CHECKPOINT_ENCODINGS_SCHEMA,
 ];
 
 /// Machine-readable report of this binary's identities, printed by
@@ -190,7 +214,11 @@ mod tests {
         assert!(SERVING_CHECKPOINT_FORMAT.supports(1));
         assert!(SERVING_CHECKPOINT_FORMAT.supports(4));
         assert!(!SERVING_CHECKPOINT_FORMAT.supports(0));
-        assert!(!SERVING_CHECKPOINT_FORMAT.supports(5));
+        assert_eq!(
+            SERVING_CHECKPOINT_FORMAT.supports(5),
+            cfg!(feature = "test-successor")
+        );
+        assert!(!SERVING_CHECKPOINT_FORMAT.supports(6));
         assert!(SERVING_CHECKPOINT_SCHEMA.supports_i16(1));
         assert!(!SERVING_CHECKPOINT_SCHEMA.supports_i16(2));
         assert!(!SERVING_CHECKPOINT_SCHEMA.supports_i16(-1));

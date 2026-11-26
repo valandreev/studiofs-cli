@@ -6,10 +6,13 @@ use super::{
     PG_EVENT_INSERT_CHUNK_SIZE, PgMetaEngine, PgSnapshotBackend, SnapshotBackendAccess,
     StartupSnapshotImportMode, runtime, sql,
 };
-use crate::engine::{BootstrapCheckpointDescriptor, MetaError, MetaResult};
+use crate::engine::{
+    BootstrapCheckpointDescriptor, CheckpointDescriptorFailure, CheckpointEncoding, MetaError,
+    MetaResult,
+};
 use crate::events::{MetaEvent, encode_event};
 use crate::snapshot::ServingCheckpoint;
-use crate::version::SHARED_VOLUME_FORMAT;
+use crate::version::{SERVING_CHECKPOINT_FORMAT, SERVING_CHECKPOINT_SCHEMA, SHARED_VOLUME_FORMAT};
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -43,6 +46,14 @@ fn try_descriptor_from_row(row: &tokio_postgres::Row) -> MetaResult<BootstrapChe
             .try_get::<_, Option<i64>>("checkpoint_version")
             .map_err(descriptor_row_error)?
             .unwrap_or(-1),
+        checkpoint_encoding: row
+            .try_get::<_, Option<i16>>("checkpoint_format")
+            .map_err(descriptor_row_error)?
+            .zip(
+                row.try_get::<_, Option<i16>>("checkpoint_schema")
+                    .map_err(descriptor_row_error)?,
+            )
+            .map(|(format, schema)| CheckpointEncoding { format, schema }),
         checkpoint_bytes: row
             .try_get::<_, Option<Vec<u8>>>("snapshot")
             .map_err(descriptor_row_error)?
@@ -66,35 +77,171 @@ fn try_descriptor_from_row(row: &tokio_postgres::Row) -> MetaResult<BootstrapChe
     })
 }
 
+const MAX_ALTERNATIVE_CHECKPOINT_RETRIES: usize = 8;
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+struct ExcludedCheckpoint {
+    encoding: CheckpointEncoding,
+    version: i64,
+}
+
+#[derive(Clone, Copy)]
+enum CheckpointSelection<'a> {
+    Compatible { excluded: &'a [ExcludedCheckpoint] },
+    BaselineOnly,
+}
+
+fn check_bootstrap_descriptor_compatibility(
+    descriptor: &BootstrapCheckpointDescriptor,
+    replay_floor: i64,
+    incompatible_alternative: bool,
+) -> MetaResult<()> {
+    SHARED_VOLUME_FORMAT.check(descriptor.metadata_format_version)?;
+    if !descriptor.format_info_bytes.is_empty()
+        && let Err(
+            error
+            @ (MetaError::UnsupportedFormatVersion { .. } | MetaError::UpgradeRequired { .. }),
+        ) = crate::decode_format_info(&descriptor.format_info_bytes)
+    {
+        return Err(error);
+    }
+    if incompatible_alternative
+        || (descriptor.checkpoint_version >= 0 && descriptor.checkpoint_version < replay_floor)
+    {
+        return Err(MetaError::NeedCompatibleCheckpoint { replay_floor });
+    }
+    Ok(())
+}
+
 pub(super) async fn read_bootstrap_checkpoint_and_decode_with_pool(
     command_pool: Arc<runtime::PgConnectionPool>,
     volume_id: i64,
     command_timeout: std::time::Duration,
 ) -> MetaResult<(BootstrapCheckpointDescriptor, ServingCheckpoint)> {
+    let mut excluded = Vec::new();
+    loop {
+        let selection = if excluded.len() < MAX_ALTERNATIVE_CHECKPOINT_RETRIES {
+            CheckpointSelection::Compatible {
+                excluded: &excluded,
+            }
+        } else {
+            CheckpointSelection::BaselineOnly
+        };
+        let descriptor = select_bootstrap_checkpoint(
+            Arc::clone(&command_pool),
+            volume_id,
+            command_timeout,
+            selection,
+        )
+        .await?;
+        match descriptor.validate_and_decode() {
+            Err(
+                MetaError::InvalidCheckpointDescriptor {
+                    reason:
+                        CheckpointDescriptorFailure::Checksum
+                        | CheckpointDescriptorFailure::CheckpointBytes
+                        | CheckpointDescriptorFailure::EnvelopeIdentity,
+                }
+                | MetaError::UnsupportedCheckpointEncoding { .. },
+            ) if descriptor.checkpoint_encoding.is_some() => {
+                if let Some(encoding) = descriptor.checkpoint_encoding {
+                    let rejected = ExcludedCheckpoint {
+                        encoding,
+                        version: descriptor.checkpoint_version,
+                    };
+                    if !excluded.contains(&rejected) {
+                        excluded.push(rejected);
+                        continue;
+                    }
+                }
+                // Re-read the baseline with its current head and prune floor. It
+                // may have advanced since the alternate artifact was selected.
+                let baseline = select_bootstrap_checkpoint(
+                    command_pool,
+                    volume_id,
+                    command_timeout,
+                    CheckpointSelection::BaselineOnly,
+                )
+                .await?;
+                let checkpoint = baseline.validate_and_decode()?;
+                return Ok((baseline, checkpoint));
+            }
+            result => return result.map(|checkpoint| (descriptor, checkpoint)),
+        }
+    }
+}
+
+async fn select_bootstrap_checkpoint(
+    command_pool: Arc<runtime::PgConnectionPool>,
+    volume_id: i64,
+    command_timeout: std::time::Duration,
+    selection: CheckpointSelection<'_>,
+) -> MetaResult<BootstrapCheckpointDescriptor> {
+    let excluded: Option<(Vec<i16>, Vec<i16>, Vec<i64>)> = match selection {
+        CheckpointSelection::Compatible { excluded } => Some((
+            excluded.iter().map(|item| item.encoding.format).collect(),
+            excluded.iter().map(|item| item.encoding.schema).collect(),
+            excluded.iter().map(|item| item.version).collect(),
+        )),
+        CheckpointSelection::BaselineOnly => None,
+    };
     let row = PgMetaEngine::with_postgres_client_timeout(
         command_pool,
         command_timeout,
         "bootstrap checkpoint descriptor",
         move |client| {
             Box::pin(async move {
-                let row = client
-                    .query_opt(sql::SELECT_BOOTSTRAP_CHECKPOINT_DESCRIPTOR, &[&volume_id])
-                    .await
-                    .map_err(|e| {
-                        PgMetaEngine::classify_pg_error(
-                            "postgres bootstrap checkpoint select failed",
-                            e,
+                if let Some((excluded_formats, excluded_schemas, excluded_versions)) = excluded {
+                    match client
+                        .query_opt(
+                            sql::SELECT_COMPATIBLE_CHECKPOINT_DESCRIPTOR,
+                            &[
+                                &volume_id,
+                                &(SERVING_CHECKPOINT_FORMAT.min_supported as i16),
+                                &ServingCheckpoint::FORMAT_VERSION,
+                                &(SERVING_CHECKPOINT_SCHEMA.min_supported as i16),
+                                &ServingCheckpoint::SCHEMA_VERSION,
+                                &excluded_formats,
+                                &excluded_schemas,
+                                &excluded_versions,
+                            ],
                         )
-                    })?
-                    .ok_or(MetaError::BootstrapCheckpointDescriptorMissing)?;
-                Ok(row)
+                        .await
+                    {
+                        // Allow discovery before the additive migration.
+                        Err(error)
+                            if error.code()
+                                == Some(&tokio_postgres::error::SqlState::UNDEFINED_TABLE) => {}
+                        result => return checked_bootstrap_row(result),
+                    }
+                }
+                checked_bootstrap_row(
+                    client
+                        .query_opt(sql::SELECT_BOOTSTRAP_CHECKPOINT_DESCRIPTOR, &[&volume_id])
+                        .await,
+                )
             })
         },
     )
     .await?;
     let descriptor = try_descriptor_from_row(&row)?;
-    let checkpoint = descriptor.validate_and_decode()?;
-    Ok((descriptor, checkpoint))
+    let replay_floor: i64 = row
+        .try_get("event_log_prune_floor")
+        .map_err(descriptor_row_error)?;
+    let incompatible_alternative: bool = row
+        .try_get("incompatible_alternative_present")
+        .map_err(descriptor_row_error)?;
+    check_bootstrap_descriptor_compatibility(&descriptor, replay_floor, incompatible_alternative)?;
+    Ok(descriptor)
+}
+
+fn checked_bootstrap_row(
+    row: Result<Option<tokio_postgres::Row>, tokio_postgres::Error>,
+) -> MetaResult<tokio_postgres::Row> {
+    row.map_err(|error| {
+        PgMetaEngine::classify_pg_error("postgres bootstrap checkpoint select failed", error)
+    })?
+    .ok_or(MetaError::BootstrapCheckpointDescriptorMissing)
 }
 
 async fn read_bootstrap_checkpoint_with_pool(
@@ -175,31 +322,85 @@ async fn read_remote_metadata_head_version_with_pool(
     .await
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RemoteHeadCheckpointState {
+    remote_head_version: i64,
+    checkpoint_version: i64,
+    replay_floor: i64,
+}
+
+fn should_download_startup_checkpoint(
+    local_version: i64,
+    head: RemoteHeadCheckpointState,
+) -> MetaResult<bool> {
+    if head.remote_head_version <= local_version {
+        return Ok(false);
+    }
+    if head.checkpoint_version < local_version {
+        if local_version < head.replay_floor {
+            return Err(MetaError::NeedCompatibleCheckpoint {
+                replay_floor: head.replay_floor,
+            });
+        }
+        return Ok(false);
+    }
+    Ok(true)
+}
+
 async fn read_remote_metadata_head_and_checkpoint_version_with_pool(
     command_pool: Arc<runtime::PgConnectionPool>,
     volume_id: i64,
     command_timeout: std::time::Duration,
-) -> MetaResult<(i64, i64)> {
+) -> MetaResult<RemoteHeadCheckpointState> {
     PgMetaEngine::with_postgres_client_timeout(
         command_pool,
         command_timeout,
         "metadata head and checkpoint version",
         move |client| {
             Box::pin(async move {
-                let row = client
+                let row = match client
                     .query_opt(
-                        sql::SELECT_METADATA_HEAD_AND_CHECKPOINT_VERSION,
-                        &[&volume_id],
+                        sql::SELECT_METADATA_HEAD_AND_COMPATIBLE_CHECKPOINT_VERSION,
+                        &[
+                            &volume_id,
+                            &(SERVING_CHECKPOINT_FORMAT.min_supported as i16),
+                            &ServingCheckpoint::FORMAT_VERSION,
+                            &(SERVING_CHECKPOINT_SCHEMA.min_supported as i16),
+                            &ServingCheckpoint::SCHEMA_VERSION,
+                        ],
                     )
                     .await
-                    .map_err(|e| {
+                {
+                    Err(error)
+                        if error.code()
+                            == Some(&tokio_postgres::error::SqlState::UNDEFINED_TABLE) =>
+                    {
+                        client
+                            .query_opt(
+                                sql::SELECT_METADATA_HEAD_AND_CHECKPOINT_VERSION,
+                                &[&volume_id],
+                            )
+                            .await
+                            .map_err(|e| {
+                                PgMetaEngine::classify_pg_error(
+                                    "postgres metadata head and checkpoint version select failed",
+                                    e,
+                                )
+                            })?
+                    }
+                    result => result.map_err(|e| {
                         PgMetaEngine::classify_pg_error(
                             "postgres metadata head and checkpoint version select failed",
                             e,
                         )
-                    })?;
+                    })?,
+                };
                 let Some(row) = row else {
-                    return Ok((0, -1));
+                    return Ok(RemoteHeadCheckpointState {
+                        remote_head_version: 0,
+                        checkpoint_version: -1,
+                        replay_floor: 0,
+                    });
                 };
                 let head = row
                     .try_get::<_, Option<i64>>(0)
@@ -219,7 +420,20 @@ async fn read_remote_metadata_head_and_checkpoint_version_with_pool(
                         )
                     })?
                     .unwrap_or(-1);
-                Ok((head, checkpoint))
+                let replay_floor = row
+                    .try_get::<_, Option<i64>>(2)
+                    .map_err(|e| {
+                        PgMetaEngine::classify_pg_error(
+                            "postgres event-log prune floor row parse failed",
+                            e,
+                        )
+                    })?
+                    .unwrap_or(0);
+                Ok(RemoteHeadCheckpointState {
+                    remote_head_version: head,
+                    checkpoint_version: checkpoint,
+                    replay_floor,
+                })
             })
         },
     )
@@ -436,9 +650,8 @@ impl PgMetaEngine {
         import_mode: StartupSnapshotImportMode,
     ) -> MetaResult<bool> {
         let local_version = self.local_version.load(Ordering::SeqCst);
-        let (remote_head_version, checkpoint_version) =
-            self.read_remote_metadata_head_and_checkpoint_version_unrecorded()?;
-        if remote_head_version <= local_version || checkpoint_version < local_version {
+        let head = self.read_remote_metadata_head_and_checkpoint_version_unrecorded()?;
+        if !should_download_startup_checkpoint(local_version, head)? {
             return Ok(false);
         }
         let (descriptor, checkpoint) =
@@ -541,7 +754,7 @@ impl PgMetaEngine {
 
     fn read_remote_metadata_head_and_checkpoint_version_unrecorded(
         &self,
-    ) -> MetaResult<(i64, i64)> {
+    ) -> MetaResult<RemoteHeadCheckpointState> {
         self.run_async(read_remote_metadata_head_and_checkpoint_version_with_pool(
             self.command_pool.clone(),
             self.volume_id,
@@ -1289,5 +1502,81 @@ mod tests {
                 Err(MetaError::Storage(_))
             ));
         }
+    }
+
+    #[test]
+    fn bootstrap_compatibility_preserves_format_and_upgrade_errors_before_need_checkpoint() {
+        let mut descriptor = BootstrapCheckpointDescriptor {
+            volume_id: 1,
+            volume_uuid: "uuid".to_string(),
+            format_info_bytes: Vec::new(),
+            metadata_format_version: SHARED_VOLUME_FORMAT.current + 1,
+            remote_head_version: 10,
+            checkpoint_version: 2,
+            checkpoint_encoding: None,
+            checkpoint_bytes: Vec::new(),
+            checkpoint_sha256: Vec::new(),
+            publication_state: "pending".to_string(),
+            publication_generation: 1,
+        };
+        assert!(matches!(
+            check_bootstrap_descriptor_compatibility(&descriptor, 8, true),
+            Err(MetaError::UnsupportedFormatVersion { found, expected })
+                if found == SHARED_VOLUME_FORMAT.current + 1
+                    && expected == SHARED_VOLUME_FORMAT.current
+        ));
+
+        descriptor.metadata_format_version = SHARED_VOLUME_FORMAT.current;
+        let mut json =
+            serde_json::to_value(crate::baseline_fixtures::fixture_format_info()).unwrap();
+        json["successor_field"] = serde_json::json!(true);
+        descriptor.format_info_bytes = serde_json::to_vec(&json).unwrap();
+        assert!(matches!(
+            check_bootstrap_descriptor_compatibility(&descriptor, 8, true),
+            Err(MetaError::UpgradeRequired { .. })
+        ));
+
+        descriptor.format_info_bytes.clear();
+        assert!(matches!(
+            check_bootstrap_descriptor_compatibility(&descriptor, 8, true),
+            Err(MetaError::NeedCompatibleCheckpoint { replay_floor: 8 })
+        ));
+    }
+
+    #[test]
+    fn startup_checkpoint_decision_skips_stale_only_when_above_replay_floor() {
+        assert!(
+            !should_download_startup_checkpoint(
+                1,
+                RemoteHeadCheckpointState {
+                    remote_head_version: 2,
+                    checkpoint_version: 0,
+                    replay_floor: 0,
+                }
+            )
+            .unwrap()
+        );
+        assert!(matches!(
+            should_download_startup_checkpoint(
+                2,
+                RemoteHeadCheckpointState {
+                    remote_head_version: 6,
+                    checkpoint_version: 0,
+                    replay_floor: 5,
+                }
+            ),
+            Err(MetaError::NeedCompatibleCheckpoint { replay_floor: 5 })
+        ));
+        assert!(
+            should_download_startup_checkpoint(
+                2,
+                RemoteHeadCheckpointState {
+                    remote_head_version: 6,
+                    checkpoint_version: 5,
+                    replay_floor: 5,
+                }
+            )
+            .unwrap()
+        );
     }
 }

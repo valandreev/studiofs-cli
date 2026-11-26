@@ -5,7 +5,9 @@ use super::{
     RemoteReplayExecution, janitor::pg_event_log_prune_lock_key, sql,
 };
 use crate::engine::{MetaError, MetaInodes, MetaResult, PgSyncLifecycle, PgSyncPageDiagnostics};
+use crate::snapshot::ServingCheckpoint;
 use crate::types::{FileType, Ino};
+use crate::version::{SERVING_CHECKPOINT_FORMAT, SERVING_CHECKPOINT_SCHEMA};
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
@@ -282,7 +284,7 @@ impl PgMetaEngine {
                                 )
                             })?;
                         crate::ensure_supported_pg_sync_format_version(format_version)?;
-                        let checkpoint_version = replay_state
+                        let baseline_checkpoint_version = replay_state
                             .try_get::<_, i64>("checkpoint_version")
                             .map_err(|e| {
                                 Self::classify_pg_error(
@@ -298,6 +300,83 @@ impl PgMetaEngine {
                                     e,
                                 )
                             })?;
+                        let publication_state = replay_state
+                            .try_get::<_, String>("checkpoint_publication_state")
+                            .map_err(|e| {
+                                Self::classify_pg_error(
+                                    "postgres checkpoint publication state read failed",
+                                    e,
+                                )
+                            })?;
+                        let mut effective_checkpoint = if publication_state == "published" {
+                            baseline_checkpoint_version
+                        } else {
+                            -1
+                        };
+                        if effective_checkpoint < retained_floor {
+                            let has_encodings = tx
+                                .query_one(sql::CHECKPOINT_ENCODINGS_AVAILABLE, &[])
+                                .await
+                                .map_err(|e| {
+                                    Self::classify_pg_error(
+                                        "postgres checkpoint encodings probe failed",
+                                        e,
+                                    )
+                                })?
+                                .try_get::<_, bool>(0)
+                                .map_err(|e| {
+                                    Self::classify_pg_error(
+                                        "postgres checkpoint encodings probe parse failed",
+                                        e,
+                                    )
+                                })?;
+                            if has_encodings {
+                                let alt_version = tx
+                                    .query_one(
+                                        sql::SELECT_COMPATIBLE_CHECKPOINT_MAX_VERSION,
+                                        &[
+                                            &volume_id,
+                                            &retained_floor,
+                                            &(SERVING_CHECKPOINT_FORMAT.min_supported as i16),
+                                            &ServingCheckpoint::FORMAT_VERSION,
+                                            &(SERVING_CHECKPOINT_SCHEMA.min_supported as i16),
+                                            &ServingCheckpoint::SCHEMA_VERSION,
+                                        ],
+                                    )
+                                    .await
+                                    .map_err(|e| {
+                                        Self::classify_pg_error(
+                                            "postgres compatible checkpoint version read failed",
+                                            e,
+                                        )
+                                    })?
+                                    .try_get::<_, Option<i64>>(0)
+                                    .map_err(|e| {
+                                        Self::classify_pg_error(
+                                            "postgres compatible checkpoint version parse failed",
+                                            e,
+                                        )
+                                    })?;
+                                if let Some(alt_version) = alt_version {
+                                    effective_checkpoint = effective_checkpoint.max(alt_version);
+                                }
+                            }
+                            if effective_checkpoint < retained_floor
+                                && last_batch_version >= 0
+                                && retained_floor >= 0
+                                && target_version >= 0
+                                && last_batch_version < retained_floor
+                            {
+                                return Err(MetaError::NeedCompatibleCheckpoint {
+                                    replay_floor: retained_floor,
+                                });
+                            }
+                        }
+                        let checkpoint_version = if effective_checkpoint >= 0 {
+                            effective_checkpoint
+                        } else {
+                            baseline_checkpoint_version
+                        };
                         Self::validate_replay_cursor_against_floor(
                             last_batch_version,
                             retained_floor,

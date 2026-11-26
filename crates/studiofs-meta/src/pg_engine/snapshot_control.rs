@@ -62,6 +62,7 @@ enum SnapshotSourceError {
     MissingFormatInfo,
     UpgradeRequired,
     UnsupportedFormatVersion { found: u16, expected: u16 },
+    UnsupportedCheckpointEncoding { format: i16, schema: i16 },
 }
 
 impl SnapshotSourceError {
@@ -69,8 +70,13 @@ impl SnapshotSourceError {
         Self::Retryable
     }
 
-    fn permanent(_: MetaError) -> Self {
-        Self::Permanent
+    fn permanent(error: MetaError) -> Self {
+        match error {
+            MetaError::UnsupportedCheckpointEncoding { format, schema } => {
+                Self::UnsupportedCheckpointEncoding { format, schema }
+            }
+            _ => Self::Permanent,
+        }
     }
 
     fn local(error: MetaError) -> Self {
@@ -104,6 +110,10 @@ impl SnapshotSourceError {
                 &format!(
                     "format {found} expected {expected} recreate metadata or run studiofs discover"
                 ),
+            ),
+            Self::UnsupportedCheckpointEncoding { format, schema } => SnapshotPortError::permanent(
+                "unsupported_checkpoint_encoding",
+                &format!("unsupported serving checkpoint format {format} or schema {schema}"),
             ),
         }
     }
@@ -377,14 +387,17 @@ impl PgSnapshotBackend {
         })?;
         if raw.checkpoint_version < 0
             || raw.checkpoint_version > cut.cut_version()
-            || !ServingCheckpoint::supports_format_version(raw.checkpoint_format_version)
-            || !ServingCheckpoint::supports_schema_version(raw.checkpoint_schema_version)
             || raw.checkpoint_sha256.as_slice() != Sha256::digest(&raw.checkpoint_bytes).as_slice()
         {
             return Err(SnapshotSourceError::permanent(snapshot_control_error(
                 "snapshot source checkpoint is invalid",
             )));
         }
+        ServingCheckpoint::check_encoding(crate::CheckpointEncoding {
+            format: raw.checkpoint_format_version,
+            schema: raw.checkpoint_schema_version,
+        })
+        .map_err(SnapshotSourceError::permanent)?;
         let replay_proof = SnapshotSha256::from_bytes(
             raw.checkpoint_sha256.as_slice().try_into().map_err(|_| {
                 SnapshotSourceError::permanent(snapshot_control_error(
@@ -431,11 +444,16 @@ impl PgSnapshotBackend {
         loaded: LoadedSnapshotSource,
         destination: &Path,
     ) -> Result<SnapshotReconstruction, SnapshotSourceError> {
-        let checkpoint = ServingCheckpoint::decode(&loaded.checkpoint_bytes).map_err(|_| {
-            SnapshotSourceError::permanent(snapshot_control_error(
-                "decode snapshot source checkpoint",
-            ))
-        })?;
+        let checkpoint = ServingCheckpoint::decode_snapshot_source(
+            &loaded.checkpoint_bytes,
+            crate::CheckpointEncoding {
+                format: loaded.descriptor.checkpoint_format_version,
+                schema: loaded.descriptor.checkpoint_schema_version,
+            },
+            loaded.cut.volume_id(),
+            loaded.descriptor.checkpoint_version,
+        )
+        .map_err(SnapshotSourceError::permanent)?;
         let local = RedbMetaEngine::open(destination).map_err(SnapshotSourceError::retryable)?;
         local
             .set_format_info(&loaded.format_info)
@@ -654,6 +672,27 @@ fn validate_snapshot_event_rows(
     Ok(())
 }
 
+fn validate_reconstruct_source_descriptor(
+    volume_id: VolumeId,
+    cut: &SnapshotCut,
+    descriptor: &SnapshotSourceDescriptor,
+) -> Result<(), SnapshotPortError> {
+    if cut.volume_id() != volume_id
+        || descriptor.checkpoint_version < 0
+        || descriptor.checkpoint_version > cut.cut_version()
+    {
+        return Err(SnapshotPortError::permanent(
+            "invalid_source",
+            "snapshot source descriptor is invalid",
+        ));
+    }
+    ServingCheckpoint::check_encoding(crate::CheckpointEncoding {
+        format: descriptor.checkpoint_format_version,
+        schema: descriptor.checkpoint_schema_version,
+    })
+    .map_err(|error| SnapshotSourceError::permanent(error).into_port_error())
+}
+
 impl<T: SnapshotBackendAccess + Send + Sync> SnapshotSourceReader for T {
     fn load_descriptor<'a>(
         &'a self,
@@ -682,17 +721,7 @@ impl<T: SnapshotBackendAccess + Send + Sync> SnapshotSourceReader for T {
         destination: &'a Path,
     ) -> SnapshotPortFuture<'a, SnapshotReconstruction> {
         Box::pin(async move {
-            if cut.volume_id() != self.snapshot_volume_id()
-                || descriptor.checkpoint_version < 0
-                || descriptor.checkpoint_version > cut.cut_version()
-                || !ServingCheckpoint::supports_format_version(descriptor.checkpoint_format_version)
-                || !ServingCheckpoint::supports_schema_version(descriptor.checkpoint_schema_version)
-            {
-                return Err(SnapshotPortError::permanent(
-                    "invalid_source",
-                    "snapshot source descriptor is invalid",
-                ));
-            }
+            validate_reconstruct_source_descriptor(self.snapshot_volume_id(), cut, descriptor)?;
             let snapshot_id = SnapshotId::parse(&descriptor.checkpoint_id).map_err(|_| {
                 SnapshotPortError::permanent(
                     "invalid_source",
@@ -878,8 +907,8 @@ where
                 &snapshot_id_text,
                 &cut.cut_version(),
                 &checkpoint_version,
-                &ServingCheckpoint::FORMAT_VERSION,
-                &ServingCheckpoint::SCHEMA_VERSION,
+                &ServingCheckpoint::BASELINE_FORMAT_VERSION,
+                &ServingCheckpoint::BASELINE_SCHEMA_VERSION,
                 &checkpoint_bytes,
                 &checkpoint_sha256,
                 &event_start_seq,
@@ -1043,5 +1072,37 @@ mod tests {
             .to_string(),
             "snapshot operation rejected: unsupported_format_version: format 4 expected 5 recreate metadata or run studiofs discover"
         );
+    }
+
+    #[test]
+    fn reconstruct_descriptor_validation_reports_unsupported_checkpoint_encoding() {
+        let cut = SnapshotCut::new(7, 10, Utc::now()).unwrap();
+        let base = SnapshotSourceDescriptor {
+            checkpoint_id: "snap-20260101-000000".to_string(),
+            checkpoint_version: 10,
+            checkpoint_format_version: ServingCheckpoint::BASELINE_FORMAT_VERSION,
+            checkpoint_schema_version: ServingCheckpoint::BASELINE_SCHEMA_VERSION,
+            event_start_seq: None,
+            event_end_seq: None,
+            event_start_version: None,
+            event_end_version: None,
+            event_row_count: 0,
+            replay_proof: SnapshotSha256::from_bytes([0; 32]),
+        };
+        assert!(validate_reconstruct_source_descriptor(7, &cut, &base).is_ok());
+
+        for (format, schema) in [(ServingCheckpoint::FORMAT_VERSION + 1, 1), (4, 99), (0, 1)] {
+            let mut unsupported = base.clone();
+            unsupported.checkpoint_format_version = format;
+            unsupported.checkpoint_schema_version = schema;
+            let error = validate_reconstruct_source_descriptor(7, &cut, &unsupported).unwrap_err();
+            assert_eq!(
+                error,
+                SnapshotPortError::permanent(
+                    "unsupported_checkpoint_encoding",
+                    &format!("unsupported serving checkpoint format {format} or schema {schema}"),
+                )
+            );
+        }
     }
 }
