@@ -567,7 +567,7 @@ fn baseline_events_decode_one_per_tag() {
 fn baseline_serving_checkpoint_decodes_format_4() {
     let bytes = read_fixture(&fixture_dir().join("serving-checkpoint.bin"));
     let checkpoint = ServingCheckpoint::decode(&bytes).expect("decode checkpoint");
-    assert_eq!(ServingCheckpoint::FORMAT_VERSION, 4);
+    assert_eq!(ServingCheckpoint::BASELINE_FORMAT_VERSION, 4);
     assert_eq!(checkpoint.volume_settings, fixture_volume_settings());
     assert_eq!(checkpoint.inodes.len(), 4);
     assert_eq!(checkpoint.dentries.len(), 3);
@@ -579,6 +579,23 @@ fn baseline_serving_checkpoint_decodes_format_4() {
     engine.import_serving_checkpoint_bytes(&bytes).unwrap();
     assert_published_namespace(&engine);
     assert_eq!(engine.volume_settings().unwrap(), fixture_volume_settings());
+}
+
+#[cfg(feature = "test-successor")]
+#[test]
+fn successor_serving_checkpoint_matches_pinned_format_5_fixture() {
+    let baseline = read_fixture(&fixture_dir().join("serving-checkpoint.bin"));
+    let header = b"\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xffSFS-CHK\
+        \x00\x05\x00\x01\x00\x00\x00\x00\x00\x00\x00\x07\x00\x00\x00\x00\x00\x00\x00\x09";
+    let fixture = [header.as_slice(), baseline.as_slice()].concat();
+    assert_eq!(
+        ServingCheckpoint::encode_successor(&baseline, 7, 9),
+        fixture
+    );
+    assert_eq!(
+        ServingCheckpoint::decode_published(&fixture, Some((5, 1)), 7, 9).unwrap(),
+        ServingCheckpoint::decode(&baseline).unwrap()
+    );
 }
 
 #[test]

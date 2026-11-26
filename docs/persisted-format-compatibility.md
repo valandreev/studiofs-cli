@@ -317,35 +317,29 @@ that declares support for 0.2.5 (the compiled test successor of
 
 ### 6. Serving checkpoints
 
-- Location: `metadata_state.snapshot` with `checkpoint_sha256`,
-  publication state and generation; snapshot source checkpoints in
-  `snapshot_source_checkpoints` with explicit `checkpoint_format_version`
-  (`crates/studiofs-meta/src/pg_engine/schema.rs:327`).
-- Version fields: `ServingCheckpoint::FORMAT_VERSION = 4` and
-  `SCHEMA_VERSION = 1` (`crates/studiofs-meta/src/snapshot.rs:310`). The
-  serving checkpoint in `metadata_state` has no format column of its own; it is
-  gated by `metadata_format_version` through the descriptor
-  (`crates/studiofs-meta/src/engine.rs:141`).
-- Reader strictness: `decode` is suffix-based and rejects trailing bytes after
-  the format 4 suffix (`crates/studiofs-meta/src/snapshot.rs:341`). Snapshot
-  source checkpoints are rejected unless
-  `supports_format_version` (1..=4, `crates/studiofs-meta/src/snapshot.rs:315`)
-  accepts them (`crates/studiofs-meta/src/pg_engine/snapshot_control.rs:362`,
-  `crates/studiofs-meta/src/pg_engine/snapshot_control.rs:681`), but the
-  refusal is untyped: an unknown format, a checksum mismatch and a schema
-  mismatch all return the same permanent `snapshot source checkpoint is
-  invalid` (`crates/studiofs-meta/src/pg_engine/snapshot_control.rs:360`).
-- Writers: checkpoint coordinator under `bootstrap_checkpoint_leases`
-  (`crates/studiofs-meta/src/pg_engine/schema.rs:158`). The lease uses the
-  server clock (`clock_timestamp()`) and increments a fencing token on
-  takeover (`crates/studiofs-meta/src/pg_engine/sql.rs:158`).
-- Successor may change additively: a new checkpoint format published beside
-  the format 4 one while any 0.2.5 reader is supported.
-- Fail-closed outcome: a typed unsupported-checkpoint error, mapped to
-  `UpgradeRequired` (ADR 0018); bootstrap falls
-  back to a supported checkpoint plus bounded replay, or refuses. Pruning must
-  keep the newest checkpoint each supported reader can decode. Owner:
-  [SFS-1011](https://linear.app/valandreev/issue/SFS-1011).
+- The coordinator always writes the 0.2.5 format 4, schema 1 checkpoint to
+  `metadata_state.snapshot`, with its SHA-256 and publication generation.
+  The additive `checkpoint_encodings` migration adds
+  `serving_checkpoint_encodings`, keyed by volume, byte format, state schema
+  and checkpoint cut. `snapshot_source_checkpoints` retains separate copies
+  for historical snapshot reconstruction.
+- The `test-successor` build also publishes format 5, schema 1 in the same
+  fenced lease transaction from the same redb read view. Its `SFS-CHK`
+  envelope contains the encoding identities, volume ID and cut. Its SHA-256
+  covers the entire envelope. Publication reclaims older copies of that
+  format and schema after the replacement becomes available.
+- Bootstrap observes the remote head, durable prune floor and the selected
+  published checkpoint in one PostgreSQL statement. It chooses the newest
+  compatible cut and prefers the newer encoding on a tie. Every supported
+  client can decode the baseline slot, which remains the prune anchor.
+  Retained snapshot sources can further limit pruning. Replay rechecks the
+  floor under its shared advisory lock before fetching a page.
+- Formats 1–4 use strict untagged postcard decoding with a bounded suffix.
+  Tagged formats dispatch by explicit format and schema. The reader checks
+  the declared range, descriptor identity and checksum before import. An
+  unsupported encoding returns `UnsupportedCheckpointEncoding`. Bootstrap
+  returns `NeedCompatibleCheckpoint` when it has no compatible cut covering
+  the retained event range.
 
 ### 7. VolumeSettings
 
@@ -543,7 +537,7 @@ successor can fence it safely. "Current state" is what `main` does today.
 | Destructive maintenance sets a maintenance capability GUC before deleting. | Partial: Janitor claims set `studiofs.deletion_format` (`crates/studiofs-meta/src/pg_engine/janitor.rs:1089`); snapshot cleanup, event-log pruning and checkpoint pruning set none. | [SFS-1016](https://linear.app/valandreev/issue/SFS-1016) |
 | Unknown required capabilities fail closed with a typed reason. | Present in the pure evaluator (SFS-1004): `compat::evaluate` refuses unknown required capabilities, unknown safety-critical optional ones, unknown events and payload formats with stable reason codes. Not wired into mount, replay or publication until the volume policy and enforcement land. | [SFS-1004](https://linear.app/valandreev/issue/SFS-1004) |
 | Unknown event tags fail closed with a typed reason. | Present: replay preserves `UpgradeRequired` with `UnsupportedEventReason` and leaves the durable cursor at its last applied position. | [SFS-1009](https://linear.app/valandreev/issue/SFS-1009) |
-| Unknown checkpoint formats fail closed with a typed reason. | Missing typed reason: snapshot sources fail closed, but one untyped `snapshot source checkpoint is invalid` covers unknown format, checksum mismatch and schema mismatch (`crates/studiofs-meta/src/pg_engine/snapshot_control.rs:360`). The serving checkpoint has no format field of its own and relies on `metadata_format_version`. | [SFS-1011](https://linear.app/valandreev/issue/SFS-1011) |
+| Unknown checkpoint formats fail closed with a typed reason. | Tagged serving checkpoints and retained sources report unsupported format or schema separately from invalid bytes or a missing compatible cut. | [SFS-1011](https://linear.app/valandreev/issue/SFS-1011) |
 | Unknown payload object formats fail closed with a typed reason. | Present: `UnsupportedVersion` and `UnsupportedCodec` (`crates/studiofs-data/src/object.rs:325`, `crates/studiofs-data/src/object.rs:160`); SFEC version and flags are strict. | [SFS-1009](https://linear.app/valandreev/issue/SFS-1009) (write gating) |
 | Unknown local formats fail closed with a typed reason. | Partial: payload index format is typed (`crates/studiofs-cache/src/payload_index.rs:1299`), entry encoding is `Corruption` (`crates/studiofs-cache/src/payload_index.rs:1790`); redb has no own identity. | [SFS-1012](https://linear.app/valandreev/issue/SFS-1012), [SFS-1003](https://linear.app/valandreev/issue/SFS-1003) |
 | Additive PG objects are tolerated when declared capabilities allow it. | Present for mount startup: `validate_postgres_schema` checks only the components and objects used by the mount (`crates/studiofs-meta/src/pg_engine/startup_schema.rs`). DDL from `init`/`load`/`upgrade` goes through the SFS-1005 migration registry, which refuses newer or unknown components before any DDL. | [SFS-1006](https://linear.app/valandreev/issue/SFS-1006) |

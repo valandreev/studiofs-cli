@@ -2,7 +2,8 @@
 
 use super::*;
 use crate::pg_engine::migrations::{
-    CORE_COMPONENT, MIGRATIONS, Migration, MigrationPhase, ensure_with, migrate_with,
+    CHECKPOINT_ENCODINGS_COMPONENT, CLIENT_SESSIONS_COMPONENT, CORE_COMPONENT, MIGRATIONS,
+    Migration, MigrationPhase, ensure_with, migrate_with,
 };
 
 const fn step(version: i32, phase: MigrationPhase, sql: &'static str) -> Migration {
@@ -32,7 +33,13 @@ const CONTRACT: Migration = step(
 );
 
 fn registry(extra: &[Migration]) -> Vec<Migration> {
-    MIGRATIONS.iter().chain(extra).copied().collect()
+    // Exercise baseline reconciliation even in the synthetic successor build.
+    MIGRATIONS
+        .iter()
+        .filter(|step| step.component != CORE_COMPONENT || step.version == 1)
+        .chain(extra)
+        .copied()
+        .collect()
 }
 
 /// A client whose connection task is aborted when the guard drops.
@@ -99,12 +106,15 @@ fn migration_registry_applies_resumes_and_refuses_drift_on_live_postgres() {
         let mut connection = connect(&dsn).await?;
         let client = &mut connection.client;
 
-        // An existing baseline gains only the additive client session migration.
-        let (sessions, prior) = MIGRATIONS.split_last().expect("registered session migration");
-        assert_eq!(sessions.component, "client_sessions");
-        ensure_in_tx(client, prior).await?;
-        assert_eq!(migrate_with(client, MIGRATIONS, false).await?, [*sessions]);
-        ensure_in_tx(client, MIGRATIONS).await?;
+        // An existing baseline gains the two independent additive components.
+        let migrations = registry(&[]);
+        let baseline = migrations[0];
+        let migration = |component| *migrations.iter().find(|step| step.component == component).unwrap();
+        let sessions = migration(CLIENT_SESSIONS_COMPONENT);
+        let encodings = migration(CHECKPOINT_ENCODINGS_COMPONENT);
+        ensure_in_tx(client, &[baseline]).await?;
+        assert_eq!(migrate_with(client, &migrations, false).await?, [sessions, encodings]);
+        ensure_in_tx(client, &migrations).await?;
         assert_eq!(
             scalar(client, "SELECT count(*) FROM studiofs_schema_components WHERE (component, version) IN (('core', 1), ('payload_gc', 2)) AND (component = 'payload_gc' OR octet_length(checksum) = 32)").await,
             2
@@ -113,21 +123,24 @@ fn migration_registry_applies_resumes_and_refuses_drift_on_live_postgres() {
         // A verified schema gets no DDL from either path.
         let lock_table = "SELECT count(*) FROM pg_class WHERE relname = 'file_lock_leases' AND relnamespace = current_schema()::regnamespace";
         let sessions_table = "SELECT count(*) FROM pg_class WHERE relname = 'client_sessions' AND relnamespace = current_schema()::regnamespace";
+        let encodings_table = "SELECT count(*) FROM pg_class WHERE relname = 'serving_checkpoint_encodings' AND relnamespace = current_schema()::regnamespace";
         client
-            .batch_execute("DROP TABLE file_lock_leases; DROP TABLE client_sessions")
+            .batch_execute("DROP TABLE file_lock_leases; DROP TABLE client_sessions; DROP TABLE serving_checkpoint_encodings")
             .await
             .map_err(|e| MetaError::Storage(pg_err(e)))?;
-        ensure_in_tx(client, MIGRATIONS).await?;
-        assert!(migrate_with(client, MIGRATIONS, false).await?.is_empty());
+        ensure_in_tx(client, &migrations).await?;
+        assert!(migrate_with(client, &migrations, false).await?.is_empty());
         assert_eq!(scalar(client, lock_table).await, 0);
         assert_eq!(scalar(client, sessions_table).await, 0);
-        // `--repair-schema` re-applies the verified baseline and client_sessions once.
+        assert_eq!(scalar(client, encodings_table).await, 0);
+        // `--repair-schema` re-applies each idempotent component once.
         assert_eq!(
-            migrate_with(client, MIGRATIONS, true).await?,
-            [MIGRATIONS[0], *sessions]
+            migrate_with(client, &migrations, true).await?,
+            [baseline, sessions, encodings]
         );
         assert_eq!(scalar(client, lock_table).await, 1);
         assert_eq!(scalar(client, sessions_table).await, 1);
+        assert_eq!(scalar(client, encodings_table).await, 1);
         client
             .batch_execute("DROP TABLE file_lock_leases")
             .await
@@ -139,14 +152,14 @@ fn migration_registry_applies_resumes_and_refuses_drift_on_live_postgres() {
             .batch_execute("UPDATE studiofs_schema_components SET checksum = NULL WHERE component = 'core'")
             .await
             .map_err(|e| MetaError::Storage(pg_err(e)))?;
-        assert!(matches!(ensure_in_tx(client, MIGRATIONS).await, Err(MetaError::RepairRequired(_))));
-        assert_eq!(migrate_with(client, MIGRATIONS, false).await?, [MIGRATIONS[0]]);
+        assert!(matches!(ensure_in_tx(client, &migrations).await, Err(MetaError::RepairRequired(_))));
+        assert_eq!(migrate_with(client, &migrations, false).await?, [baseline]);
         assert_eq!(scalar(client, lock_table).await, 1);
 
         // A newer core is refused before any DDL runs.
         client.batch_execute("DROP TABLE file_lock_leases; UPDATE studiofs_schema_components SET version = 99 WHERE component = 'core'").await.map_err(|e| MetaError::Storage(pg_err(e)))?;
         assert!(matches!(
-            ensure_in_tx(client, MIGRATIONS).await,
+            ensure_in_tx(client, &migrations).await,
             Err(MetaError::UpgradeRequired { .. })
         ));
         assert_eq!(scalar(client, lock_table).await, 0);

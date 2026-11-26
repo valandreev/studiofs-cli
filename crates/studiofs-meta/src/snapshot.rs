@@ -305,10 +305,18 @@ struct ServingCheckpointV1 {
     acl_rules: Vec<(Vec<u8>, u8)>,
 }
 
+// Eleven continuation bytes cannot begin an untagged postcard vector length.
+const CHECKPOINT_ENVELOPE_MAGIC: &[u8] = b"\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xffSFS-CHK";
+const CHECKPOINT_ENVELOPE_HEADER_LEN: usize = 20;
+
 impl ServingCheckpoint {
     /// The persisted checkpoint format version.
     pub(crate) const FORMAT_VERSION: i16 =
         crate::version::SERVING_CHECKPOINT_FORMAT.current_pg_smallint();
+    pub(crate) const BASELINE_FORMAT_VERSION: i16 =
+        crate::version::BASELINE_SERVING_CHECKPOINT_FORMAT as i16;
+    pub(crate) const BASELINE_SCHEMA_VERSION: i16 =
+        crate::version::BASELINE_SERVING_CHECKPOINT_SCHEMA as i16;
     /// The serving-state schema version.
     pub(crate) const SCHEMA_VERSION: i16 =
         crate::version::SERVING_CHECKPOINT_SCHEMA.current_pg_smallint();
@@ -329,20 +337,120 @@ impl ServingCheckpoint {
     /// aliases, format 3 appends volume settings without compression, and
     /// format 4 appends the compression policy.
     pub(crate) fn decode(bytes: &[u8]) -> Result<Self, postcard::Error> {
+        Self::decode_legacy(bytes).map(|(checkpoint, _)| checkpoint)
+    }
+
+    #[cfg(feature = "test-successor")]
+    pub(crate) fn encode_successor(baseline_bytes: &[u8], volume_id: i64, cut: i64) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(
+            CHECKPOINT_ENVELOPE_MAGIC.len() + CHECKPOINT_ENVELOPE_HEADER_LEN + baseline_bytes.len(),
+        );
+        bytes.extend_from_slice(CHECKPOINT_ENVELOPE_MAGIC);
+        bytes.extend_from_slice(&Self::FORMAT_VERSION.to_be_bytes());
+        bytes.extend_from_slice(&Self::SCHEMA_VERSION.to_be_bytes());
+        bytes.extend_from_slice(&volume_id.to_be_bytes());
+        bytes.extend_from_slice(&cut.to_be_bytes());
+        bytes.extend_from_slice(baseline_bytes);
+        bytes
+    }
+
+    pub(crate) fn check_encoding(format: i16, schema: i16) -> crate::MetaResult<()> {
+        if !Self::supports_format_version(format) || !Self::supports_schema_version(schema) {
+            return Err(crate::MetaError::UnsupportedCheckpointEncoding { format, schema });
+        }
+        Ok(())
+    }
+
+    pub(crate) fn decode_published(
+        bytes: &[u8],
+        declared: Option<(i16, i16)>,
+        volume_id: i64,
+        cut: i64,
+    ) -> crate::MetaResult<Self> {
+        use crate::{CheckpointDescriptorFailure as Failure, MetaError};
+
+        let invalid = |reason| MetaError::InvalidCheckpointDescriptor { reason };
+        if let Some((format, schema)) = declared {
+            Self::check_encoding(format, schema)?;
+        }
+        let Some(envelope) = bytes.strip_prefix(CHECKPOINT_ENVELOPE_MAGIC) else {
+            let (checkpoint, format) =
+                Self::decode_legacy(bytes).map_err(|_| invalid(Failure::CheckpointBytes))?;
+            Self::check_encoding(format, Self::BASELINE_SCHEMA_VERSION)?;
+            if declared.is_some_and(|encoding| encoding != (format, Self::BASELINE_SCHEMA_VERSION))
+            {
+                return Err(invalid(Failure::EnvelopeIdentity));
+            }
+            return Ok(checkpoint);
+        };
+        let (header, payload) = envelope
+            .split_at_checked(CHECKPOINT_ENVELOPE_HEADER_LEN)
+            .ok_or_else(|| invalid(Failure::CheckpointBytes))?;
+        let format = i16::from_be_bytes([header[0], header[1]]);
+        let schema = i16::from_be_bytes([header[2], header[3]]);
+        Self::check_encoding(format, schema)?;
+        if declared.is_some_and(|encoding| encoding != (format, schema))
+            || header[4..12] != volume_id.to_be_bytes()
+            || header[12..20] != cut.to_be_bytes()
+        {
+            return Err(invalid(Failure::EnvelopeIdentity));
+        }
+        match (format, schema) {
+            #[cfg(feature = "test-successor")]
+            (5, Self::BASELINE_SCHEMA_VERSION) => {
+                let (checkpoint, payload_format) =
+                    Self::decode_legacy(payload).map_err(|_| invalid(Failure::CheckpointBytes))?;
+                if payload_format != Self::BASELINE_FORMAT_VERSION {
+                    return Err(invalid(Failure::CheckpointBytes));
+                }
+                Ok(checkpoint)
+            }
+            _ => {
+                let _ = payload;
+                Err(invalid(Failure::CheckpointBytes))
+            }
+        }
+    }
+
+    pub(crate) fn decode_snapshot_source(
+        bytes: &[u8],
+        format: i16,
+        schema: i16,
+        volume_id: i64,
+        cut: i64,
+    ) -> crate::MetaResult<Self> {
+        Self::check_encoding(format, schema)?;
+        // Historical snapshot capture stamped the writer's format (4) even
+        // when it copied an older untagged checkpoint out of metadata_state.
+        let declared = if format == Self::BASELINE_FORMAT_VERSION
+            && !bytes.starts_with(CHECKPOINT_ENVELOPE_MAGIC)
+        {
+            None
+        } else {
+            Some((format, schema))
+        };
+        Self::decode_published(bytes, declared, volume_id, cut)
+    }
+
+    fn decode_legacy(bytes: &[u8]) -> Result<(Self, i16), postcard::Error> {
         let (v1, suffix) = postcard::take_from_bytes::<ServingCheckpointV1>(bytes)?;
+        let mut format = 1;
         let (directory_aliases, suffix) = if suffix.is_empty() {
             (Vec::new(), suffix)
         } else {
+            format = 2;
             postcard::take_from_bytes(suffix)?
         };
         let volume_settings = if suffix.is_empty() {
             crate::trash::VolumeSettings::default()
         } else {
+            format = 3;
             let ((revision, trash, logical_quota_bytes), suffix) =
                 postcard::take_from_bytes::<(u64, crate::trash::TrashPolicy, Option<u64>)>(suffix)?;
             let compression = if suffix.is_empty() {
                 crate::trash::CompressionPolicy::off()
             } else {
+                format = Self::BASELINE_FORMAT_VERSION;
                 let (compression, remainder) =
                     postcard::take_from_bytes::<crate::trash::CompressionPolicy>(suffix)?;
                 if !remainder.is_empty() {
@@ -357,16 +465,19 @@ impl ServingCheckpoint {
                 compression,
             }
         };
-        Ok(Self {
-            inodes: v1.inodes,
-            dentries: v1.dentries,
-            regular_file_base: v1.regular_file_base,
-            symlinks: v1.symlinks,
-            xattrs: v1.xattrs,
-            acl_rules: v1.acl_rules,
-            directory_aliases,
-            volume_settings,
-        })
+        Ok((
+            Self {
+                inodes: v1.inodes,
+                dentries: v1.dentries,
+                regular_file_base: v1.regular_file_base,
+                symlinks: v1.symlinks,
+                xattrs: v1.xattrs,
+                acl_rules: v1.acl_rules,
+                directory_aliases,
+                volume_settings,
+            },
+            format,
+        ))
     }
 }
 
@@ -1078,6 +1189,59 @@ mod tests {
     }
 
     #[test]
+    fn serving_checkpoint_envelope_rejects_unknown_format_and_schema() {
+        let mut bytes = CHECKPOINT_ENVELOPE_MAGIC.to_vec();
+        bytes.extend_from_slice(&7_i16.to_be_bytes());
+        bytes.extend_from_slice(&1_i16.to_be_bytes());
+        bytes.extend_from_slice(&1_i64.to_be_bytes());
+        bytes.extend_from_slice(&2_i64.to_be_bytes());
+        assert!(matches!(
+            ServingCheckpoint::decode_published(&bytes, None, 1, 2),
+            Err(crate::MetaError::UnsupportedCheckpointEncoding {
+                format: 7,
+                schema: 1
+            })
+        ));
+        assert!(matches!(
+            ServingCheckpoint::decode_published(&[0; 6], Some((1, 7)), 1, 2),
+            Err(crate::MetaError::UnsupportedCheckpointEncoding {
+                format: 1,
+                schema: 7
+            })
+        ));
+        assert_eq!(
+            ServingCheckpoint::decode_snapshot_source(&[0; 6], 4, 1, 1, 2).unwrap(),
+            ServingCheckpoint::default()
+        );
+    }
+
+    #[cfg(feature = "test-successor")]
+    #[test]
+    fn serving_checkpoint_successor_envelope_is_bound_to_descriptor_and_cut() {
+        let payload = postcard::to_stdvec(&ServingCheckpoint::default()).unwrap();
+        let bytes = ServingCheckpoint::encode_successor(&payload, 7, 9);
+        let encoding = Some((5, 1));
+        assert_eq!(
+            ServingCheckpoint::decode_published(&bytes, encoding, 7, 9).unwrap(),
+            ServingCheckpoint::default()
+        );
+        assert!(ServingCheckpoint::decode(&bytes).is_err());
+        for (encoding, volume_id, cut) in
+            [(encoding, 8, 9), (encoding, 7, 10), (Some((4, 1)), 7, 9)]
+        {
+            assert!(matches!(
+                ServingCheckpoint::decode_published(&bytes, encoding, volume_id, cut),
+                Err(crate::MetaError::InvalidCheckpointDescriptor {
+                    reason: crate::CheckpointDescriptorFailure::EnvelopeIdentity
+                })
+            ));
+        }
+        assert!(
+            ServingCheckpoint::decode_published(&bytes[..bytes.len() - 1], encoding, 7, 9).is_err()
+        );
+    }
+
+    #[test]
     fn serving_checkpoint_decodes_all_format_versions() {
         let mut checkpoint = ServingCheckpoint {
             inodes: vec![(1, vec![7])],
@@ -1120,7 +1284,7 @@ mod tests {
         assert!(ServingCheckpoint::supports_format_version(2));
         assert!(ServingCheckpoint::supports_format_version(3));
         assert!(ServingCheckpoint::supports_format_version(4));
-        assert!(!ServingCheckpoint::supports_format_version(5));
+        assert!(!ServingCheckpoint::supports_format_version(6));
     }
     use super::*;
     use chrono::{NaiveDate, TimeZone, Utc};
@@ -1504,12 +1668,16 @@ mod tests {
     fn serving_checkpoint_decodes_v3_as_compression_off_and_roundtrips_v4() {
         use crate::trash::{CompressionPolicy, TrashPolicy, VolumeSettings};
 
-        assert_eq!(ServingCheckpoint::FORMAT_VERSION, 4);
+        assert_eq!(ServingCheckpoint::BASELINE_FORMAT_VERSION, 4);
         for version in 1..=4 {
             assert!(ServingCheckpoint::supports_format_version(version));
         }
         assert!(!ServingCheckpoint::supports_format_version(0));
-        assert!(!ServingCheckpoint::supports_format_version(5));
+        assert_eq!(
+            ServingCheckpoint::supports_format_version(5),
+            cfg!(feature = "test-successor")
+        );
+        assert!(!ServingCheckpoint::supports_format_version(6));
 
         let mut trash = TrashPolicy::default();
         trash.set_days(7);

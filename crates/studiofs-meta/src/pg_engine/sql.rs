@@ -30,10 +30,85 @@ pub(super) const SELECT_BOOTSTRAP_CHECKPOINT_DESCRIPTOR: &str = r#"
         ms.checkpoint_sha256,
         ms.format_info,
         ms.checkpoint_publication_state,
-        ms.checkpoint_generation
+        ms.checkpoint_generation,
+        ms.event_log_prune_floor,
+        NULL::SMALLINT AS checkpoint_format,
+        NULL::SMALLINT AS checkpoint_schema,
+        false AS alternative_checkpoint_present
     FROM volumes AS v
     INNER JOIN metadata_state AS ms ON ms.vol = v.vol
     WHERE v.vol = $1
+    "#;
+
+pub(super) const SELECT_COMPATIBLE_CHECKPOINT_DESCRIPTOR: &str = r#"
+    SELECT v.vol, v.uuid, ms.metadata_format_version, ms.version, ms.format_info,
+        ms.event_log_prune_floor,
+        COALESCE(candidate.checkpoint_version, ms.checkpoint_version) AS checkpoint_version,
+        COALESCE(candidate.snapshot, ms.snapshot) AS snapshot,
+        COALESCE(candidate.checkpoint_sha256, ms.checkpoint_sha256) AS checkpoint_sha256,
+        COALESCE(candidate.publication_state, ms.checkpoint_publication_state)
+            AS checkpoint_publication_state,
+        COALESCE(candidate.publication_generation, ms.checkpoint_generation) AS checkpoint_generation,
+        candidate.checkpoint_format, candidate.checkpoint_schema,
+        CASE WHEN candidate.checkpoint_version IS NULL
+             AND ms.checkpoint_publication_state <> 'published'
+             THEN EXISTS (
+                 SELECT 1 FROM serving_checkpoint_encodings
+                 WHERE vol = ms.vol
+                   AND checkpoint_version BETWEEN ms.event_log_prune_floor AND ms.version
+             )
+             ELSE false
+        END AS alternative_checkpoint_present
+    FROM volumes AS v
+    INNER JOIN metadata_state AS ms ON ms.vol = v.vol
+    LEFT JOIN LATERAL (
+        SELECT enc.checkpoint_version, enc.snapshot, enc.checkpoint_sha256,
+            'published'::TEXT AS publication_state, enc.publication_generation,
+            enc.checkpoint_format, enc.checkpoint_schema
+        FROM serving_checkpoint_encodings AS enc
+        WHERE enc.vol = ms.vol
+          AND enc.checkpoint_version BETWEEN ms.event_log_prune_floor AND ms.version
+          AND enc.checkpoint_format BETWEEN $2 AND $3
+          AND enc.checkpoint_schema BETWEEN $4 AND $5
+          AND (ms.checkpoint_publication_state <> 'published'
+               OR enc.checkpoint_version >= ms.checkpoint_version)
+        ORDER BY enc.checkpoint_version DESC, enc.checkpoint_format DESC, enc.checkpoint_schema DESC
+        LIMIT 1
+    ) AS candidate ON true
+    WHERE v.vol = $1
+    "#;
+
+#[cfg(feature = "test-successor")]
+pub(super) const CHECKPOINT_ENCODINGS_AVAILABLE: &str = r#"
+    SELECT to_regclass(quote_ident(current_schema()) || '.serving_checkpoint_encodings') IS NOT NULL
+    "#;
+
+#[cfg(feature = "test-successor")]
+pub(super) const INSERT_CHECKPOINT_ENCODING: &str = r#"
+    INSERT INTO serving_checkpoint_encodings (
+        vol, checkpoint_version, checkpoint_format, checkpoint_schema,
+        publication_generation, snapshot, checkpoint_sha256
+    )
+    SELECT $1, $2, $3, $4, checkpoint_generation, $5, $6
+    FROM metadata_state WHERE vol = $1
+    ON CONFLICT (vol, checkpoint_format, checkpoint_schema, checkpoint_version) DO NOTHING
+    "#;
+
+#[cfg(feature = "test-successor")]
+pub(super) const CHECK_EXISTING_CHECKPOINT_ENCODING: &str = r#"
+    SELECT EXISTS (
+        SELECT 1 FROM serving_checkpoint_encodings
+        WHERE vol = $1 AND checkpoint_version = $2
+          AND checkpoint_format = $3 AND checkpoint_schema = $4
+          AND snapshot = $5 AND checkpoint_sha256 = $6
+    )
+    "#;
+
+#[cfg(feature = "test-successor")]
+pub(super) const DELETE_SUPERSEDED_CHECKPOINT_ENCODINGS: &str = r#"
+    DELETE FROM serving_checkpoint_encodings
+    WHERE vol = $1 AND checkpoint_format = $3 AND checkpoint_schema = $4
+      AND checkpoint_version < $2
     "#;
 
 pub(super) const SELECT_METADATA_FORMAT_VERSION: &str =

@@ -571,6 +571,7 @@ mod tests {
             metadata_format_version: version::SHARED_VOLUME_FORMAT.current,
             remote_head_version: 1,
             checkpoint_version: 1,
+            checkpoint_encoding: None,
             checkpoint_sha256: Sha256::digest(&checkpoint_bytes).to_vec(),
             checkpoint_bytes,
             publication_state: "published".to_string(),

@@ -6,10 +6,12 @@ use super::{
     PG_EVENT_INSERT_CHUNK_SIZE, PgMetaEngine, PgSnapshotBackend, SnapshotBackendAccess,
     StartupSnapshotImportMode, runtime, sql,
 };
-use crate::engine::{BootstrapCheckpointDescriptor, MetaError, MetaResult};
+use crate::engine::{
+    BootstrapCheckpointDescriptor, CheckpointDescriptorFailure, MetaError, MetaResult,
+};
 use crate::events::{MetaEvent, encode_event};
 use crate::snapshot::ServingCheckpoint;
-use crate::version::SHARED_VOLUME_FORMAT;
+use crate::version::{SERVING_CHECKPOINT_FORMAT, SERVING_CHECKPOINT_SCHEMA, SHARED_VOLUME_FORMAT};
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -43,6 +45,13 @@ fn try_descriptor_from_row(row: &tokio_postgres::Row) -> MetaResult<BootstrapChe
             .try_get::<_, Option<i64>>("checkpoint_version")
             .map_err(descriptor_row_error)?
             .unwrap_or(-1),
+        checkpoint_encoding: row
+            .try_get::<_, Option<i16>>("checkpoint_format")
+            .map_err(descriptor_row_error)?
+            .zip(
+                row.try_get::<_, Option<i16>>("checkpoint_schema")
+                    .map_err(descriptor_row_error)?,
+            ),
         checkpoint_bytes: row
             .try_get::<_, Option<Vec<u8>>>("snapshot")
             .map_err(descriptor_row_error)?
@@ -71,30 +80,95 @@ pub(super) async fn read_bootstrap_checkpoint_and_decode_with_pool(
     volume_id: i64,
     command_timeout: std::time::Duration,
 ) -> MetaResult<(BootstrapCheckpointDescriptor, ServingCheckpoint)> {
+    let descriptor =
+        select_bootstrap_checkpoint(Arc::clone(&command_pool), volume_id, command_timeout, true)
+            .await?;
+    match descriptor.validate_and_decode() {
+        Err(
+            MetaError::InvalidCheckpointDescriptor {
+                reason:
+                    CheckpointDescriptorFailure::Checksum
+                    | CheckpointDescriptorFailure::CheckpointBytes
+                    | CheckpointDescriptorFailure::EnvelopeIdentity,
+            }
+            | MetaError::UnsupportedCheckpointEncoding { .. },
+        ) if descriptor.checkpoint_encoding.is_some() => {
+            // Re-read the baseline with its current head and prune floor. It
+            // may have advanced since the alternate artifact was selected.
+            let baseline =
+                select_bootstrap_checkpoint(command_pool, volume_id, command_timeout, false)
+                    .await?;
+            let checkpoint = baseline.validate_and_decode()?;
+            Ok((baseline, checkpoint))
+        }
+        result => result.map(|checkpoint| (descriptor, checkpoint)),
+    }
+}
+
+async fn select_bootstrap_checkpoint(
+    command_pool: Arc<runtime::PgConnectionPool>,
+    volume_id: i64,
+    command_timeout: std::time::Duration,
+    include_alternatives: bool,
+) -> MetaResult<BootstrapCheckpointDescriptor> {
     let row = PgMetaEngine::with_postgres_client_timeout(
         command_pool,
         command_timeout,
         "bootstrap checkpoint descriptor",
         move |client| {
             Box::pin(async move {
-                let row = client
-                    .query_opt(sql::SELECT_BOOTSTRAP_CHECKPOINT_DESCRIPTOR, &[&volume_id])
-                    .await
-                    .map_err(|e| {
-                        PgMetaEngine::classify_pg_error(
-                            "postgres bootstrap checkpoint select failed",
-                            e,
+                if include_alternatives {
+                    match client
+                        .query_opt(
+                            sql::SELECT_COMPATIBLE_CHECKPOINT_DESCRIPTOR,
+                            &[
+                                &volume_id,
+                                &(SERVING_CHECKPOINT_FORMAT.min_supported as i16),
+                                &ServingCheckpoint::FORMAT_VERSION,
+                                &(SERVING_CHECKPOINT_SCHEMA.min_supported as i16),
+                                &ServingCheckpoint::SCHEMA_VERSION,
+                            ],
                         )
-                    })?
-                    .ok_or(MetaError::BootstrapCheckpointDescriptorMissing)?;
-                Ok(row)
+                        .await
+                    {
+                        // Allow discovery before the additive migration.
+                        Err(error)
+                            if error.code()
+                                == Some(&tokio_postgres::error::SqlState::UNDEFINED_TABLE) => {}
+                        result => return checked_bootstrap_row(result),
+                    }
+                }
+                checked_bootstrap_row(
+                    client
+                        .query_opt(sql::SELECT_BOOTSTRAP_CHECKPOINT_DESCRIPTOR, &[&volume_id])
+                        .await,
+                )
             })
         },
     )
     .await?;
     let descriptor = try_descriptor_from_row(&row)?;
-    let checkpoint = descriptor.validate_and_decode()?;
-    Ok((descriptor, checkpoint))
+    let replay_floor: i64 = row
+        .try_get("event_log_prune_floor")
+        .map_err(descriptor_row_error)?;
+    let incompatible_alternative: bool = row
+        .try_get("alternative_checkpoint_present")
+        .map_err(descriptor_row_error)?;
+    if incompatible_alternative
+        || (descriptor.checkpoint_version >= 0 && descriptor.checkpoint_version < replay_floor)
+    {
+        return Err(MetaError::NeedCompatibleCheckpoint { replay_floor });
+    }
+    Ok(descriptor)
+}
+
+fn checked_bootstrap_row(
+    row: Result<Option<tokio_postgres::Row>, tokio_postgres::Error>,
+) -> MetaResult<tokio_postgres::Row> {
+    row.map_err(|error| {
+        PgMetaEngine::classify_pg_error("postgres bootstrap checkpoint select failed", error)
+    })?
+    .ok_or(MetaError::BootstrapCheckpointDescriptorMissing)
 }
 
 async fn read_bootstrap_checkpoint_with_pool(
@@ -436,9 +510,9 @@ impl PgMetaEngine {
         import_mode: StartupSnapshotImportMode,
     ) -> MetaResult<bool> {
         let local_version = self.local_version.load(Ordering::SeqCst);
-        let (remote_head_version, checkpoint_version) =
+        let (remote_head_version, _) =
             self.read_remote_metadata_head_and_checkpoint_version_unrecorded()?;
-        if remote_head_version <= local_version || checkpoint_version < local_version {
+        if remote_head_version <= local_version {
             return Ok(false);
         }
         let (descriptor, checkpoint) =

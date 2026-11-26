@@ -62,6 +62,7 @@ enum SnapshotSourceError {
     MissingFormatInfo,
     UpgradeRequired,
     UnsupportedFormatVersion { found: u16, expected: u16 },
+    UnsupportedCheckpointEncoding { format: i16, schema: i16 },
 }
 
 impl SnapshotSourceError {
@@ -69,8 +70,13 @@ impl SnapshotSourceError {
         Self::Retryable
     }
 
-    fn permanent(_: MetaError) -> Self {
-        Self::Permanent
+    fn permanent(error: MetaError) -> Self {
+        match error {
+            MetaError::UnsupportedCheckpointEncoding { format, schema } => {
+                Self::UnsupportedCheckpointEncoding { format, schema }
+            }
+            _ => Self::Permanent,
+        }
     }
 
     fn local(error: MetaError) -> Self {
@@ -104,6 +110,10 @@ impl SnapshotSourceError {
                 &format!(
                     "format {found} expected {expected} recreate metadata or run studiofs discover"
                 ),
+            ),
+            Self::UnsupportedCheckpointEncoding { format, schema } => SnapshotPortError::permanent(
+                "unsupported_checkpoint_encoding",
+                &format!("unsupported serving checkpoint format {format} or schema {schema}"),
             ),
         }
     }
@@ -377,14 +387,17 @@ impl PgSnapshotBackend {
         })?;
         if raw.checkpoint_version < 0
             || raw.checkpoint_version > cut.cut_version()
-            || !ServingCheckpoint::supports_format_version(raw.checkpoint_format_version)
-            || !ServingCheckpoint::supports_schema_version(raw.checkpoint_schema_version)
             || raw.checkpoint_sha256.as_slice() != Sha256::digest(&raw.checkpoint_bytes).as_slice()
         {
             return Err(SnapshotSourceError::permanent(snapshot_control_error(
                 "snapshot source checkpoint is invalid",
             )));
         }
+        ServingCheckpoint::check_encoding(
+            raw.checkpoint_format_version,
+            raw.checkpoint_schema_version,
+        )
+        .map_err(SnapshotSourceError::permanent)?;
         let replay_proof = SnapshotSha256::from_bytes(
             raw.checkpoint_sha256.as_slice().try_into().map_err(|_| {
                 SnapshotSourceError::permanent(snapshot_control_error(
@@ -431,11 +444,14 @@ impl PgSnapshotBackend {
         loaded: LoadedSnapshotSource,
         destination: &Path,
     ) -> Result<SnapshotReconstruction, SnapshotSourceError> {
-        let checkpoint = ServingCheckpoint::decode(&loaded.checkpoint_bytes).map_err(|_| {
-            SnapshotSourceError::permanent(snapshot_control_error(
-                "decode snapshot source checkpoint",
-            ))
-        })?;
+        let checkpoint = ServingCheckpoint::decode_snapshot_source(
+            &loaded.checkpoint_bytes,
+            loaded.descriptor.checkpoint_format_version,
+            loaded.descriptor.checkpoint_schema_version,
+            loaded.cut.volume_id(),
+            loaded.descriptor.checkpoint_version,
+        )
+        .map_err(SnapshotSourceError::permanent)?;
         let local = RedbMetaEngine::open(destination).map_err(SnapshotSourceError::retryable)?;
         local
             .set_format_info(&loaded.format_info)
@@ -878,8 +894,8 @@ where
                 &snapshot_id_text,
                 &cut.cut_version(),
                 &checkpoint_version,
-                &ServingCheckpoint::FORMAT_VERSION,
-                &ServingCheckpoint::SCHEMA_VERSION,
+                &ServingCheckpoint::BASELINE_FORMAT_VERSION,
+                &ServingCheckpoint::BASELINE_SCHEMA_VERSION,
                 &checkpoint_bytes,
                 &checkpoint_sha256,
                 &event_start_seq,
