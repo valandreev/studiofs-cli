@@ -149,6 +149,7 @@ impl PgMetaEngine {
                             }
                                 let accepted = update_volume_settings_in_tx(
                                     &tx,
+                                    current_session.protocol(),
                                     volume,
                                     Some(expected_revision),
                                     &current_client_id,
@@ -284,9 +285,16 @@ async fn update_volume_settings(
         .await
         .map_err(|error| PgMetaEngine::classify_pg_error("begin volume settings", error))?;
     let session = PublicationSession::begin(&tx, volume).await?;
-    let accepted =
-        update_volume_settings_in_tx(&tx, volume, expected_revision, client_id, now_ms, update)
-            .await?;
+    let accepted = update_volume_settings_in_tx(
+        &tx,
+        session.protocol(),
+        volume,
+        expected_revision,
+        client_id,
+        now_ms,
+        update,
+    )
+    .await?;
     if accepted.is_some() {
         session.finish(&tx, volume).await?;
         tx.commit()
@@ -298,6 +306,7 @@ async fn update_volume_settings(
 
 async fn update_volume_settings_in_tx(
     tx: &tokio_postgres::Transaction<'_>,
+    protocol: &crate::volume_protocol::VolumeProtocol,
     volume: i64,
     expected_revision: Option<u64>,
     client_id: &str,
@@ -327,6 +336,8 @@ async fn update_volume_settings_in_tx(
         .ok_or_else(|| MetaError::Storage("volume settings revision overflow".into()))?;
     update(&mut settings);
     let event = MetaEvent::SetVolumeSettings { settings };
+    // Selects tag 19, 20 or 21; a policy that cannot carry it refuses the change.
+    crate::events::ensure_publishable([&event], protocol)?;
     let payload = crate::events::encode_event(&event)?;
     let payload_bytes = i64::try_from(payload.len())
         .map_err(|_| MetaError::Storage("volume settings payload too large".into()))?;
@@ -438,9 +449,15 @@ pub async fn update_shared_s3_settings(
     .await
     .map_err(|error| PgMetaEngine::classify_pg_error("store shared S3 settings", error))?;
     if let Some(days) = update.trash_days {
-        update_volume_settings_in_tx(&tx, volume, None, client_id, now_ms, |settings| {
-            settings.trash.set_days(days)
-        })
+        update_volume_settings_in_tx(
+            &tx,
+            session.protocol(),
+            volume,
+            None,
+            client_id,
+            now_ms,
+            |settings| settings.trash.set_days(days),
+        )
         .await?
         .ok_or_else(|| MetaError::Storage("shared trash settings update was rejected".into()))?;
     }

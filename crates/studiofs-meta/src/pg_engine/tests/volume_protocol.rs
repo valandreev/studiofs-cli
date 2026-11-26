@@ -412,3 +412,139 @@ fn volume_protocol_waiting_update_rechecks_policy_epoch_on_live_postgres() {
     })
     .expect("concurrent volume protocol update");
 }
+
+/// Runs one statement on the isolated schema; returns its first column, if any.
+fn sql_i64(dsn: &str, sql: &str, volume: i64, text: Option<String>) -> Option<i64> {
+    let (dsn, statement) = (dsn.to_owned(), sql.to_owned());
+    run_async(async move {
+        let sql = statement;
+        let (client, connection) = tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
+            .await
+            .map_err(|e| MetaError::Storage(pg_err(e)))?;
+        let connection = tokio::spawn(connection);
+        let rows = match &text {
+            Some(text) => client.query(&sql, &[&volume, text]).await,
+            None => client.query(&sql, &[&volume]).await,
+        }
+        .map_err(|e| MetaError::Storage(pg_err(e)))?;
+        connection.abort();
+        Ok(rows.first().map(|row| row.get::<_, i64>(0)))
+    })
+    .expect(sql)
+}
+
+#[test]
+#[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
+fn pending_events_stay_unpublished_while_the_policy_cannot_represent_them() {
+    use crate::pg_engine::set_shared_trash_days;
+
+    let dsn = pg_dsn().expect("STUDIOFS_TEST_PG_DSN is required for this explicit test");
+    let schema = IsolatedPgSchema::new(&dsn);
+    let volume = PgTestVolume::new(&schema.dsn, "sfs1010-pending");
+    let vol = volume.volume_id;
+    run_async(async {
+        let (client, connection) = tokio_postgres::connect(&schema.dsn, tokio_postgres::NoTls)
+            .await
+            .map_err(|e| MetaError::Storage(pg_err(e)))?;
+        let connection = tokio::spawn(connection);
+        insert_initial_volume_protocol(&client, vol, "sfs1010-test").await?;
+        connection.abort();
+        Ok(())
+    })
+    .unwrap();
+    let dir = studiofs_test_support::workspace_target_tempdir("test-");
+    let path = dir.path().join("meta.redb");
+    seed_local(&path, &volume.format_info());
+    let pg = PgMetaEngine::open_with_options(
+        &path,
+        PgOpenOptions {
+            background_poll: false,
+            ..Default::default()
+        },
+    )
+    .expect("open writer");
+
+    // Authored under the baseline policy, then the policy stops requiring the
+    // v1 event codec for readers before the journal is published.
+    let draft = pg.create_dir(ROOT_INO, b"draft", 0, 0, 0o755).unwrap();
+    let mut narrowed = VolumeProtocol::baseline();
+    let sets = &mut narrowed.requirements;
+    sets.read.remove(crate::compat::CAP_EVENT_CODEC_V1);
+    sets.write.remove(crate::compat::CAP_EVENT_CODEC_V1);
+    sets.features.insert(
+        crate::compat::CAP_EVENT_CODEC_V1.to_owned(),
+        FeatureState::Compatible,
+    );
+    let set_policy = |epoch: i64, policy: &VolumeProtocol| {
+        sql_i64(
+            &schema.dsn,
+            &format!(
+                "UPDATE volume_protocol SET policy_epoch = {epoch}, requirements = $2::TEXT::JSONB \
+                 WHERE vol = $1 RETURNING policy_epoch"
+            ),
+            vol,
+            Some(policy.encode_requirements().unwrap()),
+        )
+    };
+    assert_eq!(set_policy(2, &narrowed), Some(2));
+    let events = "SELECT count(*) FROM event_log WHERE vol = $1";
+    let version = "SELECT version FROM metadata_state WHERE vol = $1";
+    let version_before = sql_i64(&schema.dsn, version, vol, None);
+    let cursor = pg.flushed_event_seq.load(Ordering::SeqCst);
+    let pending = pg.replication_backlog().pending_ops;
+    assert!(pending > 0);
+
+    let batch = pg.claim_pending_batch(true).expect("pending batch");
+    let refused = pg.flush_pending_claimed_batch_with_restore(batch).err();
+    assert!(
+        matches!(
+            refused,
+            Some(MetaError::VolumeProtocolRejected(
+                ProtocolRejection::EventNotRepresentable { .. }
+            ))
+        ),
+        "{refused:?}"
+    );
+    assert_eq!(sql_i64(&schema.dsn, events, vol, None), Some(0));
+    assert_eq!(sql_i64(&schema.dsn, version, vol, None), version_before);
+    assert_eq!(pg.flushed_event_seq.load(Ordering::SeqCst), cursor);
+    assert_eq!(pg.replication_backlog().pending_ops, pending);
+    assert_eq!(pg.lookup(ROOT_INO, b"draft").unwrap().ino, draft.ino);
+
+    // Online settings changes negotiate against the same policy.
+    let settings = run_async({
+        let dsn = schema.dsn.clone();
+        async move {
+            let (mut client, connection) = tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
+                .await
+                .map_err(|e| MetaError::Storage(pg_err(e)))?;
+            let connection = tokio::spawn(connection);
+            let result = set_shared_trash_days(&mut client, vol, None, 3, "sfs1010-test", 1).await;
+            connection.abort();
+            Ok(result)
+        }
+    })
+    .unwrap();
+    assert!(
+        matches!(
+            settings,
+            Err(MetaError::VolumeProtocolRejected(
+                ProtocolRejection::EventNotRepresentable {
+                    kind: "set_volume_settings",
+                    ..
+                }
+            ))
+        ),
+        "{settings:?}"
+    );
+    assert_eq!(sql_i64(&schema.dsn, events, vol, None), Some(0));
+
+    // Once the policy can carry the encoding again, the retained journal publishes.
+    assert_eq!(set_policy(3, &VolumeProtocol::baseline()), Some(3));
+    let batch = pg.claim_pending_batch(true).expect("retained batch");
+    pg.flush_pending_claimed_batch_with_restore(batch)
+        .expect("publish retained journal");
+    assert_eq!(pg.replication_backlog().pending_ops, 0);
+    assert!(sql_i64(&schema.dsn, events, vol, None).unwrap() > 0);
+    pg.prepare_for_close().expect("close writer");
+}

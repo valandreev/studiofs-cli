@@ -135,6 +135,18 @@ pub enum ProtocolRejection {
         /// Violated rule.
         rule: &'static str,
     },
+    /// Publication would emit an event encoding that some reader admitted by
+    /// the policy may not decode (SFS-1010). The event stays unpublished
+    /// local work until the capability is required for readers.
+    #[error(
+        "event `{kind}` needs reader capability `{capability}`, which the volume protocol does not require; it stays unpublished"
+    )]
+    EventNotRepresentable {
+        /// [`MetaEvent::kind`](crate::events::MetaEvent::kind) of the refused event.
+        kind: &'static str,
+        /// Read capability its oldest faithful encoding needs.
+        capability: &'static str,
+    },
 }
 
 impl VolumeProtocol {
