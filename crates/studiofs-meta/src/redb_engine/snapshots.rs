@@ -614,6 +614,9 @@ impl RedbMetaEngine {
                 .retain(|_, _| false)
                 .map_err(|e| MetaError::Storage(e.to_string()))?;
             for (k, v) in &snapshot.settings {
+                if k == super::format::LOCAL_UPGRADE_STAGE {
+                    continue;
+                }
                 if k == super::volume_settings::VOLUME_SETTINGS_KEY
                     || k == super::volume_settings::BASE_VOLUME_SETTINGS_KEY
                 {

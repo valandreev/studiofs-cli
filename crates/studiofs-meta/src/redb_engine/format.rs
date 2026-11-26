@@ -7,16 +7,16 @@ pub(super) fn local_header(info: &FormatInfo, previous: Option<&[u8]>) -> MetaRe
         && let Some(previous) = previous
     {
         let previous: serde_json::Value = serde_json::from_slice(previous)
-            .map_err(|error| MetaError::Serialization(error.to_string()))?;
+            .map_err(|error| crate::invalid_format_info_json(&error))?;
         if let Some(revision) = previous.get(crate::LOCAL_REDB_REVISION) {
             let mut header = serde_json::to_value(info)
-                .map_err(|error| MetaError::Serialization(error.to_string()))?;
+                .map_err(|error| crate::invalid_format_info_json(&error))?;
             header[crate::LOCAL_REDB_REVISION] = revision.clone();
             return serde_json::to_vec(&header)
-                .map_err(|error| MetaError::Serialization(error.to_string()));
+                .map_err(|error| crate::invalid_format_info_json(&error));
         }
     }
-    serde_json::to_vec(info).map_err(|error| MetaError::Serialization(error.to_string()))
+    serde_json::to_vec(info).map_err(|error| crate::invalid_format_info_json(&error))
 }
 
 impl RedbMetaEngine {
@@ -30,9 +30,11 @@ impl RedbMetaEngine {
     pub(super) fn read_format_info_for_upgrade_from_read_txn(
         txn: &redb::ReadTransaction,
     ) -> MetaResult<FormatInfo> {
-        let table = txn
-            .open_table(SETTINGS_TABLE)
-            .map_err(|error| MetaError::Storage(error.to_string()))?;
+        let table = match txn.open_table(SETTINGS_TABLE) {
+            Ok(table) => table,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Err(MetaError::NotFormatted),
+            Err(error) => return Err(MetaError::Storage(error.to_string())),
+        };
         let bytes = table.get("format")?.ok_or(MetaError::NotFormatted)?;
         let version: crate::FormatVersionOnly = serde_json::from_slice(bytes.value())
             .map_err(|error| crate::invalid_format_info_json(&error))?;
@@ -56,6 +58,7 @@ impl RedbMetaEngine {
         &self,
         checkpoint: impl Fn(u8) -> MetaResult<()>,
     ) -> MetaResult<()> {
+        let current_revision = crate::version::LOCAL_METADATA_LAYOUT.current;
         checkpoint(0)?;
         loop {
             let txn = self.begin_immediate_write_txn()?;
@@ -72,16 +75,21 @@ impl RedbMetaEngine {
                 let stage = table
                     .get(LOCAL_UPGRADE_STAGE)?
                     .map(|stage| stage.value().to_vec());
-                let activated = header.get(crate::LOCAL_REDB_REVISION).is_some();
+                let revision = header
+                    .get(crate::LOCAL_REDB_REVISION)
+                    .cloned()
+                    .map(serde_json::from_value::<u16>)
+                    .transpose()
+                    .map_err(|error| crate::invalid_format_info_json(&error))?;
+                let activated = revision == Some(current_revision);
                 let next = match (stage.as_deref(), activated) {
                     (None, true) => return Ok(()),
                     (None, false) => 1,
                     (Some([1]), false) => 2,
                     (Some([2]), false) => {
-                        header[crate::LOCAL_REDB_REVISION] =
-                            crate::version::LOCAL_METADATA_LAYOUT.current.into();
+                        header[crate::LOCAL_REDB_REVISION] = current_revision.into();
                         let bytes = serde_json::to_vec(&header)
-                            .map_err(|error| MetaError::Serialization(error.to_string()))?;
+                            .map_err(|error| crate::invalid_format_info_json(&error))?;
                         table.insert("format", bytes.as_slice())?;
                         3
                     }
