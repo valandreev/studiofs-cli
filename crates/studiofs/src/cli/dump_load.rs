@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use studiofs_meta::compat::{CheckpointDescriptor, Operation, VolumeRequirements};
 use studiofs_meta::pg_engine::{
     migrations::{ensure_registered_schema, recorded_schema_revisions, validate_restore_revisions},
-    read_compatible_checkpoint, read_volume_protocol,
+    read_policy_checkpoint, read_volume_protocol, validate_event_batch_client,
 };
 use studiofs_meta::version::{EVENT_CODEC_WIRE, LOCAL_METADATA_LAYOUT};
 use studiofs_meta::volume_protocol::VolumeProtocol;
@@ -267,9 +267,14 @@ fn load_remote_dump(
                 .await
                 .map_err(|source| postgres_operation("start dump snapshot transaction", source))?;
 
-            let descriptor = read_compatible_checkpoint(&transaction, volume_id).await?;
-            let checkpoint = descriptor.validated_encoding()?;
             let volume_protocol = read_volume_protocol(&transaction, volume_id).await?;
+            let descriptor = read_policy_checkpoint(
+                &transaction,
+                volume_id,
+                volume_protocol.requirements.checkpoint,
+            )
+            .await?;
+            let checkpoint = descriptor.validated_encoding()?;
             let schema_revisions = recorded_schema_revisions(&transaction).await?;
             let row = transaction
                 .query_one(
@@ -848,6 +853,7 @@ fn validate_dump(dump: &MetadataDump) -> DumpLoadResult<()> {
     }
 
     let mut last_event_version = None;
+    let mut batch_client = None;
     let mut contiguous_through = checkpoint_version;
     for event in &dump.event_log {
         let batch_version = event.batch_version;
@@ -863,7 +869,12 @@ fn validate_dump(dump: &MetadataDump) -> DumpLoadResult<()> {
             }
             .into());
         }
-        last_event_version = Some(batch_version);
+        if last_event_version == Some(batch_version) {
+            validate_event_batch_client(batch_client, event.client_id.as_deref())?;
+        } else {
+            batch_client = event.client_id.as_deref();
+            last_event_version = Some(batch_version);
+        }
 
         if batch_version <= checkpoint_version {
             continue;
@@ -1382,6 +1393,27 @@ mod tests {
     }
 
     #[test]
+    fn dump_validation_rejects_mixed_client_identities() {
+        let mut dump = test_dump();
+        let version = dump.metadata_state_checkpoint_version + 1;
+        dump.metadata_state_version = version;
+        let mut identified = test_event(version);
+        identified.client_id = Some("writer".into());
+        let mut anonymous = test_event(version);
+        anonymous.client_id = None;
+        dump.event_log = vec![identified, anonymous];
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("dump.json");
+        write_dump_output(&input, &dump).unwrap();
+
+        let error = load(&input, "invalid PostgreSQL DSN").unwrap_err();
+        assert!(
+            error.to_string().contains("mixed client identities"),
+            "{error}"
+        );
+    }
+
+    #[test]
     fn dump_validation_rejects_an_unsupported_event_before_restore() {
         let mut dump = test_dump();
         let version = dump.metadata_state_checkpoint_version + 1;
@@ -1511,7 +1543,7 @@ mod tests {
     #[cfg(feature = "test-successor")]
     #[test]
     #[ignore = "requires the PostgreSQL test database"]
-    fn successor_restore_preserves_checkpoint_and_rebinds_its_volume_id() {
+    fn successor_dump_preserves_baseline_policy_checkpoint() {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let dsn = test_pg_dsn().expect("STUDIOFS_TEST_PG_DSN is required");
         let dsn = rt
@@ -1543,20 +1575,100 @@ mod tests {
         };
         manifest.schema_revisions.insert("core".into(), 2);
         manifest.source_local_redb_revision = LOCAL_METADATA_LAYOUT.current;
+        let source_vol = apply_dump(schema.dsn(), &dump).unwrap();
+        let error =
+            load_remote_dump(schema.dsn(), source_vol, LOCAL_METADATA_LAYOUT.current).unwrap_err();
+        assert!(matches!(
+            error,
+            DumpLoadError::Meta(MetaError::RequiredCheckpointUnavailable {
+                format: 4, schema: 1, available,
+            }) if available == "format 5, schema 1"
+        ));
         let dir = tempfile::tempdir().unwrap();
+        let baseline_reader = std::env::var_os("STUDIOFS_TEST_BASELINE_BIN");
+        let discover = |reader: &std::ffi::OsStr, dsn: &str| {
+            std::process::Command::new(reader)
+                .arg("discover")
+                .arg(&dump.volume.name)
+                .arg("--meta")
+                .arg(dsn)
+                .env(crate::cli::utils::CLIENT_ROOT_ENV, dir.path())
+                .output()
+                .expect("run baseline StudioFS discovery")
+        };
+        if let Some(reader) = &baseline_reader {
+            let output = discover(reader, schema.dsn());
+            assert!(!output.status.success());
+            let diagnostic = String::from_utf8_lossy(&output.stderr);
+            assert!(diagnostic.contains("format 5, schema 1"));
+            assert!(diagnostic.contains("upgrade to a StudioFS client"));
+        }
+        rt.block_on(async {
+            let (client, connection) = connect_studiofs_postgres(schema.dsn()).await.unwrap();
+            let task = tokio::spawn(connection);
+            // The legacy successor-only backup must still restore and rebind its envelope.
+            let descriptor = studiofs_meta::pg_engine::read_compatible_checkpoint(&client, source_vol)
+                .await.unwrap();
+            assert_ne!(source_vol, dump.volume.vol);
+            assert_eq!(descriptor.validated_encoding().unwrap().format, 5);
+            let checksum = Sha256::digest(&baseline);
+            client.execute(
+                "UPDATE metadata_state SET snapshot = $2, checkpoint_sha256 = $3, checkpoint_publication_state = 'published' WHERE vol = $1",
+                &[&source_vol, &baseline, &checksum.as_slice()],
+            ).await.unwrap();
+            drop(client);
+            task.await.unwrap().unwrap();
+        });
+        let captured =
+            load_remote_dump(schema.dsn(), source_vol, LOCAL_METADATA_LAYOUT.current).unwrap();
         let input = dir.path().join("dump.json");
-        write_dump_output(&input, &dump).unwrap();
-        load(&input, schema.dsn()).unwrap();
-        let restored = load_remote_dump(schema.dsn(), 1, LOCAL_METADATA_LAYOUT.current).unwrap();
+        write_dump_output(&input, &captured).unwrap();
+        let target = crate::cli::pg_test_schema::PgTestSchema::new(&dsn).unwrap();
+        // Reserve ID 1 to exercise rebinding the restored FormatInfo.
+        rt.block_on(async {
+            let (mut client, connection) = connect_studiofs_postgres(target.dsn()).await.unwrap();
+            let task = tokio::spawn(connection);
+            let tx = client.transaction().await.unwrap();
+            ensure_registered_schema(&tx).await.unwrap();
+            tx.query_one("SELECT nextval('volumes_vol_seq')", &[])
+                .await
+                .unwrap();
+            tx.commit().await.unwrap();
+            drop(client);
+            task.await.unwrap().unwrap();
+        });
+        load(&input, target.dsn()).unwrap();
+        let restored = load_remote_dump(target.dsn(), 2, LOCAL_METADATA_LAYOUT.current).unwrap();
+        assert_ne!(restored.volume.vol, source_vol);
         assert_ne!(restored.volume.vol, dump.volume.vol);
         assert_eq!(
             restored.manifest.as_ref().unwrap().checkpoint,
             CheckpointEncoding {
-                format: 5,
+                format: 4,
                 schema: 1
             }
         );
         validate_manifest(&restored, true).unwrap();
+        rt.block_on(async {
+            let (client, connection) = connect_studiofs_postgres(target.dsn()).await.unwrap();
+            let task = tokio::spawn(connection);
+            let row = client.query_one(
+                "SELECT snapshot, checkpoint_publication_state FROM metadata_state WHERE vol = $1",
+                &[&restored.volume.vol],
+            ).await.unwrap();
+            assert_eq!(row.get::<_, String>(1), "published");
+            assert_eq!(row.get::<_, Vec<u8>>(0), baseline);
+            drop(client);
+            task.await.unwrap().unwrap();
+        });
+        if let Some(reader) = &baseline_reader {
+            let output = discover(reader, target.dsn());
+            assert!(
+                output.status.success(),
+                "baseline discovery exited with {}",
+                output.status
+            );
+        }
     }
 
     #[test]

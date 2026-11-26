@@ -15,6 +15,16 @@ use std::time::{Duration, Instant};
 
 const REPLAY_LOCK_WAIT_SLICE: Duration = Duration::from_millis(10);
 
+/// Every row in a persisted event batch must have the same client identity.
+pub fn validate_event_batch_client(expected: Option<&str>, actual: Option<&str>) -> MetaResult<()> {
+    if actual != expected {
+        return Err(MetaError::Storage(
+            "postgres event_log batch contains mixed client identities".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 thread_local! {
     pub(super) static LOCAL_PROJECTION_TREE_WORK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -1733,11 +1743,7 @@ impl<'a> RemoteApplyCoordinator<'a> {
             if row_batch_version != batch_version {
                 break;
             }
-            if row_client != batch_client {
-                return Err(MetaError::Storage(
-                    "postgres event_log batch contains mixed client identities".to_string(),
-                ));
-            }
+            validate_event_batch_client(batch_client, row_client)?;
             let seq_id: i64 = rows[idx].try_get("seq_id").map_err(|error| {
                 MetaError::Storage(format!(
                     "postgres foreign event seq_id decode failed: {error}"

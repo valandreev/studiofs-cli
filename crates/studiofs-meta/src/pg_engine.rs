@@ -547,10 +547,12 @@ mod metadata_sync;
 /// Ordered, checksummed PostgreSQL schema migration registry (SFS-1005).
 pub mod migrations;
 pub use metadata_io::{
-    read_compatible_checkpoint, restore_checkpoint_encoding, validate_checkpoint_replay,
+    read_compatible_checkpoint, read_policy_checkpoint, restore_checkpoint_encoding,
+    validate_checkpoint_replay,
 };
 #[path = "pg_engine/remote_apply.rs"]
 mod remote_apply;
+pub use remote_apply::validate_event_batch_client;
 #[path = "pg_engine/replication_api.rs"]
 mod replication_api;
 #[path = "pg_engine/replication_flush.rs"]

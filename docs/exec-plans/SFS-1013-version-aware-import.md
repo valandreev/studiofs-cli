@@ -20,8 +20,10 @@ client installs a local database or commits restored volume metadata.
 Discovery selects a compatible checkpoint already. It installs that checkpoint
 and leaves the replay cursor there for mount to catch up. The staging gate now
 validates the tail within the same PostgreSQL read snapshot. A restore that
-uses an alternate checkpoint must leave the baseline slot pending with a
-32-byte digest placeholder and write the alternate encoding separately.
+uses an alternate checkpoint leaves the baseline slot pending with a 32-byte
+digest placeholder and writes the alternate encoding separately. New dumps
+select the encoding required by the source policy so a baseline-policy volume
+remains bootstrappable after restore.
 
 ## Decision Log
 
@@ -31,7 +33,8 @@ Version 5 records the source identities, while version 4 remains readable for
 volumes already on the supported shared format. Preserve the restore policy
 when provisioning a volume. Require a matching policy when replacing live
 metadata or completing a target whose policy was already provisioned. Use the alternate checkpoint registry for format 5 and rebind the
-volume identity in its envelope before publishing it.
+volume identity in its envelope before publishing it. Reuse replay's
+batch-client identity check when validating the dump before restore.
 
 ## Outcomes & Retrospective
 
@@ -98,6 +101,12 @@ Git whitespace checks passed. An
 earlier concurrent baseline run timed out while waiting for the dump's
 counters query. The sequential baseline run passed the case. Native mounted
 and object-store tests are outside this run.
+
+For the policy-checkpoint regression, build `studiofs` without
+`test-successor` and set `STUDIOFS_TEST_BASELINE_BIN` to its path before
+running `successor_dump_preserves_baseline_policy_checkpoint` with
+`test-successor`. The test launches that binary against the restored
+PostgreSQL volume and checks the upgrade diagnostic on a successor-only source.
 
 ## Interfaces and Dependencies
 

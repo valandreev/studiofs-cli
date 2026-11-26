@@ -455,9 +455,13 @@ volume connection and storage settings.
 `studiofs dump` writes version 5 JSON. Its manifest records the PostgreSQL
 migration ledger revisions, volume protocol policy, selected serving
 checkpoint format and schema, event encodings present in the tail, and the
-source redb layout revision. The checkpoint, policy, and tail come from a
-single PostgreSQL read snapshot. Snapshot mounts check their artifact format
-and schema independently of the serving checkpoint used for live mounts.
+source redb layout revision. The checkpoint uses the format and schema required
+by the volume policy. A baseline policy also accepts older encodings readable
+by the baseline client. If the checkpoint cannot reach the retained journal,
+publish one under the current policy before retrying the backup. The checkpoint,
+policy, and tail come from a single PostgreSQL read snapshot. Snapshot mounts
+check their artifact format and schema independently of the serving checkpoint
+used for live mounts.
 
 `studiofs load` validates the manifest and encoded data before connecting. It
 also accepts baseline version 4 dumps with the supported shared volume

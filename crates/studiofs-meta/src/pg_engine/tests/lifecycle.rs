@@ -7408,6 +7408,7 @@ fn pg_checkpoint_encodings_keep_baseline_and_successor_replayable() {
                     &empty_i16,
                     &empty_i16,
                     &empty_i64,
+                    &false,
                 ],
             )
             .await
