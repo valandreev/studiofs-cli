@@ -811,6 +811,7 @@ fn setup_pg_volume(dsn: &str, name: &str, uuid: &str, block_size: u32) -> MetaRe
                 MetaError::Storage(format!("postgres volume upsert failed: {}", pg_err(e)))
             })?;
         let volume_id: i64 = row.get(0);
+        crate::pg_engine::insert_initial_volume_protocol(&tx, volume_id, "test fixture").await?;
 
         let empty_checkpoint = postcard::to_stdvec(&crate::snapshot::ServingCheckpoint::default())
             .map_err(|e| MetaError::Serialization(format!("snapshot encode failed: {e}")))?;

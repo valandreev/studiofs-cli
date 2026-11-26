@@ -13,7 +13,7 @@
 //! |---|---|
 //! | Local payload index format 2 / entry encoding 3 | `studiofs-cache` `payload_index.rs`: `INDEX_FORMAT_VERSION`, `ENTRY_ENCODING_VERSION` |
 //! | Snapshot artifact format 1 / schema 1 | `studiofs_vfs::snapshot_worker::SNAPSHOT_ARTIFACT_FORMAT_VERSION`, `SNAPSHOT_ARTIFACT_SCHEMA_VERSION` |
-//! | Dump format 4 | `studiofs` CLI `dump_load.rs`: `MetadataDump::dump_version` |
+//! | Dump formats 4 and 5 | `studiofs` CLI `dump_load.rs`: `MetadataDump::dump_version` |
 //! | STFS payload object v2 / v3 | `studiofs_data::object::VERSION`, `VERSION_V3` |
 //! | SFEC envelope v1 | `studiofs_data::envelope::SFEC_VERSION` |
 //! | Remote payload encryption config 1 | [`crate::schema::CURRENT_ENCRYPTION_FORMAT_VERSION`] |

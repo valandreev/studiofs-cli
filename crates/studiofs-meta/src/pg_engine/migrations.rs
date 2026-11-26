@@ -547,6 +547,52 @@ where
     Ok((recorded, pending))
 }
 
+/// Check a backup's schema revisions against the compiled migration registry.
+pub fn validate_restore_revisions(
+    revisions: &std::collections::BTreeMap<String, i32>,
+) -> MetaResult<()> {
+    for (component, &found) in revisions {
+        let known = if component == PAYLOAD_GC_COMPONENT {
+            i32::from(POSTGRES_PAYLOAD_GC_SCHEMA.current)
+        } else {
+            latest_version(MIGRATIONS, component)
+        };
+        if found > known {
+            return Err(MetaError::UpgradeRequired {
+                reason: UpgradeRequiredReason::SchemaComponentNewer {
+                    component: component.clone(),
+                    found,
+                    known,
+                },
+            });
+        }
+        if found <= 0 {
+            return Err(MetaError::Serialization(format!(
+                "invalid PostgreSQL schema revision for {component}"
+            )));
+        }
+    }
+    for component in [CORE_COMPONENT, PAYLOAD_GC_COMPONENT] {
+        if !revisions.contains_key(component) {
+            return Err(MetaError::Serialization(format!(
+                "dump misses PostgreSQL schema revision for {component}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Read schema revisions from the migration ledger without running DDL.
+pub async fn recorded_schema_revisions<C: GenericClient + Sync>(
+    client: &C,
+) -> MetaResult<std::collections::BTreeMap<String, i32>> {
+    let (recorded, _) = read_recorded(client).await?;
+    Ok(recorded
+        .into_iter()
+        .map(|row| (row.component, row.version))
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -9,7 +9,7 @@
 use tokio_postgres::GenericClient;
 
 use super::{PgMetaEngine, sql};
-use crate::compat::ClientCapabilities;
+use crate::compat::{ClientCapabilities, Operation, VolumeRequirements};
 use crate::engine::{MetaError, MetaResult, UpgradeRequiredReason};
 use crate::version::SHARED_WRITE_REQUIREMENT;
 use crate::volume_protocol::{ProtocolRejection, VolumeProtocol, check_update};
@@ -47,10 +47,20 @@ pub async fn insert_initial_volume_protocol<C>(
 where
     C: GenericClient + Sync,
 {
-    let baseline = VolumeProtocol::baseline();
-    let requirements = baseline.encode_requirements()?;
-    let epoch = epoch_i64(baseline.epoch)?;
-    let write_requirement = requirement_i16(baseline.write_requirement)?;
+    insert_restored_volume_protocol(client, volume, &VolumeProtocol::baseline(), actor).await
+}
+
+/// Install a validated restore policy as the first policy of a fresh volume.
+pub async fn insert_restored_volume_protocol<C: GenericClient + Sync>(
+    client: &C,
+    volume: i64,
+    protocol: &VolumeProtocol,
+    actor: &str,
+) -> MetaResult<()> {
+    protocol.validate()?;
+    let requirements = protocol.encode_requirements()?;
+    let epoch = epoch_i64(protocol.epoch)?;
+    let write_requirement = requirement_i16(protocol.write_requirement)?;
     client
         .execute(
             "WITH inserted AS (
@@ -232,5 +242,38 @@ where
     }
     MetaError::Storage(
         "postgres metadata version bump did not update the current-format row".into(),
+    )
+}
+
+/// Verify the read policy at bootstrap or snapshot acquisition.
+pub async fn check_volume_read_policy<C: GenericClient + Sync>(
+    client: &C,
+    volume: i64,
+    checkpoint: Option<&crate::BootstrapCheckpointDescriptor>,
+) -> MetaResult<()> {
+    if checkpoint.is_none() {
+        let found = client
+            .query_opt(sql::SELECT_METADATA_FORMAT_VERSION, &[&volume])
+            .await
+            .map_err(|error| {
+                PgMetaEngine::classify_pg_error("read volume format for policy", error)
+            })?
+            .and_then(|row| row.get(0));
+        crate::ensure_supported_pg_sync_format_version(found)?;
+    }
+    let protocol = read_volume_protocol(client, volume).await?;
+    protocol.check_operations(
+        VolumeRequirements::baseline(),
+        checkpoint.map(|descriptor| {
+            descriptor.checkpoint_encoding.map_or(
+                crate::compat::CheckpointDescriptor::BASELINE,
+                |encoding| crate::compat::CheckpointDescriptor {
+                    format: encoding.format as u16,
+                    schema: encoding.schema as u16,
+                },
+            )
+        }),
+        &Default::default(),
+        &[Operation::Bootstrap, Operation::Replay],
     )
 }

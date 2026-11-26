@@ -408,6 +408,39 @@ impl ServingCheckpoint {
         bytes
     }
 
+    pub(crate) fn published_encoding(bytes: &[u8]) -> crate::MetaResult<crate::CheckpointEncoding> {
+        let corrupt = || crate::MetaError::InvalidCheckpointDescriptor {
+            reason: crate::CheckpointDescriptorFailure::CheckpointBytes,
+        };
+        if let Some(envelope) = bytes.strip_prefix(CHECKPOINT_ENVELOPE_MAGIC) {
+            let [a, b, c, d] = *envelope.first_chunk::<4>().ok_or_else(corrupt)?;
+            return Ok(crate::CheckpointEncoding {
+                format: i16::from_be_bytes([a, b]),
+                schema: i16::from_be_bytes([c, d]),
+            });
+        }
+        let (_, format) = Self::decode_legacy(bytes).map_err(|_| corrupt())?;
+        Ok(crate::CheckpointEncoding {
+            format,
+            schema: Self::BASELINE_SCHEMA_VERSION,
+        })
+    }
+
+    pub(crate) fn rebind_published(
+        bytes: &[u8],
+        source_volume: i64,
+        target_volume: i64,
+        cut: i64,
+    ) -> crate::MetaResult<Vec<u8>> {
+        Self::decode_published(bytes, None, source_volume, cut)?;
+        let mut bytes = bytes.to_vec();
+        if bytes.starts_with(CHECKPOINT_ENVELOPE_MAGIC) {
+            let offset = CHECKPOINT_ENVELOPE_MAGIC.len() + 4;
+            bytes[offset..offset + 8].copy_from_slice(&target_volume.to_be_bytes());
+        }
+        Ok(bytes)
+    }
+
     pub(crate) fn check_encoding(encoding: crate::CheckpointEncoding) -> crate::MetaResult<()> {
         if !Self::supports_format_version(encoding.format)
             || !Self::supports_schema_version(encoding.schema)

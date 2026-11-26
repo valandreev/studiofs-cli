@@ -8,8 +8,8 @@ use uuid::Uuid;
 use super::PgMetaEngine;
 use super::runtime::PgConnectionPool;
 use crate::client_sessions::{ClientSession, SessionCapabilities};
-use crate::compat::{ClientCapabilities, Operation, VolumeRequirements, evaluate};
-use crate::engine::{MetaError, MetaResult, UpgradeRequiredReason};
+use crate::compat::{ClientCapabilities, Operation, VolumeRequirements};
+use crate::engine::{MetaError, MetaResult};
 use crate::version::{CLIENT_RELEASE, SHARED_VOLUME_FORMAT, SHARED_WRITE_REQUIREMENT};
 use crate::volume_protocol::VolumeProtocol;
 
@@ -220,18 +220,6 @@ pub(super) fn evaluate_protocol_for_role(
     protocol: &VolumeProtocol,
     role: SessionRole,
 ) -> Result<(), MetaError> {
-    if role == SessionRole::Mount && protocol.write_requirement > SHARED_WRITE_REQUIREMENT.current {
-        return Err(MetaError::UpgradeRequired {
-            reason: UpgradeRequiredReason::WriteRequirementNewer {
-                found: protocol.write_requirement,
-                supported: SHARED_WRITE_REQUIREMENT.current,
-            },
-        });
-    }
-    let client_caps = ClientCapabilities::current();
-    let mut volume_reqs = VolumeRequirements::baseline();
-    protocol.apply_to(&mut volume_reqs);
-    let decision = evaluate(&client_caps, &volume_reqs, &BTreeMap::new());
     let required_ops: &[Operation] = match role {
         SessionRole::Mount => &[
             Operation::Bootstrap,
@@ -245,16 +233,12 @@ pub(super) fn evaluate_protocol_for_role(
             Operation::Maintenance,
         ],
     };
-    for &operation in required_ops {
-        if let Some(refusal) = decision.refusal(operation) {
-            return Err(MetaError::UpgradeRequired {
-                reason: UpgradeRequiredReason::VolumeProtocolUnknown {
-                    detail: format!("{} ({})", refusal.reason.as_str(), refusal.subject),
-                },
-            });
-        }
-    }
-    Ok(())
+    protocol.check_operations(
+        VolumeRequirements::baseline(),
+        Some(protocol.requirements.checkpoint),
+        &BTreeMap::new(),
+        required_ops,
+    )
 }
 
 pub(super) async fn validate_volume_protocol_for_role<C: GenericClient + Sync>(

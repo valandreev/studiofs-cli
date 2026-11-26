@@ -89,7 +89,8 @@ pub enum CheckpointDescriptorFailure {
 }
 
 /// Persisted serving checkpoint byte format and state schema pair.
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CheckpointEncoding {
     /// Persisted byte format version.
     pub format: i16,
@@ -203,6 +204,12 @@ impl BootstrapCheckpointDescriptor {
             self.volume_id,
             self.checkpoint_version,
         )
+    }
+
+    /// Return the encoding verified by the serving checkpoint registry.
+    pub fn validated_encoding(&self) -> MetaResult<CheckpointEncoding> {
+        self.validate()?;
+        crate::snapshot::ServingCheckpoint::published_encoding(&self.checkpoint_bytes)
     }
 
     /// Validates all identity, version, publication, and payload invariants.

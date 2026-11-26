@@ -41,6 +41,7 @@ const MOUNT_COMPONENTS: [MountComponent; 3] = [
             "counters",
             "event_log",
             "metadata_state",
+            "volume_protocol",
             "bootstrap_checkpoint_leases",
             "acl_rules",
             "file_lock_leases",
@@ -249,18 +250,7 @@ impl PgMetaEngine {
                     return Err(MetaError::Storage(message));
                 }
 
-                let row = client
-                    .query_opt(
-                        "SELECT metadata_format_version FROM metadata_state WHERE vol = $1",
-                        &[&volume_id],
-                    )
-                    .await
-                    .map_err(|error| {
-                        Self::classify_pg_error("postgres metadata format query failed", error)
-                    })?;
-                let found = row.and_then(|row| row.get::<_, Option<i16>>(0));
-                crate::ensure_supported_pg_sync_format_version(found)?;
-                Ok(())
+                super::check_volume_read_policy(&client, volume_id, None).await
             })
             .await
             .map_err(|_| {

@@ -32,6 +32,9 @@ fn map_error(operation: &'static str, error: MetaError) -> SnapshotPortError {
         MetaError::Storage(message) if message == SNAPSHOT_NOT_READY => {
             SnapshotPortError::permanent("snapshot_not_ready", "snapshot is not ready")
         }
+        MetaError::UpgradeRequired { .. } | MetaError::NeedsMigration { .. } => {
+            SnapshotPortError::permanent("volume_incompatible", &error.to_string())
+        }
         _ => SnapshotPortError::from_backend(operation, &error.to_string()),
     }
 }
@@ -95,6 +98,7 @@ impl SnapshotMountStore for super::PgMetaEngine {
                             .transaction()
                             .await
                             .map_err(|_| pg_failure("begin mount lease acquisition"))?;
+                        super::check_volume_read_policy(&tx, volume_id, None).await?;
                         let catalog = tx
                             .query_opt(
                                 "SELECT lifecycle, (expires_at IS NULL OR expires_at > clock_timestamp())

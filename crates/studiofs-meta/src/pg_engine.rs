@@ -546,6 +546,9 @@ mod metadata_notify;
 mod metadata_sync;
 /// Ordered, checksummed PostgreSQL schema migration registry (SFS-1005).
 pub mod migrations;
+pub use metadata_io::{
+    read_compatible_checkpoint, restore_checkpoint_encoding, validate_checkpoint_replay,
+};
 #[path = "pg_engine/remote_apply.rs"]
 mod remote_apply;
 #[path = "pg_engine/replication_api.rs"]
@@ -586,7 +589,8 @@ use remote_apply::{
 };
 pub use retained::{RetainedLifecycleSweep, seed_retained_authority};
 pub use volume_protocol::{
-    insert_initial_volume_protocol, read_volume_protocol, update_volume_protocol,
+    check_volume_read_policy, insert_initial_volume_protocol, insert_restored_volume_protocol,
+    read_volume_protocol, update_volume_protocol,
 };
 pub use volume_settings::{
     S3VolumeSettingsUpdate, set_shared_compression, set_shared_initial_volume_settings,
@@ -1449,21 +1453,7 @@ impl PgMetaEngine {
                 command_pool,
                 command_timeout,
                 "validate postgres format",
-                move |client| {
-                    Box::pin(async move {
-                        let row = client
-                            .query_opt(sql::SELECT_METADATA_FORMAT_VERSION, &[&volume_id])
-                            .await
-                            .map_err(|error| {
-                                Self::classify_pg_error(
-                                    "postgres metadata format query failed",
-                                    error,
-                                )
-                            })?;
-                        let found = row.and_then(|row| row.get::<_, Option<i16>>(0));
-                        crate::ensure_supported_pg_sync_format_version(found)
-                    })
-                },
+                move |client| Box::pin(check_volume_read_policy(client, volume_id, None)),
             )
             .await
         })

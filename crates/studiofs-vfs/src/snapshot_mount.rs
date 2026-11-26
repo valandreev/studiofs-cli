@@ -388,7 +388,13 @@ impl SnapshotMountSession {
         {
             return Err(SnapshotMountError::Port(SnapshotPortError::permanent(
                 "unsupported_artifact_version",
-                "snapshot artifact version is unsupported",
+                &format!(
+                    "snapshot artifact format {} schema {} is unsupported. This client supports format {} schema {}",
+                    descriptor.format_version,
+                    descriptor.schema_version,
+                    SNAPSHOT_ARTIFACT_FORMAT_VERSION,
+                    SNAPSHOT_ARTIFACT_SCHEMA_VERSION,
+                ),
             )));
         }
         let cache_key = SnapshotArtifactCacheKey::new(

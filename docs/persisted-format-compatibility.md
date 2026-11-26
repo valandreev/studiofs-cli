@@ -446,17 +446,28 @@ that declares support for 0.2.5 (the compiled test successor of
 
 ### 11. Dump and load
 
-- Location: JSON file written by `studiofs dump`, type `MetadataDump` with
-  `deny_unknown_fields` (`crates/studiofs/src/cli/dump_load.rs:38`).
-- Version field: `dump_version = 4` (`crates/studiofs/src/cli/dump_load.rs:320`).
-- Reader strictness: anything other than 4 is rejected
-  (`crates/studiofs/src/cli/dump_load.rs:693`) with an untyped message.
-- Successor may change: a new dump version that records the source release and
-  required capabilities.
-- Fail-closed outcome: a typed unsupported-dump error, mapped to
-  `UpgradeRequired` (ADR 0018); `load` performs no DDL and no writes before the
-  version check. Owner:
-  [SFS-1013](https://linear.app/valandreev/issue/SFS-1013).
+Save a backup before upgrading PostgreSQL metadata or restoring a volume. Stop
+all clients and janitors before replacing an existing volume. Keep a copy of
+the original PostgreSQL database and the referenced object-store data until
+the restored volume is verified. Keep the dump private because it contains
+volume connection and storage settings.
+
+`studiofs dump` writes version 5 JSON. Its manifest records the PostgreSQL
+migration ledger revisions, volume protocol policy, selected serving
+checkpoint format and schema, event encodings present in the tail, and the
+source redb layout revision. The checkpoint, policy, and tail come from a
+single PostgreSQL read snapshot. Snapshot mounts check their artifact format
+and schema independently of the serving checkpoint used for live mounts.
+
+`studiofs load` validates the manifest and encoded data before connecting. It
+also accepts baseline version 4 dumps with the supported shared volume
+format. For a pre-0.2.5 volume, run `studiofs upgrade` on the source and take a
+new dump. For newer formats, use a StudioFS release that supports the
+reported identity. The migration registry prepares the target PostgreSQL
+schema. The restore checks its revisions and publishes the volume, policy,
+checkpoint, and replay tail in one transaction. A failed restore can be
+retried after resolving the reported error. A committed schema expansion can
+remain after a failed restore. Object data stays in place.
 
 ### 12. Janitor and GC state
 

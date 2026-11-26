@@ -119,7 +119,6 @@ pub(super) const SELECT_COMPATIBLE_CHECKPOINT_MAX_VERSION: &str = r#"
       AND enc.checkpoint_schema BETWEEN $5 AND $6
     "#;
 
-#[cfg(feature = "test-successor")]
 pub(super) const INSERT_CHECKPOINT_ENCODING: &str = r#"
     INSERT INTO serving_checkpoint_encodings (
         vol, checkpoint_version, checkpoint_format, checkpoint_schema,
