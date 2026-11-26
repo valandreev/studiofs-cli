@@ -340,7 +340,7 @@ evidence that must exist before the gate closes.
 | A refused volume-settings publication returns a typed reason, not a generic PostgreSQL error | ignored PostgreSQL test `volume_protocol_policy_and_write_requirement_on_live_postgres` (SFS-1007) |
 | Sessions record release, capabilities, epoch and a server-clock lease; expired sessions are reported | planned session registry tests (SFS-1008) |
 | Unknown event tags and wire versions fail closed with a typed reason; tags 19–21 keep decoding | planned codec tests (SFS-1009) |
-| Replay stops at the first event it cannot decode without advancing the replay cursor, and publication uses only encodings the volume protocol allows | planned negotiation tests (SFS-1010) |
+| Replay stops at the first event it cannot decode without advancing the replay cursor, and publication uses only encodings the volume protocol allows | ignored PostgreSQL tests `pg_unsupported_event_stops_replay_before_durable_cursor_advance` and `pending_events_stay_unpublished_while_the_policy_cannot_represent_them`; unit tests `publication_negotiates_the_oldest_settings_tag_that_keeps_the_policy`, `publication_refuses_an_event_the_active_protocol_cannot_represent` (SFS-1010) |
 | A 0.2.5 binary refuses to rewrite `VolumeSettings` it cannot represent instead of dropping an unknown field | planned settings codec tests (SFS-1009) |
 | Bootstrap and pruning keep a checkpoint every supported reader can decode; unknown checkpoint formats fail closed with a typed reason | planned checkpoint tests (SFS-1011) |
 | Local redb and payload-index migrations are crash-safe; a newer local format is refused as `LocalUpgradeRequired`, never treated as corruption, and dirty entries survive | planned crash-injection tests (SFS-1012) |

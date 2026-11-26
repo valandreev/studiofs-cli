@@ -136,7 +136,8 @@ const STAMP: &str = "
                 THEN set_config('studiofs.policy_epoch', locked.policy_epoch::TEXT, true) END,
            CASE WHEN locked.lease_expires_at > observed.now_ts
                      AND locked.policy_epoch = current_policy.epoch
-                THEN set_config('studiofs.session_fencing_token', $4::BIGINT::TEXT, true) END
+                THEN set_config('studiofs.session_fencing_token', $4::BIGINT::TEXT, true) END,
+           locked.policy_epoch
     FROM locked CROSS JOIN observed CROSS JOIN current_policy";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -147,7 +148,9 @@ pub(super) enum SessionRole {
 
 #[derive(Debug, Clone)]
 pub(super) enum PolicyValidation {
-    Compatible(i64),
+    /// The validated epoch (0 without a policy row) and the policy publication
+    /// negotiates event encodings against.
+    Compatible(i64, Arc<VolumeProtocol>),
     Incompatible(MetaError),
 }
 
@@ -264,7 +267,10 @@ pub(super) async fn validate_volume_protocol_for_role<C: GenericClient + Sync>(
         .await
         .map_err(|error| classify_session_pg_error("read volume protocol for session", error))?;
     let Some(row) = row else {
-        return Ok(PolicyValidation::Compatible(0));
+        return Ok(PolicyValidation::Compatible(
+            0,
+            Arc::new(VolumeProtocol::baseline()),
+        ));
     };
     let epoch: i64 = row.get(0);
     let write_requirement: i16 = row.get(1);
@@ -274,7 +280,7 @@ pub(super) async fn validate_volume_protocol_for_role<C: GenericClient + Sync>(
         Err(error) => return Ok(PolicyValidation::Incompatible(error)),
     };
     match evaluate_protocol_for_role(&protocol, role) {
-        Ok(()) => Ok(PolicyValidation::Compatible(epoch)),
+        Ok(()) => Ok(PolicyValidation::Compatible(epoch, Arc::new(protocol))),
         Err(error) => Ok(PolicyValidation::Incompatible(error)),
     }
 }
@@ -357,10 +363,13 @@ impl SessionOwner {
         expected_token: Option<i64>,
         role: SessionRole,
     ) -> Result<(SessionLease, Option<MetaError>), HeartbeatError> {
-        let (validated_epoch, policy_error) =
+        let (validated_epoch, protocol, policy_error) =
             match validate_volume_protocol_for_role(client, volume, role).await {
-                Ok(PolicyValidation::Compatible(epoch)) => (epoch, None),
-                Ok(PolicyValidation::Incompatible(error)) => (0, Some(error)),
+                Ok(PolicyValidation::Compatible(epoch, protocol)) => (epoch, protocol, None),
+                // Publication refuses with `policy_error` before it uses this lease.
+                Ok(PolicyValidation::Incompatible(error)) => {
+                    (0, Arc::new(VolumeProtocol::baseline()), Some(error))
+                }
                 Err(error) => return Err(HeartbeatError::Other(error)),
             };
         let row = match expected_token {
@@ -419,6 +428,8 @@ impl SessionOwner {
             SessionLease {
                 owner: self.clone(),
                 token: row.get(0),
+                validated_epoch,
+                protocol,
                 #[cfg(test)]
                 policy_epoch: row.get(1),
             },
@@ -471,6 +482,9 @@ impl SessionOwner {
 pub(super) struct SessionLease {
     owner: SessionOwner,
     token: i64,
+    /// Epoch of `protocol`; a stamp under any other epoch is stale.
+    validated_epoch: i64,
+    protocol: Arc<VolumeProtocol>,
     #[cfg(test)]
     policy_epoch: i64,
 }
@@ -478,6 +492,12 @@ pub(super) struct SessionLease {
 impl SessionLease {
     pub(super) fn token(&self) -> i64 {
         self.token
+    }
+
+    /// Policy this lease validated. After a successful stamp it is the
+    /// volume's current policy for the rest of the transaction's checks.
+    pub(super) fn protocol(&self) -> &VolumeProtocol {
+        &self.protocol
     }
 
     #[cfg(test)]
@@ -545,7 +565,9 @@ impl SessionLease {
             return Err(StampError::SessionInactive);
         }
         let policy_current: bool = row.get(1);
-        if !policy_current {
+        // A concurrent renewal may have stamped a newer epoch than the policy
+        // this lease carries; publication must negotiate against the stamped one.
+        if !policy_current || row.get::<_, i64>(5) != self.validated_epoch {
             return Err(StampError::PolicyStale);
         }
         Ok(())
@@ -611,14 +633,11 @@ impl PublicationSession {
     /// incompatible with this binary, or a classified PostgreSQL error if
     /// registration or stamping fails.
     pub async fn begin(tx: &Transaction<'_>, volume: i64) -> MetaResult<Self> {
-        let (validated_epoch, policy_error) =
+        let (validated_epoch, protocol) =
             match validate_volume_protocol_for_role(tx, volume, SessionRole::Mount).await? {
-                PolicyValidation::Compatible(epoch) => (epoch, None),
-                PolicyValidation::Incompatible(error) => (0, Some(error)),
+                PolicyValidation::Compatible(epoch, protocol) => (epoch, protocol),
+                PolicyValidation::Incompatible(error) => return Err(error),
             };
-        if let Some(error) = policy_error {
-            return Err(error);
-        }
         let owner = SessionOwner::new();
         let capabilities = encode_capabilities()?;
         let row = tx
@@ -640,6 +659,8 @@ impl PublicationSession {
         let lease = SessionLease {
             owner,
             token: row.get(0),
+            validated_epoch,
+            protocol,
             #[cfg(test)]
             policy_epoch: row.get(1),
         };
@@ -655,6 +676,11 @@ impl PublicationSession {
     /// Returns a classified PostgreSQL error if cleanup fails.
     pub async fn finish(self, tx: &Transaction<'_>, volume: i64) -> MetaResult<()> {
         self.0.delete_short_lived(tx, volume).await
+    }
+
+    /// Policy validated and stamped for this transaction.
+    pub(super) fn protocol(&self) -> &VolumeProtocol {
+        self.0.protocol()
     }
 }
 

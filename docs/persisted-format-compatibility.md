@@ -308,6 +308,12 @@ that declares support for 0.2.5 (the compiled test successor of
   ordinary encoder in both builds emits tag 10 for the equivalent mutation.
   Publishing a successor tag requires an activated capability and the
   encoding selection from [SFS-1010](https://linear.app/valandreev/issue/SFS-1010).
+- Publication negotiation (SFS-1010): the registry names each tag's read
+  capability. Inside the publication transaction, after the session stamp
+  pins the policy epoch, every event's oldest faithful tag must have its
+  capability in the policy `read` set; otherwise publication returns
+  `VolumeProtocolRejected(EventNotRepresentable)` before any write and the
+  local journal stays pending. Online settings changes apply the same check.
 
 ### 6. Serving checkpoints
 

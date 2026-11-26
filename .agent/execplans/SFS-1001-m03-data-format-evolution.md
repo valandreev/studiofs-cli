@@ -11,7 +11,7 @@ After this milestone, every data format a successor might change has its own ver
 ## Progress
 
 - [x] (2026-11-25) SFS-1009: register baseline and test-successor MetaEvent codecs, refuse unsupported events before replay advances, and guard settings rewrites.
-- [ ] SFS-1010: negotiate event publication and replay against the active volume protocol.
+- [x] (2026-11-26) SFS-1010: publication negotiates each event encoding against the stamped volume policy and refuses, keeping the journal, when a reader may not decode it; replay keeps decoding the whole page before the redb apply. A refusal is a sticky `PublicationBlocked` sync failure, warned once with the event kind and capability, that survives successful polls, does not invalidate remote identity validation, and clears on the next successful publication.
 - [ ] SFS-1011: support multiple checkpoint formats with safe bootstrap and pruning.
 - [ ] SFS-1012: crash-safe local redb and payload-index format migration and recovery.
 - [ ] SFS-1013: version-aware discovery, snapshot mounts and dump/load restore.
@@ -25,6 +25,13 @@ After this milestone, every data format a successor might change has its own ver
   Evidence: the settings compare-and-set regression in `crates/studiofs-meta/src/redb_engine/volume_settings.rs` verifies byte and journal preservation.
 
 ## Decision Log
+
+- Decision: the codec registry records, per tag, the read capability every active reader must declare; publication emits the oldest faithful tag only when that capability is in the policy's `read` set, otherwise it returns `VolumeProtocolRejected(EventNotRepresentable)`.
+  Rationale: the `read` set is what every admitted reader is guaranteed to hold; a `compatible` feature is optional, so a reader may lack it. The policy row decides, so publication never scans event history. All tags the encoders emit share `event.codec.v1`, so the oldest faithful tag (19, 20 or 21 for settings) is the only candidate; a successor tag with its own capability must extend `negotiate_wire_tag` to try faithful tags oldest-first.
+  Date/Author: 2026-11-26, SFS-1010.
+- Decision: the session lease carries the policy it validated, and the publication stamp is stale unless the stamped epoch equals that policy's epoch. Negotiation runs inside the publication transaction right after the stamp.
+  Rationale: a concurrent heartbeat can stamp a newer epoch than the lease's policy; the existing one-retry force refresh then renegotiates. Local events stay `MetaEvent` values until publication, so events authored before a policy change are re-encoded under the current policy, which is a translation only where the encoding is identical. A refusal takes the generic flush error path and restores the pending batch. Atomic trigger fencing stays with SFS-1014 and mount lifecycle states with SFS-1015.
+  Date/Author: 2026-11-26, SFS-1010.
 
 - Decision: continue the tag-per-version pattern for settings events (tags 19, 20, 21) instead of versioning payloads inside a tag.
   Rationale: the encoder already picks the oldest tag that can carry the value, so older readers keep working until a field they cannot represent is set.
@@ -65,6 +72,7 @@ From the repository root:
     cargo test -p studiofs-meta --lib future_volume_settings_are_not_rewritten
     cargo test -p studiofs-meta --lib unknown_required_capabilities_never_grant_write_authority
     cargo test -p studiofs-meta --lib pg_unsupported_event_stops_replay_before_durable_cursor_advance -- --ignored
+    cargo test -p studiofs-meta --lib pending_events_stay_unpublished_while_the_policy_cannot_represent_them -- --ignored
     cargo test -p studiofs --test snapshot_cli_test compression_cli_updates_shared_setting_handles_cas_conflict_and_converges -- --ignored
     cargo test -p studiofs-meta --lib snapshot
     cargo test -p studiofs-cache --lib payload_index

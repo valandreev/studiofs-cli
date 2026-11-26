@@ -640,6 +640,12 @@ impl PgMetaEngine {
                                     return Err(error);
                                 }
                             }
+                            // The stamp pinned the policy epoch; refuse before any write
+                            // so the caller keeps the whole batch as local work.
+                            crate::events::ensure_publishable(
+                                current_batches.iter().flat_map(|batch| &batch.events),
+                                current_session.protocol(),
+                            )?;
                             let mut last_batch_version = None;
                             let mut retained_locked = std::collections::HashMap::new();
                             let mut last_observation = None;
@@ -828,6 +834,7 @@ impl PgMetaEngine {
         };
         let result = self.record_remote_operation_result(result);
         if let Ok((_, observation)) = &result {
+            self.record_publication_success();
             self.record_checkpoint_freshness_observation(*observation);
         }
         result.map(|(version, _)| version)

@@ -1,5 +1,7 @@
+use crate::compat::CAP_EVENT_CODEC_V1;
 use crate::engine::{MetaError, MetaResult, UpgradeRequiredReason};
 use crate::types::{DirEntryValue, InodeAttr};
+use crate::volume_protocol::{ProtocolRejection, VolumeProtocol};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
@@ -38,38 +40,74 @@ const TAG_SET_USER_XATTR: u8 = 22;
 // Before enabling publication, define replay semantics, rollback behavior, and
 // golden fixtures. A reader may normalize a new encoding to an existing mutation
 // only when that mutation represents the full meaning of the new encoding.
-// None marks a local-journal-only tag.
-const EVENT_CODECS: &[(u8, Option<&str>)] = &[
-    (TAG_SET_ATTR, Some("set_attr")),
-    (TAG_REMOVE_ATTR, Some("remove_attr")),
-    (TAG_ADD_ENTRY, Some("add_entry")),
-    (TAG_REMOVE_ENTRY, Some("remove_entry")),
-    (TAG_RENAME_ENTRY, Some("rename_entry")),
+// None marks a local-journal-only tag. The capability is the read capability
+// every active reader must declare before publication may emit the tag.
+const EVENT_CODECS: &[(u8, Option<&str>, &str)] = &[
+    (TAG_SET_ATTR, Some("set_attr"), CAP_EVENT_CODEC_V1),
+    (TAG_REMOVE_ATTR, Some("remove_attr"), CAP_EVENT_CODEC_V1),
+    (TAG_ADD_ENTRY, Some("add_entry"), CAP_EVENT_CODEC_V1),
+    (TAG_REMOVE_ENTRY, Some("remove_entry"), CAP_EVENT_CODEC_V1),
+    (TAG_RENAME_ENTRY, Some("rename_entry"), CAP_EVENT_CODEC_V1),
     (
         TAG_REMOVE_REGULAR_FILE_GRAPH,
         Some("remove_regular_file_graph"),
+        CAP_EVENT_CODEC_V1,
     ),
     (
         TAG_SET_REGULAR_FILE_OVERLAY_SLICES,
         Some("set_regular_file_overlay_slices"),
+        CAP_EVENT_CODEC_V1,
     ),
     (
         TAG_PUBLISH_REGULAR_FILE_BASE_SLICES,
         Some("publish_regular_file_base_slices"),
+        CAP_EVENT_CODEC_V1,
     ),
-    (TAG_SET_SYMLINK_TARGET, Some("set_symlink_target")),
-    (TAG_SET_XATTR, Some("set_xattr")),
-    (TAG_REMOVE_XATTR, Some("remove_xattr")),
-    (TAG_SET_ACL_RULE, Some("set_acl_rule")),
-    (TAG_REMOVE_ACL_RULE, Some("remove_acl_rule")),
-    (TAG_ADD_PENDING_DELETION, Some("add_pending_deletion")),
-    (TAG_REMOVE_PENDING_DELETION, Some("remove_pending_deletion")),
-    (TAG_REMOVE_LOCAL_ENTRY, None),
-    (TAG_SET_VOLUME_SETTINGS, Some("set_volume_settings")),
-    (TAG_SET_VOLUME_SETTINGS_V2, Some("set_volume_settings")),
-    (TAG_SET_VOLUME_SETTINGS_V3, Some("set_volume_settings")),
+    (
+        TAG_SET_SYMLINK_TARGET,
+        Some("set_symlink_target"),
+        CAP_EVENT_CODEC_V1,
+    ),
+    (TAG_SET_XATTR, Some("set_xattr"), CAP_EVENT_CODEC_V1),
+    (TAG_REMOVE_XATTR, Some("remove_xattr"), CAP_EVENT_CODEC_V1),
+    (TAG_SET_ACL_RULE, Some("set_acl_rule"), CAP_EVENT_CODEC_V1),
+    (
+        TAG_REMOVE_ACL_RULE,
+        Some("remove_acl_rule"),
+        CAP_EVENT_CODEC_V1,
+    ),
+    (
+        TAG_ADD_PENDING_DELETION,
+        Some("add_pending_deletion"),
+        CAP_EVENT_CODEC_V1,
+    ),
+    (
+        TAG_REMOVE_PENDING_DELETION,
+        Some("remove_pending_deletion"),
+        CAP_EVENT_CODEC_V1,
+    ),
+    (TAG_REMOVE_LOCAL_ENTRY, None, CAP_EVENT_CODEC_V1),
+    (
+        TAG_SET_VOLUME_SETTINGS,
+        Some("set_volume_settings"),
+        CAP_EVENT_CODEC_V1,
+    ),
+    (
+        TAG_SET_VOLUME_SETTINGS_V2,
+        Some("set_volume_settings"),
+        CAP_EVENT_CODEC_V1,
+    ),
+    (
+        TAG_SET_VOLUME_SETTINGS_V3,
+        Some("set_volume_settings"),
+        CAP_EVENT_CODEC_V1,
+    ),
     #[cfg(feature = "test-successor")]
-    (TAG_SET_USER_XATTR, Some("set_user_xattr")),
+    (
+        TAG_SET_USER_XATTR,
+        Some("set_user_xattr"),
+        crate::test_successor::SET_USER_XATTR_CAPABILITY,
+    ),
 ];
 
 const _: () = {
@@ -112,11 +150,56 @@ impl From<UnsupportedEventReason> for MetaError {
     }
 }
 
-fn event_codec(tag: u8) -> MetaResult<Option<&'static str>> {
+fn registered_codec(tag: u8) -> MetaResult<&'static (u8, Option<&'static str>, &'static str)> {
     EVENT_CODECS
-        .binary_search_by_key(&tag, |&(registered, _)| registered)
-        .map(|index| EVENT_CODECS[index].1)
+        .binary_search_by_key(&tag, |&(registered, _, _)| registered)
+        .map(|index| &EVENT_CODECS[index])
         .map_err(|_| UnsupportedEventReason::Tag(tag).into())
+}
+
+fn event_codec(tag: u8) -> MetaResult<Option<&'static str>> {
+    registered_codec(tag).map(|codec| codec.1)
+}
+
+/// Chooses the wire tag publication emits for `event` under the volume's
+/// active protocol (SFS-1010): the oldest tag that represents the whole
+/// mutation, provided every reader the policy admits declares its codec.
+/// The policy row decides; no event history is scanned. A mutation the
+/// oldest faithful tag cannot carry for every reader is refused, never
+/// re-encoded with fewer fields.
+// ponytail: every emitted tag shares `event.codec.v1`, so the oldest faithful
+// tag is the only candidate. A future tag with its own capability must try the
+// faithful tags oldest-first and encode publication with the chosen one.
+fn negotiate_wire_tag(event: &MetaEvent, protocol: &VolumeProtocol) -> MetaResult<u8> {
+    let &(tag, _, capability) = registered_codec(event.wire_tag())?;
+    if protocol.requirements.read.contains(capability) {
+        Ok(tag)
+    } else {
+        Err(ProtocolRejection::EventNotRepresentable {
+            kind: event.kind(),
+            capability,
+        }
+        .into())
+    }
+}
+
+/// Checks a publication batch against the volume's active protocol before
+/// any event is written. A refusal leaves the batch, which the caller keeps
+/// as unpublished local work; events authored before a policy change are
+/// checked against the current policy, so they publish only where it still
+/// admits their encoding.
+///
+/// # Errors
+///
+/// `VolumeProtocolRejected(EventNotRepresentable)` for the first event the
+/// protocol cannot carry.
+pub(crate) fn ensure_publishable<'a>(
+    events: impl IntoIterator<Item = &'a MetaEvent>,
+    protocol: &VolumeProtocol,
+) -> MetaResult<()> {
+    events
+        .into_iter()
+        .try_for_each(|event| negotiate_wire_tag(event, protocol).map(drop))
 }
 
 /// Represents a single mutation to the metadata state.
@@ -474,7 +557,7 @@ pub(crate) fn decode_event_with_type(event_type: &str, bytes: &[u8]) -> MetaResu
     if kind != Some(event_type) {
         if !EVENT_CODECS
             .iter()
-            .any(|&(_, kind)| kind == Some(event_type))
+            .any(|&(_, kind, _)| kind == Some(event_type))
         {
             return Err(UnsupportedEventReason::PostgresType.into());
         }
@@ -1308,5 +1391,93 @@ mod tests {
                 .to_string()
                 .contains("does not match decoded")
         );
+    }
+
+    fn settings_event(quota: Option<u64>, compression: bool) -> MetaEvent {
+        let mut settings = crate::trash::VolumeSettings {
+            revision: 3,
+            logical_quota_bytes: quota,
+            ..Default::default()
+        };
+        if compression {
+            settings.compression = crate::trash::CompressionPolicy::zstd_default();
+        }
+        MetaEvent::SetVolumeSettings { settings }
+    }
+
+    /// A policy whose readers are not all known to hold the v1 event codec.
+    fn policy_without_event_codec() -> VolumeProtocol {
+        let mut policy = VolumeProtocol::baseline();
+        let sets = &mut policy.requirements;
+        sets.read.remove(CAP_EVENT_CODEC_V1);
+        sets.write.remove(CAP_EVENT_CODEC_V1);
+        sets.features.insert(
+            CAP_EVENT_CODEC_V1.to_owned(),
+            crate::volume_protocol::FeatureState::Compatible,
+        );
+        policy.validate().unwrap();
+        policy
+    }
+
+    #[test]
+    fn publication_negotiates_the_oldest_settings_tag_that_keeps_the_policy() {
+        let baseline = VolumeProtocol::baseline();
+        for (event, tag) in [
+            (settings_event(None, false), 19),
+            (settings_event(Some(1 << 30), false), 20),
+            (settings_event(None, true), 21),
+            (settings_event(Some(1 << 30), true), 21),
+        ] {
+            assert_eq!(negotiate_wire_tag(&event, &baseline).unwrap(), tag);
+            let encoded = encode_event(&event).unwrap();
+            assert_eq!(encoded[8], tag);
+            // The negotiated encoding carries every field: nothing is downgraded.
+            assert_eq!(decode_event(&encoded).unwrap(), event);
+        }
+        ensure_publishable(
+            &[settings_event(None, true), MetaEvent::RemoveAttr { ino: 7 }],
+            &baseline,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn publication_refuses_an_event_the_active_protocol_cannot_represent() {
+        let policy = policy_without_event_codec();
+        for event in [
+            settings_event(None, false),
+            settings_event(None, true),
+            MetaEvent::RemoveAttr { ino: 7 },
+        ] {
+            assert!(matches!(
+                negotiate_wire_tag(&event, &policy),
+                Err(MetaError::VolumeProtocolRejected(
+                    ProtocolRejection::EventNotRepresentable {
+                        kind,
+                        capability: CAP_EVENT_CODEC_V1,
+                    }
+                )) if kind == event.kind()
+            ));
+        }
+        // Pending events authored under the old policy are checked against the
+        // current one at publication; the caller keeps them unpublished.
+        let pending = vec![MetaEvent::RemoveAttr { ino: 7 }, settings_event(None, true)];
+        let before = pending.clone();
+        assert!(matches!(
+            ensure_publishable(&pending, &policy),
+            Err(MetaError::VolumeProtocolRejected(
+                ProtocolRejection::EventNotRepresentable { .. }
+            ))
+        ));
+        assert_eq!(pending, before);
+        ensure_publishable(&pending, &VolumeProtocol::baseline()).unwrap();
+    }
+
+    #[test]
+    fn every_registered_tag_names_a_declared_read_capability() {
+        let current = crate::compat::ClientCapabilities::current();
+        for &(tag, _, capability) in EVENT_CODECS {
+            assert!(current.read.contains(capability), "tag {tag}: {capability}");
+        }
     }
 }
