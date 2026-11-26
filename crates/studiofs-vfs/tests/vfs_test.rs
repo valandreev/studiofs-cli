@@ -1109,6 +1109,8 @@ fn setup_pg_volume(
                 studiofs_meta::MetaError::Storage(format!("postgres volume insert failed: {e}"))
             })?;
         let volume_id: i64 = row.get(0);
+        studiofs_meta::pg_engine::insert_initial_volume_protocol(&tx, volume_id, "test fixture")
+            .await?;
 
         let checkpoint_dir = tempfile::tempdir().map_err(|e| {
             studiofs_meta::MetaError::Storage(format!("failed to create checkpoint fixture: {e}"))

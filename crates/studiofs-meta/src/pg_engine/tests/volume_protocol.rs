@@ -53,8 +53,8 @@ const HISTORY: &str = "SELECT count(*) FROM volume_protocol_history WHERE vol = 
 fn volume_protocol_policy_and_write_requirement_on_live_postgres() {
     let dsn = pg_dsn().expect("STUDIOFS_TEST_PG_DSN is required for this explicit test");
     let schema = IsolatedPgSchema::new(&dsn);
-    // `setup_pg_volume` inserts volume rows without a policy, like a volume
-    // provisioned before the policy existed.
+    // The fixture volumes lose their policy below, like volumes provisioned
+    // before the policy existed.
     let existing = PgTestVolume::new(&schema.dsn, "sfs1007-existing");
     let legacy = PgTestVolume::new(&schema.dsn, "sfs1007-legacy");
     let dsn = schema.dsn.clone();
@@ -67,6 +67,13 @@ fn volume_protocol_policy_and_write_requirement_on_live_postgres() {
         let client = &mut client;
 
         migrate_registered_schema(client, true).await?;
+        client
+            .batch_execute(&format!(
+                "DELETE FROM volume_protocol_history WHERE vol IN ({existing}, {legacy});
+                 DELETE FROM volume_protocol WHERE vol IN ({existing}, {legacy});"
+            ))
+            .await
+            .map_err(|e| MetaError::Storage(pg_err(e)))?;
         for volume in [existing, legacy] {
             assert!(matches!(
                 read_volume_protocol(&*client, volume).await,

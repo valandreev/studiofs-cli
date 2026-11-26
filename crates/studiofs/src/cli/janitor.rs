@@ -4862,6 +4862,12 @@ mod tests {
                 &[&volume_id, &(CURRENT_FORMAT_VERSION as i16), &Vec::<u8>::new(), &checkpoint_sha256, &format_info_bytes],
             )
             .await?;
+        studiofs_meta::pg_engine::insert_initial_volume_protocol(
+            &client,
+            volume_id,
+            "test fixture",
+        )
+        .await?;
         client
             .execute(
                 "INSERT INTO snapshot_reachability_bootstrap (vol, initialized_version) VALUES ($1, 0)",
