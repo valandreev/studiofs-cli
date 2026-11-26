@@ -155,22 +155,16 @@ cargo test -p studiofs-meta pg_engine::tests:: --lib -- --ignored --test-threads
 cargo test -p studiofs --bin studiofs cli:: -- --ignored --test-threads=1 --nocapture
 ```
 
-For the SFS-1013 cross-binary policy-checkpoint regression, first build a baseline
-`studiofs` binary without `test-successor` and point `STUDIOFS_TEST_BASELINE_BIN`
-at it before running the `test-successor` dump/load tests (the test fails instead
-of skipping when `STUDIOFS_TEST_BASELINE_BIN` is unset):
+The `cli::dump_load::tests` PostgreSQL cases cover the SFS-1013 dump/load
+contract: a 0.2.5+ dump round-trips through a different volume ID, `dump`
+refuses a volume whose baseline checkpoint is not published, and a failed load
+rolls back every row. Unit cases refuse a version 4 (0.2.4) dump with the
+upgrade instruction, refuse a manifest with a newer component, and reject a
+mixed `client_id` batch before PostgreSQL is contacted. Take a backup before
+you run `load` against anything but a disposable test database.
 
 ```bash
-cargo build -p studiofs --bin studiofs
-STUDIOFS_TEST_BASELINE_BIN=target/debug/studiofs cargo test -p studiofs --features test-successor --bin studiofs cli::dump_load::tests -- --ignored --skip regenerate_baseline_dump_fixture --test-threads=1 --nocapture
-```
-
-In PowerShell on Windows:
-
-```powershell
-cargo build -p studiofs --bin studiofs
-$env:STUDIOFS_TEST_BASELINE_BIN = "target\debug\studiofs.exe"
-cargo test -p studiofs --features test-successor --bin studiofs cli::dump_load::tests -- --ignored --skip regenerate_baseline_dump_fixture --test-threads=1 --nocapture
+cargo test -p studiofs --bin studiofs cli::dump_load::tests -- --include-ignored --test-threads=1
 ```
 
 ### SFS-772 Live S3 and Combined S3/PostgreSQL CI Gate

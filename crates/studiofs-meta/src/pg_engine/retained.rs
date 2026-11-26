@@ -164,12 +164,9 @@ pub async fn seed_retained_authority(
     checkpoint_version: i64,
     events: &[(i64, &str, &[u8])],
 ) -> MetaResult<()> {
-    let checkpoint = crate::snapshot::ServingCheckpoint::decode_published(
-        checkpoint,
-        None,
-        volume,
-        checkpoint_version,
-    )?;
+    let checkpoint = crate::snapshot::ServingCheckpoint::decode(checkpoint).map_err(|error| {
+        MetaError::Serialization(format!("serving checkpoint decode failed: {error}"))
+    })?;
     for (key, value) in &checkpoint.xattrs {
         let Some((ino, name)) = key.split_first_chunk::<8>() else {
             continue;

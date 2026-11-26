@@ -446,32 +446,41 @@ that declares support for 0.2.5 (the compiled test successor of
 
 ### 11. Dump and load
 
-Save a backup before upgrading PostgreSQL metadata or restoring a volume. Stop
-all clients and janitors before replacing an existing volume. Keep a copy of
-the original PostgreSQL database and the referenced object-store data until
-the restored volume is verified. Keep the dump private because it contains
-volume connection and storage settings.
+Dump and load cover only volumes and dumps created by StudioFS 0.2.5 and later.
 
-`studiofs dump` writes version 5 JSON. Its manifest records the PostgreSQL
-migration ledger revisions, volume protocol policy, selected serving
-checkpoint format and schema, event encodings present in the tail, and the
-source redb layout revision. The checkpoint uses the format and schema required
-by the volume policy. A baseline policy also accepts older encodings readable
-by the baseline client. If the checkpoint cannot reach the retained journal,
-publish one under the current policy before retrying the backup. The checkpoint,
-policy, and tail come from a single PostgreSQL read snapshot. Snapshot mounts
-check their artifact format and schema independently of the serving checkpoint
-used for live mounts.
+Back up first. Take a dump before you upgrade PostgreSQL metadata or restore a
+volume. Stop all clients and janitors before you replace an existing volume.
+Keep a copy of the original PostgreSQL database and the referenced object-store
+data until you have verified the restored volume. Keep the dump private: it
+contains volume connection and storage settings.
 
-`studiofs load` validates the manifest and encoded data before connecting. It
-also accepts baseline version 4 dumps with the supported shared volume
-format. For a pre-0.2.5 volume, run `studiofs upgrade` on the source and take a
-new dump. For newer formats, use a StudioFS release that supports the
-reported identity. The migration registry prepares the target PostgreSQL
-schema. The restore checks its revisions and publishes the volume, policy,
-checkpoint, and replay tail in one transaction. A failed restore can be
-retried after resolving the reported error. A committed schema expansion can
-remain after a failed restore. Object data stays in place.
+`studiofs dump` writes version 5 JSON from one PostgreSQL read snapshot. The
+dump carries exactly one checkpoint: the published baseline slot in
+`metadata_state`, plus the event tail after it. Alternate encodings in
+`serving_checkpoint_encodings` are per-format caches that the checkpoint
+coordinator republishes, so the dump leaves them out. The manifest records the
+PostgreSQL migration-ledger revisions, the volume protocol policy, the format
+and schema of that checkpoint, the event encodings in the tail, and the source
+redb layout revision. If the baseline slot is not published yet, `dump` refuses
+and asks you to mount the volume read-write until the coordinator publishes a
+checkpoint.
+
+`studiofs load` validates the whole manifest and its payload before it opens a
+PostgreSQL transaction:
+
+- A dump older than version 5 comes from StudioFS 0.2.4 or earlier and is
+  refused. Load it with the 0.2.4 binary, run `studiofs upgrade`, then dump
+  again with StudioFS 0.2.5 or later.
+- If any recorded version is newer than this binary supports, load refuses,
+  names the component, and asks you to upgrade studiofs.
+- An older supported dump is loaded. The SFS-1005 migration registry prepares
+  the target schema. The volume, policy, checkpoint, and replay tail are then
+  published in one transaction, so a failed load publishes nothing and can be
+  retried. A committed schema migration can remain after a failed load. Object
+  data stays in place.
+
+Snapshot mounts check their artifact format and schema independently of the
+serving checkpoint used for live mounts.
 
 ### 12. Janitor and GC state
 

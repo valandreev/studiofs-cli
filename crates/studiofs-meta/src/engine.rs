@@ -228,16 +228,6 @@ pub enum UpgradeRequiredReason {
     /// A metadata event uses an identity this binary cannot interpret.
     #[error(transparent)]
     UnsupportedEvent(crate::events::UnsupportedEventReason),
-    /// No supported checkpoint can reach the retained journal.
-    #[error(
-        "available serving checkpoints at or above event-log version {replay_floor}: {available}; upgrade to a StudioFS client that supports one of these checkpoint formats and schemas"
-    )]
-    ServingCheckpointEncodings {
-        /// Earliest cursor from which retained events can be replayed.
-        replay_floor: i64,
-        /// Format and schema pairs reported by the checkpoint registry.
-        available: String,
-    },
     /// A persisted settings record uses fields or variants this writer cannot preserve.
     #[error("unknown volume settings field or variant")]
     VolumeSettingsUnknown,
@@ -431,19 +421,6 @@ pub enum MetaError {
     NeedCompatibleCheckpoint {
         /// Earliest cursor from which retained events can be replayed.
         replay_floor: i64,
-    },
-
-    /// The checkpoint selected by the volume's publication policy is missing.
-    #[error(
-        "volume policy requires serving checkpoint format {format}, schema {schema}; available checkpoint encodings: {available}; publish a compatible checkpoint with a StudioFS client that supports the volume policy and retry"
-    )]
-    RequiredCheckpointUnavailable {
-        /// Checkpoint format required by policy.
-        format: u16,
-        /// Checkpoint schema required by policy.
-        schema: u16,
-        /// Format and schema pairs reported by the checkpoint registry.
-        available: String,
     },
 
     /// A persisted checkpoint declares a format or a serving schema this binary cannot decode.

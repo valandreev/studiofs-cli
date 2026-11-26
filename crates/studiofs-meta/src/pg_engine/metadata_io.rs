@@ -6,10 +6,9 @@ use super::{
     PG_EVENT_INSERT_CHUNK_SIZE, PgMetaEngine, PgSnapshotBackend, SnapshotBackendAccess,
     StartupSnapshotImportMode, runtime, sql,
 };
-use crate::compat::CheckpointDescriptor;
 use crate::engine::{
     BootstrapCheckpointDescriptor, CheckpointDescriptorFailure, CheckpointEncoding, MetaError,
-    MetaResult, UpgradeRequiredReason,
+    MetaResult,
 };
 use crate::events::{MetaEvent, encode_event};
 use crate::snapshot::ServingCheckpoint;
@@ -88,10 +87,7 @@ struct ExcludedCheckpoint {
 
 #[derive(Clone, Copy)]
 enum CheckpointSelection<'a> {
-    Compatible {
-        excluded: &'a [ExcludedCheckpoint],
-        required: Option<CheckpointDescriptor>,
-    },
+    Compatible { excluded: &'a [ExcludedCheckpoint] },
     BaselineOnly,
 }
 
@@ -136,7 +132,7 @@ pub(super) async fn read_bootstrap_checkpoint_and_decode_with_pool(
                     .start()
                     .await
                     .map_err(descriptor_row_error)?;
-                let (descriptor, checkpoint) = read_checkpoint(&tx, volume_id, None).await?;
+                let (descriptor, checkpoint) = read_checkpoint(&tx, volume_id).await?;
                 super::check_volume_read_policy(&tx, volume_id, Some(&descriptor)).await?;
                 tx.commit().await.map_err(descriptor_row_error)?;
                 Ok((descriptor, checkpoint))
@@ -151,190 +147,9 @@ pub async fn read_compatible_checkpoint<C: tokio_postgres::GenericClient + Sync>
     client: &C,
     volume_id: i64,
 ) -> MetaResult<BootstrapCheckpointDescriptor> {
-    let (descriptor, _) = read_checkpoint(client, volume_id, None).await?;
+    let (descriptor, _) = read_checkpoint(client, volume_id).await?;
     super::check_volume_read_policy(client, volume_id, Some(&descriptor)).await?;
     Ok(descriptor)
-}
-
-fn policy_checkpoint_formats(required: CheckpointDescriptor) -> std::ops::RangeInclusive<i16> {
-    let max = required.format as i16;
-    let min = if required == CheckpointDescriptor::BASELINE {
-        SERVING_CHECKPOINT_FORMAT.min_supported as i16
-    } else {
-        max
-    };
-    min..=max
-}
-
-/// Published checkpoint encodings captured at one volume cut for a backup.
-#[derive(Debug, Clone)]
-pub struct PolicyCheckpointSet {
-    /// Policy-selected checkpoint descriptor carrying the cut, head version, and volume metadata.
-    pub primary: BootstrapCheckpointDescriptor,
-    /// Published baseline `metadata_state` slot at `primary.checkpoint_version`, if present.
-    pub baseline: Option<BootstrapCheckpointDescriptor>,
-    /// Supported retained `serving_checkpoint_encodings` rows at `primary.checkpoint_version`.
-    pub alternate_encodings: Vec<BootstrapCheckpointDescriptor>,
-}
-
-/// Select the volume policy's checkpoint for a backup that preserves that policy.
-pub async fn read_policy_checkpoint<C: tokio_postgres::GenericClient + Sync>(
-    client: &C,
-    volume_id: i64,
-    required: CheckpointDescriptor,
-) -> MetaResult<BootstrapCheckpointDescriptor> {
-    ServingCheckpoint::check_encoding(CheckpointEncoding {
-        format: required.format as i16,
-        schema: required.schema as i16,
-    })?;
-    let available = match read_checkpoint(client, volume_id, Some(required)).await {
-        Ok((descriptor, _)) => {
-            let encoding = ServingCheckpoint::published_encoding(&descriptor.checkpoint_bytes)?;
-            if policy_checkpoint_formats(required).contains(&encoding.format)
-                && encoding.schema as u16 == required.schema
-            {
-                super::check_volume_read_policy(client, volume_id, Some(&descriptor)).await?;
-                return Ok(descriptor);
-            }
-            let replay_floor: i64 = client
-                .query_one(
-                    "SELECT event_log_prune_floor FROM metadata_state WHERE vol = $1",
-                    &[&volume_id],
-                )
-                .await
-                .map_err(descriptor_row_error)?
-                .try_get(0)
-                .map_err(descriptor_row_error)?;
-            let mut encodings =
-                read_retained_checkpoint_encodings(client, volume_id, replay_floor).await?;
-            if !encodings.contains(&encoding) {
-                encodings.push(encoding);
-            }
-            encodings.sort_by_key(|item| (item.format, item.schema));
-            describe_checkpoint_encodings(&encodings)
-        }
-        Err(MetaError::NeedCompatibleCheckpoint { replay_floor }) => describe_checkpoint_encodings(
-            &read_retained_checkpoint_encodings(client, volume_id, replay_floor).await?,
-        ),
-        Err(error) => return Err(error),
-    };
-    Err(MetaError::RequiredCheckpointUnavailable {
-        format: required.format,
-        schema: required.schema,
-        available,
-    })
-}
-
-/// Select the policy checkpoint and every supported published encoding at its cut.
-pub async fn read_policy_checkpoint_set<C: tokio_postgres::GenericClient + Sync>(
-    client: &C,
-    volume_id: i64,
-    required: CheckpointDescriptor,
-) -> MetaResult<PolicyCheckpointSet> {
-    let primary = read_policy_checkpoint(client, volume_id, required).await?;
-    let cut = primary.checkpoint_version;
-    let baseline = if primary.checkpoint_encoding.is_none() {
-        Some(primary.clone())
-    } else {
-        let candidate =
-            select_bootstrap_checkpoint(client, volume_id, CheckpointSelection::BaselineOnly)
-                .await?;
-        if candidate.publication_state == "published" && candidate.checkpoint_version == cut {
-            candidate.validate_and_decode()?;
-            Some(candidate)
-        } else {
-            None
-        }
-    };
-    let mut alternate_encodings = Vec::new();
-    if !read_retained_checkpoint_encodings(client, volume_id, cut)
-        .await?
-        .is_empty()
-    {
-        let rows = client
-            .query(
-                "SELECT checkpoint_format, checkpoint_schema, publication_generation, snapshot, checkpoint_sha256 \
-                 FROM serving_checkpoint_encodings \
-                 WHERE vol = $1 AND checkpoint_version = $2 \
-                 ORDER BY checkpoint_format, checkpoint_schema",
-                &[&volume_id, &cut],
-            )
-            .await
-            .map_err(descriptor_row_error)?;
-        for row in rows {
-            let encoding = CheckpointEncoding {
-                format: row.try_get(0).map_err(descriptor_row_error)?,
-                schema: row.try_get(1).map_err(descriptor_row_error)?,
-            };
-            if ServingCheckpoint::check_encoding(encoding).is_err() {
-                continue;
-            }
-            let descriptor = BootstrapCheckpointDescriptor {
-                volume_id: primary.volume_id,
-                volume_uuid: primary.volume_uuid.clone(),
-                format_info_bytes: primary.format_info_bytes.clone(),
-                metadata_format_version: primary.metadata_format_version,
-                remote_head_version: primary.remote_head_version,
-                checkpoint_version: cut,
-                checkpoint_encoding: Some(encoding),
-                checkpoint_bytes: row.try_get(3).map_err(descriptor_row_error)?,
-                checkpoint_sha256: row.try_get(4).map_err(descriptor_row_error)?,
-                publication_state: "published".to_owned(),
-                publication_generation: row.try_get(2).map_err(descriptor_row_error)?,
-            };
-            descriptor.validate_and_decode()?;
-            alternate_encodings.push(descriptor);
-        }
-    }
-    Ok(PolicyCheckpointSet {
-        primary,
-        baseline,
-        alternate_encodings,
-    })
-}
-
-async fn read_retained_checkpoint_encodings<C: tokio_postgres::GenericClient + Sync>(
-    client: &C,
-    volume_id: i64,
-    replay_floor: i64,
-) -> MetaResult<Vec<CheckpointEncoding>> {
-    let has_encodings: bool = client
-        .query_one(sql::CHECKPOINT_ENCODINGS_AVAILABLE, &[])
-        .await
-        .map_err(descriptor_row_error)?
-        .get(0);
-    if !has_encodings {
-        return Ok(Vec::new());
-    }
-    let rows = client
-        .query(
-            "SELECT DISTINCT checkpoint_format, checkpoint_schema FROM serving_checkpoint_encodings
-         WHERE vol = $1 AND checkpoint_version BETWEEN $2
-           AND (SELECT version FROM metadata_state WHERE vol = $1)
-         ORDER BY checkpoint_format, checkpoint_schema",
-            &[&volume_id, &replay_floor],
-        )
-        .await
-        .map_err(descriptor_row_error)?;
-    rows.into_iter()
-        .map(|row| {
-            Ok(CheckpointEncoding {
-                format: row.try_get(0).map_err(descriptor_row_error)?,
-                schema: row.try_get(1).map_err(descriptor_row_error)?,
-            })
-        })
-        .collect()
-}
-
-fn describe_checkpoint_encodings(encodings: &[CheckpointEncoding]) -> String {
-    if encodings.is_empty() {
-        return "none".to_owned();
-    }
-    encodings
-        .iter()
-        .map(|encoding| format!("format {}, schema {}", encoding.format, encoding.schema))
-        .collect::<Vec<_>>()
-        .join("; ")
 }
 
 /// Validate the frozen replay tail without advancing any local cursor.
@@ -368,59 +183,9 @@ pub async fn validate_checkpoint_replay(
     Ok(())
 }
 
-/// Rebind restored checkpoints and replace any `serving_checkpoint_encodings` rows.
-pub async fn restore_checkpoint_encodings(
-    tx: &tokio_postgres::Transaction<'_>,
-    source_volume: i64,
-    target_volume: i64,
-    cut: i64,
-    baseline: Option<&[u8]>,
-    alternates: &[(CheckpointEncoding, &[u8])],
-) -> MetaResult<Vec<u8>> {
-    use sha2::{Digest, Sha256};
-    tx.execute(
-        "DELETE FROM serving_checkpoint_encodings WHERE vol = $1",
-        &[&target_volume],
-    )
-    .await
-    .map_err(descriptor_row_error)?;
-    let mut authority_bytes = None;
-    if let Some(bytes) = baseline {
-        authority_bytes = Some(ServingCheckpoint::rebind_published(
-            bytes,
-            source_volume,
-            target_volume,
-            cut,
-        )?);
-    }
-    for &(encoding, bytes) in alternates {
-        let rebound =
-            ServingCheckpoint::rebind_published(bytes, source_volume, target_volume, cut)?;
-        let digest = Sha256::digest(&rebound);
-        tx.execute(
-            sql::INSERT_CHECKPOINT_ENCODING,
-            &[
-                &target_volume,
-                &cut,
-                &encoding.format,
-                &encoding.schema,
-                &rebound,
-                &digest.as_slice(),
-            ],
-        )
-        .await
-        .map_err(descriptor_row_error)?;
-        if authority_bytes.is_none() {
-            authority_bytes = Some(rebound);
-        }
-    }
-    authority_bytes.ok_or(MetaError::BootstrapCheckpointDescriptorMissing)
-}
-
 async fn read_checkpoint<C: tokio_postgres::GenericClient + Sync>(
     client: &C,
     volume_id: i64,
-    required: Option<CheckpointDescriptor>,
 ) -> MetaResult<(BootstrapCheckpointDescriptor, ServingCheckpoint)> {
     let has_encodings: bool = client
         .query_one(sql::CHECKPOINT_ENCODINGS_AVAILABLE, &[])
@@ -432,33 +197,11 @@ async fn read_checkpoint<C: tokio_postgres::GenericClient + Sync>(
         let selection = if has_encodings && excluded.len() < MAX_ALTERNATIVE_CHECKPOINT_RETRIES {
             CheckpointSelection::Compatible {
                 excluded: &excluded,
-                required,
             }
         } else {
             CheckpointSelection::BaselineOnly
         };
-        let descriptor = match select_bootstrap_checkpoint(client, volume_id, selection).await {
-            Err(MetaError::NeedCompatibleCheckpoint { replay_floor })
-                if has_encodings && required.is_none() =>
-            {
-                let encodings =
-                    read_retained_checkpoint_encodings(client, volume_id, replay_floor).await?;
-                if !encodings.is_empty()
-                    && encodings
-                        .iter()
-                        .all(|encoding| ServingCheckpoint::check_encoding(*encoding).is_err())
-                {
-                    return Err(MetaError::UpgradeRequired {
-                        reason: UpgradeRequiredReason::ServingCheckpointEncodings {
-                            replay_floor,
-                            available: describe_checkpoint_encodings(&encodings),
-                        },
-                    });
-                }
-                return Err(MetaError::NeedCompatibleCheckpoint { replay_floor });
-            }
-            result => result?,
-        };
+        let descriptor = select_bootstrap_checkpoint(client, volume_id, selection).await?;
         match descriptor.validate_and_decode() {
             Err(
                 MetaError::InvalidCheckpointDescriptor {
@@ -500,44 +243,24 @@ async fn select_bootstrap_checkpoint<C: tokio_postgres::GenericClient + Sync>(
     selection: CheckpointSelection<'_>,
 ) -> MetaResult<BootstrapCheckpointDescriptor> {
     let row = checked_bootstrap_row(
-        if let CheckpointSelection::Compatible { excluded, required } = selection {
+        if let CheckpointSelection::Compatible { excluded } = selection {
             let excluded_formats: Vec<_> =
                 excluded.iter().map(|item| item.encoding.format).collect();
             let excluded_schemas: Vec<_> =
                 excluded.iter().map(|item| item.encoding.schema).collect();
             let excluded_versions: Vec<_> = excluded.iter().map(|item| item.version).collect();
-            let (min_format, max_format, min_schema, max_schema) = required.map_or(
-                (
-                    SERVING_CHECKPOINT_FORMAT.min_supported as i16,
-                    ServingCheckpoint::FORMAT_VERSION,
-                    SERVING_CHECKPOINT_SCHEMA.min_supported as i16,
-                    ServingCheckpoint::SCHEMA_VERSION,
-                ),
-                |required| {
-                    let formats = policy_checkpoint_formats(required);
-                    (
-                        *formats.start(),
-                        *formats.end(),
-                        required.schema as i16,
-                        required.schema as i16,
-                    )
-                },
-            );
-            let allow_older_alternate =
-                required.is_some_and(|required| required != CheckpointDescriptor::BASELINE);
             client
                 .query_opt(
                     sql::SELECT_COMPATIBLE_CHECKPOINT_DESCRIPTOR,
                     &[
                         &volume_id,
-                        &min_format,
-                        &max_format,
-                        &min_schema,
-                        &max_schema,
+                        &(SERVING_CHECKPOINT_FORMAT.min_supported as i16),
+                        &ServingCheckpoint::FORMAT_VERSION,
+                        &(SERVING_CHECKPOINT_SCHEMA.min_supported as i16),
+                        &ServingCheckpoint::SCHEMA_VERSION,
                         &excluded_formats,
                         &excluded_schemas,
                         &excluded_versions,
-                        &allow_older_alternate,
                     ],
                 )
                 .await

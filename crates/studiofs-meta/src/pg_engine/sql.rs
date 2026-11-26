@@ -97,7 +97,7 @@ pub(super) const SELECT_COMPATIBLE_CHECKPOINT_DESCRIPTOR: &str = r#"
                 AND enc.checkpoint_schema = excluded.checkpoint_schema
                 AND enc.checkpoint_version = excluded.checkpoint_version
           )
-          AND ($9 OR ms.checkpoint_publication_state <> 'published'
+          AND (ms.checkpoint_publication_state <> 'published'
                OR enc.checkpoint_version >= ms.checkpoint_version)
         ORDER BY enc.checkpoint_version DESC, enc.checkpoint_format DESC, enc.checkpoint_schema DESC
         LIMIT 1
@@ -119,6 +119,7 @@ pub(super) const SELECT_COMPATIBLE_CHECKPOINT_MAX_VERSION: &str = r#"
       AND enc.checkpoint_schema BETWEEN $5 AND $6
     "#;
 
+#[cfg(feature = "test-successor")]
 pub(super) const INSERT_CHECKPOINT_ENCODING: &str = r#"
     INSERT INTO serving_checkpoint_encodings (
         vol, checkpoint_version, checkpoint_format, checkpoint_schema,

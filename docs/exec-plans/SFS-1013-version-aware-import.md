@@ -15,39 +15,51 @@ client installs a local database or commits restored volume metadata.
 - [x] (2026-11-26) Check baseline and test-successor backup restore on PostgreSQL and prove transactional rollback and retry.
 - [x] (2026-11-26) Verify discovery leaves no active database on an unsupported event and a failed fresh-client marker clear leaves the mount read-only.
 - [x] (2026-11-26) Address PR #1065 re-review: carry all published checkpoint encodings at the dumped cut in manifest v5 (`checkpoints` list + `checkpoint_encodings`), require `STUDIOFS_TEST_BASELINE_BIN` in the cross-binary test instead of silently skipping, include retained encodings in `read_policy_checkpoint` fallback diagnostics, and update ExecPlan test commands.
+- [x] (2026-11-26) Owner decision: schema evolution covers only 0.2.5+ volumes and dumps. Superseded the previous entry: the dump carries only the published baseline slot, load refuses version 4 dumps, and the multi-encoding code, its error variants, the policy-selection SQL flag, and the cross-binary test were removed.
 
 ## Surprises & Discoveries
 
 Discovery selects a compatible checkpoint already. It installs that checkpoint
 and leaves the replay cursor there for mount to catch up. The staging gate now
-validates the tail within the same PostgreSQL read snapshot. A backup now
-captures every published checkpoint encoding at the dumped cut (both the
-baseline `metadata_state` slot when published and any supported
-`serving_checkpoint_encodings` rows at that cut) and restores all of them in one
-transaction, keeping `metadata_state.checkpoint_publication_state = 'published'`
-whenever the source had a published baseline slot (preserving Janitor, event-log
-pruning, and format-4 reader preconditions). A successor-only volume without a
-published baseline slot still restores with `metadata_state` pending and its
-alternate encoding rebound in `serving_checkpoint_encodings`.
+validates the tail within the same PostgreSQL read snapshot.
+
+The earlier multi-encoding backup design had to handle a pending baseline slot,
+duplicate encodings, per-encoding publication generations, and envelope rebinds.
+All of this existed only for hypothetical volumes, so the owner cut it. The
+`metadata_state` baseline slot always holds an untagged checkpoint, so load
+needs no checkpoint rebind; it rebinds only the PostgreSQL volume ID in
+`FormatInfo`.
 
 ## Decision Log
 
 Keep local installation and PostgreSQL publication atomic at their current
 boundaries. Validate the tail before discovery publishes its checkpoint.
-Version 5 records the source identities, while version 4 remains readable for
-volumes already on the supported shared format. Preserve the restore policy
-when provisioning a volume. Require a matching policy when replacing live
-metadata or completing a target whose policy was already provisioned. Use the alternate checkpoint registry for format 5 and rebind the
-volume identity in its envelope before publishing it. Reuse replay's
-batch-client identity check when validating the dump before restore.
+
+2026-11-26, owner decision (overrides earlier review rounds): StudioFS
+guarantees schema evolution only for volumes and dumps created by 0.2.5 and
+later. 0.2.4 and earlier take no part in it; they are adopted only through
+`studiofs upgrade` (SFS-1132). Consequences:
+
+- The dump carries exactly one checkpoint, the published baseline slot from
+  `metadata_state`. If that slot is not published, `dump` refuses. Alternate
+  `serving_checkpoint_encodings` rows are coordinator caches and are not dumped.
+- Manifest v5 records the PostgreSQL schema revisions, volume protocol,
+  checkpoint format and schema, event codec revisions, and the source redb
+  layout revision.
+- `load` validates the whole manifest before any PostgreSQL transaction.
+  Version 4 dumps are refused with the upgrade path (0.2.4 load, `studiofs
+  upgrade`, new dump). A newer recorded component is refused by name. DDL goes
+  through `ensure_registered_schema`; the restore is one transaction.
+- Kept: the mixed `client_id` batch check, versioned event codec validation,
+  the target volume-ID rebind, restore of the dumped policy, and the
+  capability-evaluator wiring in mount, discovery, and `smount`.
 
 ## Outcomes & Retrospective
 
-Baseline and test-successor restore ran on the configured PostgreSQL service.
-The rollback test forced a duplicate counter during the restore transaction,
-verified zero volume, metadata, policy and counter rows, and then retried the
-same backup successfully. The successor test verified that format 5 remained
-selectable after restoring to a different PostgreSQL volume ID.
+The simplified dump/load passed on the configured PostgreSQL service: a 0.2.5+
+round trip through a different volume ID, refusal of an unpublished baseline,
+and the rollback test, which forces a duplicate counter, verifies zero volume,
+metadata, policy, and counter rows, and then retries successfully.
 
 ## Context and Orientation
 
@@ -67,28 +79,26 @@ destination and keep policy and metadata publication in one transaction.
 
 ## Concrete Steps
 
-Run the following from the worktree. For the PostgreSQL tests, import only
+Run the following from the worktree. For the PostgreSQL tests, import
 `STUDIOFS_TEST_PG_DSN` from the configured test environment and keep it out of
 command output.
 
-    cargo test -p studiofs --bin studiofs cli::dump_load::tests -- --include-ignored --skip regenerate_baseline_dump_fixture --test-threads=1
-    cargo build -p studiofs --bin studiofs
-    STUDIOFS_TEST_BASELINE_BIN=target/debug/studiofs cargo test -p studiofs --features test-successor --bin studiofs cli::dump_load::tests -- --include-ignored --skip regenerate_baseline_dump_fixture --test-threads=1
-    STUDIOFS_TEST_BASELINE_BIN=target/debug/studiofs cargo test -p studiofs --features test-successor --bin studiofs -- --ignored --test-threads=1 successor_dump_preserves_baseline_policy_checkpoint successor_dump_load_preserves_baseline_and_alternate_checkpoint_encodings read_policy_checkpoint_fallback_reports_baseline_and_retained_encodings
-    cargo test -p studiofs --bin studiofs cli::discovery::tests
-    cargo test -p studiofs-meta --lib pg_snapshot_backend_reads_a_validated_bootstrap_descriptor -- --ignored
-    cargo test -p studiofs-meta --lib fresh_client_marker_clear_failure_keeps_engine_read_only
-    cargo test -p studiofs-vfs --lib mount_rejects_unsupported_artifact_versions_before_download
-    cargo clippy -p studiofs -p studiofs-meta --all-targets -- -D warnings
-    cargo check -p studiofs --features test-successor
+    cargo test -p studiofs --bin studiofs cli::dump_load::tests -- --include-ignored --test-threads=1
+    cargo test -p studiofs --bin studiofs --features test-successor cli::dump_load::tests -- --include-ignored --test-threads=1
+    cargo test -p studiofs --bin studiofs cli::discovery::tests -- --include-ignored --test-threads=1
+    cargo test -p studiofs-meta --lib --features test-successor checkpoint_encodings -- --include-ignored --test-threads=1
+    cargo clippy -p studiofs -p studiofs-meta -p studiofs-vfs --all-targets -- -D warnings
+    cargo clippy -p studiofs -p studiofs-meta -p studiofs-vfs --all-targets --features test-successor -- -D warnings
     cargo fmt --check
     git diff --check
 
 ## Validation and Acceptance
 
 Unknown event encodings are refused with an upgrade reason. Corrupt events
-and missing history have distinct diagnostics. A failed restore leaves the
-volume unpublished even after an error inside the restore transaction.
+and missing history have distinct diagnostics. A version 4 dump is refused with
+the upgrade path. A newer manifest component is refused by name. A failed
+restore leaves the volume unpublished even after an error inside the restore
+transaction.
 
 ## Idempotence and Recovery
 
@@ -99,20 +109,9 @@ remains available for a subsequent load attempt.
 ## Artifacts and Notes
 
 The unsupported event regression failed once before the production gate and
-passed afterward. The PostgreSQL dump/load suite passed 32 cases on baseline
-and 33 with the test successor. Discovery passed 10 local cases. The
-PostgreSQL descriptor, local fresh-client and independent VFS artifact tests
-each passed one case. Scoped Clippy, test-successor Cargo check, Cargo fmt and
-Git whitespace checks passed. An
-earlier concurrent baseline run timed out while waiting for the dump's
-counters query. The sequential baseline run passed the case. Native mounted
-and object-store tests are outside this run.
-
-For the policy-checkpoint regression, build `studiofs` without
-`test-successor` and set `STUDIOFS_TEST_BASELINE_BIN` to its path before
-running `successor_dump_preserves_baseline_policy_checkpoint` with
-`test-successor`. The test launches that binary against the restored
-PostgreSQL volume and checks the upgrade diagnostic on a successor-only source.
+passed afterward. After the simplification, the PostgreSQL dump/load suite
+passed 36 cases with and without `test-successor`, and discovery passed 10
+cases. Native mounted and object-store tests are outside this run.
 
 ## Interfaces and Dependencies
 
@@ -120,5 +119,5 @@ Use `ClientCapabilities`, `VolumeRequirements`, the serving checkpoint decoder,
 the event codec, and the PostgreSQL schema migration registry from
 `studiofs-meta`.
 
-Updated on 2026-11-26 with the restore format, diagnostic behavior, and
-service-backed rollback evidence.
+Updated on 2026-11-26 with the owner's 0.2.5+ decision: single-checkpoint
+dump, version 4 refusal, and removal of the multi-encoding backup path.
