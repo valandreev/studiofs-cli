@@ -132,14 +132,24 @@ pub(super) async fn read_bootstrap_checkpoint_and_decode_with_pool(
                     .start()
                     .await
                     .map_err(descriptor_row_error)?;
-                let (descriptor, checkpoint) = read_checkpoint(&tx, volume_id).await?;
-                super::check_volume_read_policy(&tx, volume_id, Some(&descriptor)).await?;
-                tx.commit().await.map_err(descriptor_row_error)?;
-                Ok((descriptor, checkpoint))
+                let read = async {
+                    let (descriptor, checkpoint) = read_checkpoint(&tx, volume_id).await?;
+                    super::check_volume_read_policy(&tx, volume_id, Some(&descriptor)).await?;
+                    Ok((descriptor, checkpoint))
+                }
+                .await;
+                if read.is_ok() {
+                    tx.commit().await.map_err(descriptor_row_error)?;
+                } else {
+                    // A clean rollback proves the connection is healthy, so a
+                    // logical rejection returns it to the pool instead of discarding it.
+                    tx.rollback().await.map_err(descriptor_row_error)?;
+                }
+                Ok(read)
             })
         },
     )
-    .await
+    .await?
 }
 
 /// Select and validate a serving checkpoint using the caller's PostgreSQL snapshot.

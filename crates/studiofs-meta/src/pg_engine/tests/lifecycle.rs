@@ -1639,6 +1639,7 @@ fn test_format6_upgrade_fences_old_publication_and_deletion_claims() {
     let volume_uuid = volume.uuid.clone();
     let lock_dsn = dsn.clone();
     run_async(with_pg_test_client(&dsn, |mut client| async move {
+        drop_volume_protocol(&client, volume_id).await?;
         client.execute("UPDATE metadata_state SET metadata_format_version=5, format_info=$2 WHERE vol=$1", &[&volume_id, &bytes]).await
             .map_err(|error| MetaError::Storage(error.to_string()))?;
         let (locker, connection) = crate::connect_studiofs_postgres(&lock_dsn).await?;
@@ -9311,11 +9312,15 @@ fn test_pg_checkpoint_refuses_to_promote_legacy_format() {
     let pg = PgMetaEngine::open(&db).expect("open pg");
     let legacy_format = (CURRENT_FORMAT_VERSION - 1) as i16;
     run_async(with_pg_test_client(&dsn, |client| async move {
+        // Only the format column regresses; the policy row and the session's
+        // epoch stay, so the replica role skips the SFS-1132 downgrade fence.
         client
-            .execute(
-                "UPDATE metadata_state SET metadata_format_version = $1 WHERE vol = $2",
-                &[&legacy_format, &volume.volume_id],
-            )
+            .batch_execute(&format!(
+                "BEGIN; SET LOCAL session_replication_role = replica;
+                 UPDATE metadata_state SET metadata_format_version = {legacy_format}
+                 WHERE vol = {}; COMMIT;",
+                volume.volume_id
+            ))
             .await
             .map_err(|e| MetaError::Storage(e.to_string()))?;
         Ok::<(), MetaError>(())
@@ -9362,11 +9367,15 @@ fn test_pg_event_publication_refuses_legacy_format() {
     let pg = PgMetaEngine::open(&db).expect("open pg");
     let legacy_format = (CURRENT_FORMAT_VERSION - 1) as i16;
     run_async(with_pg_test_client(&dsn, |client| async move {
+        // Only the format column regresses; the policy row and the session's
+        // epoch stay, so the replica role skips the SFS-1132 downgrade fence.
         client
-            .execute(
-                "UPDATE metadata_state SET metadata_format_version = $1 WHERE vol = $2",
-                &[&legacy_format, &volume.volume_id],
-            )
+            .batch_execute(&format!(
+                "BEGIN; SET LOCAL session_replication_role = replica;
+                 UPDATE metadata_state SET metadata_format_version = {legacy_format}
+                 WHERE vol = {}; COMMIT;",
+                volume.volume_id
+            ))
             .await
             .map_err(|e| MetaError::Storage(e.to_string()))?;
         Ok::<(), MetaError>(())

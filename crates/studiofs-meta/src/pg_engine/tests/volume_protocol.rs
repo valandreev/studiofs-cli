@@ -67,13 +67,9 @@ fn volume_protocol_policy_and_write_requirement_on_live_postgres() {
         let client = &mut client;
 
         migrate_registered_schema(client, true).await?;
-        client
-            .batch_execute(&format!(
-                "DELETE FROM volume_protocol_history WHERE vol IN ({existing}, {legacy});
-                 DELETE FROM volume_protocol WHERE vol IN ({existing}, {legacy});"
-            ))
-            .await
-            .map_err(|e| MetaError::Storage(pg_err(e)))?;
+        for volume in [existing, legacy] {
+            drop_volume_protocol(client, volume).await?;
+        }
         for volume in [existing, legacy] {
             assert!(matches!(
                 read_volume_protocol(&*client, volume).await,

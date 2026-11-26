@@ -859,6 +859,18 @@ fn setup_pg_volume(dsn: &str, name: &str, uuid: &str, block_size: u32) -> MetaRe
     })
 }
 
+/// Turns a fixture volume back into a pre-policy one. Format 5/6 volumes have no
+/// policy row, and the SFS-1132 fence refuses a downgrade while one exists.
+async fn drop_volume_protocol(client: &tokio_postgres::Client, volume: i64) -> MetaResult<()> {
+    client
+        .batch_execute(&format!(
+            "DELETE FROM volume_protocol_history WHERE vol = {volume};
+             DELETE FROM volume_protocol WHERE vol = {volume};"
+        ))
+        .await
+        .map_err(|e| MetaError::Storage(pg_err(e)))
+}
+
 fn format_info(name: &str, uuid: &str, dsn: &str, volume_id: i64) -> FormatInfo {
     FormatInfo {
         format_version: CURRENT_FORMAT_VERSION,
