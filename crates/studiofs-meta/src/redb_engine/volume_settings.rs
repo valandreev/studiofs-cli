@@ -147,18 +147,12 @@ mod tests {
         engine.set_format_info(&format).unwrap();
         assert!(matches!(
             engine.compare_and_set_trash_days(0, 7),
-            Err(MetaError::UnsupportedFormatVersion {
-                found: 5,
-                expected: 6
-            })
+            Err(MetaError::NeedsMigration { found: 5 })
         ));
         assert!(engine.read_events_range(0, u64::MAX).unwrap().is_empty());
         assert!(matches!(
             engine.export_serving_checkpoint_bytes(),
-            Err(MetaError::UnsupportedFormatVersion {
-                found: 5,
-                expected: 6
-            })
+            Err(MetaError::NeedsMigration { found: 5 })
         ));
         assert_eq!(engine.volume_settings().unwrap(), VolumeSettings::default());
         engine.init_root(0, 0).unwrap();
@@ -170,9 +164,14 @@ mod tests {
         upgraded.format_version = 6;
         engine.upgrade_local_format5(&upgraded).unwrap();
         engine.upgrade_local_format5(&upgraded).unwrap();
+        upgraded.format_version = crate::schema::CURRENT_FORMAT_VERSION;
+        engine.upgrade_local_format6(&upgraded).unwrap();
         assert_eq!(engine.get_attr(attr.ino).unwrap(), attr);
         assert_eq!(engine.read_events_range(0, u64::MAX).unwrap(), journal);
-        assert_eq!(engine.get_format_info().unwrap().format_version, 6);
+        assert_eq!(
+            engine.get_format_info().unwrap().format_version,
+            upgraded.format_version
+        );
         assert!(engine.export_serving_checkpoint_bytes().is_ok());
     }
 

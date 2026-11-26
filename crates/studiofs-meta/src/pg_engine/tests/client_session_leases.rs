@@ -638,6 +638,119 @@ fn client_session_leases_stamp_shared_format5_upgrade_without_policy() {
 
 #[test]
 #[ignore = "requires a disposable PostgreSQL instance"]
+fn published_format_adoption_retries_and_fences_legacy_publication() {
+    use super::super::{read_volume_protocol, upgrade_shared_format6};
+
+    let dsn = pg_dsn().expect("STUDIOFS_TEST_PG_DSN is required");
+    let schema = IsolatedPgSchema::new(&dsn);
+    let volume5 = PgTestVolume::new(&schema.dsn, "sfs1132-format5");
+    let volume6 = PgTestVolume::new(&schema.dsn, "sfs1132-format6");
+    run_async(async {
+        let (mut client, connection) = tokio_postgres::connect(&schema.dsn, tokio_postgres::NoTls)
+            .await
+            .expect("connect");
+        let _connection = tokio::spawn(connection);
+        for (volume, initial) in [(&volume5, 5_i16), (&volume6, 6)] {
+            let vol = volume.volume_id;
+            let mut header = volume.format_info();
+            header.format_version = u16::try_from(initial).unwrap();
+            let bytes = serde_json::to_vec(&header).unwrap();
+            client.execute(
+                "UPDATE metadata_state SET metadata_format_version=$2, format_info=$3 WHERE vol=$1",
+                &[&vol, &initial, &bytes],
+            ).await.unwrap();
+            let state = |row: tokio_postgres::Row| -> Vec<u8> { row.get(0) };
+            let checkpoint_sql = "SELECT snapshot FROM metadata_state WHERE vol=$1";
+            let checkpoint = state(client.query_one(checkpoint_sql, &[&vol]).await.unwrap());
+            if initial == 5 {
+                upgrade_shared_format5(&mut client, vol, &header.uuid).await?;
+            }
+            client.batch_execute(
+                "CREATE FUNCTION interrupt_format_adoption() RETURNS trigger LANGUAGE plpgsql AS $$
+                 BEGIN
+                     IF NEW.metadata_format_version = 7
+                        AND EXISTS (SELECT 1 FROM volume_protocol WHERE vol=NEW.vol)
+                     THEN RAISE EXCEPTION 'interrupted after installing policy'; END IF;
+                     RETURN NEW;
+                 END $$;
+                 CREATE TRIGGER interrupt_format_adoption BEFORE UPDATE ON metadata_state
+                 FOR EACH ROW EXECUTE FUNCTION interrupt_format_adoption();",
+            ).await.unwrap();
+            assert!(upgrade_shared_format6(&mut client, vol, &header.uuid).await.is_err());
+            let row = client.query_one(
+                "SELECT metadata_format_version, EXISTS(SELECT 1 FROM volume_protocol WHERE vol=$1)
+                 FROM metadata_state WHERE vol=$1",
+                &[&vol],
+            ).await.unwrap();
+            assert_eq!(row.get::<_, i16>(0), 6);
+            assert!(!row.get::<_, bool>(1));
+            client.batch_execute(
+                "DROP TRIGGER interrupt_format_adoption ON metadata_state;
+                 DROP FUNCTION interrupt_format_adoption();",
+            ).await.unwrap();
+            if initial == 5 {
+                upgrade_shared_format5(&mut client, vol, &header.uuid).await?;
+            }
+            for _ in 0..2 {
+                let upgraded = upgrade_shared_format6(&mut client, vol, &header.uuid).await?;
+                assert_eq!(upgraded.format_version, 7);
+            }
+            assert_eq!(read_volume_protocol(&client, vol).await?, crate::volume_protocol::VolumeProtocol::baseline());
+            let older_update = client.execute(
+                "UPDATE metadata_state SET version=version+1 WHERE vol=$1 AND metadata_format_version=6",
+                &[&vol],
+            ).await.unwrap();
+            assert_eq!(older_update, 0);
+            let row = client.query_one(
+                "SELECT metadata_format_version FROM metadata_state WHERE vol=$1", &[&vol],
+            ).await.unwrap();
+            let old_reader = crate::version::VersionIdentity {
+                name: "0.2.4 volume format",
+                current: 6,
+                min_supported: 6,
+            };
+            assert!(!old_reader.supports_i16(row.get(0)));
+            assert_eq!(state(client.query_one(checkpoint_sql, &[&vol]).await.unwrap()), checkpoint);
+            // A 0.2.x `init` re-applies the baseline DDL; it must not lift the fences.
+            client.batch_execute(crate::pg_engine::schema::studiofs_pg_schema_sql()).await.unwrap();
+            // A 0.2.x `load` replaces the row with its own format; refused and rolled back.
+            let tx = client.transaction().await.unwrap();
+            let downgrade = tx.batch_execute(&format!(
+                "CREATE TEMP TABLE sfs1132_row ON COMMIT DROP AS SELECT * FROM metadata_state WHERE vol={vol};
+                 DELETE FROM metadata_state WHERE vol={vol};
+                 UPDATE sfs1132_row SET metadata_format_version=6;
+                 INSERT INTO metadata_state SELECT * FROM sfs1132_row;",
+            )).await.unwrap_err();
+            assert_eq!(
+                downgrade.as_db_error().unwrap().message(),
+                "volume format 7 cannot be replaced by an older format"
+            );
+            drop(tx);
+            let row = client.query_one(
+                "SELECT metadata_format_version FROM metadata_state WHERE vol=$1", &[&vol],
+            ).await.unwrap();
+            assert_eq!(row.get::<_, i16>(0), 7);
+            let claim = "INSERT INTO snapshot_payload_upload_objects
+                (vol, object_id, state, reconcile_owner)
+                VALUES ($1, 1132, 'delete_pending', 'sfs1132')";
+            // A 0.2.4 Janitor declares only the legacy capability.
+            client.query_one("SELECT set_config('studiofs.deletion_format', '6', false), set_config('studiofs.deletion_volume_format', '', false)", &[])
+                .await.unwrap();
+            let refused = client.execute(claim, &[&vol]).await.unwrap_err();
+            assert_eq!(
+                refused.as_db_error().unwrap().message(),
+                "deletion claim requires current volume format capability"
+            );
+            client.query_one("SELECT set_config('studiofs.deletion_format', '6', false), set_config('studiofs.deletion_volume_format', '7', false)", &[])
+                .await.unwrap();
+            assert_eq!(client.execute(claim, &[&vol]).await.unwrap(), 1);
+        }
+        Ok(())
+    }).expect("retry shared adoption");
+}
+
+#[test]
+#[ignore = "requires a disposable PostgreSQL instance"]
 fn client_session_leases_concurrent_refreshes_converge_on_one_live_owner() {
     let dsn = pg_dsn().expect("STUDIOFS_TEST_PG_DSN is required");
     let schema = IsolatedPgSchema::new(&dsn);

@@ -36,7 +36,7 @@ impl TrashDaysArgs {
             &self.name,
             self.days
                 .map(super::volume_settings::SettingsUpdate::TrashDays),
-            "Could not reach the shared volume settings. Check PostgreSQL connectivity and that every cache uses format 6, then retry.",
+            "Could not reach the shared volume settings. Check PostgreSQL connectivity and that every cache uses the current volume format, then retry.",
         )?;
         print_settings(&self.name, settings);
         Ok(())

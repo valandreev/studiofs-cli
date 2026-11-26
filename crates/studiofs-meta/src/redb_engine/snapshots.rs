@@ -51,7 +51,10 @@ impl RedbMetaEngine {
             {
                 check()?;
                 let (k, v) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
-                if k.value() == super::format::LOCAL_UPGRADE_STAGE {
+                if matches!(
+                    k.value(),
+                    super::format::LOCAL_UPGRADE_STAGE | super::format::LOCAL_ADOPTION_STAGE
+                ) {
                     continue;
                 }
                 let bytes = if cfg!(feature = "test-successor") && k.value() == "format" {
@@ -614,7 +617,10 @@ impl RedbMetaEngine {
                 .retain(|_, _| false)
                 .map_err(|e| MetaError::Storage(e.to_string()))?;
             for (k, v) in &snapshot.settings {
-                if k == super::format::LOCAL_UPGRADE_STAGE {
+                if matches!(
+                    k.as_str(),
+                    super::format::LOCAL_UPGRADE_STAGE | super::format::LOCAL_ADOPTION_STAGE
+                ) {
                     continue;
                 }
                 if k == super::volume_settings::VOLUME_SETTINGS_KEY

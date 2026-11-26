@@ -96,11 +96,12 @@ fn check_bootstrap_descriptor_compatibility(
     replay_floor: i64,
     incompatible_alternative: bool,
 ) -> MetaResult<()> {
-    SHARED_VOLUME_FORMAT.check(descriptor.metadata_format_version)?;
+    crate::check_volume_format(descriptor.metadata_format_version)?;
     if !descriptor.format_info_bytes.is_empty()
         && let Err(
-            error
-            @ (MetaError::UnsupportedFormatVersion { .. } | MetaError::UpgradeRequired { .. }),
+            error @ (MetaError::UnsupportedFormatVersion { .. }
+            | MetaError::UpgradeRequired { .. }
+            | MetaError::NeedsMigration { .. }),
         ) = crate::decode_format_info(&descriptor.format_info_bytes)
     {
         return Err(error);

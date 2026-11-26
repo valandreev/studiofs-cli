@@ -429,7 +429,7 @@ fn resolve_mount_point_for_mount(
     Ok(mount_point)
 }
 
-fn resolve_cache_dir_for_mount(
+pub(in crate::cli) fn resolve_cache_dir_for_mount(
     config: &settings::StudioFsConfig,
     cli_cache_dir: Option<&Path>,
 ) -> Option<PathBuf> {

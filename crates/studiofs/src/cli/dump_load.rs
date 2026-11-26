@@ -452,6 +452,16 @@ fn apply_dump(postgres_address: &str, dump: &MetadataDump) -> DumpLoadResult<i64
             tx.query_one("SELECT vol FROM volumes WHERE vol = $1 FOR UPDATE", &[&target_vol])
                 .await
                 .map_err(|source| postgres_operation("lock load target volume", source))?;
+            let previous_state = tx
+                .query_opt(
+                    "SELECT write_requirement, metadata_format_version FROM metadata_state WHERE vol = $1",
+                    &[&target_vol],
+                )
+                .await
+                .map_err(|source| postgres_operation("read load target format", source))?;
+            if let Some(row) = &previous_state {
+                ensure_supported_pg_sync_format_version(row.get(1))?;
+            }
             let format_info_bytes =
                 rebind_postgres_volume_id(&dump.metadata_state_format_info, target_vol)?;
 
@@ -478,17 +488,7 @@ fn apply_dump(postgres_address: &str, dump: &MetadataDump) -> DumpLoadResult<i64
                 });
             }
 
-            // An existing metadata row may belong to a legacy volume awaiting
-            // explicit adoption. Inspect and preserve its policy and write
-            // requirement before stamping the publication session and clearing
-            // publication-state tables.
-            let previous_state = tx
-                .query_opt(
-                    "SELECT write_requirement FROM metadata_state WHERE vol = $1",
-                    &[&target_vol],
-                )
-                .await
-                .map_err(|source| postgres_operation("read metadata_state write_requirement", source))?;
+            // Preserve the existing policy and write requirement.
             if previous_state.is_none() {
                 studiofs_meta::pg_engine::insert_initial_volume_protocol(&tx, target_vol, "studiofs load")
                     .await?;
@@ -790,7 +790,7 @@ mod tests {
                 uuid: info.uuid.clone(),
                 block_size: i32::try_from(info.block_size).unwrap(),
             },
-            metadata_state_format_version: 6,
+            metadata_state_format_version: studiofs_meta::schema::CURRENT_FORMAT_VERSION as i16,
             metadata_state_version: 7,
             metadata_state_checkpoint_version: 4,
             metadata_state_checkpoint_sha256: Sha256::digest(&checkpoint).to_vec(),
@@ -818,7 +818,18 @@ mod tests {
     #[test]
     fn baseline_dump_fixture_decodes_with_current_binary() {
         let path = baseline_dump_fixture();
-        let dump = parse_dump(&path, &std::fs::read(&path).unwrap()).unwrap();
+        let mut dump = parse_dump(&path, &std::fs::read(&path).unwrap()).unwrap();
+        // The pinned dump predates adoption: load refuses its format-6 volume.
+        assert!(matches!(
+            validate_dump(&dump),
+            Err(DumpLoadError::Meta(MetaError::NeedsMigration { found: 6 }))
+        ));
+        let current = studiofs_meta::schema::CURRENT_FORMAT_VERSION;
+        let mut header: studiofs_meta::schema::FormatInfo =
+            serde_json::from_slice(&dump.metadata_state_format_info).unwrap();
+        header.format_version = current;
+        dump.metadata_state_format_info = serde_json::to_vec(&header).unwrap();
+        dump.metadata_state_format_version = i16::try_from(current).unwrap();
         validate_dump(&dump).unwrap();
         assert_eq!(dump.dump_version, 4);
         assert_eq!(
@@ -933,7 +944,7 @@ mod tests {
                 uuid: "test".to_string(),
                 block_size: 4096,
             },
-            metadata_state_format_version: 6,
+            metadata_state_format_version: studiofs_meta::schema::CURRENT_FORMAT_VERSION as i16,
             metadata_state_version: 1,
             metadata_state_checkpoint_version: 1,
             metadata_state_snapshot: snapshot.clone(),
@@ -959,6 +970,50 @@ mod tests {
             counters: Vec::new(),
             event_log: Vec::new(),
         }
+    }
+
+    #[test]
+    #[ignore = "requires the PostgreSQL test database"]
+    fn load_refuses_to_adopt_an_existing_format6_volume() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let raw_dsn = test_pg_dsn().expect("STUDIOFS_TEST_PG_DSN is required");
+        let metadata_dsn = runtime
+            .block_on(ensure_studiofs_database(&raw_dsn))
+            .unwrap()
+            .metadata_dsn;
+        let schema = crate::cli::pg_test_schema::PgTestSchema::new(&metadata_dsn).unwrap();
+        let mut dump = test_dump();
+        let mut header = decode_format_info(&dump.metadata_state_format_info).unwrap();
+        header.metadata.backend = studiofs_meta::MetadataBackend::Postgres;
+        header.metadata.postgres = Some(studiofs_meta::PostgresConfig {
+            url: "test-postgres-dsn".into(),
+            volume_id: 1,
+        });
+        dump.metadata_state_format_info = serde_json::to_vec(&header).unwrap();
+        let volume = apply_dump(schema.dsn(), &dump).unwrap();
+        let (client, connection) = runtime
+            .block_on(studiofs_meta::connect_studiofs_postgres(schema.dsn()))
+            .unwrap();
+        let task = runtime.spawn(connection);
+        // A 0.2.4 volume has no policy row; the downgrade fence admits it.
+        for sql in [
+            "DELETE FROM volume_protocol WHERE vol = $1",
+            "UPDATE metadata_state SET metadata_format_version = 6 WHERE vol = $1",
+        ] {
+            runtime.block_on(client.execute(sql, &[&volume])).unwrap();
+        }
+        assert!(matches!(
+            apply_dump(schema.dsn(), &dump),
+            Err(DumpLoadError::Meta(MetaError::NeedsMigration { found: 6 }))
+        ));
+        let row = runtime
+            .block_on(client.query_one(
+                "SELECT metadata_format_version FROM metadata_state WHERE vol = $1",
+                &[&volume],
+            ))
+            .unwrap();
+        assert_eq!(row.get::<_, i16>(0), 6);
+        task.abort();
     }
 
     #[test]
@@ -1077,7 +1132,7 @@ mod tests {
             err,
             DumpLoadError::Meta(MetaError::UnsupportedFormatVersion {
                 found: 4,
-                expected: 6
+                expected: studiofs_meta::schema::CURRENT_FORMAT_VERSION
             })
         ));
     }

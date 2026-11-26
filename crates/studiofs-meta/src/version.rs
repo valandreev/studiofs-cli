@@ -70,8 +70,8 @@ impl VersionIdentity {
 /// protocol), the bootstrap checkpoint descriptor and the publication predicate.
 pub const SHARED_VOLUME_FORMAT: VersionIdentity = VersionIdentity {
     name: "shared volume format",
-    current: 6,
-    min_supported: 6,
+    current: 7,
+    min_supported: 7,
 };
 
 /// Physical PostgreSQL DDL version of the existing `payload_gc` schema component.
@@ -219,18 +219,17 @@ mod tests {
         assert!(!SERVING_CHECKPOINT_SCHEMA.supports_i16(2));
         assert!(!SERVING_CHECKPOINT_SCHEMA.supports_i16(-1));
         assert!(matches!(
-            SHARED_VOLUME_FORMAT.check(7),
+            SHARED_VOLUME_FORMAT.check(8),
             Err(MetaError::UnsupportedFormatVersion {
-                found: 7,
-                expected: 6
+                found: 8,
+                expected: 7
             })
         ));
     }
 
     #[test]
     fn version_identities_keep_current_baseline_values() {
-        // SFS-1003 splits identities without bumping any of them.
-        assert_eq!(SHARED_VOLUME_FORMAT.current, 6);
+        assert_eq!(SHARED_VOLUME_FORMAT.current, 7);
         assert_eq!(
             LOCAL_METADATA_LAYOUT.current,
             if cfg!(feature = "test-successor") {
@@ -239,7 +238,7 @@ mod tests {
                 6
             }
         );
-        assert_eq!(crate::schema::CURRENT_FORMAT_VERSION, 6);
+        assert_eq!(crate::schema::CURRENT_FORMAT_VERSION, 7);
         assert_eq!(EVENT_CODEC_WIRE.current, 1);
         assert_eq!(POSTGRES_PAYLOAD_GC_SCHEMA.current, 2);
         assert!(!POSTGRES_PAYLOAD_GC_SCHEMA.supports(1));

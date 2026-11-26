@@ -7,7 +7,9 @@
 //! regenerate only with the baseline encoder and record the reason in the
 //! manifest.
 
-use crate::engine::{MetaEngine, MetaError, MetaFormat, MetaInodes, MetaNamespace, MetaXattr};
+use crate::engine::{
+    MetaEngine, MetaError, MetaFormat, MetaFsOps, MetaInodes, MetaNamespace, MetaXattr,
+};
 use crate::events::{MetaEvent, decode_event, decode_event_with_type, encode_event};
 use crate::redb_engine::RedbMetaEngine;
 use crate::schema::{
@@ -56,6 +58,12 @@ fn copy_to_temp(fixture: &Path) -> (tempfile::TempDir, PathBuf) {
     let path = dir.path().join("fixture.redb");
     studiofs_test_support::copy_file_contents(fixture, &path)
         .unwrap_or_else(|err| panic!("copy fixture {}: {err}", fixture.display()));
+    if fixture.parent() == Some(fixture_dir().as_path()) {
+        let engine = RedbMetaEngine::open_for_format_upgrade(&path).unwrap();
+        let mut header = engine.format_info_for_upgrade().unwrap();
+        header.format_version = crate::schema::CURRENT_FORMAT_VERSION;
+        engine.upgrade_local_format6(&header).unwrap();
+    }
     (dir, path)
 }
 
@@ -518,9 +526,10 @@ fn assert_published_namespace(engine: &dyn MetaEngine) {
 #[test]
 fn baseline_format_info_decodes_with_current_binary() {
     let bytes = read_fixture(&fixture_dir().join("format-info.json"));
-    let info = crate::decode_format_info(&bytes).expect("decode baseline FormatInfo");
+    let mut info: FormatInfo = serde_json::from_slice(&bytes).expect("decode pinned FormatInfo");
     let expected = fixture_format_info();
     assert_eq!(info.format_version, 6);
+    info.format_version = crate::schema::CURRENT_FORMAT_VERSION;
     assert_eq!(
         serde_json::to_value(&info).unwrap(),
         serde_json::to_value(&expected).unwrap()
@@ -677,10 +686,7 @@ fn published_v0_2_2_format5_volume_requires_upgrade() {
     let bytes = read_fixture(&dir.join("format-info.json"));
     assert!(matches!(
         crate::decode_format_info(&bytes),
-        Err(MetaError::UnsupportedFormatVersion {
-            found: 5,
-            expected: 6
-        })
+        Err(MetaError::NeedsMigration { found: 5 })
     ));
     let bytes = read_fixture(&dir.join("serving-checkpoint.bin"));
     let checkpoint = ServingCheckpoint::decode(&bytes).expect("v0.2.2 checkpoint decodes");
@@ -702,18 +708,20 @@ fn published_v0_2_2_format5_volume_requires_upgrade() {
     let (_tmp, path) = copy_to_temp(&dir.join("local-cache.redb"));
     assert!(matches!(
         RedbMetaEngine::read_format_info_readonly(&path),
-        Err(MetaError::UnsupportedFormatVersion { found: 5, .. })
+        Err(MetaError::NeedsMigration { found: 5 })
     ));
     let engine = RedbMetaEngine::open_for_format_upgrade(&path).expect("open for upgrade");
     assert_eq!(engine.format_info_for_upgrade().unwrap().format_version, 5);
+    assert_published_upgrade(&dir, engine);
 }
 
 #[test]
-fn published_v0_2_4_format6_volume_decodes_with_current_binary() {
+fn published_v0_2_4_format6_volume_requires_upgrade() {
     let dir = published_dir("v0.2.4");
-    let info = crate::decode_format_info(&read_fixture(&dir.join("format-info.json")))
-        .expect("format-6 FormatInfo decodes");
-    assert_eq!(info.format_version, 6);
+    let error =
+        crate::decode_format_info(&read_fixture(&dir.join("format-info.json"))).unwrap_err();
+    assert!(matches!(error, MetaError::NeedsMigration { found: 6 }));
+    assert!(error.to_string().contains("studiofs upgrade <volume>"));
     let checkpoint = read_fixture(&dir.join("serving-checkpoint.bin"));
     // init publishes the checkpoint at version 0 and its settings as batch 1.
     let checkpoint = ServingCheckpoint::decode(&checkpoint).expect("format-6 checkpoint decodes");
@@ -741,8 +749,113 @@ fn published_v0_2_4_format6_volume_decodes_with_current_binary() {
     }
 
     let (_tmp, path) = copy_to_temp(&dir.join("local-cache.redb"));
-    let local = RedbMetaEngine::read_format_info_readonly(&path).expect("local header decodes");
-    assert_eq!(local.uuid, info.uuid);
+    assert!(matches!(
+        RedbMetaEngine::read_format_info_readonly(&path),
+        Err(MetaError::NeedsMigration { found: 6 })
+    ));
+    let engine = RedbMetaEngine::open_for_format_upgrade(&path).unwrap();
+    assert_published_upgrade(&dir, engine);
+}
+
+fn assert_published_upgrade(dir: &Path, engine: RedbMetaEngine) {
+    use sha2::{Digest, Sha256};
+
+    let state: serde_json::Value =
+        serde_json::from_slice(&read_fixture(&dir.join("metadata-state.json"))).unwrap();
+    let checkpoint = read_fixture(&dir.join("serving-checkpoint.bin"));
+    let checksum = format!("{:x}", Sha256::digest(&checkpoint));
+    assert_eq!(state["checkpoint_sha256"].as_str(), Some(checksum.as_str()));
+
+    let mut shared: FormatInfo =
+        serde_json::from_slice(&read_fixture(&dir.join("format-info.json"))).unwrap();
+    let events_before = engine.read_events_range(0, u64::MAX).unwrap();
+    let cursor_before = engine.local_outbound_ack_positions().unwrap();
+    if shared.format_version == 5 {
+        shared.format_version = 6;
+        engine.upgrade_local_format5(&shared).unwrap();
+        assert!(matches!(
+            engine.get_format_info(),
+            Err(MetaError::NeedsMigration { found: 6 })
+        ));
+    }
+    shared.format_version = crate::schema::CURRENT_FORMAT_VERSION;
+    engine.upgrade_local_format6(&shared).unwrap();
+    engine.upgrade_local_format6(&shared).unwrap();
+    assert_eq!(engine.get_format_info().unwrap().format_version, 7);
+    assert_eq!(engine.get_format_info().unwrap().uuid, shared.uuid);
+    assert_eq!(
+        engine.read_events_range(0, u64::MAX).unwrap(),
+        events_before
+    );
+    assert_eq!(
+        engine.local_outbound_ack_positions().unwrap(),
+        cursor_before
+    );
+}
+
+#[test]
+fn published_format6_upgrade_resumes_after_each_local_stage() {
+    let dir = published_dir("v0.2.4");
+    for interrupted_stage in 0..=4 {
+        let (_tmp, path) = copy_to_temp(&dir.join("local-cache.redb"));
+        let engine = RedbMetaEngine::open_for_format_upgrade(&path).unwrap();
+        let mut shared = engine.format_info_for_upgrade().unwrap();
+        shared.format_version = crate::schema::CURRENT_FORMAT_VERSION;
+        seed_pending_upgrade_state(&engine);
+        let attr = engine
+            .create_file(ROOT_INO, b"pending-upgrade", 0, 0, 0o600)
+            .unwrap();
+        let journal = engine.read_events_range(0, u64::MAX).unwrap();
+        assert!(!journal.is_empty());
+        let positions = engine.local_outbound_ack_positions().unwrap();
+        let ledger = engine.pending_local_upload_ledger(16).unwrap();
+        let result = engine.advance_local_upgrade(Some(&shared), |stage| {
+            if stage == interrupted_stage {
+                return Err(MetaError::Storage("simulated interruption".into()));
+            }
+            Ok(())
+        });
+        assert!(result.is_err(), "stage {interrupted_stage} must interrupt");
+        drop(engine);
+        let error = RedbMetaEngine::open(&path).err().unwrap();
+        if interrupted_stage == 0 {
+            assert!(matches!(error, MetaError::NeedsMigration { found: 6 }));
+        } else {
+            assert!(matches!(error, MetaError::LocalAdoptionPending));
+        }
+        assert!(error.to_string().contains("studiofs upgrade <volume>"));
+        let engine = RedbMetaEngine::open_for_format_upgrade(&path).unwrap();
+        engine.upgrade_local_format6(&shared).unwrap();
+        drop(engine);
+        let engine = RedbMetaEngine::open(&path).unwrap();
+        assert_eq!(engine.get_attr(attr.ino).unwrap(), attr);
+        assert_eq!(engine.read_events_range(0, u64::MAX).unwrap(), journal);
+        assert_eq!(engine.local_outbound_ack_positions().unwrap(), positions);
+        assert_eq!(engine.pending_local_upload_ledger(16).unwrap(), ledger);
+        assert_eq!(engine.get_counter("pgClientSlotPlusOne").unwrap(), 8);
+    }
+}
+
+fn seed_pending_upgrade_state(engine: &RedbMetaEngine) {
+    use crate::engine::MetaGc;
+    use crate::snapshot_ports::UploadedFragmentLedgerEntry;
+
+    let upload = UploadedFragmentLedgerEntry {
+        volume_id: 7,
+        object_id: 42,
+        fragment_index: 0,
+        object_key: "objects/42".into(),
+        expected_byte_length: 4,
+        expected_sha256: [0xA5; 32],
+    };
+    engine.set_counter("pgClientSlotPlusOne", 8).unwrap();
+    engine.add_pending_deletion(43, 1).unwrap();
+    engine
+        .record_local_upload_ledger_begin(std::slice::from_ref(&upload))
+        .unwrap();
+    engine
+        .record_local_upload_ledger_confirm(std::slice::from_ref(&upload))
+        .unwrap();
 }
 
 #[cfg(feature = "test-successor")]
@@ -761,23 +874,7 @@ fn baseline_dirty_cache_local_revision_resumes_at_every_boundary() {
         let (_dir, path) = copy_to_temp(&fixture_dir().join("local-dirty.redb"));
         let engine = RedbMetaEngine::open_for_format_upgrade(&path).unwrap();
         use crate::engine::MetaGc;
-        use crate::snapshot_ports::UploadedFragmentLedgerEntry;
-        let upload = UploadedFragmentLedgerEntry {
-            volume_id: 7,
-            object_id: 42,
-            fragment_index: 0,
-            object_key: "objects/42".into(),
-            expected_byte_length: 4,
-            expected_sha256: [0xA5; 32],
-        };
-        engine.set_counter("pgClientSlotPlusOne", 8).unwrap();
-        engine.add_pending_deletion(43, 1).unwrap();
-        engine
-            .record_local_upload_ledger_begin(std::slice::from_ref(&upload))
-            .unwrap();
-        engine
-            .record_local_upload_ledger_confirm(std::slice::from_ref(&upload))
-            .unwrap();
+        seed_pending_upgrade_state(&engine);
         let ledger = engine.pending_local_upload_ledger(16).unwrap();
         let before = serde_json::to_value(engine.export_snapshot().unwrap()).unwrap();
         let positions = engine.local_outbound_ack_positions().unwrap();
@@ -839,10 +936,10 @@ fn baseline_dirty_cache_local_revision_resumes_at_every_boundary() {
             RedbMetaEngine::read_format_info_readonly(&path)
                 .unwrap()
                 .format_version,
-            6
+            crate::schema::CURRENT_FORMAT_VERSION
         );
         let reopened = RedbMetaEngine::open(&path).unwrap();
-        assert_eq!(reopened.get_format_info().unwrap().format_version, 6);
+        assert_eq!(reopened.get_format_info().unwrap().format_version, 7);
         let mut exported = reopened.export_snapshot().unwrap();
         exported
             .settings

@@ -10,6 +10,7 @@ use super::runtime_tuning::PublicRuntimeTuningArgs;
 use studiofs_meta::snapshot::SnapshotId;
 
 pub(crate) use session::MountSession;
+pub(in crate::cli) use session::resolve_cache_dir_for_mount;
 
 #[derive(Debug, Clone)]
 pub(crate) struct MountCommand {

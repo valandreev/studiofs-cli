@@ -23,12 +23,7 @@ use crate::version::{
 /// Shared volume format of the 0.2.5 baseline, written by `studiofs upgrade`
 /// (SFS-1132). From this format on the number stays fixed; later changes move
 /// capabilities and identities instead.
-pub const BASELINE_VOLUME_FORMAT: u16 = 7;
-
-const _: () = assert!(
-    BASELINE_VOLUME_FORMAT == SHARED_VOLUME_FORMAT.current + 1,
-    "SFS-1132: reconcile the evaluator baseline with SHARED_VOLUME_FORMAT"
-);
+pub const BASELINE_VOLUME_FORMAT: u16 = SHARED_VOLUME_FORMAT.current;
 
 /// Shared formats of 0.2.0–0.2.4 volumes that `studiofs upgrade` adopts.
 pub const MIGRATABLE_VOLUME_FORMATS: RangeInclusive<u16> = 5..=6;
@@ -87,21 +82,14 @@ pub struct ClientCapabilities {
 }
 
 impl ClientCapabilities {
-    /// Capabilities of this binary once `studiofs upgrade` writes format
-    /// [`BASELINE_VOLUME_FORMAT`] (SFS-1132). Until then the shipped binary
-    /// still serves [`SHARED_VOLUME_FORMAT`], so this must not be wired into
-    /// mount (SFS-1015) before SFS-1132 lands.
+    /// Capabilities of the current baseline binary.
     ///
     /// Requiring [`POSTGRES_PAYLOAD_GC_SCHEMA`] is PostgreSQL-specific; SFS-1034
     /// parameterises the schema components by metadata backend.
     #[must_use]
     pub fn current() -> Self {
         Self {
-            volume_format: VersionIdentity {
-                name: SHARED_VOLUME_FORMAT.name,
-                current: BASELINE_VOLUME_FORMAT,
-                min_supported: BASELINE_VOLUME_FORMAT,
-            },
+            volume_format: SHARED_VOLUME_FORMAT,
             read: BTreeSet::from([
                 CAP_EVENT_CODEC_V1,
                 CAP_PAYLOAD_STFS_V2,

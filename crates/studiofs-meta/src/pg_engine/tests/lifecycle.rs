@@ -9328,10 +9328,7 @@ fn test_pg_checkpoint_refuses_to_promote_legacy_format() {
     assert!(
         matches!(
             error,
-            MetaError::UnsupportedFormatVersion {
-                found,
-                expected
-            } if found == legacy_format as u16 && expected == CURRENT_FORMAT_VERSION
+            MetaError::NeedsMigration { found } if found == legacy_format as u16
         ),
         "unexpected checkpoint format error: {error}"
     );
@@ -9386,10 +9383,7 @@ fn test_pg_event_publication_refuses_legacy_format() {
     assert!(
         matches!(
             error,
-            MetaError::UnsupportedFormatVersion {
-                found,
-                expected
-            } if found == legacy_format as u16 && expected == CURRENT_FORMAT_VERSION
+            MetaError::NeedsMigration { found } if found == legacy_format as u16
         ),
         "unexpected event publication format error: {error}"
     );

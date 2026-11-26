@@ -15,7 +15,8 @@ After this milestone, every data format a successor might change has its own ver
 - [x] (2026-11-26) SFS-1011: publish compatible checkpoint encodings at the same cut and retain a baseline prune anchor. [Implementation and focused validation](SFS-1011-checkpoint-formats.md).
 - [ ] SFS-1012: crash-safe local redb and payload-index format migration and recovery.
 - [ ] SFS-1013: version-aware discovery, snapshot mounts and dump/load restore.
-- [ ] SFS-1132: adopt format 5 and 6 volumes into the baseline via `studiofs upgrade`, chaining to format 7.
+- [x] (2026-11-26) SFS-1132: implement format 5→6→7 and 6→7 in `studiofs upgrade`. Apply registered migrations, retain the intermediate format-6 commit, and atomically install the policy and format 7. Upgrade the existing payload index before activating the staged local header.
+- [x] (2026-11-26) Verify SFS-1132 with pinned fixtures, stage interruptions, PostgreSQL and RustFS. Test the CLI retry after shared adoption and verify that load refuses an existing format-6 target.
 
 ## Surprises & Discoveries
 
@@ -23,6 +24,7 @@ After this milestone, every data format a successor might change has its own ver
   Evidence: `crates/studiofs-cache/src/payload_index.rs:1790`.
 - Observation: the stored settings JSON previously accepted unknown fields, including fields nested in the trash and compression policies. Shared and local compare-and-set operations could drop those fields.
   Evidence: the settings compare-and-set regression in `crates/studiofs-meta/src/redb_engine/volume_settings.rs` verifies byte and journal preservation.
+- Observation: `load` can replace a PostgreSQL metadata row for a matching volume UUID. Validate the existing row's format under the schema lock before replacing it, so a format-7 dump cannot implicitly adopt a format-5 or format-6 volume.
 
 ## Decision Log
 
@@ -39,6 +41,8 @@ After this milestone, every data format a successor might change has its own ver
 - Decision: `studiofs upgrade` is the only adoption path for pre-0.2.5 volumes; there is no read compatibility with 0.2.0–0.2.4 binaries afterwards.
   Rationale: preflight decision of 2026-11-25.
   Date/Author: 2026-11-25, project preflight.
+- Decision: register a separate deletion-fence schema migration to preserve existing schema checksums. Its function admits claimants only when their declared format matches the volume. When repairing the baseline, restore that function in the same transaction.
+  Date/Author: 2026-11-26, SFS-1132.
 
 - Decision: the test-successor tag 22 encodes an unconditional assignment to a user xattr and normalizes to the existing replay mutation. It declares a read capability only.
   Rationale: the fixture exercises a new shared kind while the regular journal and publication encoders keep producing their baseline tags. A persisted tag 22 requires the successor to replay it, so the manifest declares it irreversible.
@@ -49,6 +53,8 @@ After this milestone, every data format a successor might change has its own ver
 SFS-1009 preserves every baseline event byte fixture and keeps tag 22 confined to the test-successor reader. An isolated PostgreSQL 18 test proved that the unknown event refused a whole replay page before any settings or cursor changes. The valid prefix applied on its own, and a retry kept the durable cursor at the last accepted batch. The redb settings regression proved that a failed rewrite preserves the original JSON and appends no event.
 
 Review regressions reproduced three failures before the correction. Snapshot reconstruction now reports a permanent upgrade requirement, a damaged envelope prefix reports a serialization error, and the CLI reports the upgrade requirement for unknown settings. A PostgreSQL 18 test verified that the CLI and authoritative settings update both refuse the unknown field and preserve the stored bytes.
+
+SFS-1132 verified both release fixtures against their recorded checkpoint checksums. Interrupted local migration preserved the outbound journal, upload ledger, client slot and pending inode. The PostgreSQL test proved policy insertion rolls back with a failed format bump. After adoption, the old writer predicate matched zero rows and the old deletion claim was rejected. The CLI test retried after a shared commit and verified an existing RustFS object's SHA-256.
 
 ## Context and Orientation
 

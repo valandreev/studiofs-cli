@@ -61,6 +61,7 @@ enum SnapshotSourceError {
     Permanent,
     MissingFormatInfo,
     UpgradeRequired,
+    NeedsMigration(u16),
     UnsupportedFormatVersion { found: u16, expected: u16 },
     UnsupportedCheckpointEncoding { format: i16, schema: i16 },
 }
@@ -82,6 +83,7 @@ impl SnapshotSourceError {
     fn local(error: MetaError) -> Self {
         match error {
             MetaError::UpgradeRequired { .. } => Self::UpgradeRequired,
+            MetaError::NeedsMigration { found } => Self::NeedsMigration(found),
             MetaError::Serialization(_) => Self::Permanent,
             _ => Self::Retryable,
         }
@@ -104,6 +106,10 @@ impl SnapshotSourceError {
             Self::UpgradeRequired => SnapshotPortError::permanent(
                 "upgrade_required",
                 "snapshot source requires a newer StudioFS client",
+            ),
+            Self::NeedsMigration(found) => SnapshotPortError::permanent(
+                "needs_migration",
+                &MetaError::NeedsMigration { found }.to_string(),
             ),
             Self::UnsupportedFormatVersion { found, expected } => SnapshotPortError::permanent(
                 "unsupported_format_version",
@@ -128,6 +134,7 @@ fn decode_snapshot_source_format_info(bytes: &[u8]) -> Result<FormatInfo, Snapsh
             SnapshotSourceError::UnsupportedFormatVersion { found, expected }
         }
         MetaError::UpgradeRequired { .. } => SnapshotSourceError::UpgradeRequired,
+        MetaError::NeedsMigration { found } => SnapshotSourceError::NeedsMigration(found),
         _ => SnapshotSourceError::Permanent,
     })
 }

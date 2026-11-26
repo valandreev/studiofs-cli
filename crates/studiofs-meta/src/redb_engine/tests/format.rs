@@ -19,6 +19,35 @@ fn opens_redb_4_3_database_without_studiofs_format_migration() {
     check_redb_fixture("4.3", Some(b"4.3.0"));
 }
 
+#[test]
+fn local_adoption_keeps_local_dsn_and_s3_settings() {
+    let temp = studiofs_test_support::workspace_target_tempdir("test-adoption-dsn-");
+    let database_path = temp.path().join("metadata.redb");
+    let fixture_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/published-v0.2.4/local-cache.redb");
+    studiofs_test_support::copy_file_contents(&fixture_path, &database_path).unwrap();
+    let local_url = {
+        let upgrading = RedbMetaEngine::open_for_format_upgrade(&database_path).unwrap();
+        let local = upgrading.format_info_for_upgrade().unwrap();
+        let local_url = local.metadata.postgres.as_ref().unwrap().url.clone();
+        let mut shared = local.clone();
+        shared.format_version = CURRENT_FORMAT_VERSION;
+        shared.metadata.postgres.as_mut().unwrap().url = "postgres://creator-host/db".into();
+        // S3 settings rotated in PostgreSQL while this cache was stopped.
+        shared.endpoint = "http://rotated-endpoint:9000".into();
+        shared.secret_key = "rotated-secret".into();
+        let mut other_volume = shared.clone();
+        other_volume.metadata.postgres.as_mut().unwrap().volume_id += 1;
+        assert!(upgrading.upgrade_local_format6(&other_volume).is_err());
+        upgrading.upgrade_local_format6(&shared).unwrap();
+        local_url
+    };
+    let probed = RedbMetaEngine::read_format_info_readonly(&database_path).unwrap();
+    assert_eq!(probed.format_version, CURRENT_FORMAT_VERSION);
+    assert_eq!(probed.metadata.postgres.unwrap().url, local_url);
+    assert_ne!(probed.endpoint, "http://rotated-endpoint:9000");
+}
+
 fn check_redb_fixture(version: &str, expected_writer_marker: Option<&[u8]>) {
     let temp = studiofs_test_support::workspace_target_tempdir("test-redb-compat-meta-");
     let database_path = temp.path().join("metadata.redb");
@@ -32,8 +61,10 @@ fn check_redb_fixture(version: &str, expected_writer_marker: Option<&[u8]>) {
         let upgrading = RedbMetaEngine::open_for_format_upgrade(&database_path).unwrap();
         let mut shared = upgrading.format_info_for_upgrade().unwrap();
         assert_eq!(shared.format_version, 5);
-        shared.format_version = CURRENT_FORMAT_VERSION;
+        shared.format_version = 6;
         upgrading.upgrade_local_format5(&shared).unwrap();
+        shared.format_version = CURRENT_FORMAT_VERSION;
+        upgrading.upgrade_local_format6(&shared).unwrap();
     }
 
     let probed = RedbMetaEngine::read_format_info_readonly(&database_path).unwrap();
@@ -220,10 +251,7 @@ fn format_info_decode_reports_unsupported_version_before_missing_encryption() {
 
     assert!(matches!(
         err,
-        MetaError::UnsupportedFormatVersion {
-            found,
-            expected
-        } if found == CURRENT_FORMAT_VERSION - 1 && expected == CURRENT_FORMAT_VERSION
+        MetaError::NeedsMigration { found } if found == CURRENT_FORMAT_VERSION - 1
     ));
 }
 

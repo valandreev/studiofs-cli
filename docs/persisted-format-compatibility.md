@@ -494,7 +494,7 @@ Later issues must build on these instead of adding parallel mechanisms:
 | Mechanism | Source | Extend in |
 |---|---|---|
 | `studiofs_schema_components` with monotonic marker (SFS-980) | `crates/studiofs-meta/src/pg_engine/schema.rs:903` | SFS-1005, SFS-1006 |
-| `studiofs upgrade` (format 5→6) | `crates/studiofs/src/cli/upgrade.rs:15`, `crates/studiofs-meta/src/pg_engine/format_upgrade.rs:10` | SFS-1132 |
+| `studiofs upgrade` (format 5→6→7 or 6→7) | `crates/studiofs/src/cli/upgrade.rs`, `crates/studiofs-meta/src/pg_engine/format_upgrade.rs` | SFS-1132 |
 | `BUMP_METADATA_VERSION` format and write-requirement predicates on publication | `crates/studiofs-meta/src/pg_engine/sql.rs:51` | SFS-1014 |
 | Per-volume policy record `volume_protocol` with epoch, audit history and `check_update` transition rules | `crates/studiofs-meta/src/volume_protocol.rs`, `crates/studiofs-meta/src/pg_engine/volume_protocol.rs` | SFS-1008, SFS-1015, SFS-1017, SFS-1132 |
 | `studiofs_fence_legacy_deletion_claim` trigger with `studiofs.deletion_format` GUC | `crates/studiofs-meta/src/pg_engine/schema.rs:569`, `crates/studiofs-meta/src/pg_engine/janitor.rs:1089` | SFS-1014, SFS-1016 |
@@ -511,11 +511,15 @@ they change shared objects:
 - Expand that installs or replaces a trigger or function, because the body
   applies to every volume's rows. The trigger body must branch on per-volume
   state (as `studiofs_fence_legacy_deletion_claim` does with
-  `metadata_format_version >= 6`). It must also compare the actor's GUC with
-  that per-volume state, not with a constant: the current trigger accepts
-  `studiofs.deletion_format = '6'` on any format 6 or later volume, so it does
-  not fence a 0.2.3 or 0.2.4 Janitor on a format 7 volume (SFS-1132,
-  SFS-1016).
+  `metadata_format_version >= 6`). The registered `format_fences` migration
+  (SFS-1132) adds triggers under names the 0.2.x DDL never touches, so an
+  older `init` cannot replace them. `studiofs_deletion_claim_volume_format_fence`
+  compares the actor's `studiofs.deletion_volume_format` with the format of a
+  volume at format 7 or later, so a 0.2.4 Janitor, which sets only
+  `studiofs.deletion_format = '6'`, loses deletion admission there.
+  `studiofs_adopted_format_downgrade_fence` refuses writing a format below 7
+  for a volume that has a `volume_protocol` row, so an older `load` cannot
+  restore a format-6 row over an adopted volume.
 - Contract (dropping a table, column or trigger body branch), which requires
   that no volume in the database still needs it.
 - Raising a database-wide component version that older Janitors check exactly
@@ -543,7 +547,7 @@ successor can fence it safely. "Current state" is what `main` does today.
 | Additive PG objects are tolerated when declared capabilities allow it. | Present for mount startup: `validate_postgres_schema` checks only the components and objects used by the mount (`crates/studiofs-meta/src/pg_engine/startup_schema.rs`). DDL from `init`/`load`/`upgrade` goes through the SFS-1005 migration registry, which refuses newer or unknown components before any DDL. | [SFS-1006](https://linear.app/valandreev/issue/SFS-1006) |
 | Policy epoch is revalidated after reconnect. | Partial: the format and write-requirement predicates are re-evaluated in every publication transaction; the policy epoch exists (`volume_protocol.policy_epoch`, SFS-1007) but no client caches or compares it yet. | [SFS-1015](https://linear.app/valandreev/issue/SFS-1015), [SFS-1007](https://linear.app/valandreev/issue/SFS-1007) |
 | Unknown `MetadataBackend` variant or unknown `FormatInfo` field fails closed with typed `UpgradeRequired`. | Present (SFS-1003): `decode_format_info` returns `MetaError::UpgradeRequired` naming the field or variant, including nested configs, and the bootstrap descriptor keeps it instead of reporting an invalid checkpoint. | [SFS-1003](https://linear.app/valandreev/issue/SFS-1003) |
-| 0.2.x volumes adopt the baseline by `studiofs upgrade` to format 7. | Missing: upgrade handles 5→6 only (`crates/studiofs-meta/src/pg_engine/format_upgrade.rs:35`). | [SFS-1132](https://linear.app/valandreev/issue/SFS-1132) |
+| 0.2.x volumes adopt the baseline by `studiofs upgrade` to format 7. | Pending migrations run before policy initialization and the format bump. The stopped client then upgrades its local stores in place. | [SFS-1132](https://linear.app/valandreev/issue/SFS-1132) |
 
 ## Version and operation support matrix
 

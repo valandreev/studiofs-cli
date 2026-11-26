@@ -125,8 +125,11 @@ studiofs init projectfs --endpoint http://127.0.0.1:9000 --bucket studiofs-test 
 
 ### `upgrade`
 
-Applies pending PostgreSQL schema migrations, then upgrades a stopped, locally
-discovered format 5 volume cache to format 6.
+Applies pending PostgreSQL schema migrations and adopts a stopped, locally
+discovered 0.2.x volume into format 7. Format 5 passes through format 6 in
+the same command. Repeat the upgrade for each stopped local cache. If a mount
+uses a custom `--cache-dir`, pass that same directory to `upgrade`.
+Keep the cache in place if the command is interrupted and rerun it.
 
 ```bash
 studiofs upgrade <name> --dry-run   # report only; changes nothing
@@ -136,8 +139,8 @@ studiofs upgrade <name>
 Notes:
 - Before upgrading, stop every mount and janitor of every volume in the
   PostgreSQL database, back up the database (for example with `pg_dump`) and
-  run `studiofs dump` for each volume. Schema migrations are database-wide and
-  never move back.
+  run `studiofs dump` with the version that last opened each volume. Schema
+  migrations are database-wide and never move back.
 - `--dry-run` lists the recorded schema components, the migrations that would
   run with their phase (`additive`, `backfill` or `contract`), and the local
   and shared volume format. It refuses a database with a newer or unknown
@@ -376,7 +379,7 @@ Notes:
   already in trash still expire on their previous schedule.
 - Omit `<days>` to print the current shared setting.
 - The setting is stored in PostgreSQL; mounted clients apply it after
-  replication. Every cache must use format 6 (see `upgrade`).
+  replication. Every cache must use the current volume format (see `upgrade`).
 
 ### `quota`
 

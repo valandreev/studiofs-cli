@@ -1103,8 +1103,8 @@ impl RedbMetaEngine {
         )
     }
 
-    /// Own an existing stopped cache for explicit format-5 completion only.
-    /// Normal mount startup must continue to use `open` and reject format 5.
+    /// Own an existing stopped cache for explicit format adoption.
+    /// Normal mount startup uses `open` and rejects legacy formats.
     pub fn open_for_format_upgrade(path: impl AsRef<Path>) -> MetaResult<Self> {
         if !path.as_ref().is_file() {
             return Err(MetaError::NotFormatted);
@@ -1145,8 +1145,12 @@ impl RedbMetaEngine {
             }
         }
 
-        let db = Database::create(path.as_ref())
-            .map_err(|e| MetaError::Storage(format!("failed to open redb: {e}")))?;
+        let db = if format_upgrade {
+            Database::open(path.as_ref())
+        } else {
+            Database::create(path.as_ref())
+        }
+        .map_err(|e| MetaError::Storage(format!("failed to open redb: {e}")))?;
 
         let persisted_format = {
             let txn = db

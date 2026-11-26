@@ -35,6 +35,7 @@ pub const CORE_COMPONENT: &str = "core";
 /// Database-wide additive component for per-volume client session leases (SFS-1008).
 pub const CLIENT_SESSIONS_COMPONENT: &str = "client_sessions";
 pub(super) const CHECKPOINT_ENCODINGS_COMPONENT: &str = "checkpoint_encodings";
+pub(super) const FORMAT_FENCES_COMPONENT: &str = "format_fences";
 
 /// Recorded by the baseline itself and checked exactly by the CLI Janitor.
 const PAYLOAD_GC_COMPONENT: &str = "payload_gc";
@@ -126,6 +127,50 @@ const CHECKPOINT_ENCODINGS: Migration = Migration {
           );",
 };
 
+/// Server-side fences against 0.2.x writers on adopted (format 7) volumes.
+/// Object names differ from the 0.2.x DDL, so an older `init` re-applying its
+/// schema cannot replace them; the legacy deletion fence stays as shipped.
+const FORMAT_FENCES: Migration = Migration {
+    component: FORMAT_FENCES_COMPONENT,
+    version: 1,
+    name: "fence 0.2.x writers on adopted volumes",
+    phase: MigrationPhase::Additive,
+    sql: "CREATE OR REPLACE FUNCTION studiofs_fence_deletion_claim_volume_format()
+          RETURNS TRIGGER LANGUAGE plpgsql AS $$
+          BEGIN
+              IF NEW.state = 'delete_pending' AND NEW.reconcile_owner IS NOT NULL
+                 AND (TG_OP = 'INSERT' OR NEW.reconcile_fence IS DISTINCT FROM OLD.reconcile_fence)
+                 AND EXISTS (
+                     SELECT 1 FROM metadata_state
+                     WHERE vol = NEW.vol AND metadata_format_version >= 7
+                       AND current_setting('studiofs.deletion_volume_format', true)
+                           IS DISTINCT FROM metadata_format_version::text
+                 )
+              THEN
+                  RAISE EXCEPTION 'deletion claim requires current volume format capability';
+              END IF;
+              RETURN NEW;
+          END $$;
+          DROP TRIGGER IF EXISTS studiofs_deletion_claim_volume_format_fence ON snapshot_payload_upload_objects;
+          CREATE TRIGGER studiofs_deletion_claim_volume_format_fence
+              BEFORE INSERT OR UPDATE ON snapshot_payload_upload_objects
+              FOR EACH ROW EXECUTE FUNCTION studiofs_fence_deletion_claim_volume_format();
+          CREATE OR REPLACE FUNCTION studiofs_fence_adopted_format_downgrade()
+          RETURNS TRIGGER LANGUAGE plpgsql AS $$
+          BEGIN
+              -- Only adopted or 0.2.5-created volumes have a policy row.
+              IF EXISTS (SELECT 1 FROM volume_protocol WHERE vol = NEW.vol) THEN
+                  RAISE EXCEPTION 'volume format 7 cannot be replaced by an older format';
+              END IF;
+              RETURN NEW;
+          END $$;
+          DROP TRIGGER IF EXISTS studiofs_adopted_format_downgrade_fence ON metadata_state;
+          CREATE TRIGGER studiofs_adopted_format_downgrade_fence
+              BEFORE INSERT OR UPDATE OF metadata_format_version ON metadata_state
+              FOR EACH ROW WHEN (NEW.metadata_format_version < 7)
+              EXECUTE FUNCTION studiofs_fence_adopted_format_downgrade();",
+};
+
 /// Test-successor change (SFS-1131): one additive table that 0.2.5 ignores.
 #[cfg(feature = "test-successor")]
 const SUCCESSOR_PROBE: Migration = Migration {
@@ -141,7 +186,12 @@ const SUCCESSOR_PROBE: Migration = Migration {
 
 /// Every migration this binary knows, grouped by component in version order.
 #[cfg(not(feature = "test-successor"))]
-pub const MIGRATIONS: &[Migration] = &[BASELINE, CLIENT_SESSIONS, CHECKPOINT_ENCODINGS];
+pub const MIGRATIONS: &[Migration] = &[
+    BASELINE,
+    CLIENT_SESSIONS,
+    CHECKPOINT_ENCODINGS,
+    FORMAT_FENCES,
+];
 /// Every migration this binary knows, grouped by component in version order.
 #[cfg(feature = "test-successor")]
 pub const MIGRATIONS: &[Migration] = &[
@@ -149,6 +199,7 @@ pub const MIGRATIONS: &[Migration] = &[
     SUCCESSOR_PROBE,
     CLIENT_SESSIONS,
     CHECKPOINT_ENCODINGS,
+    FORMAT_FENCES,
 ];
 
 /// A `studiofs_schema_components` row.
@@ -543,7 +594,8 @@ mod tests {
             vec![
                 CHECKPOINT_ENCODINGS_COMPONENT,
                 CLIENT_SESSIONS_COMPONENT,
-                CORE_COMPONENT
+                CORE_COMPONENT,
+                FORMAT_FENCES_COMPONENT,
             ]
         );
         for (component, versions) in &by_component {
