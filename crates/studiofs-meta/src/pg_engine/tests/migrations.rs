@@ -143,7 +143,7 @@ fn migration_registry_applies_resumes_and_refuses_drift_on_live_postgres() {
         assert_eq!(scalar(client, sessions_table).await, 1);
         assert_eq!(scalar(client, encodings_table).await, 1);
         // Baseline DDL (also what a 0.2.x `init` re-applies) must not touch these.
-        let current_fence = "SELECT count(*) FROM pg_trigger WHERE tgname IN ('studiofs_deletion_claim_volume_format_fence', 'studiofs_adopted_format_downgrade_fence') AND tgenabled IN ('O', 'A')";
+        let current_fence = "SELECT count(*) FROM pg_trigger WHERE tgrelid IN ('snapshot_payload_upload_objects'::regclass, 'metadata_state'::regclass) AND tgname IN ('studiofs_deletion_claim_volume_format_fence', 'studiofs_adopted_format_downgrade_fence') AND tgenabled IN ('O', 'A')";
         assert_eq!(scalar(client, current_fence).await, 2);
         client
             .batch_execute("DROP TABLE file_lock_leases")
