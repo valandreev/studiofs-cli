@@ -104,6 +104,24 @@ pub const CHANGES: &[SuccessorChange] = &[
             successor: 5,
         }),
     },
+    SuccessorChange {
+        id: "local-redb-prepare-revision-7",
+        issue: "SFS-1012",
+        kind: ChangeKind::LocalFormat,
+        rollback: Rollback::Reversible,
+        bump: None,
+    },
+    SuccessorChange {
+        id: "local-redb-revision-7",
+        issue: "SFS-1012",
+        kind: ChangeKind::LocalFormat,
+        rollback: Rollback::Irreversible,
+        bump: Some(IdentityBump {
+            identity: crate::version::LOCAL_METADATA_LAYOUT.name,
+            baseline: 6,
+            successor: 7,
+        }),
+    },
 ];
 
 /// Read capability for the successor's namespace-specific xattr event.

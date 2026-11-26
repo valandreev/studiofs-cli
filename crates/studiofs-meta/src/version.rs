@@ -119,20 +119,16 @@ pub const SHARED_WRITE_REQUIREMENT: VersionIdentity = VersionIdentity {
     min_supported: 1,
 };
 
-/// Local redb metadata layout, recorded in the redb `SETTINGS_TABLE["format"]`
-/// header. Both checks use `FormatInfo.format_version` until SFS-1012 adds a
-/// dedicated local layout marker, so their supported ranges must agree.
+/// Independent local redb revision. An unmarked format-6 header is revision 6.
 pub const LOCAL_METADATA_LAYOUT: VersionIdentity = VersionIdentity {
     name: "local redb metadata layout",
-    current: 6,
+    current: if cfg!(feature = "test-successor") {
+        7
+    } else {
+        6
+    },
     min_supported: 6,
 };
-
-const _: () = assert!(
-    LOCAL_METADATA_LAYOUT.current == SHARED_VOLUME_FORMAT.current
-        && LOCAL_METADATA_LAYOUT.min_supported == SHARED_VOLUME_FORMAT.min_supported,
-    "redb and the shared volume use the same format field until SFS-1012"
-);
 
 /// `MetaEvent` wire envelope version (`SFS-EVT`); tags are append-only.
 pub const EVENT_CODEC_WIRE: VersionIdentity = VersionIdentity {
@@ -235,7 +231,14 @@ mod tests {
     fn version_identities_keep_current_baseline_values() {
         // SFS-1003 splits identities without bumping any of them.
         assert_eq!(SHARED_VOLUME_FORMAT.current, 6);
-        assert_eq!(LOCAL_METADATA_LAYOUT.current, 6);
+        assert_eq!(
+            LOCAL_METADATA_LAYOUT.current,
+            if cfg!(feature = "test-successor") {
+                7
+            } else {
+                6
+            }
+        );
         assert_eq!(crate::schema::CURRENT_FORMAT_VERSION, 6);
         assert_eq!(EVENT_CODEC_WIRE.current, 1);
         assert_eq!(POSTGRES_PAYLOAD_GC_SCHEMA.current, 2);

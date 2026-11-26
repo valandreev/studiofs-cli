@@ -744,3 +744,114 @@ fn published_v0_2_4_format6_volume_decodes_with_current_binary() {
     let local = RedbMetaEngine::read_format_info_readonly(&path).expect("local header decodes");
     assert_eq!(local.uuid, info.uuid);
 }
+
+#[cfg(feature = "test-successor")]
+#[test]
+fn baseline_dirty_cache_local_revision_resumes_at_every_boundary() {
+    let (_snapshot_dir, snapshot_path) =
+        copy_to_temp(&fixture_dir().join("snapshot-artifact.redb"));
+    let snapshot_bytes = std::fs::read(&snapshot_path).unwrap();
+    let snapshot = RedbMetaEngine::open_read_only(&snapshot_path).unwrap();
+    assert!(snapshot.upgrade_local_revision().is_err());
+    drop(snapshot);
+    assert_eq!(std::fs::read(&snapshot_path).unwrap(), snapshot_bytes);
+
+    for stage in 0..=4 {
+        let (_dir, path) = copy_to_temp(&fixture_dir().join("local-dirty.redb"));
+        let engine = RedbMetaEngine::open_for_format_upgrade(&path).unwrap();
+        use crate::engine::MetaGc;
+        use crate::snapshot_ports::UploadedFragmentLedgerEntry;
+        let upload = UploadedFragmentLedgerEntry {
+            volume_id: 7,
+            object_id: 42,
+            fragment_index: 0,
+            object_key: "objects/42".into(),
+            expected_byte_length: 4,
+            expected_sha256: [0xA5; 32],
+        };
+        engine.set_counter("pgClientSlotPlusOne", 8).unwrap();
+        engine.add_pending_deletion(43, 1).unwrap();
+        engine
+            .record_local_upload_ledger_begin(std::slice::from_ref(&upload))
+            .unwrap();
+        engine
+            .record_local_upload_ledger_confirm(std::slice::from_ref(&upload))
+            .unwrap();
+        let ledger = engine.pending_local_upload_ledger(16).unwrap();
+        let before = serde_json::to_value(engine.export_snapshot().unwrap()).unwrap();
+        let positions = engine.local_outbound_ack_positions().unwrap();
+        let interrupted = engine.advance_local_revision(|at| {
+            if at == stage {
+                return Err(MetaError::RepairRequired("simulated interruption".into()));
+            }
+            Ok(())
+        });
+        assert!(matches!(interrupted, Err(MetaError::RepairRequired(_))));
+        drop(engine);
+
+        if stage != 0 {
+            let contents = std::fs::read(&path).unwrap();
+            assert!(matches!(
+                RedbMetaEngine::read_format_info_readonly(&path),
+                Err(MetaError::UpgradeRequired {
+                    reason: crate::UpgradeRequiredReason::LocalRedbUpgradePending
+                })
+            ));
+            assert!(matches!(
+                RedbMetaEngine::open(&path),
+                Err(MetaError::UpgradeRequired {
+                    reason: crate::UpgradeRequiredReason::LocalRedbUpgradePending
+                })
+            ));
+            assert_eq!(std::fs::read(&path).unwrap(), contents);
+        }
+
+        let engine = RedbMetaEngine::open_for_format_upgrade(&path).unwrap();
+        engine.upgrade_local_revision().unwrap();
+        engine.upgrade_local_revision().unwrap();
+        assert_eq!(engine.get_counter("pgClientSlotPlusOne").unwrap(), 8);
+        assert!(engine.get_pending_deletions().unwrap().contains(&(43, 1)));
+        assert_eq!(engine.pending_local_upload_ledger(16).unwrap(), ledger);
+        assert_eq!(engine.local_outbound_ack_positions().unwrap(), positions);
+        assert_eq!(
+            serde_json::to_value(engine.export_snapshot().unwrap()).unwrap(),
+            before
+        );
+        drop(engine);
+        assert_eq!(
+            RedbMetaEngine::read_format_info_readonly(&path)
+                .unwrap()
+                .format_version,
+            6
+        );
+    }
+}
+
+#[cfg(not(feature = "test-successor"))]
+#[test]
+fn baseline_dirty_cache_local_revision_refuses_successor_without_writes() {
+    let (_dir, path) = copy_to_temp(&fixture_dir().join("local-dirty.redb"));
+    {
+        let db = redb::Database::open(&path).unwrap();
+        let txn = db.begin_write().unwrap();
+        let definition = redb::TableDefinition::<&str, &[u8]>::new("settings");
+        {
+            let mut settings = txn.open_table(definition).unwrap();
+            let mut header = serde_json::to_value(fixture_format_info()).unwrap();
+            header[crate::LOCAL_REDB_REVISION] = 7.into();
+            let bytes = serde_json::to_vec(&header).unwrap();
+            settings.insert("format", bytes.as_slice()).unwrap();
+        }
+        txn.commit().unwrap();
+    }
+    let before = std::fs::read(&path).unwrap();
+    assert!(matches!(
+        RedbMetaEngine::open(&path),
+        Err(MetaError::UpgradeRequired { .. })
+    ));
+    assert!(matches!(
+        RedbMetaEngine::open_for_format_upgrade(&path),
+        Err(MetaError::UpgradeRequired { .. })
+    ));
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+}

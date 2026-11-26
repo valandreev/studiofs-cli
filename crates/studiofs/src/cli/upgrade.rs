@@ -20,6 +20,10 @@ pub struct UpgradeArgs {
     /// Re-apply the 0.2.5 baseline schema to restore dropped objects; allowed only while no later schema migration is recorded.
     #[arg(long)]
     pub repair_schema: bool,
+    /// Upgrade only the stopped local metadata database.
+    #[cfg(feature = "test-successor")]
+    #[arg(long, conflicts_with_all = ["repair_schema", "dry_run"])]
+    pub local_only: bool,
 }
 
 impl UpgradeArgs {
@@ -31,6 +35,11 @@ impl UpgradeArgs {
             super::utils::get_default_meta_dir(&self.name)?.join(format!("{}.db", self.name));
         if !path.is_file() {
             bail!("Local volume metadata is missing; discover the volume before upgrading.");
+        }
+        #[cfg(feature = "test-successor")]
+        if self.local_only {
+            let local = RedbMetaEngine::open_for_format_upgrade(&path)?;
+            return Ok(local.upgrade_local_revision()?);
         }
         let runtime = tokio::runtime::Runtime::new()?;
         if self.dry_run {

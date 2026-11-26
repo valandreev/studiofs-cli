@@ -44,9 +44,8 @@ pub const DEFAULT_BLOCK_SIZE: u32 = 4 * BYTES_PER_MIB;
 pub const DEFAULT_CHUNK_SIZE: u32 = 64 * 1024 * 1024;
 /// `FormatInfo.format_version` that writers stamp: the shared volume format.
 ///
-/// Checks route to their own identity in [`crate::version`]: the shared
-/// volume format ([`crate::version::SHARED_VOLUME_FORMAT`]) or the local redb
-/// layout ([`crate::version::LOCAL_METADATA_LAYOUT`]).
+/// The local redb layout has a separate revision
+/// ([`crate::version::LOCAL_METADATA_LAYOUT`]).
 pub const CURRENT_FORMAT_VERSION: u16 = crate::version::SHARED_VOLUME_FORMAT.current;
 /// Supported encryption format version for remote payload envelopes.
 pub const CURRENT_ENCRYPTION_FORMAT_VERSION: u16 = 1;

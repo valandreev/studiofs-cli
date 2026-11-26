@@ -1127,6 +1127,24 @@ impl RedbMetaEngine {
             })?;
         }
 
+        // Reject incompatible headers through redb's read-only backend before
+        // a writable open can update the database's recovery bookkeeping.
+        if let Ok(readonly) = ReadOnlyDatabase::open(path.as_ref()) {
+            let txn = readonly
+                .begin_read()
+                .map_err(|error| MetaError::Storage(error.to_string()))?;
+            let checked = if format_upgrade {
+                Self::read_format_info_for_upgrade_from_read_txn(&txn)
+            } else {
+                Self::read_format_info_from_read_txn(&txn)
+            };
+            match checked {
+                Ok(_) => {}
+                Err(MetaError::NotFormatted) if !format_upgrade => {}
+                Err(error) => return Err(error),
+            }
+        }
+
         let db = Database::create(path.as_ref())
             .map_err(|e| MetaError::Storage(format!("failed to open redb: {e}")))?;
 
