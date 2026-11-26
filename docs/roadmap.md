@@ -59,8 +59,9 @@ imply that every platform gate has been rerun for the current revision.
   Legacy test-disk state is rejected; there is no automatic migration, dual-read,
   or dual-write path across that boundary. Follow documented recreate or discover
   guidance rather than assuming an in-place upgrade.
-- **Post-public-release upgrades:** define a bounded client support window and
-  test mixed-version operation before promising rolling upgrades. Evolve schemas
+- **Post-public-release upgrades:** the client support window is N-2 from 0.2.5
+  on (see [persisted-format compatibility](persisted-format-compatibility.md));
+  test mixed-version operation inside it before promising rolling upgrades. Evolve schemas
   with expand/migrate/contract changes and track schema, event, object-format,
   and capability compatibility explicitly. Versioned events
   (SFS-639) are an existing building

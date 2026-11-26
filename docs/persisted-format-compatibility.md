@@ -19,6 +19,19 @@ reference was verified against `main` at `f9e258cf`.
   releases that explicitly declare support for it. Compatibility with pre-0.2.5
   clients or state is out of scope: there is no guarantee, and such volumes are
   adopted only through `studiofs upgrade`.
+- Client support window: from 0.2.5 on, every release must keep the two
+  previous releases working against its schema and volume state (N-2; 0.2.5
+  itself is the oldest release that can be in the window). A supported older
+  client may lose access to new features, but it must still mount, read
+  (lookup, readdir, stat, read), write (create, write, truncate, rename) and
+  delete (unlink, rmdir) as a full read-write client. A change that would make a
+  supported client read-only or incompatible for these operations must not
+  ship, or must stay behind an operator-activated feature that cannot be
+  activated while such clients are within the window. Releases older than the
+  window, and everything before 0.2.5, get no guarantee.
+- Test only what this window needs. Do not build or test compatibility paths
+  for releases outside it, or for hypothetical multi-format states that no
+  supported release produces.
 - 0.2.x volumes join the baseline only through `studiofs upgrade`. Format 5
   (0.2.0–0.2.2) and format 6 (0.2.3–0.2.4) chain to format 7
   ([SFS-1132](https://linear.app/valandreev/issue/SFS-1132)). That bump fences

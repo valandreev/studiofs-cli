@@ -97,6 +97,11 @@ Read these entry points as needed:
   crossed invalidation.
 - `write`, `flush`, `fsync`, and handle release have distinct local durability
   contracts. Do not add synchronous remote publication to callbacks.
+- Client support window: from 0.2.5 on, a release keeps the two previous
+  releases (N-2) able to mount, read, write and delete as read-write clients
+  against its schema; they may only lose new features. Pre-0.2.5 and
+  out-of-window releases get no compatibility code or tests. The full rule is
+  in `docs/persisted-format-compatibility.md`.
 - Credentials, full DSNs, tokens, and secret-bearing configuration must not
   appear in `Debug`, rendered errors, logs, plans, commits, or final reports.
 
