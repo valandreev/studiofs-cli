@@ -245,6 +245,17 @@ where
     )
 }
 
+pub(super) fn is_volume_read_policy_rejection(error: &MetaError) -> bool {
+    matches!(
+        error,
+        MetaError::UnsupportedFormatVersion { .. }
+            | MetaError::UpgradeRequired { .. }
+            | MetaError::NeedsMigration { .. }
+            | MetaError::VolumeProtocolRejected(_)
+            | MetaError::RepairRequired(_)
+    )
+}
+
 /// Verify the read policy at bootstrap or snapshot acquisition.
 pub async fn check_volume_read_policy<C: GenericClient + Sync>(
     client: &C,

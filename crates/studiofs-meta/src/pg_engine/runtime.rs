@@ -411,6 +411,26 @@ fn shared_once_runtime() -> MetaResult<&'static PgRemoteRuntime> {
     }
 }
 
+/// Finish a pooled transaction, returning a cleanly rolled-back rejection to the caller.
+pub(super) async fn finish_pooled_transaction<T>(
+    tx: tokio_postgres::Transaction<'_>,
+    outcome: MetaResult<T>,
+    is_rejection: impl FnOnce(&MetaError) -> bool,
+    map_pg_error: impl FnOnce(tokio_postgres::Error) -> MetaError,
+) -> MetaResult<MetaResult<T>> {
+    match outcome {
+        Ok(value) => {
+            tx.commit().await.map_err(map_pg_error)?;
+            Ok(Ok(value))
+        }
+        Err(error) if is_rejection(&error) => {
+            tx.rollback().await.map_err(map_pg_error)?;
+            Ok(Err(error))
+        }
+        Err(error) => Err(error),
+    }
+}
+
 impl PgMetaEngine {
     pub(super) fn classify_pg_error(
         context: impl Display,
