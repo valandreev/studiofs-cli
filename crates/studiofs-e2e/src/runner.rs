@@ -32,7 +32,7 @@ use crate::process_job::{CHILD_TERMINATION_GRACE, ChildJob, wait_for_child_exit}
 use crate::report::{
     ArtifactReport, CleanupReport, ComposeImageReport, EnvironmentReport, EventRecord, HostReport,
     PathOwnershipReport, PreflightCheckReport, PreflightReport, RunManifest, RunReport,
-    RunnerReport, SandboxReport, ScenarioReport,
+    RunnerReport, SandboxReport, ScenarioReport, ScenarioSkipKind,
 };
 use crate::runner_lifecycle::{
     ScenarioLifecycleOutcome, SupervisedScenarioInput, failed_scenario_child,
@@ -98,7 +98,7 @@ impl PlatformSelection {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RunStatus {
-    /// The runner completed all scenarios and cleanup successfully.
+    /// Runnable scenarios and cleanup passed. Platform skips are allowed.
     Passed,
     /// One or more scenarios failed.
     Failed,
@@ -364,10 +364,15 @@ pub fn run_with_executor(
         request.scenarios
     };
     let scenarios = resolve_scenarios(&scenario_names)?;
+    let mut runnable = scenarios
+        .iter()
+        .filter(|resolved| resolved.scenario.unsupported_platform().is_none())
+        .peekable();
+    let has_runnable = runnable.peek().is_some();
+    let studiofs_bin = request.studiofs_bin.as_deref().filter(|_| has_runnable);
     if request.infra != InfraMode::Disabled
-        && request.studiofs_bin.is_none()
-        && let Some(definition) = scenarios
-            .iter()
+        && studiofs_bin.is_none()
+        && let Some(definition) = runnable
             .map(|resolved| resolved.definition)
             .find(|definition| definition.requires_studiofs_bin)
     {
@@ -375,22 +380,24 @@ pub fn run_with_executor(
             scenario: definition.name.to_string(),
         });
     }
-    if let Some(path) = &request.studiofs_bin
+    if let Some(path) = studiofs_bin
         && !path.is_file()
     {
-        return Err(RunnerError::StudiofsBinNotFound { path: path.clone() });
+        return Err(RunnerError::StudiofsBinNotFound {
+            path: path.to_path_buf(),
+        });
     }
     let sandbox = root.join(&run_id);
     let selected_platform = request.platform.resolved().to_string();
     let infra_mode = request.infra;
-    let compose_stack = match infra_mode {
-        InfraMode::Disabled => None,
-        InfraMode::Env => None,
-        InfraMode::Compose => Some(DockerComposeStack::new(ComposeConfig::for_run(
+    let compose_stack = if has_runnable && infra_mode == InfraMode::Compose {
+        Some(DockerComposeStack::new(ComposeConfig::for_run(
             &run_id,
             &sandbox,
             request.port_range.clone(),
-        ))?),
+        ))?)
+    } else {
+        None
     };
     let compose_project = compose_stack
         .as_ref()
@@ -412,7 +419,7 @@ pub fn run_with_executor(
         infra: infra_mode,
         compose_project: compose_project.as_deref(),
         allocated_ports: allocated_ports.clone(),
-        studiofs_bin: request.studiofs_bin.as_deref(),
+        studiofs_bin,
         port_range: request.port_range.as_deref(),
         timeout: request.timeout.as_deref(),
         created_at: &started_at,
@@ -433,7 +440,7 @@ pub fn run_with_executor(
         &root,
         &sandbox,
         request.platform,
-        infra_mode,
+        has_runnable.then_some(infra_mode),
         compose_stack.as_ref(),
         executor,
     )?;
@@ -473,7 +480,7 @@ pub fn run_with_executor(
             retention: request.retention,
             report_copy: request.report,
             scenarios: &scenario_names,
-            studiofs_bin: request.studiofs_bin.as_deref(),
+            studiofs_bin,
             compose_stack: compose_stack.as_ref(),
             compose_project: compose_project.as_deref(),
             allocated_ports: allocated_ports.clone(),
@@ -520,7 +527,7 @@ pub fn run_with_executor(
             retention: request.retention,
             report_copy: request.report,
             scenarios: &scenario_names,
-            studiofs_bin: request.studiofs_bin.as_deref(),
+            studiofs_bin,
             compose_stack: compose_stack.as_ref(),
             compose_project: compose_project.as_deref(),
             allocated_ports: allocated_ports.clone(),
@@ -538,6 +545,7 @@ pub fn run_with_executor(
     let mut mounted_cleanup_block: Option<String> = None;
     for (scenario_index, resolved) in scenarios.into_iter().enumerate() {
         let definition = resolved.definition;
+        let supported = resolved.scenario.unsupported_platform().is_none();
         let scenario_progress = ScenarioProgress {
             index: scenario_index + 1,
             total: scenario_total,
@@ -549,7 +557,8 @@ pub fn run_with_executor(
             "scenario",
             ProgressStatus::Started,
         );
-        if definition.requires_studiofs_bin
+        if supported
+            && definition.requires_studiofs_bin
             && let Some(block_reason) = &mounted_cleanup_block
         {
             let lifecycle = skipped_scenario_lifecycle(
@@ -564,7 +573,7 @@ pub fn run_with_executor(
                 definition.name,
                 Some(scenario_progress),
                 "scenario",
-                ProgressStatus::Failed,
+                ProgressStatus::Skipped,
             );
             scenario_reports.push(lifecycle.report);
             scenario_outcomes.push(lifecycle.outcome);
@@ -578,10 +587,10 @@ pub fn run_with_executor(
                 .join("artifacts")
                 .join("scenarios")
                 .join(definition.name),
-            client_controller_config: match (infra_mode, request.studiofs_bin.as_ref()) {
+            client_controller_config: match (infra_mode, studiofs_bin.filter(|_| supported)) {
                 (InfraMode::Compose, Some(studiofs_bin)) => {
                     Some(ClientControllerConfig::from_compose_services_for_scenario(
-                        studiofs_bin.clone(),
+                        studiofs_bin.to_path_buf(),
                         sandbox.clone(),
                         &run_id,
                         request.seed,
@@ -591,7 +600,7 @@ pub fn run_with_executor(
                 }
                 (InfraMode::Env, Some(studiofs_bin)) => {
                     Some(ClientControllerConfig::from_external_env_for_scenario(
-                        studiofs_bin.clone(),
+                        studiofs_bin.to_path_buf(),
                         sandbox.clone(),
                         &run_id,
                         request.seed,
@@ -602,7 +611,7 @@ pub fn run_with_executor(
             },
         };
 
-        let lifecycle_result = if supervise_scenarios {
+        let lifecycle_result = if supported && supervise_scenarios {
             run_supervised_scenario(SupervisedScenarioInput {
                 events_path: &events_path,
                 run_id: &run_id,
@@ -637,7 +646,7 @@ pub fn run_with_executor(
             Err(error) => return Err(error),
         };
         let mut lifecycle = lifecycle;
-        if definition.requires_studiofs_bin && lifecycle.outcome.status != ScenarioStatus::Passed {
+        if definition.requires_studiofs_bin && lifecycle.report.fails_run() {
             let detail = lifecycle
                 .report
                 .error
@@ -645,7 +654,9 @@ pub fn run_with_executor(
                 .unwrap_or_else(|| "mounted scenario failed".to_string());
             mounted_cleanup_block = Some(detail);
         }
-        if let Some(stack) = compose_stack.as_ref() {
+        if let Some(stack) = compose_stack.as_ref()
+            && lifecycle.report.status != ScenarioStatus::Skipped
+        {
             collect_post_scenario_postgres_state_artifact(
                 stack,
                 executor,
@@ -661,11 +672,7 @@ pub fn run_with_executor(
             definition.name,
             Some(scenario_progress),
             "scenario",
-            if lifecycle.outcome.status == ScenarioStatus::Passed {
-                ProgressStatus::Passed
-            } else {
-                ProgressStatus::Failed
-            },
+            lifecycle.report.status.into(),
         );
         scenario_reports.push(lifecycle.report);
         scenario_outcomes.push(lifecycle.outcome);
@@ -679,9 +686,7 @@ pub fn run_with_executor(
         cleanup_errors,
     )?;
 
-    let scenario_failed = scenario_outcomes
-        .iter()
-        .any(|scenario| scenario.status != ScenarioStatus::Passed);
+    let scenario_failed = scenario_reports.iter().any(ScenarioReport::fails_run);
     let cleanup_failed = cleanup.status == RunStatus::CleanupFailed;
     let status = if scenario_failed {
         RunStatus::Failed
@@ -713,7 +718,7 @@ pub fn run_with_executor(
             scenarios: &scenario_names,
             seed: request.seed,
             sandbox: &sandbox,
-            studiofs_bin: request.studiofs_bin.as_deref(),
+            studiofs_bin,
             compose_stack: compose_stack.as_ref(),
             compose_project: compose_project.as_deref(),
             allocated_ports,
@@ -751,24 +756,20 @@ fn skipped_scenario_lifecycle(
 ) -> ScenarioLifecycleOutcome {
     let started_at = timestamp();
     let finished_at = timestamp();
-    ScenarioLifecycleOutcome {
-        report: ScenarioReport {
+    ScenarioLifecycleOutcome::new(
+        ScenarioReport {
             name: definition.name.to_string(),
             seed,
             status: ScenarioStatus::Skipped,
+            skip_kind: Some(ScenarioSkipKind::ContaminatedRunner),
             started_at,
             finished_at,
             duration_ms: 0,
             artifacts: Vec::new(),
             error: Some(reason),
         },
-        outcome: ScenarioOutcome {
-            name: definition.name.to_string(),
-            status: ScenarioStatus::Skipped,
-            artifacts: Vec::new(),
-        },
-        cleanup_error: None,
-    }
+        None,
+    )
 }
 
 pub(crate) fn colorize_progress_statuses(output: &str) -> String {
@@ -784,6 +785,7 @@ fn colorize_progress_status_line(line: &str) -> String {
     for status in [
         ProgressStatus::Started,
         ProgressStatus::Passed,
+        ProgressStatus::Skipped,
         ProgressStatus::Failed,
     ] {
         let needle = format!("status={}", status.as_str());
@@ -835,7 +837,13 @@ pub fn run_one(request: RunOneRequest) -> Result<RunOneOutcome, RunnerError> {
             .join("artifacts")
             .join("scenarios")
             .join(definition.name),
-        client_controller_config: match (manifest.infra, manifest.studiofs_bin.as_ref()) {
+        client_controller_config: match (
+            manifest.infra,
+            manifest
+                .studiofs_bin
+                .as_ref()
+                .filter(|_| scenario.unsupported_platform().is_none()),
+        ) {
             (InfraMode::Compose, Some(studiofs_bin)) => {
                 Some(ClientControllerConfig::from_compose_services_for_scenario(
                     PathBuf::from(studiofs_bin),
@@ -875,16 +883,12 @@ pub fn run_one(request: RunOneRequest) -> Result<RunOneOutcome, RunnerError> {
     };
     let report_path = context.scenario_dir.join(SCENARIO_CHILD_REPORT_FILE);
     write_pretty_json(&report_path, &child_report)?;
-    let exit_code = if child_report.scenario.status == ScenarioStatus::Passed
-        && child_report.cleanup_error.is_none()
-    {
-        0
-    } else if child_report.cleanup_error.is_some()
-        && child_report.scenario.status == ScenarioStatus::Passed
-    {
+    let exit_code = if child_report.scenario.fails_run() {
+        1
+    } else if child_report.cleanup_error.is_some() {
         4
     } else {
-        1
+        0
     };
     Ok(RunOneOutcome {
         run_id: request.run_id,
@@ -1502,11 +1506,15 @@ fn prepare_preflight(
     root: &Path,
     sandbox: &Path,
     platform: PlatformSelection,
-    infra_mode: InfraMode,
+    infra_mode: Option<InfraMode>,
     compose_stack: Option<&DockerComposeStack>,
     executor: &dyn CommandExecutor,
 ) -> Result<PreparedPreflight, RunnerError> {
-    let mut runner_checks = runner_preflight_checks(root, platform, executor);
+    let mut runner_checks = if infra_mode.is_some() {
+        runner_preflight_checks(root, platform, executor)
+    } else {
+        Vec::new()
+    };
     let Some(stack) = compose_stack else {
         write_pretty_json(
             &sandbox.join("ports.json"),
@@ -1516,12 +1524,16 @@ fn prepare_preflight(
             name: "runner-skeleton".to_string(),
             status: RunStatus::Passed,
             detail: match infra_mode {
-                InfraMode::Disabled => "external infrastructure disabled for this run".to_string(),
-                InfraMode::Env => {
+                None => "infrastructure unnecessary: all selected scenarios are platform skips"
+                    .to_string(),
+                Some(InfraMode::Disabled) => {
+                    "external infrastructure disabled for this run".to_string()
+                }
+                Some(InfraMode::Env) => {
                     "external infrastructure provided by repository .env / process environment"
                         .to_string()
                 }
-                InfraMode::Compose => "docker compose infrastructure selected".to_string(),
+                Some(InfraMode::Compose) => "docker compose infrastructure selected".to_string(),
             },
         });
         let status = if runner_checks
@@ -2250,6 +2262,40 @@ fn run_scenario_lifecycle(
     let operation_artifact = scenario_artifact_path(definition.name, "operations.ndjson");
 
     fs::create_dir_all(&context.scenario_dir)?;
+    if let Some(reason) = scenario.unsupported_platform() {
+        for path in [events_path, &operation_log] {
+            record_event_with_detail(
+                path,
+                run_id,
+                Some(definition.name),
+                "platform",
+                "skipped",
+                reason.to_string(),
+            )?;
+        }
+        emit_progress(
+            run_id,
+            definition.name,
+            Some(progress),
+            "platform_skip",
+            ProgressStatus::Skipped,
+        );
+        return Ok(ScenarioLifecycleOutcome::new(
+            ScenarioReport {
+                name: definition.name.to_string(),
+                seed: context.seed,
+                status: ScenarioStatus::Skipped,
+                skip_kind: Some(ScenarioSkipKind::UnsupportedPlatform),
+                started_at,
+                finished_at: timestamp(),
+                duration_ms: duration_millis(started_instant),
+                artifacts: vec![operation_artifact],
+                error: Some(reason.to_string()),
+            },
+            None,
+        ));
+    }
+
     let result = run_scenario_body(
         events_path,
         &operation_log,
@@ -2268,63 +2314,33 @@ fn run_scenario_lifecycle(
         || scenario.cleanup(context),
     );
 
-    match (result, cleanup_result) {
-        (Ok(mut artifacts), Ok(())) => {
-            let finished_at = timestamp();
-            artifacts.insert(0, operation_artifact);
-            Ok(ScenarioLifecycleOutcome {
-                report: ScenarioReport {
-                    name: definition.name.to_string(),
-                    seed: context.seed,
-                    status: ScenarioStatus::Passed,
-                    started_at,
-                    finished_at,
-                    duration_ms: duration_millis(started_instant),
-                    artifacts: artifacts.clone(),
-                    error: None,
-                },
-                outcome: ScenarioOutcome {
-                    name: definition.name.to_string(),
-                    status: ScenarioStatus::Passed,
-                    artifacts,
-                },
-                cleanup_error: None,
-            })
-        }
-        (body_result, cleanup_result) => {
-            let scenario_failed = body_result.is_err();
-            let primary_error = body_result.err().map(|err| err.to_string());
-            let cleanup_error = cleanup_result.err().map(|err| err.to_string());
-            let finished_at = timestamp();
-            let artifacts = vec![operation_artifact];
-            Ok(ScenarioLifecycleOutcome {
-                report: ScenarioReport {
-                    name: definition.name.to_string(),
-                    seed: context.seed,
-                    status: if primary_error.is_some() {
-                        ScenarioStatus::Failed
-                    } else {
-                        ScenarioStatus::Passed
-                    },
-                    started_at,
-                    finished_at,
-                    duration_ms: duration_millis(started_instant),
-                    artifacts: artifacts.clone(),
-                    error: primary_error,
-                },
-                outcome: ScenarioOutcome {
-                    name: definition.name.to_string(),
-                    status: if scenario_failed {
-                        ScenarioStatus::Failed
-                    } else {
-                        ScenarioStatus::Passed
-                    },
-                    artifacts,
-                },
-                cleanup_error,
-            })
-        }
-    }
+    let (mut artifacts, error, cleanup_error) = match (result, cleanup_result) {
+        (Ok(artifacts), Ok(())) => (artifacts, None, None),
+        (body_result, cleanup_result) => (
+            Vec::new(),
+            body_result.err().map(|err| err.to_string()),
+            cleanup_result.err().map(|err| err.to_string()),
+        ),
+    };
+    artifacts.insert(0, operation_artifact);
+    Ok(ScenarioLifecycleOutcome::new(
+        ScenarioReport {
+            name: definition.name.to_string(),
+            seed: context.seed,
+            status: if error.is_some() {
+                ScenarioStatus::Failed
+            } else {
+                ScenarioStatus::Passed
+            },
+            skip_kind: None,
+            started_at,
+            finished_at: timestamp(),
+            duration_ms: duration_millis(started_instant),
+            artifacts,
+            error,
+        },
+        cleanup_error,
+    ))
 }
 
 fn run_scenario_body(
@@ -2336,26 +2352,6 @@ fn run_scenario_body(
     progress: ScenarioProgress,
 ) -> Result<Vec<String>, RunnerError> {
     let definition = scenario.definition();
-    if let Some(reason) = scenario.unsupported_platform() {
-        for path in [events_path, operation_log] {
-            record_event_with_detail(
-                path,
-                run_id,
-                Some(definition.name),
-                "platform",
-                "skipped",
-                reason.to_string(),
-            )?;
-        }
-        emit_progress(
-            run_id,
-            definition.name,
-            Some(progress),
-            "platform_skip",
-            ProgressStatus::Passed,
-        );
-        return Ok(Vec::new());
-    }
     run_hook(
         events_path,
         operation_log,
@@ -2421,7 +2417,18 @@ fn run_hook<T>(
 pub(crate) enum ProgressStatus {
     Started,
     Passed,
+    Skipped,
     Failed,
+}
+
+impl From<ScenarioStatus> for ProgressStatus {
+    fn from(status: ScenarioStatus) -> Self {
+        match status {
+            ScenarioStatus::Passed => Self::Passed,
+            ScenarioStatus::Skipped => Self::Skipped,
+            ScenarioStatus::Failed | ScenarioStatus::TimedOut => Self::Failed,
+        }
+    }
 }
 
 impl ProgressStatus {
@@ -2429,13 +2436,14 @@ impl ProgressStatus {
         match self {
             Self::Started => "started",
             Self::Passed => "passed",
+            Self::Skipped => "skipped",
             Self::Failed => "failed",
         }
     }
 
     fn ansi_color(self) -> &'static str {
         match self {
-            Self::Started => "\x1b[33m",
+            Self::Started | Self::Skipped => "\x1b[33m",
             Self::Passed => "\x1b[32m",
             Self::Failed => "\x1b[31m",
         }
@@ -3080,7 +3088,7 @@ mod tests {
     }
 
     #[test]
-    fn scenario_lifecycle_passes_unsupported_platform_without_hooks() {
+    fn scenario_lifecycle_skips_unsupported_platform_without_hooks() {
         let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let events_path = temp.path().join("events.ndjson");
         let context = ScenarioContext {
@@ -3102,13 +3110,141 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(outcome.outcome.status, ScenarioStatus::Passed);
-        assert_eq!(scenario.calls.borrow().as_slice(), ["cleanup"]);
-        assert!(
-            fs::read_to_string(&events_path)
-                .unwrap()
-                .contains("needs another OS")
+        assert_eq!(outcome.outcome.status, ScenarioStatus::Skipped);
+        assert_eq!(outcome.report.status, ScenarioStatus::Skipped);
+        assert_eq!(
+            outcome.report.skip_kind,
+            Some(ScenarioSkipKind::UnsupportedPlatform)
         );
+        assert_eq!(outcome.report.error.as_deref(), Some("needs another OS"));
+        assert!(scenario.calls.borrow().is_empty());
+        let events = fs::read_to_string(&events_path).unwrap();
+        let event: EventRecord = serde_json::from_str(events.trim()).unwrap();
+        assert_eq!(event.hook, "platform");
+        assert_eq!(event.phase, "skipped");
+        assert_eq!(event.detail.as_deref(), Some("needs another OS"));
+        let started = chrono::DateTime::parse_from_rfc3339(&outcome.report.started_at).unwrap();
+        let finished = chrono::DateTime::parse_from_rfc3339(&outcome.report.finished_at).unwrap();
+        assert!(started <= finished);
+    }
+
+    #[test]
+    fn run_with_only_platform_skips_passes_and_run_one_exits_zero() {
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
+        let root = temp.path().join("e2e-runs");
+        let run_id = "platform-skip";
+        let scenario = if cfg!(target_os = "macos") {
+            "mounted-posix-acl-xattr-rejection"
+        } else {
+            "mounted-macos-mmap-exec"
+        };
+        let executor = RecordingExecutor::default();
+        let outcome = run_with_executor(
+            RunRequest {
+                root: root.clone(),
+                run_id: Some(run_id.to_string()),
+                scenarios: vec![scenario.to_string()],
+                seed: 1,
+                studiofs_bin: None,
+                platform: PlatformSelection::Auto,
+                retention: RetentionPolicy::Always,
+                report: None,
+                port_range: None,
+                timeout: None,
+                infra: InfraMode::Compose,
+            },
+            &executor,
+        )
+        .unwrap();
+
+        assert_eq!(outcome.status, RunStatus::Passed);
+        assert_eq!(outcome.exit_code, 0);
+        assert_eq!(outcome.scenarios[0].status, ScenarioStatus::Skipped);
+        assert!(executor.calls.borrow().is_empty());
+        let report: RunReport =
+            serde_json::from_slice(&fs::read(outcome.report_path).unwrap()).unwrap();
+        assert!(report.environment.compose_project.is_none());
+        assert!(report.environment.allocated_ports.is_empty());
+        assert_eq!(
+            report.scenarios[0].skip_kind,
+            Some(ScenarioSkipKind::UnsupportedPlatform)
+        );
+
+        let child = run_one(RunOneRequest {
+            root,
+            run_id: run_id.to_string(),
+            scenario: scenario.to_string(),
+        })
+        .unwrap();
+        assert_eq!(child.exit_code, 0);
+        assert_eq!(child.scenario.status, ScenarioStatus::Skipped);
+    }
+
+    #[test]
+    fn run_with_mixed_platform_support_prepares_only_runnable_scenario() {
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
+        let unsupported = if cfg!(target_os = "macos") {
+            "mounted-posix-acl-xattr-rejection"
+        } else {
+            "mounted-macos-mmap-exec"
+        };
+        let runnable = scenario::BASIC_MULTI_CLIENT_SMOKE;
+        let executor = RecordingExecutor::default();
+        let mut request = RunRequest {
+            root: temp.path().join("e2e-runs"),
+            run_id: Some("mixed-platform-support".to_string()),
+            scenarios: vec![unsupported.to_string(), runnable.to_string()],
+            seed: 1,
+            studiofs_bin: None,
+            platform: PlatformSelection::Auto,
+            retention: RetentionPolicy::Always,
+            report: None,
+            port_range: None,
+            timeout: None,
+            infra: InfraMode::Compose,
+        };
+        let result = run_with_executor(request.clone(), &executor);
+        assert!(matches!(
+            result,
+            Err(RunnerError::MissingStudiofsBin { scenario }) if scenario == runnable
+        ));
+        assert!(executor.calls.borrow().is_empty());
+
+        let binary = temp.path().join("studiofs-bin");
+        fs::write(&binary, "").unwrap();
+        request.studiofs_bin = Some(binary);
+        let outcome = run_with_executor(request, &executor).unwrap();
+        assert_eq!(outcome.exit_code, 0);
+        assert_eq!(outcome.scenarios[0].status, ScenarioStatus::Skipped);
+        assert_eq!(outcome.scenarios[1].status, ScenarioStatus::Passed);
+        assert_eq!(executor.child_run_count.get(), 1);
+        let calls = executor.calls.borrow();
+        assert!(
+            calls
+                .iter()
+                .any(|call| call.args.iter().any(|arg| arg == "up"))
+        );
+        assert!(
+            calls
+                .iter()
+                .any(|call| call.args.iter().any(|arg| arg == "down"))
+        );
+    }
+
+    #[test]
+    fn contamination_skip_counts_as_run_failure() {
+        let scenario = FailingValidateScenario::new();
+        let lifecycle = skipped_scenario_lifecycle(
+            scenario::Scenario::definition(&scenario),
+            1,
+            "simulated runner contamination".to_string(),
+        );
+        assert_eq!(lifecycle.outcome.status, ScenarioStatus::Skipped);
+        assert_eq!(
+            lifecycle.report.skip_kind,
+            Some(ScenarioSkipKind::ContaminatedRunner)
+        );
+        assert!(lifecycle.report.fails_run());
     }
 
     #[test]
@@ -3184,10 +3320,12 @@ mod tests {
             colorize_progress_statuses(
                 "timestamp=2026-05-13T08:26:40.107Z studiofs-e2e run_id=run task=scenario phase=scenario_child status=started\n\
 timestamp=2026-05-13T08:26:41.107Z studiofs-e2e run_id=run task=scenario phase=scenario_child status=passed\n\
+timestamp=2026-05-13T08:26:42.107Z studiofs-e2e run_id=run task=scenario phase=platform_skip status=skipped\n\
 plain child stderr\n",
             ),
             "timestamp=2026-05-13T08:26:40.107Z studiofs-e2e run_id=run task=scenario phase=scenario_child status=\x1b[33mstarted\x1b[0m\n\
 timestamp=2026-05-13T08:26:41.107Z studiofs-e2e run_id=run task=scenario phase=scenario_child status=\x1b[32mpassed\x1b[0m\n\
+timestamp=2026-05-13T08:26:42.107Z studiofs-e2e run_id=run task=scenario phase=platform_skip status=\x1b[33mskipped\x1b[0m\n\
 plain child stderr\n",
         );
     }
@@ -3825,6 +3963,41 @@ plain child stderr\n",
     }
 
     #[test]
+    fn mounted_child_platform_skip_allows_later_mounted_child() {
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
+        let executor = RecordingExecutor {
+            skip_first_child_report: Cell::new(true),
+            ..RecordingExecutor::default()
+        };
+        let outcome = run_with_executor(
+            RunRequest {
+                root: temp.path().join("e2e-runs"),
+                run_id: Some("mounted-platform-skip-run".to_string()),
+                scenarios: vec![
+                    scenario::BASIC_MULTI_CLIENT_SMOKE.to_string(),
+                    scenario::MOUNTED_CLIENT_CRASH_RESTART_RECOVERY.to_string(),
+                ],
+                seed: 410,
+                studiofs_bin: None,
+                platform: PlatformSelection::Auto,
+                retention: RetentionPolicy::Always,
+                report: None,
+                port_range: None,
+                timeout: None,
+                infra: InfraMode::Disabled,
+            },
+            &executor,
+        )
+        .unwrap();
+
+        assert_eq!(outcome.status, RunStatus::Passed);
+        assert_eq!(outcome.exit_code, 0);
+        assert_eq!(executor.child_run_count.get(), 2);
+        assert_eq!(outcome.scenarios[0].status, ScenarioStatus::Skipped);
+        assert_eq!(outcome.scenarios[1].status, ScenarioStatus::Passed);
+    }
+
+    #[test]
     fn mounted_child_timeout_blocks_later_mounted_children() {
         let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let executor = RecordingExecutor {
@@ -3873,6 +4046,7 @@ plain child stderr\n",
             serde_json::from_slice(&std::fs::read(outcome.report_path).unwrap()).unwrap();
         assert_eq!(report["scenarios"][0]["status"], "timed_out");
         assert_eq!(report["scenarios"][1]["status"], "skipped");
+        assert_eq!(report["scenarios"][1]["skip_kind"], "contaminated_runner");
         assert!(
             report["scenarios"][1]["error"]
                 .as_str()
@@ -4778,6 +4952,7 @@ plain child stderr\n",
         fail_logs: Cell<bool>,
         fail_child_supervision_io: Cell<bool>,
         fail_first_child_report: Cell<bool>,
+        skip_first_child_report: Cell<bool>,
         time_out_first_child: Cell<bool>,
         child_run_count: Cell<usize>,
     }
@@ -4803,18 +4978,24 @@ plain child stderr\n",
                         "command timed out after 30000 ms; child still running after kill attempts",
                     ));
                 }
-                write_recorded_child_report(
-                    command,
-                    self.fail_first_child_report.get() && self.child_run_count.get() == 1,
-                )?;
+                let status = if self.child_run_count.get() != 1 {
+                    ScenarioStatus::Passed
+                } else if self.fail_first_child_report.get() {
+                    ScenarioStatus::Failed
+                } else if self.skip_first_child_report.get() {
+                    ScenarioStatus::Skipped
+                } else {
+                    ScenarioStatus::Passed
+                };
+                write_recorded_child_report(command, status)?;
                 return Ok(CommandOutput {
                     status: 0,
-                    stdout: if self.fail_first_child_report.get() && self.child_run_count.get() == 1
-                    {
-                        "child scenario failed\n".to_string()
-                    } else {
-                        "child scenario passed\n".to_string()
-                    },
+                    stdout: match status {
+                        ScenarioStatus::Failed => "child scenario failed\n",
+                        ScenarioStatus::Skipped => "child scenario skipped\n",
+                        _ => "child scenario passed\n",
+                    }
+                    .to_string(),
                     stderr: "timestamp=2026-05-13T07:21:44.783Z studiofs-e2e child\n".to_string(),
                 });
             }
@@ -4887,7 +5068,7 @@ plain child stderr\n",
 
     fn write_recorded_child_report(
         command: &crate::infra::CommandSpec,
-        failed: bool,
+        status: ScenarioStatus,
     ) -> std::io::Result<()> {
         let arg_value = |name: &str| {
             command
@@ -4911,16 +5092,20 @@ plain child stderr\n",
                 scenario: ScenarioReport {
                     name: scenario.clone(),
                     seed: 410,
-                    status: if failed {
-                        ScenarioStatus::Failed
-                    } else {
-                        ScenarioStatus::Passed
-                    },
+                    status,
+                    skip_kind: (status == ScenarioStatus::Skipped)
+                        .then_some(ScenarioSkipKind::UnsupportedPlatform),
                     started_at: "2026-05-13T07:21:44.783Z".to_string(),
                     finished_at: "2026-05-13T07:21:45.783Z".to_string(),
                     duration_ms: 1000,
                     artifacts: vec![scenario_artifact_path(&scenario, "operations.ndjson")],
-                    error: failed.then(|| "simulated child scenario failure".to_string()),
+                    error: match status {
+                        ScenarioStatus::Failed => {
+                            Some("simulated child scenario failure".to_string())
+                        }
+                        ScenarioStatus::Skipped => Some("needs another OS".to_string()),
+                        _ => None,
+                    },
                 },
                 cleanup_error: None,
             })?,

@@ -1162,6 +1162,7 @@ fn run(request: JanitorRunRequest) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cli::pg_test_schema::PgTestSchema;
     use studiofs_meta::snapshot_ports::UploadedObjectDeletionOutcome;
 
     mod adversarial;
@@ -3913,6 +3914,7 @@ mod tests {
         meta_dir: &std::path::Path,
         endpoint: &str,
         postgres_url: &str,
+        volume_id: i64,
     ) -> PathBuf {
         use studiofs_meta::schema::{MetadataBackend, MetadataConfig, PostgresConfig};
         create_metadata_fixture(
@@ -3922,7 +3924,7 @@ mod tests {
                 backend: MetadataBackend::Postgres,
                 postgres: Some(PostgresConfig {
                     url: postgres_url.to_string(),
-                    volume_id: 966,
+                    volume_id,
                 }),
                 ..MetadataConfig::default()
             },
@@ -4297,7 +4299,9 @@ mod tests {
         let (_op, fake, endpoint, server) = fake_s3_operator(1).await;
         let temp = studiofs_test_support::workspace_target_tempdir("janitor-pg-");
         let meta_dir = temp.path().join("meta");
-        let db_path = create_postgres_metadata_fixture(&meta_dir, &endpoint, &postgres_url);
+        let volume_id = live_test_volume_id();
+        let db_path =
+            create_postgres_metadata_fixture(&meta_dir, &endpoint, &postgres_url, volume_id);
         let before = std::fs::read(&db_path).unwrap();
         if hold_lock {
             // The lock holder registers a maintenance client session, which needs
@@ -4313,9 +4317,8 @@ mod tests {
             client
                 .execute(
                     "INSERT INTO volumes (vol, name, uuid, block_size) \
-                     VALUES (966, 'janitor-fixture-966', 'janitor-fixture-966', 8192) \
-                     ON CONFLICT DO NOTHING",
-                    &[],
+                     VALUES ($1, 'janitor-fixture', 'janitor-fixture', 8192)",
+                    &[&volume_id],
                 )
                 .await
                 .unwrap();
@@ -4404,9 +4407,8 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
     async fn janitor_run_lock_busy_skips_cycle_without_s3_requests() {
-        let url = test_env("STUDIOFS_TEST_PG_DSN")
-            .expect("STUDIOFS_TEST_PG_DSN must be set (environment or workspace .env)");
-        let run = run_postgres_fixture_once(url, true).await;
+        let schema = live_postgres_schema().expect("create isolated PostgreSQL schema");
+        let run = run_postgres_fixture_once(schema.dsn().to_owned(), true).await;
 
         let error = run.result.unwrap_err();
         let exit = error
@@ -4791,6 +4793,17 @@ mod tests {
         })
     }
 
+    fn live_postgres_schema() -> anyhow::Result<PgTestSchema> {
+        let dsn = test_env("STUDIOFS_TEST_PG_DSN")
+            .context("STUDIOFS_TEST_PG_DSN must be set (environment or workspace .env)")?;
+        PgTestSchema::new(&dsn)
+    }
+
+    fn live_test_volume_id() -> i64 {
+        // Advisory locks are scoped to the database and keyed by volume ID.
+        1_i64 << 48 | (uuid::Uuid::new_v4().as_u128() >> 80) as i64
+    }
+
     async fn create_live_postgres_janitor_fixture(
         postgres_url: &str,
         s3: &LiveS3Config<'_>,
@@ -4812,13 +4825,13 @@ mod tests {
             .as_nanos();
         let name = format!("sfs976-{run_id}");
         let uuid = uuid::Uuid::new_v4().to_string();
-        let volume = client
-            .query_one(
-                "INSERT INTO volumes (name, uuid, block_size) VALUES ($1, $2, $3) RETURNING vol",
-                &[&name, &uuid, &(DEFAULT_BLOCK_SIZE as i32)],
+        let volume_id = live_test_volume_id();
+        client
+            .execute(
+                "INSERT INTO volumes (vol, name, uuid, block_size) VALUES ($1, $2, $3, $4)",
+                &[&volume_id, &name, &uuid, &(DEFAULT_BLOCK_SIZE as i32)],
             )
             .await?;
-        let volume_id: i64 = volume.get(0);
         let metadata = MetadataConfig {
             backend: MetadataBackend::Postgres,
             postgres: Some(PostgresConfig {
@@ -4881,8 +4894,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[ignore = "requires local STUDIOFS_TEST_PG_DSN and a live STUDIOFS_S3_* bucket"]
     async fn live_cli_dry_run_keeps_eligible_candidate_and_object() -> anyhow::Result<()> {
-        let postgres_url = test_env("STUDIOFS_TEST_PG_DSN")
-            .expect("STUDIOFS_TEST_PG_DSN must be set (environment or workspace .env)");
+        let schema = live_postgres_schema()?;
+        let postgres_url = schema.dsn();
         let env = |key: &str, default: &str| test_env(key).unwrap_or_else(|| default.to_string());
         let endpoint = env("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:9000");
         let bucket = env("STUDIOFS_S3_BUCKET", "studiofs-test");
@@ -4923,9 +4936,9 @@ mod tests {
         let client_root = temp.path().join("client");
         let meta_dir = client_root.join("meta/janitor-live");
         let (volume_id, _db_path, _) =
-            create_live_postgres_janitor_fixture(&postgres_url, &s3, &meta_dir, object_id).await?;
+            create_live_postgres_janitor_fixture(postgres_url, &s3, &meta_dir, object_id).await?;
         let (client, connection) =
-            tokio_postgres::connect(&postgres_url, tokio_postgres::NoTls).await?;
+            tokio_postgres::connect(postgres_url, tokio_postgres::NoTls).await?;
         let connection_task = tokio::spawn(connection);
         let object_id_sql = i64::try_from(object_id)?;
         let candidate_before: String = client
@@ -5040,9 +5053,6 @@ mod tests {
                 .contains(&key)
         );
 
-        client
-            .execute("DELETE FROM volumes WHERE vol = $1", &[&volume_id])
-            .await?;
         connection_task.abort();
         writer.delete(&key).await?;
         drop(temp);
@@ -5053,8 +5063,8 @@ mod tests {
     #[ignore = "requires local STUDIOFS_TEST_PG_DSN and a live STUDIOFS_S3_* bucket"]
     async fn cancellation_drains_live_postgres_claim_and_rustfs_delete_before_unlock()
     -> anyhow::Result<()> {
-        let postgres_url = test_env("STUDIOFS_TEST_PG_DSN")
-            .expect("STUDIOFS_TEST_PG_DSN must be set (environment or workspace .env)");
+        let schema = live_postgres_schema()?;
+        let postgres_url = schema.dsn();
         let env = |key: &str, default: &str| test_env(key).unwrap_or_else(|| default.to_string());
         let endpoint = env("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:9000");
         let bucket = env("STUDIOFS_S3_BUCKET", "studiofs-test");
@@ -5101,7 +5111,7 @@ mod tests {
 
         let temp = studiofs_test_support::workspace_target_tempdir("janitor-sfs976-live-");
         let (volume_id, db_path, format_info) = create_live_postgres_janitor_fixture(
-            &postgres_url,
+            postgres_url,
             &s3,
             &temp.path().join("meta"),
             object_id,
@@ -5116,7 +5126,7 @@ mod tests {
         // Connect and open the competing session before the gate: the held DELETE runs under
         // the 1 s test DELETE timeout, so only the claim query and lock probe may run inside it.
         let (client, connection) =
-            tokio_postgres::connect(&postgres_url, tokio_postgres::NoTls).await?;
+            tokio_postgres::connect(postgres_url, tokio_postgres::NoTls).await?;
         let connection_task = tokio::spawn(connection);
         let mut competing = tokio::task::spawn_blocking({
             let db_path = db_path.clone();
@@ -5205,7 +5215,7 @@ mod tests {
         assert_eq!(restarted.queued_candidates_scanned, 0);
 
         let (client, connection) =
-            tokio_postgres::connect(&postgres_url, tokio_postgres::NoTls).await?;
+            tokio_postgres::connect(postgres_url, tokio_postgres::NoTls).await?;
         let connection_task = tokio::spawn(connection);
         let acknowledged: bool = client
             .query_one(
@@ -5215,9 +5225,6 @@ mod tests {
             .await?
             .get(0);
         assert!(acknowledged);
-        client
-            .execute("DELETE FROM volumes WHERE vol = $1", &[&volume_id])
-            .await?;
         connection_task.abort();
         drop(temp);
         Ok(())

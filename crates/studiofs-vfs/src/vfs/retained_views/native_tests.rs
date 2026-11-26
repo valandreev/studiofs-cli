@@ -879,7 +879,7 @@ fn linux_profile_subtree_restore_collision_clear_acl_and_ttl_zero() {
 
 #[test]
 fn macos_profile_projects_trashes_uid_and_handles_collisions_restore_clear_ttl0() {
-    use super::super::{FileType, MetaError, NativeTrashProfile, VfsError};
+    use super::super::{FileType, MetaError, NativeTrashProfile, OpenFlags, VfsError};
 
     let tmp = studiofs_test_support::workspace_target_tempdir("retained-macos-profile-");
     let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "retained-macos-profile");
@@ -920,9 +920,23 @@ fn macos_profile_projects_trashes_uid_and_handles_collisions_restore_clear_ttl0(
 
     // Finder .DS_Store inside .Trashes/501 stays local ignored.
     let ds = vfs
-        .create(user_trash.ino, b".DS_Store", 501, 20, 0o644)
+        .create_with_deferred_metadata_admission(
+            user_trash.ino,
+            b".DS_Store",
+            501,
+            20,
+            0o644,
+            rt.handle(),
+        )
         .unwrap();
     assert!(vfs.is_synthesized_ignored_ino(ds.ino));
+    let fh = vfs
+        .open_created_file_with_known_attr(&ds, OpenFlags::WRONLY, true)
+        .unwrap();
+    rt.block_on(vfs.write_fh(fh, ds.ino, 0, b"Finder metadata"))
+        .unwrap();
+    let release = vfs.release_fh_with_deferred_last_handle_barrier(fh, rt.handle());
+    assert!(release.closed_last_handle);
 
     let f1 = vfs.create(ROOT_INO, b"clip.mov", 501, 20, 0o644).unwrap();
     let sub = vfs.mkdir(ROOT_INO, b"take2", 501, 20, 0o755).unwrap();
@@ -936,6 +950,18 @@ fn macos_profile_projects_trashes_uid_and_handles_collisions_restore_clear_ttl0(
         .unwrap();
     vfs.rename(sub.ino, b"clip.mov", user_trash.ino, b"clip.mov", true)
         .unwrap();
+
+    assert!(
+        vfs.readdir(user_trash.ino)
+            .unwrap()
+            .iter()
+            .any(|entry| entry.name == b".DS_Store" && entry.ino == ds.ino),
+        "the writer's trash listing must include the closed .DS_Store"
+    );
+    assert_eq!(
+        vfs.lookup(user_trash.ino, b".DS_Store").unwrap().ino,
+        ds.ino
+    );
 
     let v1 = vfs.lookup(user_trash.ino, b"clip.mov").unwrap();
     let v2 = vfs.lookup(user_trash.ino, b"clip.mov.2").unwrap();
@@ -964,6 +990,49 @@ fn macos_profile_projects_trashes_uid_and_handles_collisions_restore_clear_ttl0(
         .unwrap();
     assert!(vfs.lookup(sub.ino, b"clip.mov").is_err());
     assert!(vfs.lookup(user_trash.ino, b"clip.mov").is_err());
+}
+
+#[test]
+fn macos_retained_directory_clear_preserves_owner_and_original_parent_acl_checks() {
+    use super::super::{AccessLevel, MetaError, NativeTrashProfile, VfsError};
+
+    let tmp = studiofs_test_support::workspace_target_tempdir("retained-macos-clear-");
+    let (_rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "retained-macos-clear");
+    vfs.set_native_trash_profile(NativeTrashProfile::MacOs { uid: 501 });
+    meta.compare_and_set_trash_days(0, 7).unwrap().unwrap();
+    let source = vfs.mkdir(ROOT_INO, b"source", 501, 20, 0o755).unwrap();
+    let album = vfs.mkdir(source.ino, b"album", 501, 20, 0o755).unwrap();
+    let nested = vfs.mkdir(album.ino, b"nested", 501, 20, 0o755).unwrap();
+    vfs.create(nested.ino, b"child.bin", 501, 20, 0o644)
+        .unwrap();
+    vfs.mkdir(album.ino, b"foreign", 502, 20, 0o755).unwrap();
+    let trashes = vfs.lookup(ROOT_INO, b".Trashes").unwrap();
+    let trash = vfs.lookup(trashes.ino, b"501").unwrap();
+    vfs.rename(source.ino, b"album", trash.ino, b"album", false)
+        .unwrap();
+
+    let album = vfs.lookup(trash.ino, b"album").unwrap();
+    let nested = vfs.lookup(album.ino, b"nested").unwrap();
+    let foreign = vfs.lookup(album.ino, b"foreign").unwrap();
+    assert_eq!(album.mode & 0o777, 0o755);
+    assert_eq!(nested.mode & 0o777, 0o755);
+    assert_eq!(foreign.mode & 0o777, 0o555);
+
+    let principal = vfs.acl_principal.clone();
+    vfs.set_acl_rule(source.ino, &principal, AccessLevel::ReadOnly)
+        .unwrap();
+    assert!(matches!(
+        vfs.unlink(nested.ino, b"child.bin"),
+        Err(VfsError::Meta(MetaError::AccessDenied { .. }))
+    ));
+    assert!(vfs.lookup(nested.ino, b"child.bin").is_ok());
+    vfs.set_acl_rule(source.ino, &principal, AccessLevel::ReadWrite)
+        .unwrap();
+    vfs.unlink(nested.ino, b"child.bin").unwrap();
+    vfs.rmdir(album.ino, b"nested").unwrap();
+    vfs.rmdir(album.ino, b"foreign").unwrap();
+    vfs.rmdir(trash.ino, b"album").unwrap();
+    assert!(vfs.lookup(trash.ino, b"album").is_err());
 }
 
 #[test]

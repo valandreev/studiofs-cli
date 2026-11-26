@@ -295,7 +295,7 @@ fn check_postgres_accessible(rt: &tokio::runtime::Runtime, dsn: &str) -> anyhow:
 fn volume_name_exists(rt: &tokio::runtime::Runtime, dsn: &str, name: &str) -> anyhow::Result<bool> {
     rt.block_on(with_postgres_client(dsn, |client| async move {
         let has_volumes_table = client
-            .query_one("SELECT to_regclass('public.volumes') IS NOT NULL", &[])
+            .query_one("SELECT to_regclass('volumes') IS NOT NULL", &[])
             .await
             .map_err(|e| anyhow::anyhow!("postgres schema probe failed: {e}"))?;
         let has_volumes_table: bool = has_volumes_table.get(0);
@@ -968,12 +968,15 @@ mod tests {
             .expect(
                 "set STUDIOFS_TEST_PG_DSN or add it to workspace .env to run PostgreSQL init tests",
             );
+        let schema = crate::cli::pg_test_schema::PgTestSchema::new(&dsn)
+            .expect("create isolated PostgreSQL schema");
+        let dsn = schema.dsn();
         let rt = tokio::runtime::Runtime::new().expect("create test runtime");
         let name = format!("sfs642-schema-upgrade-{}", Uuid::new_v4());
         let uuid = Uuid::new_v4().to_string();
 
         rt.block_on(async {
-            let (mut client, connection) = connect_studiofs_postgres(&dsn)
+            let (mut client, connection) = connect_studiofs_postgres(dsn)
                 .await
                 .expect("connect to test PostgreSQL");
             let conn_task = tokio::spawn(async move {
@@ -999,35 +1002,19 @@ mod tests {
             conn_task.abort();
         });
 
-        let schema_result = provision_pg_schema(&rt, &dsn);
-        let volume_result = volume_name_exists(&rt, &dsn, &name);
+        let schema_result = provision_pg_schema(&rt, dsn);
+        let volume_result = volume_name_exists(&rt, dsn, &name);
         let lock_table_result = rt.block_on(async {
-            let (client, connection) = connect_studiofs_postgres(&dsn).await?;
+            let (client, connection) = connect_studiofs_postgres(dsn).await?;
             let conn_task = tokio::spawn(async move {
                 let _ = connection.await;
             });
             let row = client
-                .query_one(
-                    "SELECT to_regclass('public.file_lock_leases') IS NOT NULL",
-                    &[],
-                )
+                .query_one("SELECT to_regclass('file_lock_leases') IS NOT NULL", &[])
                 .await?;
             conn_task.abort();
             Ok::<bool, anyhow::Error>(row.get(0))
         });
-        let cleanup_result = rt.block_on(async {
-            let (client, connection) = connect_studiofs_postgres(&dsn).await?;
-            let conn_task = tokio::spawn(async move {
-                let _ = connection.await;
-            });
-            client
-                .execute("DELETE FROM volumes WHERE name = $1", &[&name])
-                .await?;
-            conn_task.abort();
-            Ok::<(), anyhow::Error>(())
-        });
-
-        cleanup_result.expect("remove test volume");
         schema_result.expect("init should repair the legacy PostgreSQL schema");
         assert!(
             volume_result.expect("look up the pre-existing volume"),

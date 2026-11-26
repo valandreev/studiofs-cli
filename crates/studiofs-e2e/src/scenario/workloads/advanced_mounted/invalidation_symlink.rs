@@ -521,6 +521,9 @@ pub(in crate::scenario) fn run_symlink_attribute_operations(
 pub(in crate::scenario) fn hotspot_helper_error_is_supported_symlink_skip(
     error: &ScenarioError,
 ) -> bool {
+    if !cfg!(windows) {
+        return false;
+    }
     let message = error.to_string().to_ascii_lowercase();
     hotspot_helper_error_is_supported_readonly_skip(error)
         || message.contains("os error 31")
@@ -530,6 +533,9 @@ pub(in crate::scenario) fn hotspot_helper_error_is_supported_symlink_skip(
 pub(in crate::scenario) fn hotspot_helper_error_is_supported_readonly_skip(
     error: &ScenarioError,
 ) -> bool {
+    if !cfg!(windows) {
+        return false;
+    }
     let message = error.to_string().to_ascii_lowercase();
     message.contains("permission denied")
         || message.contains("unsupported")

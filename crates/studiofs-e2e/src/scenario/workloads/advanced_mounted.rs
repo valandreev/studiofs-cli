@@ -373,6 +373,7 @@ impl Scenario for AdvancedMountedScenario {
             "catchup": summary.catchup,
             "large_history": summary.large_history,
             "invalidation_dropout": summary.invalidation_dropout,
+            "symlink_attributes": summary.symlink_attributes,
         });
         fs::write(
             context.scenario_dir.join("validation.json"),

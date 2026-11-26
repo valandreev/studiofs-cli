@@ -30,6 +30,8 @@ pub mod benchmark_profile_stub;
 pub mod mount_profile_types;
 pub mod operator_test;
 pub mod perf;
+#[cfg(test)]
+mod pg_test_schema;
 pub mod quota;
 pub mod runtime_tuning;
 pub mod scratch;

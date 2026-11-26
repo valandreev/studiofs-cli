@@ -941,7 +941,7 @@ Evidence per platform (mounted acceptance is separate from unit tests):
 | --- | --- | --- |
 | Windows WinFSP | Shell `SHFileOperation` recycling, namespace-10 listing, `undelete` restore, file/directory Clear, partial Clear, collision and remote-only retry probes on a local-redb mount (`winfsp_native_trash_*` in `crates/studiofs-winfsp/tests/mount_sanity.rs`) | Interactive Explorer UI; a mounted WinFSP + PostgreSQL multi-client run |
 | Linux FUSE | `gio trash`, filesystem listing/restore/Clear (`mounted_linux_gio_trash_retains_lists_restores_and_clears`); GVFS `trash:///` list, `gio trash --restore` and per-item delete through `expunged`; PG/S3 two-client, S3-outage crash replay, cold bootstrap and janitor GC E2E scenarios | Nautilus or any graphical file manager; `gio trash --empty` itself (its per-item delete is covered); GVFS while PG or S3 is down |
-| macOS | Source only | Compilation, Finder, legacy macFUSE and FSKit acceptance |
+| macOS macFUSE | `.Trashes/<uid>` move, two-client listing, remote payload read, restore, restart and recursive `unlink`/`rmdir` Clear, plus client-local `.DS_Store`, on PG/S3 (`mounted-macos-recoverable-trash-two-client`) | Finder UI (Move to Trash, Put Back, Empty Trash); FSKit transport; macFUSE runs while PG or S3 is down |
 
 All native layouts project the same shared retained receipts and payloads:
 
@@ -979,6 +979,16 @@ from inode invalidations and drain through the same shutdown gate. Retained
 Linux directories are owned by the mount uid with mode `0700`, allowing recursive
 Clear through kernel `default_permissions`; VFS still rejects new children and
 payload writes and enforces the original parent's ACL for permanent deletion.
+
+macOS retained directories owned by the mount uid (or legacy uid 0, which the
+adapter maps to the mount user) are projected with mode `0755` for the same
+reason: macFUSE `default_permissions` checks write access on the directory
+before forwarding child `unlink`/`rmdir`. Directories owned by another uid stay
+`0555`, so a retained tree containing a foreign-owned subdirectory cannot be
+cleared recursively through macFUSE; VFS authorization against the original
+parent is unchanged. Finder's `.DS_Store` inside `.Trashes/<uid>` stays a
+client-local ignored file that keeps its name after the last handle closes,
+like Linux `info/` drafts; other clients never see it.
 
 Focused bridge checks (not full crate suites):
 

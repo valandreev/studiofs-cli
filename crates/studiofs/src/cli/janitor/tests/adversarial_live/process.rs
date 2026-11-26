@@ -68,7 +68,7 @@ async fn live_cli_disposable_kill_restart_and_signal_drain() -> anyhow::Result<(
         seed_live_object(&stack, &prefix, id).await?;
         let client_root = stack.root.join(format!("process-{graceful}"));
         let (volume_id, _, _) = create_live_postgres_janitor_fixture(
-            &stack.postgres_url,
+            stack.postgres.dsn(),
             &stack.s3(&prefix),
             &client_root.join("meta/janitor-live"),
             id,
@@ -205,7 +205,7 @@ async fn live_cli_disposable_concurrent_snapshot_cuts_wait_for_janitor() -> anyh
     }
     let client_root = stack.root.join("snapshot-cuts");
     let (volume_id, db_path, _) = create_live_postgres_janitor_fixture(
-        &stack.postgres_url,
+        stack.postgres.dsn(),
         &stack.s3(&prefix),
         &client_root.join("meta/janitor-live"),
         orphan,
@@ -255,7 +255,7 @@ async fn live_cli_disposable_concurrent_snapshot_cuts_wait_for_janitor() -> anyh
     wait_for_claim_barrier(&observer, blocker_pid, child.0.id()).await?;
     let creators: Vec<_> = (0..2)
         .map(|_| {
-            let dsn = stack.postgres_url.clone();
+            let dsn = stack.postgres.dsn().to_owned();
             tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
                 let backend = studiofs_meta::PgSnapshotBackend::open(&dsn, volume_id)?;
                 Ok(backend
@@ -330,7 +330,7 @@ async fn live_cli_disposable_scan_budget_resumes_checkpoint_across_processes() -
     let prefix = format!("sfs978-resume/{base:016x}/objects/");
     let client_root = stack.root.join("resume");
     let (volume_id, _, _) = create_live_postgres_janitor_fixture(
-        &stack.postgres_url,
+        stack.postgres.dsn(),
         &stack.s3(&prefix),
         &client_root.join("meta/janitor-live"),
         base,

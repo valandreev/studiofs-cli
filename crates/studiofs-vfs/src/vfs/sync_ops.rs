@@ -963,20 +963,13 @@ impl StudioVfs {
     }
 
     fn take_ignored_entry_release_action(&self, ino: Ino) -> Option<LastHandleReleaseAction> {
-        let attr = self.ignored_entry_attr(ino)?;
+        let entry = self.ignored_entry(ino)?;
         let is_orphan = self.handle_table.take_orphan(ino);
         if is_orphan {
             self.release_ignored_entry(ino);
-        } else if attr.kind == FileType::RegularFile
-            && !self.ignored_entry(ino).is_some_and(|entry| {
-                entry.view.is_none()
-                    && matches!(
-                        self.trash_container_role(entry.parent),
-                        Ok(Some(super::retained_views::TrashContainerRole::LinuxInfo(
-                            _
-                        )))
-                    )
-            })
+        } else if entry.attr.kind == FileType::RegularFile
+            && !(entry.view.is_none()
+                && self.keeps_local_trash_name_after_release(entry.parent, &entry.name))
         {
             self.detach_ignored_entry_name(ino);
         }

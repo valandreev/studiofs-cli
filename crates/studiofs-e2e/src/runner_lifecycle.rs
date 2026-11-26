@@ -74,9 +74,10 @@ pub(crate) fn run_supervised_scenario(
                 ),
                 Err(err) => return Err(err),
             };
-            if output.status != 0 && lifecycle.report.status == ScenarioStatus::Passed {
+            if output.status != 0 && !lifecycle.report.fails_run() {
                 lifecycle.report.status = ScenarioStatus::Failed;
                 lifecycle.outcome.status = ScenarioStatus::Failed;
+                lifecycle.report.skip_kind = None;
                 lifecycle.report.error =
                     Some(command_failure_detail(output.status, &output.stderr));
             }
@@ -85,10 +86,10 @@ pub(crate) fn run_supervised_scenario(
                 input.run_id,
                 Some(input.definition.name),
                 "scenario_child",
-                if lifecycle.outcome.status == ScenarioStatus::Passed {
-                    "finished"
-                } else {
-                    "failed"
+                match lifecycle.report.status {
+                    ScenarioStatus::Passed => "finished",
+                    ScenarioStatus::Skipped => "skipped",
+                    ScenarioStatus::Failed | ScenarioStatus::TimedOut => "failed",
                 },
             )?;
             emit_progress(
@@ -96,11 +97,7 @@ pub(crate) fn run_supervised_scenario(
                 input.definition.name,
                 Some(input.scenario_progress),
                 "scenario_child",
-                if lifecycle.outcome.status == ScenarioStatus::Passed {
-                    ProgressStatus::Passed
-                } else {
-                    ProgressStatus::Failed
-                },
+                lifecycle.report.status.into(),
             );
             Ok(lifecycle)
         }
@@ -197,15 +194,10 @@ fn parse_timeout_duration(value: &str) -> Option<Duration> {
 
 fn read_scenario_child_report(path: &Path) -> Result<ScenarioLifecycleOutcome, RunnerError> {
     let child: crate::runner::ScenarioChildReport = serde_json::from_slice(&fs::read(path)?)?;
-    Ok(ScenarioLifecycleOutcome {
-        outcome: ScenarioOutcome {
-            name: child.scenario.name.clone(),
-            status: child.scenario.status,
-            artifacts: child.scenario.artifacts.clone(),
-        },
-        report: child.scenario,
-        cleanup_error: child.cleanup_error,
-    })
+    Ok(ScenarioLifecycleOutcome::new(
+        child.scenario,
+        child.cleanup_error,
+    ))
 }
 
 fn timed_out_scenario_child(
@@ -242,6 +234,7 @@ pub(crate) fn failed_scenario_child(
             name: scenario.to_string(),
             seed,
             status: ScenarioStatus::Failed,
+            skip_kind: None,
             started_at,
             finished_at,
             duration_ms: 0,
@@ -258,6 +251,18 @@ pub(crate) fn failed_scenario_child(
 }
 
 impl ScenarioLifecycleOutcome {
+    pub(crate) fn new(report: ScenarioReport, cleanup_error: Option<String>) -> Self {
+        Self {
+            outcome: ScenarioOutcome {
+                name: report.name.clone(),
+                status: report.status,
+                artifacts: report.artifacts.clone(),
+            },
+            report,
+            cleanup_error,
+        }
+    }
+
     fn with_status(mut self, status: ScenarioStatus) -> Self {
         self.report.status = status;
         self.outcome.status = status;

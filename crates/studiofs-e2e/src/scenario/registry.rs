@@ -6,6 +6,8 @@ use super::types::{Scenario, ScenarioDefinition};
 use super::workloads::cache_scrub::MountedCacheScrub;
 use super::workloads::compression::MountedCompression;
 use super::workloads::janitor_cli::{JanitorLiveBenchmark, JanitorPostgresRestart};
+use super::workloads::macos_mmap_exec::MacosMmapExec;
+use super::workloads::macos_recoverable_trash::{MACOS_RECOVERABLE_TRASH, MacosRecoverableTrash};
 use super::workloads::published_volume_capture::PublishedVolumeFixtureCapture;
 use super::workloads::scratch_auto_promote::{SCRATCH_AUTO_PROMOTE, ScratchAutoPromote};
 use super::workloads::scratch_demote::{SCRATCH_DEMOTE, ScratchDemote};
@@ -82,6 +84,7 @@ pub fn available_scenarios() -> &'static [ScenarioDefinition] {
             JanitorPostgresRestart.definition(),
             JanitorLiveBenchmark.definition(),
             PublishedVolumeFixtureCapture.definition(),
+            MacosRecoverableTrash.definition(),
         ]
     })
 }
@@ -116,6 +119,7 @@ pub(crate) fn resolve_scenario(name: &str) -> Option<Box<dyn Scenario>> {
         "mounted-recoverable-trash-janitor-gc" => Some(Box::new(RecoverableTrashJanitor)),
         "mounted-random-write-packing" => Some(Box::new(RandomWritePacking)),
         "mounted-macos-mmap-exec" => Some(Box::new(MacosMmapExec)),
+        MACOS_RECOVERABLE_TRASH => Some(Box::new(MacosRecoverableTrash)),
         "mounted-posix-acl-xattr-rejection" => Some(Box::new(PosixAclXattrRejection)),
         "mounted-worker-concurrency" => Some(Box::new(WorkerConcurrency)),
         "mounted-concurrent-mkdir-merge-convergence" | "concurrent-mkdir" => {

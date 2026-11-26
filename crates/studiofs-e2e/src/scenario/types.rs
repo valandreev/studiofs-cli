@@ -272,11 +272,11 @@ pub trait Scenario {
     fn setup(&self, context: &ScenarioContext) -> Result<(), ScenarioError>;
     /// Executes the scenario under test.
     fn run(&self, context: &ScenarioContext) -> Result<(), ScenarioError>;
-    /// Validates final scenario behavior and returns warnings if any.
+    /// Validates final scenario behavior and returns run-relative artifact paths.
     fn validate(&self, context: &ScenarioContext) -> Result<Vec<String>, ScenarioError>;
     /// Cleans scenario state and unmounts clients.
     fn cleanup(&self, context: &ScenarioContext) -> Result<(), ScenarioError>;
-    /// Why this host platform cannot run the scenario; the runner then passes it without hooks.
+    /// Why this host platform cannot run the scenario. The runner records a skip before any hooks.
     fn unsupported_platform(&self) -> Option<&'static str> {
         None
     }

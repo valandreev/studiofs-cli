@@ -1304,29 +1304,15 @@ mod tests {
             .find_map(|(key, value)| (key == "STUDIOFS_TEST_PG_DSN").then_some(value))
     }
 
-    /// Serializes this module's PostgreSQL tests. The tail test holds a
-    /// table-wide `counters` lock while its loader waits on the process-wide
-    /// `runtime_bridge` runtime mutex; a concurrent `apply_dump` holding that
-    /// mutex and blocked on `counters` deadlocks the pair until the timeout.
-    static PG_TEST_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    fn pg_test_serial() -> std::sync::MutexGuard<'static, ()> {
-        PG_TEST_SERIAL
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
-
     // Keep this guard in the synchronous test scope; Drop calls `Runtime::block_on`.
-    struct PgTestVolumeCleanup<'a> {
+    struct PgDumpTasks<'a> {
         runtime: &'a tokio::runtime::Runtime,
-        metadata_dsn: String,
-        volume_id: i64,
         connection_tasks:
             Vec<tokio::task::JoinHandle<std::result::Result<(), tokio_postgres::Error>>>,
         loader: Option<std::thread::JoinHandle<DumpLoadResult<MetadataDump>>>,
     }
 
-    impl Drop for PgTestVolumeCleanup<'_> {
+    impl Drop for PgDumpTasks<'_> {
         fn drop(&mut self) {
             let connection_tasks = std::mem::take(&mut self.connection_tasks);
             if !connection_tasks.is_empty() {
@@ -1342,18 +1328,6 @@ mod tests {
             if let Some(loader) = self.loader.take() {
                 let _ = loader.join();
             }
-            self.runtime.block_on(async {
-                let Ok((client, connection)) = connect_studiofs_postgres(&self.metadata_dsn).await
-                else {
-                    return;
-                };
-                let connection_task = tokio::spawn(connection);
-                let _ = client
-                    .execute("DELETE FROM volumes WHERE vol = $1", &[&self.volume_id])
-                    .await;
-                connection_task.abort();
-                let _ = connection_task.await;
-            });
         }
     }
 
@@ -1362,7 +1336,6 @@ mod tests {
     fn dump_snapshot_preserves_tail_pruned_after_metadata_read() {
         use std::time::Duration;
 
-        let _serial = pg_test_serial();
         let runtime = tokio::runtime::Runtime::new().expect("build PostgreSQL test runtime");
 
         let raw_dsn = test_pg_dsn().expect("STUDIOFS_TEST_PG_DSN is required");
@@ -1370,6 +1343,9 @@ mod tests {
             .block_on(ensure_studiofs_database(&raw_dsn))
             .expect("resolve PostgreSQL test database")
             .metadata_dsn;
+        let schema = crate::cli::pg_test_schema::PgTestSchema::new(&metadata_dsn)
+            .expect("create isolated PostgreSQL schema");
+        let metadata_dsn = schema.dsn().to_owned();
 
         let id = uuid::Uuid::new_v4().to_string();
         let mut dump = test_dump();
@@ -1392,10 +1368,8 @@ mod tests {
         dump.metadata_state_format_info =
             serde_json::to_vec(&format_info).expect("serialize test format info");
         let volume_id = apply_dump(&metadata_dsn, &dump).expect("seed PostgreSQL test volume");
-        let mut cleanup = PgTestVolumeCleanup {
+        let mut cleanup = PgDumpTasks {
             runtime: &runtime,
-            metadata_dsn: metadata_dsn.clone(),
-            volume_id,
             connection_tasks: Vec::new(),
             loader: None,
         };
@@ -1494,13 +1468,15 @@ mod tests {
         use studiofs_meta::trash::{MetaVolumeSettings, RetainedEntry, VolumeSettings};
         use studiofs_meta::{MetaFormat, MetaFsOps, MetaInodes, RedbMetaEngine};
 
-        let _serial = pg_test_serial();
         let runtime = tokio::runtime::Runtime::new().expect("build PostgreSQL test runtime");
         let raw_dsn = test_pg_dsn().expect("STUDIOFS_TEST_PG_DSN is required");
         let metadata_dsn = runtime
             .block_on(ensure_studiofs_database(&raw_dsn))
             .expect("resolve PostgreSQL test database")
             .metadata_dsn;
+        let schema = crate::cli::pg_test_schema::PgTestSchema::new(&metadata_dsn)
+            .expect("create isolated PostgreSQL schema");
+        let metadata_dsn = schema.dsn();
 
         // Source state: a still-retained receipt and a restored (terminal) one
         // in the checkpoint, plus a receipt admitted in the post-checkpoint tail.
@@ -1584,17 +1560,10 @@ mod tests {
             .collect();
         validate_dump(&dump).expect("synthetic dump is valid");
 
-        let volume_id = apply_dump(&metadata_dsn, &dump).expect("load dump");
-        let _cleanup = PgTestVolumeCleanup {
-            runtime: &runtime,
-            metadata_dsn: metadata_dsn.clone(),
-            volume_id,
-            connection_tasks: Vec::new(),
-            loader: None,
-        };
+        let volume_id = apply_dump(metadata_dsn, &dump).expect("load dump");
         let stored_settings = |volume_id: i64| {
             runtime.block_on(async {
-                let (client, connection) = connect_studiofs_postgres(&metadata_dsn).await.unwrap();
+                let (client, connection) = connect_studiofs_postgres(metadata_dsn).await.unwrap();
                 let task = tokio::spawn(connection);
                 let bytes: Option<Vec<u8>> = client
                     .query_one(
@@ -1614,7 +1583,7 @@ mod tests {
             "load must seed the trash-days CAS row from the checkpoint"
         );
         let seeded = runtime.block_on(async {
-            let (client, connection) = connect_studiofs_postgres(&metadata_dsn).await.unwrap();
+            let (client, connection) = connect_studiofs_postgres(metadata_dsn).await.unwrap();
             let task = tokio::spawn(connection);
             let rows = client
                 .query(
@@ -1639,7 +1608,7 @@ mod tests {
         assert_eq!(seeded, expected, "load must seed the receipt authority");
 
         // Reloading would replace the projection and its terminal tombstones.
-        let error = apply_dump(&metadata_dsn, &dump).unwrap_err();
+        let error = apply_dump(metadata_dsn, &dump).unwrap_err();
         assert!(
             matches!(
                 &error,
@@ -1668,18 +1637,11 @@ mod tests {
             client_timestamp: None,
         });
         validate_dump(&dump).expect("synthetic dump with settings tail is valid");
-        let tail_volume_id = apply_dump(&metadata_dsn, &dump).expect("load dump with settings");
-        let _tail_cleanup = PgTestVolumeCleanup {
-            runtime: &runtime,
-            metadata_dsn: metadata_dsn.clone(),
-            volume_id: tail_volume_id,
-            connection_tasks: Vec::new(),
-            loader: None,
-        };
+        let tail_volume_id = apply_dump(metadata_dsn, &dump).expect("load dump with settings");
         assert_eq!(stored_settings(tail_volume_id), Some(disabled));
         assert_eq!(disabled.trash.existing_entry_days(), 7);
         let next = runtime.block_on(async {
-            let (mut client, connection) = connect_studiofs_postgres(&metadata_dsn).await.unwrap();
+            let (mut client, connection) = connect_studiofs_postgres(metadata_dsn).await.unwrap();
             let task = tokio::spawn(connection);
             let next = studiofs_meta::pg_engine::set_shared_trash_days(
                 &mut client,
