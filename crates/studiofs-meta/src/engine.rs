@@ -88,6 +88,15 @@ pub enum CheckpointDescriptorFailure {
     EnvelopeIdentity,
 }
 
+/// Persisted serving checkpoint byte format and state schema pair.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct CheckpointEncoding {
+    /// Persisted byte format version.
+    pub format: i16,
+    /// Persisted serving-state schema version.
+    pub schema: i16,
+}
+
 /// One self-consistent PostgreSQL record used to bootstrap a fresh client.
 ///
 /// `checkpoint_version` is the exact event-log replay floor. A reader must
@@ -107,7 +116,7 @@ pub struct BootstrapCheckpointDescriptor {
     /// Exact event-log version represented by the checkpoint and replay floor.
     pub checkpoint_version: i64,
     /// Declared checkpoint format and schema, when stored separately from the baseline slot.
-    pub checkpoint_encoding: Option<(i16, i16)>,
+    pub checkpoint_encoding: Option<CheckpointEncoding>,
     /// Serialized remote-visible serving checkpoint.
     pub checkpoint_bytes: Vec<u8>,
     /// SHA-256 digest of `checkpoint_bytes`.

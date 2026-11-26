@@ -563,6 +563,10 @@ mod tests {
             latest_version(MIGRATIONS, CLIENT_SESSIONS_COMPONENT),
             i32::from(crate::version::POSTGRES_CLIENT_SESSIONS_SCHEMA.current)
         );
+        assert_eq!(
+            latest_version(MIGRATIONS, CHECKPOINT_ENCODINGS_COMPONENT),
+            i32::from(crate::version::POSTGRES_CHECKPOINT_ENCODINGS_SCHEMA.current)
+        );
         assert_eq!(MIGRATIONS[0], BASELINE);
     }
 

@@ -7375,7 +7375,13 @@ fn pg_checkpoint_encodings_keep_baseline_and_successor_replayable() {
     let successor = backend.read_bootstrap_checkpoint().unwrap();
     let first_cut = successor.checkpoint_version;
     assert!(first_cut > 0);
-    assert_eq!(successor.checkpoint_encoding, Some((5, 1)));
+    assert_eq!(
+        successor.checkpoint_encoding,
+        Some(crate::CheckpointEncoding {
+            format: 5,
+            schema: 1,
+        })
+    );
 
     let baseline_bytes = run_async(with_pg_test_client(dsn, |client| async move {
         let row = client
@@ -7388,10 +7394,21 @@ fn pg_checkpoint_encodings_keep_baseline_and_successor_replayable() {
         let baseline_bytes: Vec<u8> = row.get(1);
         assert_eq!(row.get::<_, i64>(0), first_cut);
         assert_eq!(row.get::<_, Vec<u8>>(2), Sha256::digest(&baseline_bytes).as_slice());
+        let empty_i16: Vec<i16> = Vec::new();
+        let empty_i64: Vec<i64> = Vec::new();
         let old_client_row = client
             .query_one(
                 super::sql::SELECT_COMPATIBLE_CHECKPOINT_DESCRIPTOR,
-                &[&volume_id, &1_i16, &4_i16, &1_i16, &1_i16],
+                &[
+                    &volume_id,
+                    &1_i16,
+                    &4_i16,
+                    &1_i16,
+                    &1_i16,
+                    &empty_i16,
+                    &empty_i16,
+                    &empty_i64,
+                ],
             )
             .await
             .unwrap();
@@ -7427,11 +7444,75 @@ fn pg_checkpoint_encodings_keep_baseline_and_successor_replayable() {
     );
 
     let corrupt_checksum = vec![0_u8; 32];
-    run_async(with_pg_test_client(dsn, |client| async move {
+    let baseline_sha = Sha256::digest(&baseline_bytes).to_vec();
+    let baseline_copy = baseline_bytes.clone();
+    let corrupt_copy = corrupt_checksum.clone();
+    run_async(with_pg_test_client(dsn, move |client| async move {
         client
             .execute(
                 "UPDATE serving_checkpoint_encodings SET checkpoint_sha256 = $2 WHERE vol = $1",
-                &[&volume_id, &corrupt_checksum],
+                &[&volume_id, &corrupt_copy],
+            )
+            .await
+            .unwrap();
+        // Seed a valid sibling alternate at the same cut while the baseline is
+        // pending so selection proves it tries remaining alternates before failing.
+        client
+            .execute(
+                "INSERT INTO serving_checkpoint_encodings (vol, checkpoint_version, checkpoint_format, checkpoint_schema, publication_generation, snapshot, checkpoint_sha256) VALUES ($1, $2, 4, 1, 1, $3, $4)",
+                &[&volume_id, &first_cut, &baseline_copy, &baseline_sha],
+            )
+            .await
+            .unwrap();
+        client
+            .execute(
+                "UPDATE metadata_state SET checkpoint_publication_state = 'pending' WHERE vol = $1",
+                &[&volume_id],
+            )
+            .await
+            .unwrap();
+        Ok(())
+    }))
+    .unwrap();
+    let sibling = backend.read_bootstrap_checkpoint().unwrap();
+    assert_eq!(
+        sibling.checkpoint_encoding,
+        Some(crate::CheckpointEncoding {
+            format: 4,
+            schema: 1,
+        })
+    );
+    assert_eq!(sibling.checkpoint_bytes, baseline_bytes);
+
+    let corrupt_copy = corrupt_checksum.clone();
+    run_async(with_pg_test_client(dsn, move |client| async move {
+        client
+            .execute(
+                "UPDATE serving_checkpoint_encodings SET checkpoint_sha256 = $2 WHERE vol = $1 AND checkpoint_format = 4",
+                &[&volume_id, &corrupt_copy],
+            )
+            .await
+            .unwrap();
+        Ok(())
+    }))
+    .unwrap();
+    assert!(matches!(
+        backend.read_bootstrap_checkpoint(),
+        Err(MetaError::NeedCompatibleCheckpoint { replay_floor: 0 })
+    ));
+
+    run_async(with_pg_test_client(dsn, move |client| async move {
+        client
+            .execute(
+                "DELETE FROM serving_checkpoint_encodings WHERE vol = $1 AND checkpoint_format = 4",
+                &[&volume_id],
+            )
+            .await
+            .unwrap();
+        client
+            .execute(
+                "UPDATE metadata_state SET checkpoint_publication_state = 'published' WHERE vol = $1",
+                &[&volume_id],
             )
             .await
             .unwrap();
@@ -7572,7 +7653,13 @@ fn pg_checkpoint_encodings_keep_baseline_and_successor_replayable() {
     let promoted = backend.read_bootstrap_checkpoint().unwrap();
     let promoted_cut = promoted.checkpoint_version;
     assert!(promoted_cut > head);
-    assert_eq!(promoted.checkpoint_encoding, Some((5, 1)));
+    assert_eq!(
+        promoted.checkpoint_encoding,
+        Some(crate::CheckpointEncoding {
+            format: 5,
+            schema: 1,
+        })
+    );
     run_async(with_pg_test_client(dsn, |client| async move {
         let encodings = client
             .query(
@@ -7587,7 +7674,7 @@ fn pg_checkpoint_encodings_keep_baseline_and_successor_replayable() {
     }))
     .unwrap();
 
-    // A missing compatible cut is diagnosed at selection, before replay.
+    // A missing compatible cut is diagnosed at selection and on returning replay.
     writer
         .create_dir(ROOT_INO, b"uncheckpointed", 0, 0, 0o700)
         .unwrap();
@@ -7605,6 +7692,11 @@ fn pg_checkpoint_encodings_keep_baseline_and_successor_replayable() {
     .unwrap();
     assert!(matches!(
         backend.read_bootstrap_checkpoint(),
+        Err(MetaError::NeedCompatibleCheckpoint { replay_floor }) if replay_floor > promoted_cut
+    ));
+    let _guard = returning.replication_lock.lock().unwrap();
+    assert!(matches!(
+        returning.pull_foreign_events_locked(None),
         Err(MetaError::NeedCompatibleCheckpoint { replay_floor }) if replay_floor > promoted_cut
     ));
 }

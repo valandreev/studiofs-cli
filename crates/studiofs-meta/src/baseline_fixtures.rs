@@ -593,7 +593,16 @@ fn successor_serving_checkpoint_matches_pinned_format_5_fixture() {
         fixture
     );
     assert_eq!(
-        ServingCheckpoint::decode_published(&fixture, Some((5, 1)), 7, 9).unwrap(),
+        ServingCheckpoint::decode_published(
+            &fixture,
+            Some(crate::CheckpointEncoding {
+                format: 5,
+                schema: 1,
+            }),
+            7,
+            9,
+        )
+        .unwrap(),
         ServingCheckpoint::decode(&baseline).unwrap()
     );
 }

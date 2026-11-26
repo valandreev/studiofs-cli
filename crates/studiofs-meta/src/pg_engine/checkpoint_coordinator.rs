@@ -670,7 +670,8 @@ async fn publish_successor_encoding(
         .query_one(sql::CHECKPOINT_ENCODINGS_AVAILABLE, &[])
         .await
         .map_err(classify)?
-        .get::<_, bool>(0)
+        .try_get::<_, bool>(0)
+        .map_err(classify)?
     {
         return Ok(());
     }
@@ -694,7 +695,8 @@ async fn publish_successor_encoding(
             .query_one(sql::CHECK_EXISTING_CHECKPOINT_ENCODING, params)
             .await
             .map_err(classify)?
-            .get::<_, bool>(0)
+            .try_get::<_, bool>(0)
+            .map_err(classify)?
     {
         return Err(MetaError::InvalidCheckpointDescriptor {
             reason: crate::CheckpointDescriptorFailure::EnvelopeIdentity,

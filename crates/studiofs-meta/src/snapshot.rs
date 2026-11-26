@@ -309,6 +309,60 @@ struct ServingCheckpointV1 {
 const CHECKPOINT_ENVELOPE_MAGIC: &[u8] = b"\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xffSFS-CHK";
 const CHECKPOINT_ENVELOPE_HEADER_LEN: usize = 20;
 
+/// Registry entry for a tagged `SFS-CHK` serving checkpoint encoding.
+struct TaggedCheckpointDecoder {
+    encoding: crate::CheckpointEncoding,
+    decode: fn(&[u8]) -> Result<ServingCheckpoint, crate::CheckpointDescriptorFailure>,
+}
+
+#[cfg(feature = "test-successor")]
+fn decode_successor_v5_payload(
+    payload: &[u8],
+) -> Result<ServingCheckpoint, crate::CheckpointDescriptorFailure> {
+    let (checkpoint, payload_format) = ServingCheckpoint::decode_legacy(payload)
+        .map_err(|_| crate::CheckpointDescriptorFailure::CheckpointBytes)?;
+    if payload_format != ServingCheckpoint::BASELINE_FORMAT_VERSION {
+        return Err(crate::CheckpointDescriptorFailure::CheckpointBytes);
+    }
+    Ok(checkpoint)
+}
+
+const TAGGED_CHECKPOINT_DECODERS: &[TaggedCheckpointDecoder] = &[
+    #[cfg(feature = "test-successor")]
+    TaggedCheckpointDecoder {
+        encoding: crate::CheckpointEncoding {
+            format: 5,
+            schema: ServingCheckpoint::BASELINE_SCHEMA_VERSION,
+        },
+        decode: decode_successor_v5_payload,
+    },
+];
+
+// Every supported format above the legacy untagged range (1..=4) must have a
+// registered tagged decoder for the current schema.
+const _: () = {
+    let mut format = ServingCheckpoint::BASELINE_FORMAT_VERSION + 1;
+    while format <= ServingCheckpoint::FORMAT_VERSION {
+        let mut found = false;
+        let mut index = 0;
+        while index < TAGGED_CHECKPOINT_DECODERS.len() {
+            let entry = &TAGGED_CHECKPOINT_DECODERS[index];
+            if entry.encoding.format == format
+                && entry.encoding.schema == ServingCheckpoint::SCHEMA_VERSION
+            {
+                found = true;
+                break;
+            }
+            index += 1;
+        }
+        assert!(
+            found,
+            "every supported serving checkpoint format above baseline must register a tagged decoder"
+        );
+        format += 1;
+    }
+};
+
 impl ServingCheckpoint {
     /// The persisted checkpoint format version.
     pub(crate) const FORMAT_VERSION: i16 =
@@ -354,31 +408,39 @@ impl ServingCheckpoint {
         bytes
     }
 
-    pub(crate) fn check_encoding(format: i16, schema: i16) -> crate::MetaResult<()> {
-        if !Self::supports_format_version(format) || !Self::supports_schema_version(schema) {
-            return Err(crate::MetaError::UnsupportedCheckpointEncoding { format, schema });
+    pub(crate) fn check_encoding(encoding: crate::CheckpointEncoding) -> crate::MetaResult<()> {
+        if !Self::supports_format_version(encoding.format)
+            || !Self::supports_schema_version(encoding.schema)
+        {
+            return Err(crate::MetaError::UnsupportedCheckpointEncoding {
+                format: encoding.format,
+                schema: encoding.schema,
+            });
         }
         Ok(())
     }
 
     pub(crate) fn decode_published(
         bytes: &[u8],
-        declared: Option<(i16, i16)>,
+        declared: Option<crate::CheckpointEncoding>,
         volume_id: i64,
         cut: i64,
     ) -> crate::MetaResult<Self> {
-        use crate::{CheckpointDescriptorFailure as Failure, MetaError};
+        use crate::{CheckpointDescriptorFailure as Failure, CheckpointEncoding, MetaError};
 
         let invalid = |reason| MetaError::InvalidCheckpointDescriptor { reason };
-        if let Some((format, schema)) = declared {
-            Self::check_encoding(format, schema)?;
+        if let Some(encoding) = declared {
+            Self::check_encoding(encoding)?;
         }
         let Some(envelope) = bytes.strip_prefix(CHECKPOINT_ENVELOPE_MAGIC) else {
             let (checkpoint, format) =
                 Self::decode_legacy(bytes).map_err(|_| invalid(Failure::CheckpointBytes))?;
-            Self::check_encoding(format, Self::BASELINE_SCHEMA_VERSION)?;
-            if declared.is_some_and(|encoding| encoding != (format, Self::BASELINE_SCHEMA_VERSION))
-            {
+            let actual = CheckpointEncoding {
+                format,
+                schema: Self::BASELINE_SCHEMA_VERSION,
+            };
+            Self::check_encoding(actual)?;
+            if declared.is_some_and(|encoding| encoding != actual) {
                 return Err(invalid(Failure::EnvelopeIdentity));
             }
             return Ok(checkpoint);
@@ -386,48 +448,41 @@ impl ServingCheckpoint {
         let (header, payload) = envelope
             .split_at_checked(CHECKPOINT_ENVELOPE_HEADER_LEN)
             .ok_or_else(|| invalid(Failure::CheckpointBytes))?;
-        let format = i16::from_be_bytes([header[0], header[1]]);
-        let schema = i16::from_be_bytes([header[2], header[3]]);
-        Self::check_encoding(format, schema)?;
-        if declared.is_some_and(|encoding| encoding != (format, schema))
+        let encoding = CheckpointEncoding {
+            format: i16::from_be_bytes([header[0], header[1]]),
+            schema: i16::from_be_bytes([header[2], header[3]]),
+        };
+        Self::check_encoding(encoding)?;
+        if declared.is_some_and(|expected| expected != encoding)
             || header[4..12] != volume_id.to_be_bytes()
             || header[12..20] != cut.to_be_bytes()
         {
             return Err(invalid(Failure::EnvelopeIdentity));
         }
-        match (format, schema) {
-            #[cfg(feature = "test-successor")]
-            (5, Self::BASELINE_SCHEMA_VERSION) => {
-                let (checkpoint, payload_format) =
-                    Self::decode_legacy(payload).map_err(|_| invalid(Failure::CheckpointBytes))?;
-                if payload_format != Self::BASELINE_FORMAT_VERSION {
-                    return Err(invalid(Failure::CheckpointBytes));
-                }
-                Ok(checkpoint)
-            }
-            _ => {
-                let _ = payload;
-                Err(invalid(Failure::CheckpointBytes))
-            }
-        }
+        let Some(decoder) = TAGGED_CHECKPOINT_DECODERS
+            .iter()
+            .find(|entry| entry.encoding == encoding)
+        else {
+            return Err(invalid(Failure::CheckpointBytes));
+        };
+        (decoder.decode)(payload).map_err(invalid)
     }
 
     pub(crate) fn decode_snapshot_source(
         bytes: &[u8],
-        format: i16,
-        schema: i16,
+        encoding: crate::CheckpointEncoding,
         volume_id: i64,
         cut: i64,
     ) -> crate::MetaResult<Self> {
-        Self::check_encoding(format, schema)?;
+        Self::check_encoding(encoding)?;
         // Historical snapshot capture stamped the writer's format (4) even
         // when it copied an older untagged checkpoint out of metadata_state.
-        let declared = if format == Self::BASELINE_FORMAT_VERSION
+        let declared = if encoding.format == Self::BASELINE_FORMAT_VERSION
             && !bytes.starts_with(CHECKPOINT_ENVELOPE_MAGIC)
         {
             None
         } else {
-            Some((format, schema))
+            Some(encoding)
         };
         Self::decode_published(bytes, declared, volume_id, cut)
     }
@@ -1203,14 +1258,44 @@ mod tests {
             })
         ));
         assert!(matches!(
-            ServingCheckpoint::decode_published(&[0; 6], Some((1, 7)), 1, 2),
+            ServingCheckpoint::decode_published(
+                &[0; 6],
+                Some(crate::CheckpointEncoding {
+                    format: 1,
+                    schema: 7,
+                }),
+                1,
+                2,
+            ),
             Err(crate::MetaError::UnsupportedCheckpointEncoding {
                 format: 1,
                 schema: 7
             })
         ));
+        // Tagged envelopes claiming a legacy untagged format must fail closed.
+        let mut legacy_tagged = CHECKPOINT_ENVELOPE_MAGIC.to_vec();
+        legacy_tagged.extend_from_slice(&4_i16.to_be_bytes());
+        legacy_tagged.extend_from_slice(&1_i16.to_be_bytes());
+        legacy_tagged.extend_from_slice(&1_i64.to_be_bytes());
+        legacy_tagged.extend_from_slice(&2_i64.to_be_bytes());
+        legacy_tagged.extend_from_slice(&[0; 6]);
+        assert!(matches!(
+            ServingCheckpoint::decode_published(&legacy_tagged, None, 1, 2),
+            Err(crate::MetaError::InvalidCheckpointDescriptor {
+                reason: crate::CheckpointDescriptorFailure::CheckpointBytes
+            })
+        ));
         assert_eq!(
-            ServingCheckpoint::decode_snapshot_source(&[0; 6], 4, 1, 1, 2).unwrap(),
+            ServingCheckpoint::decode_snapshot_source(
+                &[0; 6],
+                crate::CheckpointEncoding {
+                    format: 4,
+                    schema: 1,
+                },
+                1,
+                2,
+            )
+            .unwrap(),
             ServingCheckpoint::default()
         );
     }
@@ -1220,15 +1305,27 @@ mod tests {
     fn serving_checkpoint_successor_envelope_is_bound_to_descriptor_and_cut() {
         let payload = postcard::to_stdvec(&ServingCheckpoint::default()).unwrap();
         let bytes = ServingCheckpoint::encode_successor(&payload, 7, 9);
-        let encoding = Some((5, 1));
+        let encoding = Some(crate::CheckpointEncoding {
+            format: 5,
+            schema: 1,
+        });
         assert_eq!(
             ServingCheckpoint::decode_published(&bytes, encoding, 7, 9).unwrap(),
             ServingCheckpoint::default()
         );
         assert!(ServingCheckpoint::decode(&bytes).is_err());
-        for (encoding, volume_id, cut) in
-            [(encoding, 8, 9), (encoding, 7, 10), (Some((4, 1)), 7, 9)]
-        {
+        for (encoding, volume_id, cut) in [
+            (encoding, 8, 9),
+            (encoding, 7, 10),
+            (
+                Some(crate::CheckpointEncoding {
+                    format: 4,
+                    schema: 1,
+                }),
+                7,
+                9,
+            ),
+        ] {
             assert!(matches!(
                 ServingCheckpoint::decode_published(&bytes, encoding, volume_id, cut),
                 Err(crate::MetaError::InvalidCheckpointDescriptor {

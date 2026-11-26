@@ -101,6 +101,13 @@ pub const POSTGRES_CLIENT_SESSIONS_SCHEMA: VersionIdentity = VersionIdentity {
     min_supported: 1,
 };
 
+/// Database-wide PostgreSQL `checkpoint_encodings` schema component (SFS-1011).
+pub const POSTGRES_CHECKPOINT_ENCODINGS_SCHEMA: VersionIdentity = VersionIdentity {
+    name: "PostgreSQL checkpoint encodings schema",
+    current: 1,
+    min_supported: 1,
+};
+
 /// Per-volume write requirement (`metadata_state.write_requirement`, SFS-1007).
 /// Publication succeeds only while the volume's value is at most `current`, in
 /// the same UPDATE that bumps the volume version; Activate of a write
@@ -175,6 +182,7 @@ pub const IDENTITIES: &[VersionIdentity] = &[
     POSTGRES_CORE_SCHEMA,
     SHARED_WRITE_REQUIREMENT,
     POSTGRES_CLIENT_SESSIONS_SCHEMA,
+    POSTGRES_CHECKPOINT_ENCODINGS_SCHEMA,
 ];
 
 /// Machine-readable report of this binary's identities, printed by
