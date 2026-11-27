@@ -1,8 +1,8 @@
 //! `studiofs compatibility <volume>`: a read-only report of what this client can
 //! do with a volume. `studiofs upgrade <volume> --dry-run` appends the same
-//! report, and `studiofs status` prints its local-only lines. Local redb is only
-//! opened read-only, so a mounted volume is fine. No DSN, key or other secret is
-//! printed.
+//! report, and `studiofs status` prints its local-only lines. Local redb is
+//! opened read-only, but a mount on this computer holds its lock, so the report
+//! needs a stopped local cache. No DSN, key or other secret is printed.
 
 use anyhow::{Context, anyhow, bail};
 use clap::Args;
@@ -11,13 +11,14 @@ use std::path::Path;
 use std::time::Duration;
 use studiofs_meta::client_sessions::ClientSession;
 use studiofs_meta::compat::{
-    ClientCapabilities, Compatibility, Operation, ReasonCode, VolumeRequirements,
+    CheckpointDescriptor, ClientCapabilities, Compatibility, CompatibilityDecision, Operation,
+    ReasonCode, VolumeRequirements,
 };
 use studiofs_meta::pg_engine::migrations::{
     Migration, RecordedComponent, registered_schema_status,
 };
-use studiofs_meta::pg_engine::{read_client_sessions, read_volume_protocol};
-use studiofs_meta::schema::FormatInfo;
+use studiofs_meta::pg_engine::{collect_cutover_shared_state, read_client_sessions};
+use studiofs_meta::schema::{CURRENT_FORMAT_VERSION, FormatInfo};
 use studiofs_meta::version::{LOCAL_METADATA_LAYOUT, SHARED_WRITE_REQUIREMENT};
 use studiofs_meta::volume_protocol::{
     CutoverLocalState, ProtocolRejection, VolumeProtocol, missing_capabilities_for_session,
@@ -27,10 +28,13 @@ use tokio_postgres::GenericClient;
 
 const SESSION_ACTION: &str = "upgrade or unmount that client";
 const UNPUBLISHED_ACTION: &str = "do not reinitialize or clear this cache; mount it with a compatible release so it publishes, or keep it until upgraded";
+const UNKNOWN_ACTION: &str = "check that this cache points at the right PostgreSQL database and volume; run `studiofs discover` to list the volumes there";
+const MISSING_POLICY_ACTION: &str = "mounts refuse this volume; do not reinitialize it or clear any cache; restore the PostgreSQL backup or ask for support";
+const MOUNTED_HERE: &str = "This volume is mounted on this computer, and the mount holds its local metadata lock. The mount already enforces compatibility. Unmount it to run this report, or run the report on another computer. Nothing was changed.";
 
 #[derive(Args, Debug)]
 pub struct CompatibilityArgs {
-    /// Locally discovered volume; read-only, so it may stay mounted.
+    /// Locally discovered volume with a stopped local cache on this computer.
     pub name: String,
 }
 
@@ -38,32 +42,57 @@ pub struct CompatibilityArgs {
 pub(crate) struct LocalFacts {
     pub(crate) format: FormatInfo,
     pub(crate) state: CutoverLocalState,
-    /// Local store identities by `VersionIdentity::name`, as `evaluate` expects.
+    /// Local store identities by `VersionIdentity::name`, as `evaluate` expects;
+    /// empty for a cache whose volume format still needs `studiofs upgrade`.
     pub(crate) stores: BTreeMap<String, u16>,
+}
+
+/// Stored volume policy as the report sees it.
+pub(crate) enum SharedPolicy {
+    /// Not read: schema migrations are pending, or the volume format needs adoption.
+    NotRead,
+    /// Current-format volume without a stored policy; mounts refuse it.
+    Missing,
+    /// Written by a newer StudioFS; the text names versions only.
+    Newer(String),
+    Read {
+        policy: VolumeProtocol,
+        /// Serving checkpoint encodings a bootstrap can choose from.
+        checkpoints: Vec<CheckpointDescriptor>,
+    },
 }
 
 /// Shared PostgreSQL facts from one bounded block.
 pub(crate) struct SharedFacts {
     pub(crate) recorded: Vec<RecordedComponent>,
     pub(crate) pending: Vec<Migration>,
+    /// A schema component newer than this binary maintains; versions only.
+    pub(crate) schema_newer: Option<String>,
     /// `None` when the volume has no shared row.
     pub(crate) shared_format: Option<u16>,
     pub(crate) remote_head: Option<i64>,
-    /// `None` when no policy is stored, or when schema migrations are pending.
-    pub(crate) policy: Option<VolumeProtocol>,
-    /// `None` while schema migrations are pending; the session table may not exist yet.
+    pub(crate) policy: SharedPolicy,
+    /// `None` when not read: schema migrations pending, or the read failed.
     pub(crate) sessions: Option<Vec<ClientSession>>,
 }
 
 pub(crate) fn read_local_facts(path: &Path) -> anyhow::Result<LocalFacts> {
-    let (format, state) = RedbMetaEngine::read_upgrade_and_cutover_state_readonly(path)
-        .context("Cannot read local metadata; nothing was changed")?;
-    let layout = RedbMetaEngine::read_local_revision(path)
-        .context("Cannot read the local metadata layout; nothing was changed")?;
+    let (format, state) = RedbMetaEngine::read_upgrade_and_cutover_state_readonly(path).context(
+        "Cannot read local metadata; if this volume is mounted on this computer, unmount it first. Nothing was changed",
+    )?;
+    // The layout reader decodes strictly and refuses formats 5/6; their
+    // report comes from the volume format instead.
+    let stores = if format.format_version == CURRENT_FORMAT_VERSION {
+        let layout = RedbMetaEngine::read_local_revision(path)
+            .context("Cannot read the local metadata layout; nothing was changed")?;
+        BTreeMap::from([(LOCAL_METADATA_LAYOUT.name.to_owned(), layout)])
+    } else {
+        BTreeMap::new()
+    };
     Ok(LocalFacts {
         format,
         state,
-        stores: BTreeMap::from([(LOCAL_METADATA_LAYOUT.name.to_owned(), layout)]),
+        stores,
     })
 }
 
@@ -73,7 +102,14 @@ pub(crate) async fn read_shared_facts<C: GenericClient + Sync>(
     volume: i64,
     repair_schema: bool,
 ) -> anyhow::Result<SharedFacts> {
-    let (recorded, pending) = registered_schema_status(client, repair_schema).await?;
+    let (recorded, pending, schema_newer) =
+        match registered_schema_status(client, repair_schema).await {
+            Ok((recorded, pending)) => (recorded, pending, None),
+            Err(MetaError::UpgradeRequired { reason }) => {
+                (Vec::new(), Vec::new(), Some(reason.to_string()))
+            }
+            Err(error) => return Err(error.into()),
+        };
     // Backend error text may echo connection data; keep only the operation.
     let row = client
         .query_opt(
@@ -90,24 +126,31 @@ pub(crate) async fn read_shared_facts<C: GenericClient + Sync>(
         ),
         None => (None, None),
     };
-    let (policy, sessions) = if pending.is_empty() {
-        let policy = match read_volume_protocol(client, volume).await {
-            Ok(policy) => Some(policy),
-            Err(MetaError::VolumeProtocolRejected(ProtocolRejection::Missing)) => None,
-            Err(_) => bail!(
-                "reading the volume protocol failed; it may have been written by a newer StudioFS"
-            ),
-        };
-        let sessions = read_client_sessions(client, volume)
-            .await
-            .map_err(|_| anyhow!("reading client sessions failed"))?;
-        (policy, Some(sessions))
+    let schema_ready = pending.is_empty() && schema_newer.is_none();
+    let policy = if !schema_ready || shared_format != Some(CURRENT_FORMAT_VERSION) {
+        SharedPolicy::NotRead
     } else {
-        (None, None)
+        match collect_cutover_shared_state(client, volume).await {
+            Ok((policy, state)) => SharedPolicy::Read {
+                policy,
+                checkpoints: state.available_checkpoints,
+            },
+            Err(MetaError::VolumeProtocolRejected(ProtocolRejection::Missing)) => {
+                SharedPolicy::Missing
+            }
+            Err(MetaError::UpgradeRequired { reason }) => SharedPolicy::Newer(reason.to_string()),
+            Err(_) => bail!("reading the volume protocol failed"),
+        }
+    };
+    let sessions = if schema_ready {
+        read_client_sessions(client, volume).await.ok()
+    } else {
+        None
     };
     Ok(SharedFacts {
         recorded,
         pending,
+        schema_newer,
         shared_format,
         remote_head,
         policy,
@@ -125,42 +168,124 @@ fn add_action(actions: &mut Vec<String>, action: &str) {
     }
 }
 
+/// A refusal that stops the whole volume before any operation is evaluated.
+struct VolumeRefusal {
+    overall: &'static str,
+    reason: String,
+    action: &'static str,
+}
+
+fn volume_refusal(local: &LocalFacts, shared: &SharedFacts) -> Option<VolumeRefusal> {
+    let upgrade = ReasonCode::SchemaComponentNewer.action();
+    if shared.shared_format.is_none() {
+        return Some(VolumeRefusal {
+            overall: "unknown",
+            reason: "shared volume metadata is missing".to_owned(),
+            action: UNKNOWN_ACTION,
+        });
+    }
+    if let Some(reason) = &shared.schema_newer {
+        return Some(VolumeRefusal {
+            overall: Compatibility::UpgradeRequired.as_str(),
+            reason: reason.clone(),
+            action: upgrade,
+        });
+    }
+    match &shared.policy {
+        SharedPolicy::Newer(reason) => {
+            return Some(VolumeRefusal {
+                overall: Compatibility::UpgradeRequired.as_str(),
+                reason: reason.clone(),
+                action: upgrade,
+            });
+        }
+        SharedPolicy::Missing => {
+            return Some(VolumeRefusal {
+                overall: Compatibility::Incompatible.as_str(),
+                reason: "volume_policy_missing".to_owned(),
+                action: MISSING_POLICY_ACTION,
+            });
+        }
+        SharedPolicy::NotRead | SharedPolicy::Read { .. } => {}
+    }
+    // Shared adoption runs first; this cache still has the 0.2.x header.
+    let local_format = local.format.format_version;
+    if shared.shared_format == Some(CURRENT_FORMAT_VERSION) && local_format < CURRENT_FORMAT_VERSION
+    {
+        return Some(VolumeRefusal {
+            overall: Compatibility::NeedsMigration.as_str(),
+            reason: format!("local_format_outdated (format {local_format})"),
+            action: ReasonCode::LocalFormatOutdated.action(),
+        });
+    }
+    None
+}
+
+/// Mount bootstraps from any serving checkpoint it can decode, so the report
+/// prefers a candidate that allows bootstrap.
+fn decide(
+    client: &ClientCapabilities,
+    policy: &VolumeProtocol,
+    format: u16,
+    checkpoints: &[CheckpointDescriptor],
+    local: &BTreeMap<String, u16>,
+) -> CompatibilityDecision {
+    let decide_with = |checkpoint| {
+        policy.compatibility_decision(
+            client,
+            VolumeRequirements {
+                format,
+                ..VolumeRequirements::baseline()
+            },
+            checkpoint,
+            local,
+        )
+    };
+    let mut candidates = checkpoints
+        .iter()
+        .map(|checkpoint| decide_with(Some(*checkpoint)));
+    let first = candidates.next();
+    match first {
+        None => decide_with(None),
+        Some(first) if first.allows(Operation::Bootstrap) => first,
+        Some(first) => candidates
+            .find(|decision| decision.allows(Operation::Bootstrap))
+            .unwrap_or(first),
+    }
+}
+
 /// Renders the report from already-read facts. Pure: it prints numbers and the
 /// typed policy, never connection data or keys.
 pub(crate) fn format_report(
     client: &ClientCapabilities,
     build: &str,
-    local_format: u16,
-    local: &CutoverLocalState,
-    local_stores: &BTreeMap<String, u16>,
+    local: &LocalFacts,
     shared: &SharedFacts,
 ) -> String {
     let mut lines = Vec::new();
     let mut actions = Vec::new();
-    let effective = shared
-        .policy
-        .clone()
-        .unwrap_or_else(VolumeProtocol::baseline);
+    let baseline = VolumeProtocol::baseline();
+    let (effective, checkpoints) = match &shared.policy {
+        SharedPolicy::Read {
+            policy,
+            checkpoints,
+        } => (policy, checkpoints.as_slice()),
+        _ => (&baseline, &[][..]),
+    };
     // A client that publishes below the policy's write requirement is fenced, even
     // though the capability evaluator does not know that rule.
     let write_newer = effective.write_requirement > SHARED_WRITE_REQUIREMENT.current;
-    let schema = shared
-        .recorded
-        .iter()
-        .filter_map(|row| Some((row.component.clone(), u16::try_from(row.version).ok()?)))
-        .collect();
-    let decision = shared.shared_format.map(|format| {
-        effective.compatibility_decision(
+    let refusal = volume_refusal(local, shared);
+    let decision = match (&refusal, shared.shared_format) {
+        (None, Some(format)) => Some(decide(
             client,
-            VolumeRequirements {
-                format,
-                schema_components: schema,
-                ..VolumeRequirements::baseline()
-            },
-            Some(effective.requirements.checkpoint),
-            local_stores,
-        )
-    });
+            effective,
+            format,
+            checkpoints,
+            &local.stores,
+        )),
+        _ => None,
+    };
 
     // Operation -> (reason and subject, action) for every blocked operation.
     let mut blocked: Vec<(Operation, String, &'static str)> = Vec::new();
@@ -184,12 +309,12 @@ pub(crate) fn format_report(
         add_action(&mut actions, action);
     }
 
-    let (overall, overall_reason) = match &decision {
-        None => (
-            "unknown",
-            Some("shared volume metadata is missing".to_owned()),
-        ),
-        Some(decision) => match (&decision.reason, write_newer) {
+    let (overall, overall_reason) = match (&refusal, &decision) {
+        (Some(refusal), _) => {
+            add_action(&mut actions, refusal.action);
+            (refusal.overall, Some(refusal.reason.clone()))
+        }
+        (None, Some(decision)) => match (&decision.reason, write_newer) {
             (Some(refusal), _) => (
                 decision.compatibility.as_str(),
                 Some(format!("{} ({})", refusal.reason.as_str(), refusal.subject)),
@@ -203,6 +328,7 @@ pub(crate) fn format_report(
             ),
             (None, false) => (decision.compatibility.as_str(), None),
         },
+        (None, None) => ("unknown", None),
     };
 
     lines.push("Client".to_owned());
@@ -217,30 +343,40 @@ pub(crate) fn format_report(
     ));
 
     lines.push("Volume".to_owned());
-    lines.push(format!("  Local format:       {local_format}"));
+    lines.push(format!(
+        "  Local format:       {}",
+        local.format.format_version
+    ));
     lines.push(format!(
         "  Shared format:      {}",
         or_unknown(shared.shared_format)
     ));
-    let policy_text = if !shared.pending.is_empty() {
-        format!(
-            "not read; {} schema migration(s) pending, run `studiofs upgrade`",
-            shared.pending.len()
-        )
-    } else if shared.policy.is_none() {
-        "none recorded; `studiofs upgrade` adopts the 0.2.5 baseline".to_owned()
-    } else {
-        format!(
+    let policy_text = match &shared.policy {
+        SharedPolicy::Read { .. } => format!(
             "epoch {}, write requirement {} (publishes up to {})",
             effective.epoch, effective.write_requirement, SHARED_WRITE_REQUIREMENT.current
-        )
+        ),
+        SharedPolicy::Missing => "missing".to_owned(),
+        SharedPolicy::Newer(_) => "written by a newer StudioFS".to_owned(),
+        SharedPolicy::NotRead if !shared.pending.is_empty() => format!(
+            "not read; {} schema migration(s) pending, run `studiofs upgrade`",
+            shared.pending.len()
+        ),
+        SharedPolicy::NotRead
+            if shared
+                .shared_format
+                .is_some_and(|f| f < CURRENT_FORMAT_VERSION) =>
+        {
+            "none yet; `studiofs upgrade` adopts the 0.2.5 baseline".to_owned()
+        }
+        SharedPolicy::NotRead => "not read".to_owned(),
     };
     lines.push(format!("  Policy:             {policy_text}"));
 
     lines.push("Operations".to_owned());
     for operation in Operation::ALL {
         let state = match (&decision, blocked.iter().find(|(op, ..)| *op == operation)) {
-            (None, _) => "not evaluated: the shared volume is missing".to_owned(),
+            (None, _) => "not evaluated; see Overall".to_owned(),
             (Some(_), None) => "allowed".to_owned(),
             (Some(_), Some((_, detail, action))) => format!("blocked: {detail} — {action}"),
         };
@@ -249,39 +385,40 @@ pub(crate) fn format_report(
 
     lines.push("Sessions".to_owned());
     match &shared.sessions {
-        None => lines.push("  not read: schema migrations pending".to_owned()),
+        None => lines.push("  not read".to_owned()),
         Some(sessions) => {
             let active = sessions.iter().filter(|session| session.active).count();
             lines.push(format!(
                 "  active {active}, expired {}",
                 sessions.len() - active
             ));
-            for session in sessions.iter().filter(|session| session.active) {
-                let mut problems = Vec::new();
-                if session.policy_epoch < i64::try_from(effective.epoch).unwrap_or(i64::MAX) {
-                    problems.push(format!(
-                        "stale epoch {} (current {})",
-                        session.policy_epoch, effective.epoch
-                    ));
-                }
-                let missing = missing_capabilities_for_session(session, &effective);
-                if !missing.is_empty() {
-                    problems.push(format!("missing capabilities: {}", missing.join(", ")));
-                }
+            for session in sessions {
                 let short_id = &session.session_id.to_string()[..8];
-                if problems.is_empty() {
+                let head = format!(
+                    "  {short_id} build {} epoch {}",
+                    session.build, session.policy_epoch
+                );
+                if !session.active {
+                    lines.push(format!("{head}: expired"));
+                    continue;
+                }
+                let missing = missing_capabilities_for_session(session, effective);
+                let stale =
+                    session.policy_epoch < i64::try_from(effective.epoch).unwrap_or(i64::MAX);
+                if !missing.is_empty() {
                     lines.push(format!(
-                        "  {short_id} build {} epoch {}: ok",
-                        session.build, session.policy_epoch
-                    ));
-                } else {
-                    lines.push(format!(
-                        "  {short_id} build {} epoch {}: {} — {SESSION_ACTION}",
-                        session.build,
-                        session.policy_epoch,
-                        problems.join("; ")
+                        "{head}: missing capabilities: {} — {SESSION_ACTION}",
+                        missing.join(", ")
                     ));
                     add_action(&mut actions, SESSION_ACTION);
+                } else if stale {
+                    // A capable client adopts the new epoch when it renews its lease.
+                    lines.push(format!(
+                        "{head}: stale epoch (current {}); refreshes on its next heartbeat",
+                        effective.epoch
+                    ));
+                } else {
+                    lines.push(format!("{head}: ok"));
                 }
             }
         }
@@ -290,18 +427,18 @@ pub(crate) fn format_report(
     lines.push("Local".to_owned());
     lines.push(format!(
         "  Layout:             {}",
-        or_unknown(local_stores.get(LOCAL_METADATA_LAYOUT.name))
+        or_unknown(local.stores.get(LOCAL_METADATA_LAYOUT.name))
     ));
     lines.push(format!(
         "  Unpublished events: {}",
-        local.unpublished_events
+        local.state.unpublished_events
     ));
     lines.push(format!(
         "  Local version:      {} (shared head {})",
-        or_unknown(local.local_version),
+        or_unknown(local.state.local_version),
         or_unknown(shared.remote_head)
     ));
-    if local.unpublished_events > 0 {
+    if local.state.unpublished_events > 0 {
         lines.push(
             "  Unsafe pending:     yes; these changes are not on the shared volume yet".to_owned(),
         );
@@ -357,6 +494,9 @@ impl CompatibilityArgs {
                 "Local volume metadata is missing; run compatibility where this volume already has a local cache."
             );
         }
+        if super::utils::active_mount_record_for_volume(&self.name)?.is_some() {
+            bail!(MOUNTED_HERE);
+        }
         let local = read_local_facts(&path)?;
         let pg = super::upgrade::postgres_binding(&local.format, &self.name)?;
         let local = &local;
@@ -370,9 +510,7 @@ impl CompatibilityArgs {
                         Ok(format_report(
                             &ClientCapabilities::current(),
                             env!("STUDIOFS_BUILD_VERSION"),
-                            local.format.format_version,
-                            &local.state,
-                            &local.stores,
+                            local,
                             &shared,
                         ))
                     }),
@@ -396,11 +534,59 @@ mod tests {
 
     const FUTURE_WRITER: &str = "table.future_writer.v1";
 
-    fn current_stores() -> BTreeMap<String, u16> {
-        BTreeMap::from([(
-            LOCAL_METADATA_LAYOUT.name.to_owned(),
-            LOCAL_METADATA_LAYOUT.current,
-        )])
+    fn baseline_checkpoint() -> CheckpointDescriptor {
+        VolumeRequirements::baseline()
+            .checkpoint
+            .expect("baseline checkpoint")
+    }
+
+    /// Local facts whose header carries a DSN password and S3 keys, so every
+    /// report test also proves they never reach the output.
+    fn local_facts(format_version: u16, state: CutoverLocalState) -> LocalFacts {
+        let mut format = FormatInfo::new(
+            "secret-test".to_owned(),
+            uuid::Uuid::new_v4().to_string(),
+            FormatInfoDataStore {
+                endpoint: "http://127.0.0.1:9000".to_owned(),
+                bucket: "bucket".to_owned(),
+                access_key: "AKIASECRETACCESS".to_owned(),
+                secret_key: "S3SECRETKEYVALUE".to_owned(),
+                region: "us-east-1".to_owned(),
+            },
+            1,
+        )
+        .expect("format info");
+        format.format_version = format_version;
+        format.metadata.postgres = Some(PostgresConfig {
+            url: "postgres://studiofs:DSNPASSWORD@127.0.0.1:5432/db".to_owned(),
+            volume_id: 1,
+        });
+        let stores = if format_version == CURRENT_FORMAT_VERSION {
+            BTreeMap::from([(
+                LOCAL_METADATA_LAYOUT.name.to_owned(),
+                LOCAL_METADATA_LAYOUT.current,
+            )])
+        } else {
+            BTreeMap::new()
+        };
+        LocalFacts {
+            format,
+            state,
+            stores,
+        }
+    }
+
+    fn report(local: &LocalFacts, shared: &SharedFacts) -> String {
+        let report = format_report(&ClientCapabilities::current(), "0.2.5", local, shared);
+        for secret in [
+            "DSNPASSWORD",
+            "S3SECRETKEYVALUE",
+            "AKIASECRETACCESS",
+            "postgres://",
+        ] {
+            assert!(!report.contains(secret), "{secret} leaked:\n{report}");
+        }
+        report
     }
 
     fn healthy_shared() -> SharedFacts {
@@ -411,20 +597,30 @@ mod tests {
                 checksum: None,
             }],
             pending: Vec::new(),
-            shared_format: Some(7),
+            schema_newer: None,
+            shared_format: Some(CURRENT_FORMAT_VERSION),
             remote_head: Some(10),
-            policy: Some(VolumeProtocol::baseline()),
+            policy: SharedPolicy::Read {
+                policy: VolumeProtocol::baseline(),
+                checkpoints: vec![baseline_checkpoint()],
+            },
             sessions: Some(Vec::new()),
         }
     }
 
-    /// Session that predates the policy epoch and lacks the future writer.
-    fn stale_session() -> ClientSession {
+    fn read_policy(policy: VolumeProtocol, checkpoints: Vec<CheckpointDescriptor>) -> SharedPolicy {
+        SharedPolicy::Read {
+            policy,
+            checkpoints,
+        }
+    }
+
+    fn session(id: &str, policy_epoch: i64, active: bool) -> ClientSession {
         let client = ClientCapabilities::current();
         let now = chrono::Utc::now();
         ClientSession {
-            session_id: uuid::Uuid::parse_str("3f2a9c1e-0000-4000-8000-000000000001").unwrap(),
-            build: "0.2.4".to_owned(),
+            session_id: uuid::Uuid::parse_str(id).unwrap(),
+            build: "0.2.5".to_owned(),
             capabilities: SessionCapabilities {
                 volume_format_min: 7,
                 volume_format_max: 7,
@@ -437,16 +633,16 @@ mod tests {
                     .map(|name| (*name).to_owned())
                     .collect(),
             },
-            policy_epoch: 1,
+            policy_epoch,
             fencing_token: 1,
             heartbeat_at: now,
             lease_expires_at: now + chrono::Duration::seconds(60),
-            active: true,
+            active,
         }
     }
 
-    /// Policy whose write set names a capability this client does not declare,
-    /// with a session that is also stale and unsupported.
+    /// Policy whose write set names a capability neither this client nor the
+    /// sessions declare.
     fn blocked_shared() -> SharedFacts {
         let mut policy = VolumeProtocol::baseline();
         policy.epoch = 3;
@@ -456,20 +652,19 @@ mod tests {
             .features
             .insert(FUTURE_WRITER.to_owned(), FeatureState::Required);
         SharedFacts {
-            policy: Some(policy),
-            sessions: Some(vec![stale_session()]),
+            policy: read_policy(policy, vec![baseline_checkpoint()]),
+            sessions: Some(vec![
+                session("3f2a9c1e-0000-4000-8000-000000000001", 1, true),
+                session("5b7d0a42-0000-4000-8000-000000000002", 2, false),
+            ]),
             ..healthy_shared()
         }
     }
 
     #[test]
     fn compatibility_report_marks_a_healthy_volume_read_write() {
-        let report = format_report(
-            &ClientCapabilities::current(),
-            "0.2.5",
-            7,
-            &CutoverLocalState::default(),
-            &current_stores(),
+        let report = report(
+            &local_facts(CURRENT_FORMAT_VERSION, CutoverLocalState::default()),
             &healthy_shared(),
         );
         assert!(report.contains("Overall: compatible_rw"), "{report}");
@@ -478,19 +673,15 @@ mod tests {
     }
 
     #[test]
-    fn compatibility_report_explains_blocked_publication_stale_session_and_local_work() {
-        let local = CutoverLocalState {
-            unpublished_events: 2,
-            local_version: Some(8),
-        };
-        let report = format_report(
-            &ClientCapabilities::current(),
-            "0.2.5",
-            7,
-            &local,
-            &current_stores(),
-            &blocked_shared(),
+    fn compatibility_report_explains_blocked_publication_session_and_local_work() {
+        let local = local_facts(
+            CURRENT_FORMAT_VERSION,
+            CutoverLocalState {
+                unpublished_events: 2,
+                local_version: Some(8),
+            },
         );
+        let report = report(&local, &blocked_shared());
         let layout = LOCAL_METADATA_LAYOUT.current;
         let expected = format!(
             "\
@@ -509,8 +700,9 @@ Operations
   checkpoint   blocked: write_capability_missing (table.future_writer.v1) — upgrade StudioFS to a release that supports this volume
   maintenance  allowed
 Sessions
-  active 1, expired 0
-  3f2a9c1e build 0.2.4 epoch 1: stale epoch 1 (current 3); missing capabilities: write:table.future_writer.v1 — upgrade or unmount that client
+  active 1, expired 1
+  3f2a9c1e build 0.2.5 epoch 1: missing capabilities: write:table.future_writer.v1 — upgrade or unmount that client
+  5b7d0a42 build 0.2.5 epoch 2: expired
 Local
   Layout:             {layout}
   Unpublished events: 2
@@ -528,68 +720,154 @@ Actions
     }
 
     #[test]
-    fn compatibility_report_asks_for_upgrade_before_adopting_format_five_or_six() {
+    fn compatibility_report_lets_a_capable_stale_session_refresh_itself() {
+        let mut policy = VolumeProtocol::baseline();
+        policy.epoch = 3;
         let shared = SharedFacts {
-            recorded: Vec::new(),
-            pending: Vec::new(),
-            shared_format: Some(6),
-            remote_head: Some(3),
-            policy: None,
-            sessions: Some(Vec::new()),
+            policy: read_policy(policy, vec![baseline_checkpoint()]),
+            sessions: Some(vec![session(
+                "3f2a9c1e-0000-4000-8000-000000000001",
+                1,
+                true,
+            )]),
+            ..healthy_shared()
         };
-        let report = format_report(
-            &ClientCapabilities::current(),
-            "0.2.5",
-            6,
-            &CutoverLocalState::default(),
-            &current_stores(),
+        let report = report(
+            &local_facts(CURRENT_FORMAT_VERSION, CutoverLocalState::default()),
             &shared,
         );
         assert!(
-            report.contains("Overall: needs_migration\n  reason: volume_format_needs_migration"),
+            report.contains("epoch 1: stale epoch (current 3); refreshes on its next heartbeat"),
             "{report}"
         );
+        assert!(report.contains("Actions\n  none"), "{report}");
+    }
+
+    #[test]
+    fn compatibility_report_refuses_bootstrap_only_when_no_checkpoint_decodes() {
+        let newer = CheckpointDescriptor {
+            format: u16::MAX,
+            schema: u16::MAX,
+        };
+        let local = local_facts(CURRENT_FORMAT_VERSION, CutoverLocalState::default());
+        let mut shared = healthy_shared();
+        shared.policy = read_policy(
+            VolumeProtocol::baseline(),
+            vec![newer, baseline_checkpoint()],
+        );
+        let text = report(&local, &shared);
+        assert!(text.contains("  bootstrap    allowed"), "{text}");
+        shared.policy = read_policy(VolumeProtocol::baseline(), vec![newer]);
+        let text = report(&local, &shared);
         assert!(
-            report.contains(ReasonCode::VolumeFormatNeedsMigration.action()),
-            "{report}"
+            text.contains("  bootstrap    blocked: checkpoint_format_newer"),
+            "{text}"
+        );
+        assert!(text.contains("Overall: upgrade_required"), "{text}");
+    }
+
+    #[test]
+    fn compatibility_report_asks_for_upgrade_before_adopting_format_five_or_six() {
+        for format in [5, 6] {
+            let shared = SharedFacts {
+                recorded: Vec::new(),
+                shared_format: Some(format),
+                policy: SharedPolicy::NotRead,
+                ..healthy_shared()
+            };
+            let text = report(&local_facts(format, CutoverLocalState::default()), &shared);
+            assert!(
+                text.contains("Overall: needs_migration\n  reason: volume_format_needs_migration"),
+                "{text}"
+            );
+            assert!(
+                text.contains(ReasonCode::VolumeFormatNeedsMigration.action()),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn compatibility_report_asks_this_cache_to_upgrade_after_shared_adoption() {
+        let text = report(
+            &local_facts(6, CutoverLocalState::default()),
+            &healthy_shared(),
+        );
+        assert!(
+            text.contains("Overall: needs_migration\n  reason: local_format_outdated (format 6)"),
+            "{text}"
+        );
+        assert!(
+            text.contains(ReasonCode::LocalFormatOutdated.action()),
+            "{text}"
         );
     }
 
     #[test]
-    fn compatibility_report_never_prints_connection_secrets() {
-        let mut info = FormatInfo::new(
-            "secret-test".to_owned(),
-            uuid::Uuid::new_v4().to_string(),
-            FormatInfoDataStore {
-                endpoint: "http://127.0.0.1:9000".to_owned(),
-                bucket: "bucket".to_owned(),
-                access_key: "AKIASECRETACCESS".to_owned(),
-                secret_key: "S3SECRETKEYVALUE".to_owned(),
-                region: "us-east-1".to_owned(),
-            },
-            1,
-        )
-        .expect("format info");
-        info.metadata.postgres = Some(PostgresConfig {
-            url: "postgres://studiofs:DSNPASSWORD@127.0.0.1:5432/db".to_owned(),
-            volume_id: 1,
-        });
-        let report = format_report(
-            &ClientCapabilities::current(),
-            "0.2.5",
-            info.format_version,
-            &CutoverLocalState::default(),
-            &current_stores(),
-            &blocked_shared(),
+    fn compatibility_report_names_newer_missing_and_unknown_volumes() {
+        let local = local_facts(CURRENT_FORMAT_VERSION, CutoverLocalState::default());
+        let newer = SharedFacts {
+            policy: SharedPolicy::Newer("volume write requirement is 9".to_owned()),
+            ..healthy_shared()
+        };
+        let text = report(&local, &newer);
+        assert!(
+            text.contains("Overall: upgrade_required\n  reason: volume write requirement is 9"),
+            "{text}"
         );
-        for secret in [
-            "DSNPASSWORD",
-            "S3SECRETKEYVALUE",
-            "AKIASECRETACCESS",
-            "postgres://",
-        ] {
-            assert!(!report.contains(secret), "{secret} leaked:\n{report}");
-        }
+        assert!(
+            text.contains("  bootstrap    not evaluated; see Overall"),
+            "{text}"
+        );
+
+        let schema_newer = SharedFacts {
+            schema_newer: Some("schema component `core` is newer".to_owned()),
+            policy: SharedPolicy::NotRead,
+            ..healthy_shared()
+        };
+        let text = report(&local, &schema_newer);
+        assert!(text.contains("Overall: upgrade_required"), "{text}");
+
+        let missing = SharedFacts {
+            policy: SharedPolicy::Missing,
+            ..healthy_shared()
+        };
+        let text = report(&local, &missing);
+        assert!(
+            text.contains("Overall: incompatible\n  reason: volume_policy_missing"),
+            "{text}"
+        );
+        assert!(text.contains(MISSING_POLICY_ACTION), "{text}");
+
+        let unknown = SharedFacts {
+            shared_format: None,
+            remote_head: None,
+            policy: SharedPolicy::NotRead,
+            ..healthy_shared()
+        };
+        let text = report(&local, &unknown);
+        assert!(text.contains("Overall: unknown"), "{text}");
+        assert!(text.contains(UNKNOWN_ACTION), "{text}");
+    }
+
+    /// The published 0.2.4 cache is format 6, which the strict layout reader refuses.
+    #[test]
+    fn read_local_facts_accepts_a_published_format_six_cache() {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../studiofs-meta/tests/fixtures/published-v0.2.4/local-cache.redb");
+        let dir = studiofs_test_support::workspace_target_tempdir("compatibility-format6-");
+        let path = dir.path().join("cache.redb");
+        studiofs_test_support::copy_file_contents(&fixture, &path).expect("copy fixture");
+        let local = read_local_facts(&path).expect("format-6 cache is readable");
+        assert_eq!(local.format.format_version, 6);
+        assert!(local.stores.is_empty());
+        let shared = SharedFacts {
+            shared_format: Some(6),
+            policy: SharedPolicy::NotRead,
+            ..healthy_shared()
+        };
+        let text = report(&local, &shared);
+        assert!(text.contains("Overall: needs_migration"), "{text}");
     }
 
     #[test]

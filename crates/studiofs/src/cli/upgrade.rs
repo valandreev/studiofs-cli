@@ -383,9 +383,7 @@ async fn dry_run_report(
         report.push_str(&compatibility::format_report(
             &ClientCapabilities::current(),
             env!("STUDIOFS_BUILD_VERSION"),
-            local.format.format_version,
-            &local.state,
-            &local.stores,
+            local,
             &shared,
         ));
         Ok(report)

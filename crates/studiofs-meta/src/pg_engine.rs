@@ -592,9 +592,9 @@ use remote_apply::{
 };
 pub use retained::{RetainedLifecycleSweep, seed_retained_authority};
 pub use volume_protocol::{
-    check_volume_read_policy, execute_feature_cutover, fence_maintenance,
-    insert_initial_volume_protocol, insert_restored_volume_protocol, inspect_cutover_dry_run,
-    read_volume_protocol, update_volume_protocol,
+    check_volume_read_policy, collect_cutover_shared_state, execute_feature_cutover,
+    fence_maintenance, insert_initial_volume_protocol, insert_restored_volume_protocol,
+    inspect_cutover_dry_run, read_volume_protocol, update_volume_protocol,
 };
 pub use volume_settings::{
     S3VolumeSettingsUpdate, set_shared_compression, set_shared_initial_volume_settings,

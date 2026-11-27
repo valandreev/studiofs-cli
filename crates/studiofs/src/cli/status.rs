@@ -1021,7 +1021,9 @@ pub fn run(
             }
         }
         Err(_) => {
-            println!("  Local state:         unavailable; run `studiofs compatibility {name}`")
+            println!(
+                "  Local state:         unavailable (locked by a mount or unreadable); with the volume unmounted, run `studiofs compatibility {name}`"
+            )
         }
     }
 

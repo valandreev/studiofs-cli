@@ -795,15 +795,20 @@ Every change to a persisted boundary keeps those two reports accurate:
   as a `Volume format` or `Layout` line. It must also change the evaluator
   result that `studiofs compatibility` prints. A migration visible in neither
   is a bug.
-- `studiofs status` stays local only. It makes no PostgreSQL or object-store
-  call and no full scan. Shared checks belong to `compatibility` and
-  `upgrade --dry-run`.
+- The compatibility lines in `studiofs status` stay local only: they add no
+  PostgreSQL or object-store call and no full scan. Shared checks belong to
+  `compatibility` and `upgrade --dry-run`.
 - Reports never print connection data or secrets: no DSN, password, token, key,
   or S3 credential. `FormatInfo` must not reach a `Debug` line, an error, or a
   report. Map backend errors to a fixed operation message, as
   `read_shared_facts` does.
-- Reports are read-only. They open local redb read-only and take no exclusive
-  lock, so they work while the volume is mounted.
+- Reports are read-only and open local redb read-only. A mount holds the redb
+  lock, so `compatibility` refuses with an explicit "unmount first" message on
+  the mounting computer; other computers see the mount as a session.
+- The report decides operations with `VolumeProtocol::compatibility_decision`
+  on the baseline requirements and the serving checkpoint encodings, as mounts
+  do. A refusal of the whole volume (newer schema or policy, missing policy,
+  outdated local format) is reported before any operation is evaluated.
 - Known duplication to remove: the write-requirement-newer refusal is checked
   in `VolumeProtocol::check_operations` and again as a report override in
   `cli/compatibility.rs`. Move it into `compatibility_decision` with its own
