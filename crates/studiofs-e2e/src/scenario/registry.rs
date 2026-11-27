@@ -5,6 +5,9 @@ use std::sync::OnceLock;
 use super::types::{Scenario, ScenarioDefinition};
 use super::workloads::cache_scrub::MountedCacheScrub;
 use super::workloads::compression::MountedCompression;
+use super::workloads::forward_compat_matrix::{
+    FORWARD_COMPAT_MATRIX_ALIAS, MOUNTED_FORWARD_COMPAT_MATRIX, MountedForwardCompatMatrix,
+};
 use super::workloads::janitor_cli::{JanitorLiveBenchmark, JanitorPostgresRestart};
 use super::workloads::macos_mmap_exec::MacosMmapExec;
 use super::workloads::macos_recoverable_trash::{MACOS_RECOVERABLE_TRASH, MacosRecoverableTrash};
@@ -85,6 +88,7 @@ pub fn available_scenarios() -> &'static [ScenarioDefinition] {
             JanitorLiveBenchmark.definition(),
             PublishedVolumeFixtureCapture.definition(),
             MacosRecoverableTrash.definition(),
+            MountedForwardCompatMatrix.definition(),
         ]
     })
 }
@@ -93,6 +97,9 @@ pub fn available_scenarios() -> &'static [ScenarioDefinition] {
 pub(crate) fn resolve_scenario(name: &str) -> Option<Box<dyn Scenario>> {
     match name {
         "mounted-compression" => Some(Box::new(MountedCompression)),
+        MOUNTED_FORWARD_COMPAT_MATRIX | FORWARD_COMPAT_MATRIX_ALIAS => {
+            Some(Box::new(MountedForwardCompatMatrix))
+        }
         "janitor-postgres-restart-recovery" => Some(Box::new(JanitorPostgresRestart)),
         "janitor-live-benchmark" => Some(Box::new(JanitorLiveBenchmark)),
         "published-volume-fixture-capture" => Some(Box::new(PublishedVolumeFixtureCapture)),
@@ -272,5 +279,16 @@ mod tests {
                 .any(|scenario| scenario.name == "mounted-logical-quota")
         );
         assert!(resolve_scenario("mounted-logical-quota").is_some());
+    }
+
+    #[test]
+    fn forward_compat_matrix_is_registered_and_resolvable() {
+        assert!(
+            available_scenarios()
+                .iter()
+                .any(|scenario| scenario.name == super::MOUNTED_FORWARD_COMPAT_MATRIX)
+        );
+        assert!(resolve_scenario(super::MOUNTED_FORWARD_COMPAT_MATRIX).is_some());
+        assert!(resolve_scenario(super::FORWARD_COMPAT_MATRIX_ALIAS).is_some());
     }
 }

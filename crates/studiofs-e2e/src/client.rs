@@ -80,6 +80,8 @@ pub struct ClientControllerConfig {
     pub client_env_overrides: BTreeMap<String, Vec<(String, String)>>,
     /// Per-client extra arguments appended to `studiofs mount`.
     pub mount_arg_overrides: BTreeMap<String, Vec<String>>,
+    /// Per-client `studiofs` binary path overrides for multi-binary compatibility scenarios.
+    pub client_bin_overrides: BTreeMap<String, PathBuf>,
 }
 
 impl ClientControllerConfig {
@@ -152,6 +154,7 @@ impl ClientControllerConfig {
             mount_points,
             client_env_overrides: BTreeMap::new(),
             mount_arg_overrides: BTreeMap::new(),
+            client_bin_overrides: BTreeMap::new(),
         })
     }
 
@@ -207,6 +210,7 @@ impl ClientControllerConfig {
             mount_points,
             client_env_overrides: BTreeMap::new(),
             mount_arg_overrides: BTreeMap::new(),
+            client_bin_overrides: BTreeMap::new(),
         })
     }
 }
@@ -860,6 +864,25 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
         self.client(index)
     }
 
+    /// Returns the client by name.
+    pub fn client_by_name(&self, client: &str) -> Result<&ClientSpec, ClientControllerError> {
+        let index = self.client_index(client)?;
+        self.client(index)
+    }
+
+    /// Overrides the `studiofs` binary path for a named client.
+    pub fn set_client_bin_override(
+        &mut self,
+        client: &str,
+        bin: PathBuf,
+    ) -> Result<(), ClientControllerError> {
+        self.client_index(client)?;
+        self.config
+            .client_bin_overrides
+            .insert(client.to_string(), bin);
+        Ok(())
+    }
+
     /// Sets environment variable overrides for a named client.
     pub fn set_client_env_overrides<I, K, V>(
         &mut self,
@@ -1108,6 +1131,18 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
         let output = self.executor.run(&command)?;
         ensure_success(&command, &output)?;
         Ok(output)
+    }
+
+    /// Runs an arbitrary `studiofs` CLI command and returns its raw output without failing on non-zero exit.
+    pub fn run_cli_allow_failure(
+        &self,
+        client: &str,
+        action: &str,
+        args: Vec<String>,
+    ) -> Result<ClientCommandOutput, ClientControllerError> {
+        let index = self.client_index(client)?;
+        let command = self.command(index, action, args)?;
+        self.executor.run(&command).map_err(Into::into)
     }
 
     /// Reads the mounted runtime diagnostics snapshot for a named client.
@@ -1608,10 +1643,15 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
         args: Vec<String>,
     ) -> Result<ClientCommand, ClientControllerError> {
         let client = self.client(index)?;
+        let program = self
+            .config
+            .client_bin_overrides
+            .get(client.name.as_str())
+            .unwrap_or(&self.config.studiofs_bin);
         Ok(ClientCommand {
             client: client.name.clone(),
             action: action.to_string(),
-            program: self.config.studiofs_bin.display().to_string(),
+            program: program.display().to_string(),
             args,
             env: client_env_with_overrides(
                 client,
@@ -3085,6 +3125,7 @@ mod tests {
             mount_points: vec![temp.path().join("mount")],
             client_env_overrides: BTreeMap::new(),
             mount_arg_overrides: BTreeMap::new(),
+            client_bin_overrides: BTreeMap::new(),
         };
         let mut controller = MultiClientController::new(
             config,

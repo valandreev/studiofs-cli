@@ -248,6 +248,7 @@ pub(super) mod cache_scrub;
 pub(super) mod compression;
 mod concurrent_mkdir;
 mod faults;
+pub(super) mod forward_compat_matrix;
 pub(super) mod janitor_cli;
 mod logical_quota;
 pub(super) mod macos_mmap_exec;

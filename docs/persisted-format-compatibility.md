@@ -707,7 +707,9 @@ unchanged. It writes `target/test-successor/manifest.json` with the source
 commit, both binary SHA-256 values, both identity lists, and the declared
 changes. `--require-complete` also requires one change of each kind, plus
 one reversible change and one irreversible change. SFS-1019 runs that check
-before the matrix.
+before the matrix (`python tools/test_successor/run_compat_matrix.py`,
+invoking the registered `studiofs-e2e` scenario `mounted-forward-compat-matrix`
+and publishing `forward-compat-matrix.json` under the run sandbox).
 
 Release builds cannot contain the successor. The feature raises a
 `compile_error!` without `debug_assertions`, and the Linux quality gate checks
