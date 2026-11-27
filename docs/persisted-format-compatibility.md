@@ -701,20 +701,21 @@ persisted boundary:
 
 | Change | Identity to bump | Not bumped |
 |---|---|---|
-| Shared volume layout or the `metadata_state` protocol all writers must speak (only the SFS-1132 6→7 adoption; from format 7 on, use capabilities) | `SHARED_VOLUME_FORMAT` (`FormatInfo.format_version`, `metadata_format_version`). Keep `LOCAL_METADATA_LAYOUT` in sync while both use that field. | codecs |
-| Key or value encoding of an existing local redb table | With the dedicated marker and migration from SFS-1012, bump `LOCAL_METADATA_LAYOUT`. Before that, defer an independent local layout change. | shared format once the local marker exists |
+| Shared volume layout or the `metadata_state` protocol all writers must speak (only the SFS-1132 6→7 adoption; from format 7 on, use capabilities) | `SHARED_VOLUME_FORMAT` (`FormatInfo.format_version`, `metadata_format_version`) | `LOCAL_METADATA_LAYOUT`, codecs |
+| Key or value encoding of an existing local redb table | `LOCAL_METADATA_LAYOUT`, through the SFS-1012 local revision marker and upgrader | shared format |
 | New `MetaEvent` wire envelope | `EVENT_CODEC_WIRE`; a new event kind is a new append-only tag instead | shared format |
 | New serving checkpoint suffix | `SERVING_CHECKPOINT_FORMAT` (keep older formats in range) | shared format |
 | Serving-state schema change | `SERVING_CHECKPOINT_SCHEMA` | checkpoint format |
 | Additive PostgreSQL table, column or index | a new step in `pg_engine::migrations::MIGRATIONS`, which raises its component (`POSTGRES_CORE_SCHEMA` for `core`); `POSTGRES_PAYLOAD_GC_SCHEMA` only when the Janitor's GC schema changes | every identity above |
 | Payload index, snapshot artifact, dump, STFS, SFEC | the owner constant listed in `version.rs` | every identity above |
 
-Today the local redb header is still the `FormatInfo` copy in
-`SETTINGS_TABLE["format"]`, so both checks read `FormatInfo.format_version`.
-Local header reads use `LOCAL_METADATA_LAYOUT`. Shared `FormatInfo`, the
-descriptor, `ensure_supported_pg_sync_format_version`, and publication use
-`SHARED_VOLUME_FORMAT`. A compile-time assertion keeps both current versions
-and minimum supported versions equal until SFS-1012 adds a dedicated marker.
+The two identities are independent since SFS-1012. The local redb revision
+comes from its own marker (`read_local_revision`; an unmarked format-6 header
+is revision 6) and is checked against `LOCAL_METADATA_LAYOUT`, which is 6 in
+0.2.5. Shared `FormatInfo`, the descriptor,
+`ensure_supported_pg_sync_format_version`, and publication use
+`SHARED_VOLUME_FORMAT`, which is 7 in 0.2.5. No assertion ties the two
+together.
 
 `CLIENT_RELEASE` (the binary's `CARGO_PKG_VERSION`) is informative only. It
 appears in diagnostics and, later, in session records; it is never a storage

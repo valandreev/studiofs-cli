@@ -209,8 +209,7 @@ macro_rules! with_publication_stamp {
     ($($tail:expr),+ $(,)?) => {
         concat!(
             r#"
-            WITH observed AS MATERIALIZED (SELECT clock_timestamp() AS now_ts),
-            locked AS MATERIALIZED (
+            WITH locked AS MATERIALIZED (
                 SELECT policy_epoch, lease_expires_at FROM client_sessions
                 WHERE vol = $1 AND session_id = $2 AND owner = $3 AND fencing_token = $4
                 FOR SHARE
@@ -218,12 +217,14 @@ macro_rules! with_publication_stamp {
             current_policy AS MATERIALIZED (
                 SELECT COALESCE((SELECT policy_epoch FROM volume_protocol WHERE vol = $1), 0) AS epoch
             ),
-            lease AS (
-                SELECT locked.lease_expires_at > observed.now_ts AS lease_active,
+            lease AS MATERIALIZED (
+                -- Read the clock after FOR SHARE: a wait on a concurrent renewal
+                -- must not judge the lease against a pre-lock timestamp.
+                SELECT locked.lease_expires_at > clock_timestamp() AS lease_active,
                        locked.policy_epoch = current_policy.epoch
                            AND locked.policy_epoch = $5 AS policy_current,
                        current_policy.epoch AS current_epoch
-                FROM locked CROSS JOIN observed CROSS JOIN current_policy
+                FROM locked CROSS JOIN current_policy
             ),
             stamp AS MATERIALIZED (
                 SELECT lease.*,

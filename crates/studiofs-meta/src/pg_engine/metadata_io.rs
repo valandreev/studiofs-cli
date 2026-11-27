@@ -944,7 +944,7 @@ impl PgMetaEngine {
                                 let row = first_row.take().ok_or_else(|| {
                                     MetaError::Storage("lock retained publication: metadata state missing".into())
                                 })?;
-                                crate::check_pg_volume_format(row.get::<_, Option<i16>>(6))?;
+                                crate::check_pg_volume_format(row.get::<_, Option<i16>>("metadata_format_version"))?;
                                 if let Some(receipt) = tx.query_opt(
                                     "SELECT version FROM trash_publication_receipts WHERE vol=$1 AND digest=$2",
                                     &[&volume_id, digest],

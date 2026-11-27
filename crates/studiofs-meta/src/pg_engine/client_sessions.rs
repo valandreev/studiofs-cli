@@ -514,13 +514,7 @@ impl SessionLease {
         self.stamp_query(
             tx,
             sql::STAMP_PUBLICATION_SESSION,
-            &[
-                &volume,
-                &self.owner.id,
-                &self.owner.owner,
-                &self.token,
-                &self.validated_epoch,
-            ],
+            &self.stamp_params(&volume),
         )
         .await
         .map(|_| ())
@@ -538,18 +532,13 @@ impl SessionLease {
                 tx,
                 sql::STAMP_AND_BUMP_METADATA_VERSION,
                 &[
-                    &volume,
-                    &self.owner.id,
-                    &self.owner.owner,
-                    &self.token,
-                    &self.validated_epoch,
-                    &format,
-                    &payload_bytes,
-                    &PUBLICATION_WRITE_REQUIREMENT,
-                ],
+                    &self.stamp_params(&volume)[..],
+                    &[&format, &payload_bytes, &PUBLICATION_WRITE_REQUIREMENT],
+                ]
+                .concat(),
             )
             .await?;
-        Ok(row.get::<_, Option<i64>>(0).map(|_| row))
+        Ok(stamped_state_row(row))
     }
 
     pub(super) async fn stamp_and_lock_retained(
@@ -561,16 +550,21 @@ impl SessionLease {
             .stamp_query(
                 tx,
                 sql::STAMP_AND_LOCK_RETAINED_PUBLICATION,
-                &[
-                    &volume,
-                    &self.owner.id,
-                    &self.owner.owner,
-                    &self.token,
-                    &self.validated_epoch,
-                ],
+                &self.stamp_params(&volume),
             )
             .await?;
-        Ok(row.get::<_, Option<i64>>(0).map(|_| row))
+        Ok(stamped_state_row(row))
+    }
+
+    /// Parameters shared by every publication stamp statement (`$1..$5`).
+    fn stamp_params<'a>(&'a self, volume: &'a i64) -> [&'a (dyn ToSql + Sync); 5] {
+        [
+            volume,
+            &self.owner.id,
+            &self.owner.owner,
+            &self.token,
+            &self.validated_epoch,
+        ]
     }
 
     async fn stamp_query(
@@ -606,6 +600,13 @@ impl SessionLease {
             .await
             .map_err(StampError::into_meta_error)
     }
+}
+
+/// A passed stamp joins the bumped or locked `metadata_state` row. Its
+/// `version` column is NULL when the stamp passed but no row matched the
+/// publication predicate.
+fn stamped_state_row(row: Row) -> Option<Row> {
+    row.get::<_, Option<i64>>("version").map(|_| row)
 }
 
 pub(super) struct ClientSessionState {
