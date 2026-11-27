@@ -5192,6 +5192,9 @@ name = "studiofs-test-support"
 version = "0.2.5"
 dependencies = [
  "tempfile",
+ "tokio",
+ "tokio-postgres",
+ "uuid",
 ]
 
 [[package]]

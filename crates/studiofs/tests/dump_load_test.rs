@@ -17,6 +17,7 @@ use studiofs_meta::{
     chunk_start_offset, ensure_studiofs_database, open_meta_engine, open_meta_engine_with_options,
     schema::{ChunkId, PayloadRefState, SliceId, SliceOrder, SliceRange, SliceRecord},
 };
+use studiofs_test_support::IsolatedPgSchema;
 use uuid::Uuid;
 
 struct TestEnv {
@@ -159,11 +160,13 @@ async fn get_fragmented_object(
     Ok(payload.freeze())
 }
 
-async fn resolved_pg_dsn(raw: &str) -> String {
-    ensure_studiofs_database(raw)
+async fn isolated_pg_schema() -> IsolatedPgSchema {
+    let raw = env_or_dotenv("STUDIOFS_TEST_PG_DSN", None)
+        .expect("STUDIOFS_TEST_PG_DSN is required for ignored S3/PostgreSQL tests");
+    let dsns = ensure_studiofs_database(&raw)
         .await
-        .expect("resolve pg dsn")
-        .metadata_dsn
+        .unwrap_or_else(|_| panic!("resolve PostgreSQL test database"));
+    IsolatedPgSchema::new(&dsns.metadata_dsn)
 }
 
 async fn delete_volume_by_name(pg_dsn: &str, name: &str) {
@@ -435,8 +438,8 @@ async fn verify_payload_from_discovered(home: &Path, disk_name: &str, expected: 
 #[ignore = "requires RustFS/S3 + PostgreSQL test env (STUDIOFS_S3_*, STUDIOFS_TEST_PG_DSN)"]
 async fn dump_load_restores_volume_and_discovery_reads_data() {
     let env = load_test_env();
-    let raw_pg = env_or_dotenv("STUDIOFS_TEST_PG_DSN", None)
-        .expect("STUDIOFS_TEST_PG_DSN is required for ignored S3/PostgreSQL tests");
+    let schema = isolated_pg_schema().await;
+    let pg_dsn = schema.dsn.as_str();
 
     let disk_name = random_name("dump-load-a");
     let home_a = studiofs_test_support::workspace_target_tempdir("home-a-");
@@ -459,7 +462,7 @@ async fn dump_load_restores_volume_and_discovery_reads_data() {
             "--region",
             &env.s3_region,
             "--meta",
-            &raw_pg,
+            pg_dsn,
         ],
     );
     assert_ok(&init, "init");
@@ -503,10 +506,9 @@ async fn dump_load_restores_volume_and_discovery_reads_data() {
     );
     assert_ok(&dump, "dump");
 
-    let pg_dsn = resolved_pg_dsn(&raw_pg).await;
-    delete_volume_by_name(&pg_dsn, &disk_name).await;
+    delete_volume_by_name(pg_dsn, &disk_name).await;
     assert!(
-        !volume_exists(&pg_dsn, &disk_name).await,
+        !volume_exists(pg_dsn, &disk_name).await,
         "volume must be deleted"
     );
 
@@ -517,17 +519,17 @@ async fn dump_load_restores_volume_and_discovery_reads_data() {
             "--path-to-dump",
             dump_path.to_str().unwrap(),
             "--postgresql-adress",
-            &raw_pg,
+            pg_dsn,
         ],
     );
     assert_ok(&load, "load");
     assert!(
-        volume_exists(&pg_dsn, &disk_name).await,
+        volume_exists(pg_dsn, &disk_name).await,
         "volume must be restored"
     );
 
     let home_b = studiofs_test_support::workspace_target_tempdir("home-b-");
-    let discover = run_studiofs(home_b.path(), &["discover", &disk_name, "--meta", &raw_pg]);
+    let discover = run_studiofs(home_b.path(), &["discover", &disk_name, "--meta", pg_dsn]);
     assert_ok(&discover, "discover after load");
     verify_payload_from_discovered(home_b.path(), &disk_name, payload).await;
 }
@@ -536,8 +538,8 @@ async fn dump_load_restores_volume_and_discovery_reads_data() {
 #[ignore = "requires RustFS/S3 + PostgreSQL test env (STUDIOFS_S3_*, STUDIOFS_TEST_PG_DSN)"]
 async fn dump_load_rejects_target_with_snapshot_v2_without_breaking_other_volumes() {
     let env = load_test_env();
-    let raw_pg = env_or_dotenv("STUDIOFS_TEST_PG_DSN", None)
-        .expect("STUDIOFS_TEST_PG_DSN is required for ignored S3/PostgreSQL tests");
+    let schema = isolated_pg_schema().await;
+    let pg_dsn = schema.dsn.as_str();
 
     let target = random_name("dump-load-target");
     let extra1 = random_name("dump-load-extra1");
@@ -562,7 +564,7 @@ async fn dump_load_rejects_target_with_snapshot_v2_without_breaking_other_volume
             "--region",
             &env.s3_region,
             "--meta",
-            &raw_pg,
+            pg_dsn,
         ],
     );
     assert_ok(&init_target, "init target");
@@ -579,8 +581,7 @@ async fn dump_load_rejects_target_with_snapshot_v2_without_breaking_other_volume
     );
     assert_ok(&dump, "dump target");
 
-    let pg_dsn = resolved_pg_dsn(&raw_pg).await;
-    seed_stale_snapshot_v2_rows(&pg_dsn, &target).await;
+    seed_stale_snapshot_v2_rows(pg_dsn, &target).await;
 
     for disk in [&extra1, &extra2] {
         let out = run_studiofs(
@@ -599,7 +600,7 @@ async fn dump_load_rejects_target_with_snapshot_v2_without_breaking_other_volume
                 "--region",
                 &env.s3_region,
                 "--meta",
-                &raw_pg,
+                pg_dsn,
             ],
         );
         assert_ok(&out, "init extra");
@@ -612,7 +613,7 @@ async fn dump_load_rejects_target_with_snapshot_v2_without_breaking_other_volume
             "--path-to-dump",
             dump_path.to_str().unwrap(),
             "--postgresql-adress",
-            &raw_pg,
+            pg_dsn,
         ],
     );
     assert!(
@@ -620,21 +621,19 @@ async fn dump_load_rejects_target_with_snapshot_v2_without_breaking_other_volume
         "load must reject a target with Snapshot v2 state"
     );
     assert_eq!(
-        snapshot_v2_state(&pg_dsn, &target).await,
+        snapshot_v2_state(pg_dsn, &target).await,
         (1, 1, 1, Some("snapshots/stale-v2/artifact".to_string())),
         "rejected load must preserve Snapshot v2 rows and artifact key"
     );
 
     let verify_home = studiofs_test_support::workspace_target_tempdir("verify-home-");
-    let discover_target = run_studiofs(
-        verify_home.path(),
-        &["discover", &target, "--meta", &raw_pg],
-    );
+    let discover_target =
+        run_studiofs(verify_home.path(), &["discover", &target, "--meta", pg_dsn]);
     assert_ok(&discover_target, "discover restored target");
     verify_payload_from_discovered(verify_home.path(), &target, payload).await;
 
     for disk in [&extra1, &extra2] {
-        let out = run_studiofs(verify_home.path(), &["discover", disk, "--meta", &raw_pg]);
+        let out = run_studiofs(verify_home.path(), &["discover", disk, "--meta", pg_dsn]);
         assert_ok(&out, "discover extra volume");
         let db_path = default_meta_dir(verify_home.path(), disk).join(format!("{disk}.db"));
         let meta = open_meta_engine(&db_path).expect("open extra meta");
@@ -691,8 +690,6 @@ struct TargetVolumeState {
 /// scenario panics.
 struct LoadGuardFixture {
     env: TestEnv,
-    raw_pg: String,
-    pg_dsn: String,
     home: tempfile::TempDir,
     dump_path: PathBuf,
     client: tokio_postgres::Client,
@@ -703,27 +700,25 @@ struct LoadGuardFixture {
     /// state the source client's local metadata was built from, so cleanup
     /// cannot reopen that local metadata afterwards.
     payload_stores: std::sync::Mutex<Vec<(String, DataStore)>>,
+    schema: IsolatedPgSchema,
 }
 
 impl LoadGuardFixture {
     async fn connect(volume_names: Vec<String>) -> Self {
         let env = load_test_env();
-        let raw_pg = env_or_dotenv("STUDIOFS_TEST_PG_DSN", None)
-            .expect("STUDIOFS_TEST_PG_DSN is required for ignored S3/PostgreSQL tests");
-        let pg_dsn = resolved_pg_dsn(&raw_pg).await;
-        let (client, connection) = connect_pg(&pg_dsn).await;
+        let schema = isolated_pg_schema().await;
+        let (client, connection) = connect_pg(&schema.dsn).await;
         let home = studiofs_test_support::workspace_target_tempdir("home-");
         let dump_path = home.path().join("load-guard.dump.json");
         Self {
             env,
-            raw_pg,
-            pg_dsn,
             home,
             dump_path,
             client,
             connection,
             volume_names,
             payload_stores: std::sync::Mutex::new(Vec::new()),
+            schema,
         }
     }
 
@@ -744,7 +739,7 @@ impl LoadGuardFixture {
                 "--region",
                 &self.env.s3_region,
                 "--meta",
-                &self.raw_pg,
+                &self.schema.dsn,
             ],
         );
         assert_ok(&init, "init volume");
@@ -789,7 +784,7 @@ impl LoadGuardFixture {
             "--path-to-dump",
             self.dump_path_str(),
             "--postgresql-address",
-            &self.raw_pg,
+            &self.schema.dsn,
         ]
     }
 
@@ -1122,7 +1117,7 @@ fn dump_load_into_new_metadata_server_ignores_other_volume_accounting() {
 
         // The new metadata server has no row for the dumped UUID; dropping
         // the source row cascades its accounting away.
-        delete_volume_by_name(&fixture.pg_dsn, &target).await;
+        delete_volume_by_name(&fixture.schema.dsn, &target).await;
         let bystander_volume = fixture.volume_id(&bystander).await;
         for table in ACCOUNTING_TABLES {
             fixture
@@ -1142,7 +1137,7 @@ fn dump_load_into_new_metadata_server_ignores_other_volume_accounting() {
         let verify_home = studiofs_test_support::workspace_target_tempdir("verify-home-");
         let discover = run_studiofs(
             verify_home.path(),
-            &["discover", &target, "--meta", &fixture.raw_pg],
+            &["discover", &target, "--meta", &fixture.schema.dsn],
         );
         assert_ok(&discover, "discover loaded target");
         verify_payload_from_discovered(verify_home.path(), &target, payload).await;
@@ -1209,7 +1204,7 @@ fn dump_load_rejects_accounting_row_committed_while_load_waits() {
 
         // Hold the load's advisory lock so `load` finishes its schema DDL and
         // then parks before touching the volume row.
-        let (gate, gate_connection) = connect_pg(&fixture.pg_dsn).await;
+        let (gate, gate_connection) = connect_pg(&fixture.schema.dsn).await;
         gate.batch_execute(&format!(
             "BEGIN; SELECT pg_advisory_xact_lock({LOAD_ADVISORY_LOCK})"
         ))
@@ -1222,7 +1217,7 @@ fn dump_load_rejects_accounting_row_committed_while_load_waits() {
 
         // An uncommitted FK-backed insert holds KEY SHARE on the volume row,
         // which only the load's explicit FOR UPDATE conflicts with.
-        let (writer, writer_connection) = connect_pg(&fixture.pg_dsn).await;
+        let (writer, writer_connection) = connect_pg(&fixture.schema.dsn).await;
         writer.batch_execute("BEGIN").await.expect("begin writer");
         seed_accounting_row(
             &writer,

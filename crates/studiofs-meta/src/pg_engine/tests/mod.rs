@@ -7,6 +7,7 @@ use crate::pg_engine::lifecycle::{drain_startup_catch_up_pages, rebootstrap_star
 use crate::pg_engine::runtime::{PgConnectionPool, PgRemoteRuntime};
 use crate::schema::counters::{LOCAL_PG_FLUSHED_EVENT_SEQ, NEXT_EVENT_SEQ};
 use sha2::{Digest, Sha256};
+use studiofs_test_support::IsolatedPgSchema;
 use uuid::Uuid;
 
 mod checkpoint_scalability;
@@ -712,51 +713,6 @@ fn ensure_test_schema_once(dsn: &str) {
     })
     .expect("apply the PostgreSQL test schema");
     ready.insert(dsn.to_owned());
-}
-
-/// Returns `dsn` with its sessions confined to `schema`, for both URL and
-/// `key=value` DSNs.
-fn search_path_dsn(dsn: &str, schema: &str) -> String {
-    if dsn.starts_with("postgres://") || dsn.starts_with("postgresql://") {
-        let separator = if dsn.contains('?') { '&' } else { '?' };
-        format!("{dsn}{separator}options=-csearch_path%3D{schema}")
-    } else {
-        format!("{dsn} options='-csearch_path={schema}'")
-    }
-}
-
-/// A private, initially empty PostgreSQL schema for a test that drops or
-/// disables schema objects, so parallel tests keep an intact shared schema.
-/// Dropping the guard removes the schema and everything in it.
-struct IsolatedPgSchema {
-    base_dsn: String,
-    name: String,
-    dsn: String,
-}
-
-impl IsolatedPgSchema {
-    fn new(base_dsn: &str) -> Self {
-        let name = format!("sfs_test_{}", Uuid::new_v4().simple());
-        execute_test_sql(base_dsn, format!("CREATE SCHEMA {name}"))
-            .expect("create isolated PostgreSQL schema");
-        Self {
-            base_dsn: base_dsn.to_owned(),
-            dsn: search_path_dsn(base_dsn, &name),
-            name,
-        }
-    }
-}
-
-impl Drop for IsolatedPgSchema {
-    fn drop(&mut self) {
-        // A panic here while a failed test unwinds would abort the process and
-        // hide that failure, so a cleanup error is only reported.
-        if let Err(error) =
-            execute_test_sql(&self.base_dsn, format!("DROP SCHEMA {} CASCADE", self.name))
-        {
-            eprintln!("failed to drop isolated schema {}: {error}", self.name);
-        }
-    }
 }
 
 fn execute_test_sql(dsn: &str, statement: String) -> MetaResult<()> {
