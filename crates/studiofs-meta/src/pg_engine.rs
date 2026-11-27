@@ -1561,14 +1561,17 @@ impl PgMetaEngine {
                 .remote_transport_unavailable
                 .store(false, Ordering::Release),
             Err(error) => {
+                // A stale epoch or an unrepresentable event only rejects this publication.
+                let publication_only_rejection = matches!(
+                    error,
+                    MetaError::VolumeProtocolRejected(
+                        crate::volume_protocol::ProtocolRejection::EpochConflict { .. }
+                            | crate::volume_protocol::ProtocolRejection::EventNotRepresentable { .. }
+                    )
+                );
                 if (volume_protocol::is_volume_read_policy_rejection(error)
                     || matches!(error, MetaError::UuidMismatch { .. }))
-                    && !matches!(
-                        error,
-                        MetaError::VolumeProtocolRejected(
-                            crate::volume_protocol::ProtocolRejection::EventNotRepresentable { .. }
-                        )
-                    )
+                    && !publication_only_rejection
                 {
                     // A publish refusal while in compatible read-only mode
                     // must not interrupt replay or clear the writer refusal.
@@ -1576,15 +1579,12 @@ impl PgMetaEngine {
                         self.freeze_mount_policy(PgSyncLifecycle::Degraded);
                     }
                 }
-                // A protocol refusal of publication says nothing about remote identity.
-                if !matches!(
-                    error,
-                    MetaError::CatchUpCancelled
-                        | MetaError::CatchUpDeadlineExceeded
-                        | MetaError::VolumeProtocolRejected(
-                            crate::volume_protocol::ProtocolRejection::EventNotRepresentable { .. }
-                        )
-                ) {
+                if !publication_only_rejection
+                    && !matches!(
+                        error,
+                        MetaError::CatchUpCancelled | MetaError::CatchUpDeadlineExceeded
+                    )
+                {
                     self.invalidate_remote_validation();
                 }
                 self.remote_transport_unavailable

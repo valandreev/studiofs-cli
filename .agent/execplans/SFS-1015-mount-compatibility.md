@@ -12,6 +12,7 @@ An existing mount should continue to serve safe local reads when PostgreSQL is u
 - [x] (2026-11-27) Reproduce the false writable status on a PostgreSQL policy change in an isolated schema.
 - [x] (2026-11-27) Connect evaluator decisions to startup, replay, publication, and Janitor checks and the mounted lifecycle.
 - [x] (2026-11-27) Run focused verification and prepare the change for review.
+- [x] (2026-11-27) Reproduce and fix the publication epoch race and restore the validation preconditions in the PostgreSQL unit fixtures.
 
 ## Surprises & Discoveries
 
@@ -23,7 +24,7 @@ The requested branch has no unique commits and is checked out in the primary wor
 
 Keep the existing atomic PostgreSQL publication fence. Use the compatibility evaluator to assess the shared format and per-operation policy, and project the result into the local lifecycle without PostgreSQL calls from foreground read or mutation admission.
 
-The existing offline authority rules still apply to an established local allocator reservation. A connected incompatible writer enters `ReadOnlyCompatible` when replay remains safe. A read policy refusal, UUID mismatch, or stale writer fence degrades the mount and clears the frozen catch-up target. The local view can still serve reads in those cases. Recovery returns through catch-up, UUID, and allocator validation. A locally unusable store continues to fail startup or enter the existing fatal state. Preferred checkpoint encoding is independent of the authority to publish ordinary metadata events.
+The existing offline authority rules still apply to an established local allocator reservation. A connected incompatible writer enters `ReadOnlyCompatible` when replay remains safe. A read policy refusal or UUID mismatch degrades the mount and clears the frozen catch-up target. The local view can still serve reads in those cases. An epoch conflict during event publication refreshes the session and retries the transaction once. A second conflict leaves the journal pending and preserves the mount's last validated write authority. Recovery from a compatibility refusal returns through catch-up, UUID, and allocator validation. A locally unusable store continues to fail startup or enter the existing fatal state. Preferred checkpoint encoding is independent of the authority to publish ordinary metadata events.
 
 The synchronization head query reads the policy even without new events. Replay pages check their read policy with the same statement that reads their format and retained cursor, and publication still stamps its session and epoch inside the transaction. Expected-format locks and predicates on format adoption and artifact decoding retain their separate invariants.
 
@@ -42,3 +43,5 @@ The regression owns a disposable PostgreSQL schema. A failed publication must le
 ## Outcomes & Retrospective
 
 The new regression failed on the baseline at the mounted write-authority assertion and passed after the change. Eleven focused PostgreSQL tests passed, including catch-up, legacy-format fences, sessions, pending-event recovery, and Janitor. Forty-four focused baseline unit tests and twenty tests with `test-successor` passed. Package check, all-target package Clippy, formatting, and the staged diff check passed. The tests exercised the configured PostgreSQL service in isolated schemas. Mounted WinFSP or FUSE I/O, RustFS I/O, and the full workspace suites are outside this validation run.
+
+During PR #1069 follow-up, all four reported fixture failures reproduced before the fixture changes. The late-epoch regression returned `EpochConflict` before the retry fix and passed afterward on PostgreSQL 18. The metadata library run passed 1,162 tests, and four selected PostgreSQL tests passed in disposable schemas. The idle flush and local pruning tests still assert that remote format validation stays pending.

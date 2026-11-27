@@ -13,6 +13,7 @@ use crate::engine::{
 use crate::events::{MetaEvent, encode_event};
 use crate::snapshot::ServingCheckpoint;
 use crate::version::{SERVING_CHECKPOINT_FORMAT, SERVING_CHECKPOINT_SCHEMA, SHARED_VOLUME_FORMAT};
+use crate::volume_protocol::ProtocolRejection;
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -908,7 +909,7 @@ impl PgMetaEngine {
                                 Err(error @ (super::client_sessions::StampError::SessionInactive
                                     | super::client_sessions::StampError::PolicyStale { .. })) => {
                                     drop(tx);
-                                    return Ok(Err((error, current_batches)));
+                                    return Ok(Err((error.into_meta_error(), current_batches)));
                                 }
                                 Err(super::client_sessions::StampError::Other(error)) => {
                                     return Err(error);
@@ -941,7 +942,7 @@ impl PgMetaEngine {
                                     return Ok(Ok((version, observation)));
                                 }
                             }
-                            for batch in current_batches {
+                            for batch in &current_batches {
                                 let batch_version_row = tx
                                     .query_opt(
                                         sql::BUMP_METADATA_VERSION,
@@ -960,7 +961,16 @@ impl PgMetaEngine {
                                         )
                                     })?;
                                 let Some(batch_version_row) = batch_version_row else {
-                                    return Err(super::volume_protocol::refused_publication(&tx, volume_id).await);
+                                    let error =
+                                        super::volume_protocol::refused_publication(&tx, volume_id).await;
+                                    if matches!(
+                                        error,
+                                        MetaError::VolumeProtocolRejected(ProtocolRejection::EpochConflict { .. })
+                                    ) {
+                                        drop(tx);
+                                        return Ok(Err((error, current_batches)));
+                                    }
+                                    return Err(error);
                                 };
                                 let batch_version = row_i64(
                                     &batch_version_row,
@@ -1089,7 +1099,7 @@ impl PgMetaEngine {
             });
             match outcome {
                 Ok(Ok(done)) => break Ok(done),
-                Ok(Err((stamp_error, returned_batches))) => {
+                Ok(Err((retry_error, returned_batches))) => {
                     if attempt == 0 {
                         attempt += 1;
                         batches = returned_batches;
@@ -1101,7 +1111,7 @@ impl PgMetaEngine {
                             Err(error) => break Err(error),
                         }
                     }
-                    break Err(stamp_error.into_meta_error());
+                    break Err(retry_error);
                 }
                 Err(error) => break Err(error),
             }

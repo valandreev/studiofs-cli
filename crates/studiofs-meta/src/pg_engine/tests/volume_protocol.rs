@@ -438,6 +438,112 @@ fn sql_i64(dsn: &str, sql: &str, volume: i64, text: Option<String>) -> Option<i6
 
 #[test]
 #[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
+fn compatible_epoch_change_during_publication_keeps_local_writer() {
+    use std::sync::atomic::Ordering;
+
+    let dsn = pg_dsn().expect("STUDIOFS_TEST_PG_DSN is required");
+    let schema = IsolatedPgSchema::new(&dsn);
+    let volume = PgTestVolume::new(schema.dsn(), "sfs1015-publication-epoch");
+    let vol = volume.volume_id;
+    let dir = studiofs_test_support::workspace_target_tempdir("test-");
+    let path = dir.path().join("meta.redb");
+    seed_local(&path, &volume.format_info());
+    let pg = PgMetaEngine::open_with_options(
+        &path,
+        PgOpenOptions {
+            background_poll: false,
+            ..Default::default()
+        },
+    )
+    .expect("open writer");
+    assert_eq!(pg.pg_sync_status().lifecycle, PgSyncLifecycle::Live);
+    pg.create_dir(ROOT_INO, b"draft", 0, 0, 0o755).unwrap();
+    pg.acquire_publication_session()
+        .expect("cache the original lease");
+    // Model a mount that still holds offline eligibility and an allocator reserve.
+    pg.offline_write_authority
+        .store(OFFLINE_AUTHORITY_ELIGIBLE, Ordering::Release);
+
+    std::thread::scope(|scope| {
+        let published = run_async(async {
+            let (mut client, connection) =
+                tokio_postgres::connect(schema.dsn(), tokio_postgres::NoTls)
+                    .await
+                    .map_err(|e| MetaError::Storage(pg_err(e)))?;
+            let _connection = tokio::spawn(connection);
+            let activation = client.transaction().await.unwrap();
+            let mut next = read_volume_protocol(&activation, vol).await?;
+            next.requirements
+                .features
+                .insert("metadata.test.v1".into(), FeatureState::Available);
+            let next = update_volume_protocol(
+                &activation,
+                vol,
+                next.epoch,
+                &next,
+                &ClientCapabilities::current(),
+                "expand",
+            )
+            .await?;
+            assert_eq!(next.epoch, 2);
+
+            let published = scope.spawn(|| pg.flush_metadata());
+            // Commit only after the stamped publisher is blocked on the version bump.
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    activation
+                        .execute("SELECT pg_stat_clear_snapshot()", &[])
+                        .await
+                        .unwrap();
+                    let waiting: bool = activation
+                        .query_one(
+                            "SELECT EXISTS (
+                                SELECT FROM pg_stat_activity
+                                WHERE pg_backend_pid() = ANY(pg_blocking_pids(pid))
+                                  AND query LIKE '%total_event_payload_bytes = total_event_payload_bytes +%'
+                            )",
+                            &[],
+                        )
+                        .await
+                        .unwrap()
+                        .get(0);
+                    if waiting {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("publisher must reach the version bump before activation commits");
+            activation.commit().await.unwrap();
+            Ok(published)
+        })
+        .unwrap();
+        published
+            .join()
+            .unwrap()
+            .expect("retry publication at the compatible epoch");
+    });
+
+    assert!(pg.pg_sync_status().allows_new_mutations());
+    assert_eq!(
+        pg.offline_write_authority.load(Ordering::Acquire),
+        OFFLINE_AUTHORITY_ELIGIBLE
+    );
+    assert_eq!(pg.replication_backlog().pending_ops, 0);
+    assert_eq!(
+        sql_i64(
+            schema.dsn(),
+            "SELECT version FROM metadata_state WHERE vol = $1",
+            vol,
+            None
+        ),
+        Some(1)
+    );
+}
+
+#[test]
+#[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
 fn mount_policy_change_freezes_local_writer() {
     let dsn = pg_dsn().expect("STUDIOFS_TEST_PG_DSN is required");
     let schema = IsolatedPgSchema::new(&dsn);

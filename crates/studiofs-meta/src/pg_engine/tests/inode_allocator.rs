@@ -56,6 +56,10 @@ fn allocator_uses_separate_inode_and_payload_namespaces() {
 #[test]
 fn trusted_pg_allocator_enters_live_lifecycle_and_losing_headroom_enters_pending() {
     let (_dir, engine) = temp_pg_engine_for_unit();
+    engine
+        .remote_format_validated
+        .store(true, Ordering::Release);
+    engine.refresh_pg_sync_lifecycle_for_allocator();
 
     let live = engine.pg_sync_status();
     assert_eq!(live.lifecycle, PgSyncLifecycle::Live);

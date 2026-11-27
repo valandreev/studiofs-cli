@@ -294,6 +294,7 @@ fn split_publication_self_ack_survives_reopen_between_pages() {
 #[test]
 fn local_graph_repair_marker_clears_only_after_conflicting_payload_is_published() {
     let (_dir, pg) = temp_pg_engine_for_unit();
+    pg.remote_format_validated.store(true, Ordering::Release);
     let name = b"repair-conflicting-name.bin";
     let file = uploaded_pending_file(&pg, name, 77_028);
     let replacement = pg
