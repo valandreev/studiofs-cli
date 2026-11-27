@@ -37,6 +37,8 @@ In the examples, `projectfs` is your volume name and `Z:` is an available Window
 | Set a cache limit for a mount | `studiofs mount projectfs Z: --cache-size 500GB` | [Cache](20-cache-why-is-the-cloud-using-my-ssd.md) |
 | View status | `studiofs status projectfs` | [Settings, status, and activity](22-settings-status-and-activity.md) |
 | Get more detailed status | `studiofs status projectfs --verbose` | The same chapter |
+| Check what this version can do with a volume (read-only) | `studiofs compatibility projectfs` | [Upgrades and version compatibility](32-upgrades-and-version-compatibility.md) |
+| Preview an upgrade without changing anything | `studiofs upgrade projectfs --dry-run` | The same chapter |
 | View saved settings | `studiofs settings` | The same chapter |
 | Save a default cache limit | `studiofs settings --cache-size 500GB` | The same chapter |
 | Watch mount activity | `studiofs perf Z: --count 5` | The same chapter |

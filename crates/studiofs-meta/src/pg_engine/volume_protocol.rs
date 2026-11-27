@@ -452,7 +452,9 @@ pub(super) fn check_read_operations(
     )
 }
 
-async fn collect_cutover_shared_state<C: GenericClient + Sync>(
+/// Reads the stored policy plus head, checkpoint and maintenance state in
+/// bounded queries, for cutover readiness and the operator compatibility report.
+pub async fn collect_cutover_shared_state<C: GenericClient + Sync>(
     client: &C,
     volume: i64,
 ) -> MetaResult<(VolumeProtocol, CutoverSharedState)> {

@@ -2,6 +2,7 @@
 
 use crate::cli::WRITE_PATH_OBSERVABILITY_FILE;
 use crate::cli::cache_layout::describe_cache_layout_state;
+use crate::cli::compatibility;
 use crate::cli::utils::format_bytes;
 use clap::Args;
 use std::path::{Path, PathBuf};
@@ -10,6 +11,8 @@ use studiofs_cache::runtime::{
     CacheIndex, LocalPayloadBackendKind, LocalPayloadRuntimeDetection, detect_cache_backends,
 };
 use studiofs_cache::{OpenLocalPayloadBackendError, open_local_payload_backend};
+use studiofs_meta::RedbMetaEngine;
+use studiofs_meta::compat::ClientCapabilities;
 use studiofs_meta::counters;
 use studiofs_meta::{PgSyncDiagnostics, PgSyncPageDiagnostics};
 use studiofs_vfs::{VfsFuseAsyncWriteSnapshot, VfsWritePathObservabilitySnapshot};
@@ -848,6 +851,8 @@ pub fn run(
         return Ok(());
     }
 
+    // Read-only and before the exclusive open below; local counters only, no PostgreSQL call.
+    let local_compatibility = RedbMetaEngine::read_upgrade_and_cutover_state_readonly(&db_path);
     let engine = match studiofs_meta::open_meta_engine(&db_path) {
         Ok(engine) => engine,
         Err(error) => {
@@ -1001,6 +1006,26 @@ pub fn run(
 
     println!("\n  Metadata:   {:?}", db_path);
     println!("  Meta size:   {}", format_bytes(local_db_size));
+
+    println!("\nCompatibility (local only)");
+    println!("──────────────────────────");
+    match local_compatibility {
+        Ok((format_info, state)) => {
+            for line in compatibility::format_local_status(
+                &ClientCapabilities::current(),
+                name,
+                format_info.format_version,
+                state.unpublished_events,
+            ) {
+                println!("{line}");
+            }
+        }
+        Err(_) => {
+            println!(
+                "  Local state:         unavailable (locked by a mount or unreadable); with the volume unmounted, run `studiofs compatibility {name}`"
+            )
+        }
+    }
 
     println!("\nLocal Cache");
     println!("───────────");
