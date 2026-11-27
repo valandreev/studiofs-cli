@@ -396,6 +396,15 @@ pub trait ClientProcess {
 pub trait ClientProcessExecutor {
     /// Run a command and capture output.
     fn run(&self, command: &ClientCommand) -> io::Result<ClientCommandOutput>;
+    /// Run a command with a deadline. In-memory test executors can use the default.
+    fn run_with_timeout(
+        &self,
+        command: &ClientCommand,
+        _timeout: Duration,
+    ) -> io::Result<ClientCommandOutput> {
+        self.run(command)
+    }
+
     /// Spawn a command and return a live process handle.
     fn spawn(&self, command: &ClientCommand) -> io::Result<Box<dyn ClientProcess>>;
     /// Probe if a client mount point is already active.
@@ -438,6 +447,29 @@ impl ClientProcessExecutor for SystemClientProcessExecutor {
             status: output.status.code().unwrap_or(-1),
             stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
             stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        })
+    }
+
+    fn run_with_timeout(
+        &self,
+        command: &ClientCommand,
+        timeout: Duration,
+    ) -> io::Result<ClientCommandOutput> {
+        use crate::infra::{CommandExecutor, CommandSpec, SystemCommandExecutor};
+
+        let output = SystemCommandExecutor.run(&CommandSpec {
+            program: command.program.clone(),
+            args: command.args.clone(),
+            env: command.env.clone(),
+            cwd: None,
+            timeout: Some(timeout),
+        })?;
+        append_log(&command.stdout_log, output.stdout.as_bytes())?;
+        append_log(&command.stderr_log, output.stderr.as_bytes())?;
+        Ok(ClientCommandOutput {
+            status: output.status,
+            stdout: output.stdout,
+            stderr: output.stderr,
         })
     }
 
@@ -1150,6 +1182,14 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
         &self,
         client: &str,
     ) -> Result<serde_json::Value, ClientControllerError> {
+        self.runtime_snapshot_with_timeout(client, Duration::from_secs(15))
+    }
+
+    pub(crate) fn runtime_snapshot_with_timeout(
+        &self,
+        client: &str,
+        timeout: Duration,
+    ) -> Result<serde_json::Value, ClientControllerError> {
         let index = self.client_index(client)?;
         let spec = self.client(index)?;
         let command = self.command(
@@ -1161,7 +1201,7 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
                 spec.mount_point.display().to_string(),
             ],
         )?;
-        let output = self.executor.run(&command)?;
+        let output = self.executor.run_with_timeout(&command, timeout)?;
         ensure_success(&command, &output)?;
         let payload: serde_json::Value = serde_json::from_str(&output.stdout).map_err(|error| {
             ClientControllerError::Io(io::Error::new(io::ErrorKind::InvalidData, error))
@@ -1939,6 +1979,38 @@ pub fn client_stderr_log(sandbox: &Path, client: &str) -> PathBuf {
 /// Returns the default tracing log path for a client.
 pub fn client_tracing_log(sandbox: &Path, client: &str) -> PathBuf {
     client_artifact_dir(sandbox, client).join("studiofs-tracing.log")
+}
+
+pub(crate) fn client_daemon_log_paths(client: &ClientSpec) -> io::Result<Vec<PathBuf>> {
+    let mut paths = vec![client.stdout_log.clone(), client.stderr_log.clone()];
+    // Daily tracing files live beside the base path in the client artifact directory.
+    if let Some(parent) = client.tracing_log.parent()
+        && let Some(base) = client
+            .tracing_log
+            .file_name()
+            .and_then(|name| name.to_str())
+    {
+        match fs::read_dir(parent) {
+            Ok(entries) => {
+                for entry in entries {
+                    let entry = entry?;
+                    if entry.file_type()?.is_file()
+                        && entry.file_name().to_str().is_some_and(|name| {
+                            name == base
+                                || name
+                                    .strip_prefix(base)
+                                    .is_some_and(|suffix| suffix.starts_with('.'))
+                        })
+                    {
+                        paths.push(entry.path());
+                    }
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => (),
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(paths)
 }
 
 /// Builds a fully populated `ClientSpec` for a client and volume.

@@ -21,17 +21,19 @@ use std::time::{Duration, Instant};
 use chrono::{SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
-use studiofs_meta::schema::{DEFAULT_BLOCK_SIZE, DEFAULT_CHUNK_SIZE};
+use studiofs_meta::schema::{DEFAULT_BLOCK_SIZE, DEFAULT_CHUNK_SIZE, ROOT_INO, ResolvedSliceSpan};
+use studiofs_meta::{MetaInodes, MetaNamespace, MetaPayloadObjects, RedbMetaEngine};
 
-use super::recoverable_trash_janitor::with_pg;
+use super::recoverable_trash_janitor::{pg_observation_error_kind, with_pg, with_pg_timeout};
 use super::snapshot_v2::{
     parse_snapshot_id, redact_diagnostics, snapshot_create_args, snapshot_mount_args,
 };
 use super::*;
 use crate::client::{
     ClientCommandOutput, ClientControllerConfig, ClientControllerError,
-    available_snapshot_mount_point, mount_point_is_active,
+    available_snapshot_mount_point, client_daemon_log_paths, mount_point_is_active,
 };
+use crate::infra::{CommandExecutor, CommandSpec, SystemCommandExecutor};
 use crate::mounted_tree::hex_lower;
 use crate::process_job::{ChildJob, wait_for_child_exit};
 
@@ -102,7 +104,7 @@ impl Scenario for MountedForwardCompatMatrix {
         // Run the published v0.2.4 -> 0.2.5 adoption/fencing pair first while the Compose
         // PostgreSQL database is still at core schema <= 1, before the compiled test-successor
         // applies its irreversible core schema v2 migration.
-        let v024_pair = run_fenced_v024_pair(&config, &binaries);
+        let (v024_pair, v024_cleanup_failed) = run_fenced_v024_pair(&config, &binaries);
 
         let mut primary_pair = ReleasePairReport {
             pair_id: "0.2.5-baseline-vs-compiled-test-successor".to_string(),
@@ -112,8 +114,11 @@ impl Scenario for MountedForwardCompatMatrix {
             cells: Vec::new(),
         };
 
-        let primary_result =
-            run_baseline_successor_pair(context, &config, &compose, &binaries, &mut primary_pair);
+        let primary_result = if v024_cleanup_failed {
+            Err(io::Error::other("primary pair skipped after v0.2.4 cleanup failure").into())
+        } else {
+            run_baseline_successor_pair(context, &config, &compose, &binaries, &mut primary_pair)
+        };
 
         let pairs = vec![primary_pair, v024_pair];
         let summary = MatrixSummary::from_pairs(&pairs);
@@ -131,14 +136,9 @@ impl Scenario for MountedForwardCompatMatrix {
             summary,
             passed,
         };
-        write_matrix_report(
-            &context.scenario_dir.join(MATRIX_ARTIFACT),
-            &report,
-            &config,
-        )?;
+        write_matrix_report(&context.scenario_dir.join(MATRIX_ARTIFACT), &report)?;
 
-        primary_result
-            .map_err(|error| io::Error::other(redact_diagnostics(&config, &error.to_string())))?;
+        primary_result.map_err(|error| io::Error::other(matrix_error_detail(&config, &error)))?;
         if !report.passed {
             return Err(io::Error::other(format!(
                 "forward-compatibility matrix reported {} failed cell(s); inspect {}",
@@ -303,20 +303,9 @@ fn current_platform_label() -> &'static str {
 fn write_matrix_report(
     path: &Path,
     report: &ForwardCompatMatrixReport,
-    config: &ClientControllerConfig,
 ) -> Result<(), ScenarioError> {
     let json = serde_json::to_string_pretty(report)?;
-    let has_s3_keys = [&config.s3.access_key, &config.s3.secret_key]
-        .into_iter()
-        .filter(|key| !key.is_empty())
-        .map(serde_json::to_string)
-        .collect::<Result<Vec<_>, _>>()?
-        .iter()
-        .any(|key| json.contains(&key[1..key.len() - 1]));
-    if has_s3_keys
-        || contains_unredacted_diagnostics(&json)
-        || redact_diagnostics(config, &json) != json
-    {
+    if contains_unredacted_diagnostics(report) {
         return Err(io::Error::other("matrix report contains unredacted diagnostics").into());
     }
     fs::write(path, format!("{json}\n"))?;
@@ -535,9 +524,6 @@ where
     let started = Instant::now();
     let mut ops = Vec::new();
     let result = f(&mut ops);
-    for operation in &mut ops {
-        operation.detail = redact_diagnostics(config, &operation.detail);
-    }
     match result {
         Ok(detail) => {
             let status = if ops.iter().any(|op| op.status == CellStatus::Failed) {
@@ -550,7 +536,7 @@ where
                 category: category.to_string(),
                 status: status.clone(),
                 duration_ms: started.elapsed().as_millis() as u64,
-                detail: redact_diagnostics(config, &detail),
+                detail,
                 operations: ops,
             });
             if status == CellStatus::Failed {
@@ -567,7 +553,7 @@ where
                 category: category.to_string(),
                 status: CellStatus::Failed,
                 duration_ms: started.elapsed().as_millis() as u64,
-                detail: redact_diagnostics(config, &error.to_string()),
+                detail: matrix_error_detail(config, &error),
                 operations: ops,
             });
             Err(error)
@@ -597,7 +583,7 @@ fn assert_refusal(
     let normalized = text.to_ascii_lowercase();
     if output.status != 1 || !expected.iter().all(|reason| normalized.contains(reason)) {
         return Err(io::Error::other(format!(
-            "{action}: expected CLI refusal with exit 1 and {expected:?}, got exit {}: {text}",
+            "{action}: expected CLI refusal with exit 1 and {expected:?}, got exit {}. See the retained probe logs",
             output.status
         ))
         .into());
@@ -650,10 +636,79 @@ fn read_log_suffix(path: &Path, offset: u64) -> io::Result<String> {
     Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
-fn contains_unredacted_diagnostics(serialized: &str) -> bool {
-    ["postgres://", "postgresql://", "rustfsadmin"]
+fn matrix_error_detail(config: &ClientControllerConfig, error: &ScenarioError) -> String {
+    match error {
+        ScenarioError::Client(ClientControllerError::CommandFailed {
+            client,
+            action,
+            status,
+            stdout,
+            stderr,
+        }) => format!(
+            "client command {action} for {client} failed with exit status {status}: stderr: {}; stdout: {}",
+            redact_matrix_output(config, stderr),
+            redact_matrix_output(config, stdout),
+        ),
+        ScenarioError::CleanupAfterFailure {
+            context,
+            primary,
+            cleanup,
+        } => format!(
+            "{context} failed: {}; cleanup failed: {}",
+            matrix_error_detail(config, primary),
+            matrix_error_detail(config, cleanup),
+        ),
+        _ => redact_matrix_output(config, &error.to_string()),
+    }
+}
+
+fn redact_matrix_output(config: &ClientControllerConfig, text: &str) -> String {
+    let mut redacted = text.to_string();
+    for credential in [
+        &config.meta_dsn,
+        &config.s3.access_key,
+        &config.s3.secret_key,
+    ] {
+        if let Ok(json) = serde_json::to_string(credential) {
+            let escaped = &json[1..json.len() - 1];
+            if escaped != credential {
+                redacted = redacted.replace(escaped, "<redacted>");
+            }
+        }
+    }
+    redact_diagnostics(config, &redacted)
+}
+
+fn contains_unredacted_diagnostics(report: &ForwardCompatMatrixReport) -> bool {
+    report
+        .pairs
         .iter()
-        .any(|token| serialized.contains(token))
+        .flat_map(|pair| &pair.cells)
+        .any(|cell| {
+            std::iter::once(cell.detail.as_str())
+                .chain(cell.operations.iter().map(|op| op.detail.as_str()))
+                .any(|detail| {
+                    ["postgres://", "postgresql://"]
+                        .iter()
+                        .any(|token| detail.contains(token))
+                })
+        })
+}
+
+fn finish_cleanup<T>(
+    context: &str,
+    primary: Result<T, ScenarioError>,
+    cleanup: Result<(), ScenarioError>,
+) -> Result<T, ScenarioError> {
+    match (primary, cleanup) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
+        (Err(primary), Err(cleanup)) => Err(ScenarioError::CleanupAfterFailure {
+            context: context.to_string(),
+            primary: Box::new(primary),
+            cleanup: Box::new(cleanup),
+        }),
+    }
 }
 
 fn fast_sync_env() -> Vec<(String, String)> {
@@ -1069,8 +1124,7 @@ fn run_baseline_successor_pair(
                     &snap_mount,
                     &mut snap_proc,
                 );
-                snap_verify?;
-                snap_unmount?;
+                finish_cleanup("snapshot readback", snap_verify, snap_unmount)?;
                 record_op(
                     ops,
                     "snapshot_smount_cross_binary_readback",
@@ -1153,6 +1207,8 @@ fn run_baseline_successor_pair(
             |ops| {
                 // Ensure both active sessions are registered in client_sessions before cutover.
                 wait_for_active_sessions(config, 2, Duration::from_secs(30))?;
+                let baseline_session = active_baseline_session(config)?;
+                let active_baseline = format!("active session {baseline_session}");
 
                 // Unmount successor temporarily to drive feature cutover (cutover requires local cache unmounted).
                 controller.unmount(CLIENT_SUCCESSOR)?;
@@ -1216,7 +1272,7 @@ fn run_baseline_successor_pair(
                 assert_refusal(
                     "activation with an active baseline session",
                     &active_refusal,
-                    &["active session ", SUCCESSOR_XATTR_CAPABILITY],
+                    &[&active_baseline, SUCCESSOR_XATTR_CAPABILITY],
                 )?;
                 if observe_protocol_state(config)?.policy_epoch != epoch_before {
                     return Err(io::Error::other(
@@ -1361,7 +1417,10 @@ fn run_baseline_successor_pair(
                     .client_by_name(CLIENT_BASELINE)?
                     .local_metadata_db
                     .clone();
-                let baseline_db_size_before = fs::metadata(&baseline_db)?.len();
+                let sentinel = Path::new("compat-dir/offline-baseline.txt");
+                let sentinel_bytes = b"accepted-while-postgres-down-sfs-1019\n";
+                let baseline_before =
+                    offline_sentinel(&baseline_db, sentinel, sentinel_bytes.len())?;
                 let before_discover = observe_shared_state(config)?;
 
                 // 1. `studiofs compatibility` on baseline must report upgrade_required.
@@ -1370,9 +1429,11 @@ fn run_baseline_successor_pair(
                     "baseline-compatibility-after-activate",
                     vec!["compatibility".into(), config.volume_name.clone()],
                 )?;
-                let combined_compat =
-                    format!("{}\n{}", compat_out.stdout, compat_out.stderr).to_lowercase();
-                if !combined_compat.contains("upgrade_required") {
+                if !compat_out
+                    .stdout
+                    .lines()
+                    .any(|line| line.trim() == "Overall: upgrade_required")
+                {
                     return Err(io::Error::other(
                         "baseline compatibility report did not report upgrade_required",
                     )
@@ -1475,21 +1536,19 @@ fn run_baseline_successor_pair(
                     }
                 }
 
-                // 5. Baseline local redb must remain intact (not deleted or truncated to 0).
-                let baseline_db_size_after = fs::metadata(&baseline_db)?.len();
-                if baseline_db_size_after == 0
-                    || baseline_db_size_after < baseline_db_size_before / 2
+                if offline_sentinel(&baseline_db, sentinel, sentinel_bytes.len())?
+                    != baseline_before
                 {
-                    return Err(io::Error::other(format!(
-                        "baseline local redb unexpectedly shrank after refusal ({baseline_db_size_before} -> {baseline_db_size_after})"
-                    ))
+                    return Err(io::Error::other(
+                        "baseline sentinel inode or payload map changed after refusal",
+                    )
                     .into());
                 }
                 record_op(
                     ops,
                     "baseline_local_redb_preserved",
                     CellStatus::Passed,
-                    format!("local redb preserved ({baseline_db_size_after} bytes)"),
+                    "offline read-only redb inspection verified the sentinel inode, size, and payload map",
                 );
 
                 assert_shared_state_unchanged(config, &before_mount, "baseline mount")?;
@@ -1614,14 +1673,25 @@ fn run_baseline_successor_pair(
         Ok(())
     })();
 
-    let _ = controller.unmount_all();
-    result
+    let cleanup = controller.unmount_all().map_err(ScenarioError::from);
+    if let Err(error) = &cleanup
+        && let Some(cell) = pair.cells.last_mut()
+    {
+        cell.status = CellStatus::Failed;
+        record_op(
+            &mut cell.operations,
+            "pair_cleanup",
+            CellStatus::Failed,
+            matrix_error_detail(config, error),
+        );
+    }
+    finish_cleanup("baseline/successor pair", result, cleanup)
 }
 
 fn run_fenced_v024_pair(
     base_config: &ClientControllerConfig,
     binaries: &MatrixBinaries,
-) -> ReleasePairReport {
+) -> (ReleasePairReport, bool) {
     let baseline_record = query_version_identities(&binaries.baseline_bin, "0.2.5-baseline")
         .unwrap_or_else(|_| BinaryIdentityRecord {
             label: "0.2.5-baseline".to_string(),
@@ -1641,31 +1711,34 @@ fn run_fenced_v024_pair(
         let detail = format!(
             "published v0.2.4 binary not provided (set {V024_BIN_ENV} or run tools/test_successor/run_compat_matrix.py)"
         );
-        return ReleasePairReport {
-            pair_id: "0.2.4-published-vs-0.2.5-baseline-fenced".to_string(),
-            baseline: BinaryIdentityRecord {
-                label: "v0.2.4-published".to_string(),
-                client_release: "0.2.4".to_string(),
-                binary_sha256: "not-provided".to_string(),
-                successor_build: None,
-                identities: Vec::new(),
-                declared_changes: Vec::new(),
-            },
-            successor: baseline_record,
-            observed_protocol: ObservedProtocolState::default(),
-            cells: vec![MatrixCellReport {
-                id: "cell_08_fenced_v024_after_upgrade".to_string(),
-                category: "fenced_legacy_client".to_string(),
-                status: status.clone(),
-                duration_ms: 0,
-                detail: detail.clone(),
-                operations: vec![OperationRecord {
-                    name: "v024_binary_resolution".to_string(),
-                    status,
-                    detail,
+        return (
+            ReleasePairReport {
+                pair_id: "0.2.4-published-vs-0.2.5-baseline-fenced".to_string(),
+                baseline: BinaryIdentityRecord {
+                    label: "v0.2.4-published".to_string(),
+                    client_release: "0.2.4".to_string(),
+                    binary_sha256: "not-provided".to_string(),
+                    successor_build: None,
+                    identities: Vec::new(),
+                    declared_changes: Vec::new(),
+                },
+                successor: baseline_record,
+                observed_protocol: ObservedProtocolState::default(),
+                cells: vec![MatrixCellReport {
+                    id: "cell_08_fenced_v024_after_upgrade".to_string(),
+                    category: "fenced_legacy_client".to_string(),
+                    status: status.clone(),
+                    duration_ms: 0,
+                    detail: detail.clone(),
+                    operations: vec![OperationRecord {
+                        name: "v024_binary_resolution".to_string(),
+                        status,
+                        detail,
+                    }],
                 }],
-            }],
-        };
+            },
+            false,
+        );
     };
 
     let v024_sha = sha256_file(&v024_bin).unwrap_or_else(|_| "unknown".to_string());
@@ -1684,6 +1757,7 @@ fn run_fenced_v024_pair(
         cells: Vec::new(),
     };
 
+    let mut cleanup_failed = false;
     let _ = run_cell(
         base_config,
         &mut pair.cells,
@@ -1719,6 +1793,22 @@ fn run_fenced_v024_pair(
                 write_sync(&mount_a.join("from-v024.txt"), v024_bytes)?;
                 controller.unmount("client-v024-a")?;
 
+                // Give the client that will be fenced a durable file it created itself.
+                let sentinel = Path::new("v024-b-sentinel.txt");
+                let sentinel_bytes = b"locally-written-by-v024-b\n";
+                controller.mount("client-v024-b")?;
+                let mount_b = &controller.client_by_name("client-v024-b")?.mount_point;
+                let before_sentinel =
+                    observe_metadata_version(&v024_config, Duration::from_secs(15))?;
+                write_sync(&mount_b.join(sentinel), sentinel_bytes)?;
+                wait_for_published_write(
+                    &controller,
+                    "client-v024-b",
+                    &v024_config,
+                    before_sentinel,
+                )?;
+                controller.unmount("client-v024-b")?;
+
                 let pre_proto = observe_protocol_state(&v024_config)?;
                 if pre_proto.metadata_format_version != Some(6) {
                     return Err(io::Error::other(format!(
@@ -1739,6 +1829,7 @@ fn run_fenced_v024_pair(
                     .client_by_name("client-v024-b")?
                     .local_metadata_db
                     .clone();
+                let v024_b_before = offline_sentinel(&v024_b_db, sentinel, sentinel_bytes.len())?;
                 let v024_b_sha_before = sha256_file(&v024_b_db)?;
 
                 // 2. Switch client-v024-a to 0.2.5 baseline binary and run `studiofs upgrade` (format 6 -> 7).
@@ -1818,84 +1909,119 @@ fn run_fenced_v024_pair(
                     ),
                 );
 
-                match mount_or_verify_refusal(
+                let fence_detail = if mount_or_verify_refusal(
                     &mut controller,
                     "client-v024-b",
                     "v0.2.4 mount on format 7",
                     &[FORMAT_7_REFUSAL],
                 )? {
-                    false => {
-                        let v024_b_sha_after = sha256_file(&v024_b_db)?;
-                        if !v024_b_db.is_file() || fs::metadata(&v024_b_db)?.len() == 0 {
-                            return Err(io::Error::other(
-                                "v0.2.4 local redb was lost or emptied after mount refusal",
-                            )
-                            .into());
-                        }
-                        record_op(
-                            ops,
-                            "v024_mount_fenced_and_local_redb_preserved",
-                            CellStatus::Passed,
-                            format!(
-                                "v0.2.4 mount refused startup on format-7 volume; local redb intact (sha_unchanged={})",
-                                v024_b_sha_before == v024_b_sha_after
-                            ),
-                        );
-                    }
-                    true => {
-                        let mount_b = controller
-                            .client_by_name("client-v024-b")?
-                            .mount_point
-                            .clone();
-                        let write_result = match write_sync(
-                            &mount_b.join("fenced-v024-write.txt"),
-                            b"must-not-publish\n",
-                        ) {
-                            Ok(()) => "local write accepted".to_string(),
-                            Err(error) => format!("local write returned {:?}", error.kind()),
-                        };
-                        wait_for_v024_fence(&controller, "client-v024-b")?;
-                        assert_missing_file(&mount_b.join("from-025.txt"))?;
-                        controller.unmount("client-v024-b")?;
-                        if !v024_b_db.is_file() || fs::metadata(&v024_b_db)?.len() == 0 {
-                            return Err(io::Error::other(
-                                "v0.2.4 local redb was lost or emptied after fenced unmount",
-                            )
-                            .into());
-                        }
-                        record_op(
-                            ops,
-                            "v024_mount_fenced_and_local_redb_preserved",
-                            CellStatus::Passed,
-                            format!(
-                                "v0.2.4 format-7 fence observed ({write_result}); local redb preserved"
-                            ),
-                        );
-                    }
+                    let mount_b = controller
+                        .client_by_name("client-v024-b")?
+                        .mount_point
+                        .clone();
+                    let write_result = match write_sync(
+                        &mount_b.join("fenced-v024-write.txt"),
+                        b"must-not-publish\n",
+                    ) {
+                        Ok(()) => "local write accepted".to_string(),
+                        Err(error) => format!("local write returned {:?}", error.kind()),
+                    };
+                    wait_for_v024_fence(&controller, "client-v024-b")?;
+                    assert_missing_file(&mount_b.join("from-025.txt"))?;
+                    controller.unmount("client-v024-b")?;
+                    format!("v0.2.4 format-7 fence observed ({write_result})")
+                } else {
+                    "v0.2.4 mount refused startup on format-7 volume".to_string()
+                };
+                if offline_sentinel(&v024_b_db, sentinel, sentinel_bytes.len())? != v024_b_before {
+                    return Err(io::Error::other(
+                        "v0.2.4 sentinel inode or payload map changed after refusal",
+                    )
+                    .into());
                 }
+                let v024_b_sha_after = sha256_file(&v024_b_db)?;
+                record_op(
+                    ops,
+                    "v024_mount_fenced_and_local_redb_preserved",
+                    CellStatus::Passed,
+                    format!(
+                        "{fence_detail}; offline read-only redb inspection verified the sentinel inode, size, and payload map (sha_unchanged={})",
+                        v024_b_sha_before == v024_b_sha_after
+                    ),
+                );
 
                 assert_shared_state_unchanged(&v024_config, &before_refusals, "v0.2.4 refusals")?;
                 verify_cold_files(
                     &mut controller,
                     "client-v025-cold",
-                    &[("from-v024.txt", v024_bytes), ("from-025.txt", v025_bytes)],
+                    &[
+                        ("from-v024.txt", v024_bytes),
+                        ("from-025.txt", v025_bytes),
+                        ("v024-b-sentinel.txt", sentinel_bytes),
+                    ],
                 )?;
                 record_op(
                     ops,
                     "pg_s3_and_025_mount_intact_after_v024_fencing",
                     CellStatus::Passed,
-                    "PG state unchanged and fresh 0.2.5 client read both S3 payloads",
+                    "PG state unchanged and fresh 0.2.5 client read all three S3 payloads",
                 );
 
                 Ok("published v0.2.4 failed closed after 0.2.5 format 6 -> 7 upgrade without corrupting PG/S3 or local redb".to_string())
             })();
 
-            let _ = controller.unmount_all();
-            cell_result
+            let cleanup = controller.unmount_all().map_err(ScenarioError::from);
+            cleanup_failed = cleanup.is_err();
+            if let Err(error) = &cleanup {
+                record_op(
+                    ops,
+                    "pair_cleanup",
+                    CellStatus::Failed,
+                    matrix_error_detail(base_config, error),
+                );
+            }
+            finish_cleanup("v0.2.4 pair", cell_result, cleanup)
         },
     );
 
-    pair
+    (pair, cleanup_failed)
+}
+
+// Inspect the unmounted database through the existing read-only backend. Opening
+// it through the normal mount path could replay PG or repair the evidence.
+fn offline_sentinel(
+    database: &Path,
+    path: &Path,
+    expected_size: usize,
+) -> Result<(u64, Vec<ResolvedSliceSpan>), ScenarioError> {
+    let inspect_error = |error: studiofs_meta::MetaError| {
+        io::Error::other(format!("offline sentinel {}: {error}", path.display()))
+    };
+    let metadata = RedbMetaEngine::open_read_only(database).map_err(inspect_error)?;
+    let mut ino = ROOT_INO;
+    for name in path.iter() {
+        ino = metadata
+            .lookup(ino, name.as_encoded_bytes())
+            .map_err(inspect_error)?
+            .ino;
+    }
+    let attr = metadata.get_attr(ino).map_err(inspect_error)?;
+    if attr.size != expected_size as u64 {
+        return Err(
+            io::Error::other(format!("offline sentinel {} size mismatch", path.display())).into(),
+        );
+    }
+    let slices = metadata
+        .lookup_regular_file_stored_slices(ino, 0, attr.size)
+        .map_err(inspect_error)?;
+    if !slices.iter().any(|span| span.payload.is_some()) {
+        return Err(io::Error::other(format!(
+            "offline sentinel {} has no payload",
+            path.display()
+        ))
+        .into());
+    }
+    Ok((ino, slices))
 }
 
 fn write_sync(path: &Path, bytes: &[u8]) -> io::Result<()> {
@@ -2051,16 +2177,27 @@ fn verify_cold_files(
 ) -> Result<(), ScenarioError> {
     controller.discover(name)?;
     controller.mount(name)?;
-    let mount = &controller.client_by_name(name)?.mount_point;
-    for (path, expected) in files {
-        if fs::read(mount.join(path))? != *expected {
-            return Err(
-                io::Error::other(format!("cold client readback mismatch for {path}")).into(),
-            );
+    let readback = (|| {
+        let mount = &controller.client_by_name(name)?.mount_point;
+        for (path, expected) in files {
+            if bounded_mounted_read(
+                mount.join(path),
+                format!("cold read {name}/{path}"),
+                CONVERGENCE_TIMEOUT,
+            )? != *expected
+            {
+                return Err(
+                    io::Error::other(format!("cold client readback mismatch for {path}")).into(),
+                );
+            }
         }
-    }
-    controller.unmount(name)?;
-    Ok(())
+        Ok(())
+    })();
+    finish_cleanup(
+        "cold client readback",
+        readback,
+        controller.unmount(name).map_err(Into::into),
+    )
 }
 
 fn assert_missing_file(path: &Path) -> Result<(), ScenarioError> {
@@ -2073,21 +2210,53 @@ fn assert_missing_file(path: &Path) -> Result<(), ScenarioError> {
 fn wait_for_matrix_state(
     description: &str,
     timeout: Duration,
-    mut observe: impl FnMut() -> Result<bool, ScenarioError>,
+    mut observe: impl FnMut(Instant) -> Result<bool, ScenarioError>,
 ) -> Result<(), ScenarioError> {
     let deadline = Instant::now() + timeout;
-    loop {
-        if observe()? {
-            return Ok(());
+    let mut last_error = None;
+    while Instant::now() < deadline {
+        match observe(deadline) {
+            Ok(true) if Instant::now() < deadline => return Ok(()),
+            Ok(_) => (),
+            Err(error) if is_transient_observation_error(&error) => last_error = Some(error),
+            Err(error) => return Err(error),
         }
-        if Instant::now() >= deadline {
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                format!("timed out waiting for {description}"),
+        std::thread::sleep(POLL_INTERVAL.min(remaining_observation_time(deadline)));
+    }
+    let detail = last_error.map_or_else(String::new, |error| {
+        format!("; last readiness error: {error}")
+    });
+    Err(io::Error::new(
+        io::ErrorKind::TimedOut,
+        format!("timed out waiting for {description}{detail}"),
+    )
+    .into())
+}
+
+fn remaining_observation_time(deadline: Instant) -> Duration {
+    deadline
+        .saturating_duration_since(Instant::now())
+        .min(Duration::from_secs(15))
+}
+
+fn is_transient_observation_error(error: &ScenarioError) -> bool {
+    match error {
+        ScenarioError::Io(error) | ScenarioError::Client(ClientControllerError::Io(error)) => {
+            matches!(
+                error.kind(),
+                io::ErrorKind::TimedOut
+                    | io::ErrorKind::ConnectionRefused
+                    | io::ErrorKind::ConnectionReset
+                    | io::ErrorKind::ConnectionAborted
+                    | io::ErrorKind::BrokenPipe
             )
-            .into());
         }
-        std::thread::sleep(POLL_INTERVAL);
+        ScenarioError::Client(ClientControllerError::CommandFailed {
+            status: 1, stderr, ..
+        }) => stderr
+            .lines()
+            .any(|line| line.starts_with("Error: no live diagnostics session found for ")),
+        _ => false,
     }
 }
 
@@ -2098,13 +2267,15 @@ fn wait_for_runtime_fence(
     wait_for_matrix_state(
         "baseline degraded with an upgrade-required sync error",
         Duration::from_secs(20),
-        || {
-            Ok(controller.runtime_snapshot(name).is_ok_and(|snapshot| {
+        |deadline| {
+            let snapshot = controller
+                .runtime_snapshot_with_timeout(name, remaining_observation_time(deadline))?;
+            Ok({
                 let sync = &snapshot["synchronization"]["state"]["pg_sync"];
                 sync["lifecycle"] == "degraded"
                     && sync["write_authority"] == false
                     && sync["last_sync_error"] == "upgrade_required"
-            }))
+            })
         },
     )
 }
@@ -2117,20 +2288,12 @@ fn wait_for_v024_fence(
     wait_for_matrix_state(
         "v0.2.4 format-7 refusal in mount logs",
         CONVERGENCE_TIMEOUT,
-        || {
-            if controller.runtime_snapshot(name).is_ok_and(|snapshot| {
-                let sync = &snapshot["synchronization"]["state"]["pg_sync"];
-                let format = &sync["last_sync_error"]["unsupported_format"];
-                sync["lifecycle"] == "degraded"
-                    && sync["write_authority"] == false
-                    && format["found"] == 7
-                    && format["expected"] == 6
-            }) {
-                return Ok(true);
-            }
-            for path in [&client.stderr_log, &client.stdout_log, &client.tracing_log] {
+        |_| {
+            for path in client_daemon_log_paths(client)? {
                 match fs::read_to_string(path) {
-                    Ok(log) if log.contains(FORMAT_7_REFUSAL) => return Ok(true),
+                    Ok(log) if log.to_ascii_lowercase().contains(FORMAT_7_REFUSAL) => {
+                        return Ok(true);
+                    }
                     Ok(_) => (),
                     Err(error) if error.kind() == io::ErrorKind::NotFound => (),
                     Err(error) => return Err(error.into()),
@@ -2151,25 +2314,30 @@ struct SharedState {
 
 fn observe_shared_state(config: &ClientControllerConfig) -> Result<SharedState, ScenarioError> {
     let volume_name = config.volume_name.clone();
-    with_pg(config, "observe shared state", |client| async move {
-        let row = client
-            .query_one(
-                "SELECT m.version, (SELECT count(*) FROM event_log WHERE vol = m.vol),
+    with_pg_timeout(
+        config,
+        "observe shared state",
+        Some(Duration::from_secs(15)),
+        |client| async move {
+            let row = client
+                .query_one(
+                    "SELECT m.version, (SELECT count(*) FROM event_log WHERE vol = m.vol),
                     m.metadata_format_version, p.policy_epoch
              FROM metadata_state m JOIN volumes v ON v.vol = m.vol
              LEFT JOIN volume_protocol p ON p.vol = m.vol WHERE v.name = $1",
-                &[&volume_name],
-            )
-            .await
-            .map_err(pg_err("read shared state"))?;
-        let decode = pg_err("decode shared state");
-        Ok(SharedState {
-            version: row.try_get(0).map_err(&decode)?,
-            event_count: row.try_get(1).map_err(&decode)?,
-            format: row.try_get(2).map_err(&decode)?,
-            policy_epoch: row.try_get(3).map_err(&decode)?,
-        })
-    })
+                    &[&volume_name],
+                )
+                .await
+                .map_err(pg_err("read shared state"))?;
+            let decode = pg_err("decode shared state");
+            Ok(SharedState {
+                version: row.try_get(0).map_err(&decode)?,
+                event_count: row.try_get(1).map_err(&decode)?,
+                format: row.try_get(2).map_err(&decode)?,
+                policy_epoch: row.try_get(3).map_err(&decode)?,
+            })
+        },
+    )
 }
 
 fn assert_shared_state_unchanged(
@@ -2187,6 +2355,26 @@ fn assert_shared_state_unchanged(
     Ok(())
 }
 
+fn observe_metadata_version(
+    config: &ClientControllerConfig,
+    timeout: Duration,
+) -> Result<i64, ScenarioError> {
+    let volume_name = config.volume_name.clone();
+    // This query also runs against format 6, before volume_protocol exists.
+    with_pg_timeout(
+        config,
+        "observe metadata version",
+        Some(timeout),
+        |client| async move {
+            let row = client.query_one(
+            "SELECT m.version FROM metadata_state m JOIN volumes v ON v.vol = m.vol WHERE v.name = $1",
+            &[&volume_name],
+        ).await.map_err(pg_err("read metadata version"))?;
+            row.try_get(0).map_err(pg_err("decode metadata version"))
+        },
+    )
+}
+
 fn wait_for_published_write(
     controller: &MultiClientController<SystemClientProcessExecutor>,
     writer: &str,
@@ -2196,12 +2384,14 @@ fn wait_for_published_write(
     wait_for_matrix_state(
         "compatible client publication and an advanced metadata_state.version",
         CONVERGENCE_TIMEOUT,
-        || {
-            let runtime = controller.runtime_snapshot(writer)?;
+        |deadline| {
+            let runtime = controller
+                .runtime_snapshot_with_timeout(writer, remaining_observation_time(deadline))?;
             Ok(runtime["sync_safety"]["state"] == "safe"
                 && runtime["upload"]["pending_uploads"] == 0
                 && runtime["upload"]["active_uploads"] == 0
-                && observe_shared_state(config)?.version > version)
+                && observe_metadata_version(config, remaining_observation_time(deadline))?
+                    > version)
         },
     )
 }
@@ -2226,7 +2416,7 @@ fn optional_pg_observation<T>(
 }
 
 fn pg_err(op: &str) -> impl Fn(tokio_postgres::Error) -> ScenarioError + '_ {
-    move |error| io::Error::other(format!("{op}: {error}")).into()
+    move |error| io::Error::new(pg_observation_error_kind(&error), format!("{op}: {error}")).into()
 }
 
 fn observe_protocol_state(
@@ -2437,6 +2627,27 @@ fn wait_for_active_sessions(
     }
 }
 
+fn active_baseline_session(config: &ClientControllerConfig) -> Result<String, ScenarioError> {
+    let volume_name = config.volume_name.clone();
+    with_pg_timeout(
+        config,
+        "identify baseline lease",
+        Some(Duration::from_secs(15)),
+        |client| async move {
+            let row = client
+                .query_one(
+                    "SELECT s.session_id FROM client_sessions s JOIN volumes v ON v.vol = s.vol
+             WHERE v.name = $1 AND s.lease_expires_at > now()
+               AND NOT (s.capabilities::jsonb -> 'read' ? $2)",
+                    &[&volume_name, &SUCCESSOR_XATTR_CAPABILITY],
+                )
+                .await
+                .map_err(pg_err("read unique active baseline session"))?;
+            row.try_get(0).map_err(pg_err("decode baseline session ID"))
+        },
+    )
+}
+
 fn expire_all_client_sessions(config: &ClientControllerConfig) -> Result<(), ScenarioError> {
     let volume_name = config.volume_name.clone();
     with_pg(config, "expire client sessions", |client| async move {
@@ -2487,8 +2698,10 @@ fn spawn_tracked_mount(cmd: &mut Command) -> Result<SnapshotProc, ScenarioError>
         Ok(job) => job,
         Err(error) => {
             let _ = child.kill();
-            let _ = child.wait();
-            return Err(error.into());
+            let cleanup = wait_for_child_exit(&mut child, Duration::from_secs(5))
+                .map_err(ScenarioError::from)
+                .and_then(require_child_exit);
+            return finish_cleanup("mount job assignment", Err(error.into()), cleanup);
         }
     };
     Ok(SnapshotProc { child, job })
@@ -2517,17 +2730,60 @@ fn unmount_snapshot_mount(
     mount: &Path,
     proc: &mut SnapshotProc,
 ) -> Result<(), ScenarioError> {
-    let _ = Command::new(bin)
-        .args(["umount", &mount.display().to_string()])
-        .env("STUDIOFS_CLIENT_ROOT", &client.client_root)
-        .output();
-    if !wait_for_child_exit(&mut proc.child, Duration::from_secs(10))? {
-        let _ = proc.job.terminate();
-        let _ = proc.job.force_kill();
-        let _ = proc.child.kill();
-        let _ = proc.child.wait();
+    let command = SystemCommandExecutor.run(&CommandSpec {
+        program: bin.display().to_string(),
+        args: vec!["umount".into(), mount.display().to_string()],
+        env: vec![(
+            "STUDIOFS_CLIENT_ROOT".into(),
+            client.client_root.display().to_string(),
+        )],
+        cwd: None,
+        timeout: Some(Duration::from_secs(10)),
+    });
+    if wait_for_child_exit(&mut proc.child, Duration::from_secs(10))? {
+        require_mount_detached(mount)
+    } else {
+        let stop = stop_mount_probe(proc).and_then(|()| require_mount_detached(mount));
+        let graceful = match command {
+            Ok(output) => Err(io::Error::other(format!(
+                "mount stayed alive after umount (exit {})",
+                output.status
+            ))
+            .into()),
+            Err(error) => Err(error.into()),
+        };
+        finish_cleanup("graceful probe unmount", graceful, stop)
+    }
+}
+
+fn require_mount_detached(mount: &Path) -> Result<(), ScenarioError> {
+    if mount_point_is_active(mount)? {
+        return Err(
+            io::Error::other(format!("probe mount {} is still active", mount.display())).into(),
+        );
     }
     Ok(())
+}
+
+fn require_child_exit(exited: bool) -> Result<(), ScenarioError> {
+    if !exited {
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "mount probe still alive after termination",
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn stop_mount_probe(proc: &mut SnapshotProc) -> Result<(), ScenarioError> {
+    let _ = proc.job.terminate();
+    let _ = proc.job.force_kill();
+    let _ = proc.child.kill();
+    require_child_exit(wait_for_child_exit(
+        &mut proc.child,
+        Duration::from_secs(5),
+    )?)
 }
 
 fn run_mount_expect_failure(
@@ -2550,49 +2806,54 @@ fn run_mount_expect_failure(
     .env("STUDIOFS_CLIENT_ROOT", &client.client_root)
     .stdout(fs::File::create(&stdout)?)
     .stderr(fs::File::create(&stderr)?);
-    let SnapshotProc { mut child, job } = spawn_tracked_mount(&mut cmd)?;
+    let mut proc = spawn_tracked_mount(&mut cmd)?;
     let deadline = Instant::now() + timeout;
-    loop {
-        if let Some(status) = child.try_wait()? {
-            return Ok(ClientCommandOutput {
-                status: status.code().unwrap_or(-1),
-                stdout: String::from_utf8_lossy(&fs::read(stdout)?).into_owned(),
-                stderr: String::from_utf8_lossy(&fs::read(stderr)?).into_owned(),
-            });
-        }
-        if mount_point_is_active(&client.mount_point)? {
-            let _ = Command::new(bin)
-                .args(["umount", &client.mount_point.display().to_string()])
-                .env("STUDIOFS_CLIENT_ROOT", &client.client_root)
-                .output();
-            let _ = job.terminate();
-            let _ = job.force_kill();
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(io::Error::other(format!(
-                "expected mount for {} to fail closed, but mount point {} became active",
-                client.name,
-                client.mount_point.display()
-            ))
-            .into());
-        }
-        if Instant::now() >= deadline {
-            let _ = job.terminate();
-            let _ = job.force_kill();
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                format!(
-                    "expected mount for {} to fail closed within {}s, but it stayed alive",
+    let result = (|| {
+        loop {
+            if let Some(status) = proc.child.try_wait()? {
+                return Ok(ClientCommandOutput {
+                    status: status.code().unwrap_or(-1),
+                    stdout: String::from_utf8_lossy(&fs::read(stdout)?).into_owned(),
+                    stderr: String::from_utf8_lossy(&fs::read(stderr)?).into_owned(),
+                });
+            }
+            if mount_point_is_active(&client.mount_point)? {
+                return Err(io::Error::other(format!(
+                    "expected mount for {} to fail closed, but mount point {} became active",
                     client.name,
-                    timeout.as_secs()
-                ),
-            )
-            .into());
+                    client.mount_point.display()
+                ))
+                .into());
+            }
+            if Instant::now() >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!(
+                        "expected mount for {} to fail closed within {}s, but it stayed alive",
+                        client.name,
+                        timeout.as_secs()
+                    ),
+                )
+                .into());
+            }
+            std::thread::sleep(
+                POLL_INTERVAL.min(deadline.saturating_duration_since(Instant::now())),
+            );
         }
-        std::thread::sleep(POLL_INTERVAL);
+    })();
+    if result.is_err() {
+        let cleanup = match mount_point_is_active(&client.mount_point) {
+            Ok(true) => unmount_snapshot_mount(bin, client, &client.mount_point, &mut proc),
+            Ok(false) => stop_mount_probe(&mut proc),
+            Err(error) => finish_cleanup(
+                "probe mount state",
+                Err(error.into()),
+                stop_mount_probe(&mut proc),
+            ),
+        };
+        return finish_cleanup("refusal probe", result, cleanup);
     }
+    result
 }
 
 pub(crate) fn validate_matrix_report(report: &ForwardCompatMatrixReport) -> Vec<String> {
@@ -2629,7 +2890,7 @@ pub(crate) fn validate_matrix_report(report: &ForwardCompatMatrixReport) -> Vec<
             issues.push(format!("pair {} contains no cells", pair.pair_id));
         }
     }
-    if serde_json::to_string(report).is_ok_and(|json| contains_unredacted_diagnostics(&json)) {
+    if contains_unredacted_diagnostics(report) {
         issues.push("matrix report contains a forbidden token".to_string());
     }
     issues
@@ -2690,6 +2951,30 @@ mod tests {
 
         let same_sha = sample_identity("compiled-test-successor", "aaa", true);
         assert!(verify_successor_contract(&base, &same_sha).is_err());
+    }
+
+    #[test]
+    fn redacts_quoted_and_encoded_credentials_from_command_diagnostics() {
+        let mut config = super::super::tests::_test_config(Path::new("."));
+        config.s3.access_key = "mount".into();
+        config.s3.secret_key = "a\"b+c".into();
+        let error = ScenarioError::from(ClientControllerError::CommandFailed {
+            client: "client-a".into(),
+            action: "mount".into(),
+            status: 1,
+            stdout: r#"secret a%22b%2Bc and {"secret":"a\"b+c"}"#.into(),
+            stderr: "access=mount secret=\"a\"b+c\"".into(),
+        });
+
+        let detail = matrix_error_detail(&config, &error);
+        let serialized = serde_json::to_string(&detail).unwrap();
+        assert!(detail.starts_with("client command mount for client-a"));
+        assert!(detail.contains("access=<redacted-access-key>"));
+        assert_eq!(detail.matches("<redacted-secret-key>").count(), 2);
+        assert!(!serialized.contains("a%22b%2Bc"));
+        assert!(!detail.contains(r#"a\"b+c"#));
+        let quoted = serde_json::to_string(&config.s3.secret_key).unwrap();
+        assert!(!serialized.contains(&quoted[1..quoted.len() - 1]));
     }
 
     #[test]

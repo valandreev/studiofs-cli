@@ -29,6 +29,14 @@ The run publishes a deterministic JSON matrix artifact (`artifacts/scenarios/mou
 - [x] Ran the second follow-up on WinFSP. Six cells passed. The retained logs identified the exact revision-7 redb diagnostic and showed that v0.2.4 delivered its startup diagnostic through redirected stderr.
 - [x] Validated the review follow-up with `sfs-1019-windows-fix3` on WinFSP. All eight cells passed. The POSIX xattr operation was skipped on Windows.
 
+- [x] Added offline sentinel checks to cells 6 and 8. The v0.2.4 client under test creates its own file before the upgrade. The runner compares the inode, size, and payload map across fencing and verifies the bytes from a fresh compatible mount.
+- [x] Bounded runtime and PostgreSQL publication probes by the remaining wait budget. Recorded cleanup failures while preserving the original error, and gated the next pair on cleanup.
+- [x] Bound the active-session blocker to the baseline lease and checked the compatibility report's `Overall` field. Redacted credential-bearing output before serializing matrix diagnostics.
+- [x] Ran Windows focused checks. The matrix, registry, runner contract, and client controller targets passed 5, 3, 40, and 31 tests. Clippy passed with warnings denied.
+- [x] Ran the clean `ff68e7ad` build as `sfs-1019-windows-r2a`. Cells 1–7 passed. Cell 8 timed out because v0.2.4 reported the format fence in its daily rolled tracing file, while the waiter only checked the base filename. The runner now finds rolled per-client logs through the shared log discovery helper.
+- [x] Ran the clean `b552ef7b` build as `sfs-1019-windows-r2a-retry`. Cells 1–7 passed. Cell 8 still timed out because the v0.2.4 tracing message uses uppercase `PG`. Its first shutdown also showed a pending sentinel upload. The runner now matches the format diagnostic case-insensitively and proves the sentinel was published while the v0.2.4 writer is mounted.
+- [ ] Verify the revised build with two consecutive WinFSP runs.
+
 ## Surprises & Discoveries
 
 - Observation: `crates/studiofs-meta/src/test_successor.rs` already implements and declares all 5 changes required by `tools/test_successor/build.py --require-complete`: `postgres-core-schema-2` (`postgres_migration`, irreversible), `event-set-user-xattr-v1` (`event_kind`, irreversible), `serving-checkpoint-envelope-v5` (`checkpoint_format`, reversible), `local-redb-prepare-revision-7` (`local_format`, reversible), and `local-redb-revision-7` (`local_format`, irreversible). No product-code hack or new successor mechanism is needed.

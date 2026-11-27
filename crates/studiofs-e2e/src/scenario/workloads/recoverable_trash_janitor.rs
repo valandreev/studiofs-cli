@@ -12,7 +12,7 @@ use tokio_postgres::NoTls;
 use super::recoverable_trash::{checked_command, expect_payload, wait_absent};
 use super::snapshot_v2::{parse_snapshot_id, redact_diagnostics, snapshot_create_args};
 use super::*;
-use crate::client::ClientControllerConfig;
+use crate::client::{ClientControllerConfig, client_daemon_log_paths};
 
 pub(in crate::scenario) struct RecoverableTrashJanitor;
 
@@ -516,19 +516,40 @@ where
     F: FnOnce(tokio_postgres::Client) -> Fut,
     Fut: std::future::Future<Output = Result<T, ScenarioError>>,
 {
+    with_pg_timeout(config, op_name, None, work)
+}
+
+pub(in crate::scenario) fn with_pg_timeout<F, Fut, T>(
+    config: &ClientControllerConfig,
+    op_name: &str,
+    timeout: Option<Duration>,
+    work: F,
+) -> Result<T, ScenarioError>
+where
+    F: FnOnce(tokio_postgres::Client) -> Fut,
+    Fut: std::future::Future<Output = Result<T, ScenarioError>>,
+{
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
-    runtime.block_on(async {
+    let operation = async {
         let (client, conn) =
             tokio::time::timeout(DB_TIMEOUT, tokio_postgres::connect(&config.meta_dsn, NoTls))
                 .await
-                .map_err(|_| io::Error::other(format!("{op_name}: PG connect timeout")))?
+                .map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        format!("{op_name}: PG connect timeout"),
+                    )
+                })?
                 .map_err(|err| {
-                    io::Error::other(format!(
-                        "{op_name}: PG connect failed: {}",
-                        redact_diagnostics(config, &err.to_string())
-                    ))
+                    io::Error::new(
+                        pg_observation_error_kind(&err),
+                        format!(
+                            "{op_name}: PG connect failed: {}",
+                            redact_diagnostics(config, &err.to_string())
+                        ),
+                    )
                 })?;
         let conn_task = tokio::spawn(async move {
             let _ = conn.await;
@@ -537,7 +558,49 @@ where
         conn_task.abort();
         let _ = conn_task.await;
         result
+    };
+    runtime.block_on(async {
+        match timeout {
+            Some(timeout) => tokio::time::timeout(timeout, operation)
+                .await
+                .map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        format!("{op_name}: PG observation timeout"),
+                    )
+                })?,
+            None => operation.await,
+        }
     })
+}
+
+pub(in crate::scenario) fn pg_observation_error_kind(
+    error: &tokio_postgres::Error,
+) -> io::ErrorKind {
+    use std::error::Error as _;
+    use tokio_postgres::error::SqlState;
+    if error.is_closed()
+        || matches!(
+            error.code(),
+            Some(&SqlState::CANNOT_CONNECT_NOW | &SqlState::ADMIN_SHUTDOWN)
+        )
+    {
+        return io::ErrorKind::ConnectionAborted;
+    }
+    match error
+        .source()
+        .and_then(|source| source.downcast_ref::<io::Error>())
+        .map(io::Error::kind)
+    {
+        Some(
+            kind @ (io::ErrorKind::ConnectionRefused
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::TimedOut
+            | io::ErrorKind::BrokenPipe),
+        ) => kind,
+        _ => io::ErrorKind::Other,
+    }
 }
 
 pub(in crate::scenario) fn load_volume_id_and_prefix(
@@ -887,29 +950,11 @@ fn scan_client_daemon_logs_for_deletions(
 ) -> Result<(usize, usize), ScenarioError> {
     let mut files = BTreeSet::new();
     for client in clients {
-        for path in [&client.stdout_log, &client.stderr_log, &client.tracing_log] {
-            if path.is_file() {
-                files.insert(path.clone());
-            }
-        }
-        // Rolled tracing files (`studiofs-tracing.log.<date>`) live beside the base file in the
-        // per-client artifact dir; the janitor CLI's own logs live under client-root/logs.
-        if let Some(parent) = client.tracing_log.parent()
-            && let Some(base) = client.tracing_log.file_name().and_then(|n| n.to_str())
-            && parent.is_dir()
-        {
-            for entry in fs::read_dir(parent)? {
-                let path = entry?.path();
-                if path.is_file()
-                    && path
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .is_some_and(|n| n.starts_with(base))
-                {
-                    files.insert(path);
-                }
-            }
-        }
+        files.extend(
+            client_daemon_log_paths(client)?
+                .into_iter()
+                .filter(|path| path.is_file()),
+        );
     }
     let mut hits = 0usize;
     for file in &files {
