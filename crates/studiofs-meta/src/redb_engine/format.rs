@@ -51,7 +51,16 @@ impl RedbMetaEngine {
     /// Advance the stopped local metadata database to the compiled local revision.
     #[cfg(feature = "test-successor")]
     pub fn upgrade_local_revision(&self) -> MetaResult<()> {
-        self.advance_local_revision(|_| Ok(()))
+        self.advance_local_revision(|stage| {
+            if stage == 3
+                && std::env::var("STUDIOFS_E2E_EXIT_AFTER_LOCAL_ACTIVATION").as_deref() == Ok("1")
+            {
+                // Leave the database unclosed after the irreversible stage
+                // commits, before the marker is removed by the next transaction.
+                std::process::exit(86);
+            }
+            Ok(())
+        })
     }
 
     #[cfg(feature = "test-successor")]

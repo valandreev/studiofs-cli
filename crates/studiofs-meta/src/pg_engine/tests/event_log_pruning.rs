@@ -126,6 +126,33 @@ fn pg_event_log_prune_deletes_complete_batches_in_bounded_transactions() {
         session.finish(&seed_tx, volume.volume_id).await?;
         seed_tx.commit().await.unwrap();
 
+        // The prune transaction has already deleted a complete batch when it
+        // advances the durable floor. Cancel there and verify both effects roll back.
+        client.batch_execute(
+            "CREATE FUNCTION cancel_prune_progress() RETURNS trigger LANGUAGE plpgsql AS $$
+             BEGIN
+                 RAISE EXCEPTION USING ERRCODE = '57014', MESSAGE = 'cancel prune progress';
+             END $$;
+             CREATE TRIGGER cancel_prune_progress AFTER UPDATE OF event_log_prune_floor
+             ON metadata_state FOR EACH ROW EXECUTE FUNCTION cancel_prune_progress();",
+        ).await.unwrap();
+        let interrupted = engine.run_event_log_prune_once().unwrap_err();
+        assert!(interrupted.to_string().contains("57014"), "{interrupted}");
+        let row = client.query_one(
+            "SELECT event_log_prune_floor, event_log_pruned_rows,
+                (SELECT count(*) FROM event_log WHERE vol = $1)
+             FROM metadata_state WHERE vol = $1",
+            &[&volume.volume_id],
+        ).await.unwrap();
+        assert_eq!(
+            (row.get::<_, i64>(0), row.get::<_, i64>(1), row.get::<_, i64>(2)),
+            (0, 0, 6)
+        );
+        client.batch_execute(
+            "DROP TRIGGER cancel_prune_progress ON metadata_state;
+             DROP FUNCTION cancel_prune_progress();",
+        ).await.unwrap();
+
         let first = engine
             .run_event_log_prune_once()?
             .expect("published metadata state should be prunable");

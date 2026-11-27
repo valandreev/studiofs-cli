@@ -338,6 +338,28 @@ platform-gated (`skipped`), while the xattr capability cutover and refusal
 `--v024-bin <path>` to include the fenced `v0.2.4` cell alongside the baseline
 and compiled successor pair.
 
+For SFS-1020, run the same registered scenario with the crash and rollback
+checks enabled. Verify the native v0.2.2 and v0.2.4 binaries against their
+published release checksums. The v0.2.2 binary provides the format-5 adoption
+case. Use a fresh run ID and keep the report and CLI logs.
+
+```sh
+python tools/test_successor/run_compat_matrix.py --crash-rollback --run-id sfs1020-crash --retain always --v022-bin <verified-native-v0.2.2-binary> --v024-bin <verified-native-v0.2.4-binary>
+cargo run -p studiofs-e2e --locked -- run janitor-postgres-restart-recovery --scenario snapshot-materializer-takeover --studiofs-bin target/debug/studiofs --infra compose --retain always --run-id sfs1020-maintenance
+```
+
+The crash run records cancellation and recovery operations in the matrix
+report. PostgreSQL faults are installed only inside the runner's disposable
+Compose database. An unclean exit at the redb revision marker is available
+only in the compiled test successor. Each platform uses its native
+`studiofs` executable name. See
+[the SFS-1020 ExecPlan](exec-plans/SFS-1020-crash-rollback-validation.md)
+for the exact evidence commands and remaining failures.
+
+To count SQL statements in a file-payload publication batch, run
+`python tools/test_successor/check_publication_statements.py <compose.log>`
+with the instrumented PostgreSQL log described in the ExecPlan.
+
 For SFS-1066, select
 `live_cli_disposable_retires_abandoned_upload_but_protects_delayed_publication`
 to verify actual S3 removal of a retired upload and protection through delayed
