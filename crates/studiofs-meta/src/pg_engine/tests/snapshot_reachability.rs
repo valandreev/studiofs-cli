@@ -1521,7 +1521,7 @@ fn reported_payload_watermark_bounds_cli_janitor_fences() {
             "SELECT acked_through FROM snapshot_payload_upload_watermarks WHERE vol = $1 AND payload_namespace = {namespace}"
         ))
     };
-    let mut janitor = crate::pg_engine::PgJanitorSession::new(dsn.clone(), volume_id);
+    let mut janitor = crate::pg_engine::PgJanitorSession::new(dsn.as_str().to_owned(), volume_id);
     assert!(
         janitor
             .try_acquire_global_janitor_lock()

@@ -50,7 +50,34 @@ fn workspace_env_path() -> std::path::PathBuf {
         .join(".env")
 }
 
-fn pg_dsn() -> Option<String> {
+#[derive(Clone)]
+struct PgTestDsn(Arc<IsolatedPgSchema>);
+
+impl PgTestDsn {
+    fn new(base_dsn: &str) -> Self {
+        Self(Arc::new(IsolatedPgSchema::new(base_dsn)))
+    }
+
+    fn as_str(&self) -> &str {
+        self.0.dsn()
+    }
+}
+
+impl std::ops::Deref for PgTestDsn {
+    type Target = str;
+
+    fn deref(&self) -> &Self::Target {
+        self.0.dsn()
+    }
+}
+
+impl AsRef<str> for PgTestDsn {
+    fn as_ref(&self) -> &str {
+        self.0.dsn()
+    }
+}
+
+fn pg_dsn() -> Option<PgTestDsn> {
     let env_path = workspace_env_path();
     if env_path.is_file() {
         dotenvy::from_path(&env_path).expect("failed to load workspace .env");
@@ -60,11 +87,10 @@ fn pg_dsn() -> Option<String> {
     let raw = std::env::var("STUDIOFS_TEST_PG_DSN")
         .ok()
         .filter(|value| !value.trim().is_empty())?;
-    Some(
-        run_async(async { ensure_studiofs_database(&raw).await })
-            .expect("failed to provision STUDIOFS_TEST_PG_DSN database")
-            .metadata_dsn,
-    )
+    let base_dsn = run_async(async { ensure_studiofs_database(&raw).await })
+        .unwrap_or_else(|_| panic!("failed to provision STUDIOFS_TEST_PG_DSN database"))
+        .metadata_dsn;
+    Some(PgTestDsn::new(&base_dsn))
 }
 
 fn run_async<T, F>(fut: F) -> MetaResult<T>
@@ -366,7 +392,9 @@ impl Drop for PgTestVolume {
                 .map_err(|e| {
                     MetaError::Storage(format!("postgres cleanup failed: {}", pg_err(e)))
                 })?;
+            drop(client);
             conn_task.abort();
+            let _ = conn_task.await;
             Ok::<(), MetaError>(())
         });
     }
@@ -707,9 +735,24 @@ fn ensure_test_schema_once(dsn: &str) {
             .await
             .map_err(|e| MetaError::Storage(format!("postgres connect failed: {}", pg_err(e))))?;
         let conn_task = tokio::spawn(connection);
-        let result =
-            crate::pg_engine::schema::ensure_studiofs_pg_schema_committed(&mut client).await;
+        let result = async {
+            crate::pg_engine::schema::ensure_studiofs_pg_schema_committed(&mut client).await?;
+            let initial_vol = 1_i64 << 48 | (Uuid::new_v4().as_u128() >> 80) as i64;
+            client
+                .execute(
+                    "SELECT setval(pg_get_serial_sequence('volumes', 'vol'), $1, false)",
+                    &[&initial_vol],
+                )
+                .await
+                .map_err(|e| {
+                    MetaError::Storage(format!("seed volume sequence failed: {}", pg_err(e)))
+                })?;
+            Ok(())
+        }
+        .await;
+        drop(client);
         conn_task.abort();
+        let _ = conn_task.await;
         result
     })
     .expect("apply the PostgreSQL test schema");
@@ -813,7 +856,9 @@ fn setup_pg_volume(dsn: &str, name: &str, uuid: &str, block_size: u32) -> MetaRe
         tx.commit()
             .await
             .map_err(|e| MetaError::Storage(format!("postgres commit failed: {}", pg_err(e))))?;
+        drop(client);
         conn_task.abort();
+        let _ = conn_task.await;
         Ok(volume_id)
     })
 }

@@ -10,6 +10,8 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::OnceLock;
+use studiofs_meta::ensure_studiofs_database;
+use studiofs_test_support::IsolatedPgSchema;
 use uuid::Uuid;
 
 fn workspace_dotenv_vars() -> &'static BTreeMap<String, String> {
@@ -88,6 +90,13 @@ fn detached_mount_accepts_first_root_create_on_return() {
     let cache_dir = temp.path().join("cache");
     std::fs::create_dir_all(&mount_parent).expect("create mount parent");
     let name = format!("sfs902-{}", Uuid::new_v4().simple());
+    let raw_pg = required_env("STUDIOFS_TEST_PG_DSN");
+    let studio_dsn = tokio::runtime::Runtime::new()
+        .expect("build runtime")
+        .block_on(ensure_studiofs_database(&raw_pg))
+        .unwrap_or_else(|_| panic!("connect to PostgreSQL test service"))
+        .metadata_dsn;
+    let pg_schema = IsolatedPgSchema::new(&studio_dsn);
 
     let init = studiofs(&client_root)
         .arg("init")
@@ -101,7 +110,7 @@ fn detached_mount_accepts_first_root_create_on_return() {
         .arg("--secret-key")
         .arg(required_env("STUDIOFS_S3_SECRET_KEY"))
         .arg("--meta")
-        .arg(required_env("STUDIOFS_TEST_PG_DSN"))
+        .arg(pg_schema.dsn())
         .output()
         .expect("run studiofs init");
     let mut volume = DetachedVolume {

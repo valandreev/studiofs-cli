@@ -72,7 +72,8 @@ fn pg_janitor_gc_candidate_pages_keyset_through_ten_thousand_rows() {
     })
     .expect("seed candidate queue");
 
-    let mut session = crate::pg_engine::janitor::PgJanitorSession::new(dsn, volume_id);
+    let mut session =
+        crate::pg_engine::janitor::PgJanitorSession::new(dsn.as_str().to_owned(), volume_id);
     assert!(
         session
             .try_acquire_global_janitor_lock()
@@ -1134,7 +1135,8 @@ fn pg_janitor_sweep_checkpoint_restart_scope_dry_run_and_version() {
         pending_key: Some("objects/002a/000000000000002a/0".into()),
     };
     let open = || {
-        let mut session = crate::pg_engine::PgJanitorSession::new(dsn.clone(), volume.volume_id);
+        let mut session =
+            crate::pg_engine::PgJanitorSession::new(dsn.as_str().to_owned(), volume.volume_id);
         assert!(session.try_acquire_global_janitor_lock().unwrap());
         session
     };
