@@ -246,18 +246,31 @@ impl VolumeProtocol {
             .collect();
     }
 
+    /// Decides every operation for `volume` under this policy. The mount checks
+    /// and the operator report both use this path.
+    #[must_use]
+    pub fn compatibility_decision(
+        &self,
+        client: &ClientCapabilities,
+        mut volume: VolumeRequirements,
+        actual_checkpoint: Option<CheckpointDescriptor>,
+        local: &BTreeMap<String, u16>,
+    ) -> crate::compat::CompatibilityDecision {
+        self.apply_to(&mut volume);
+        volume.checkpoint = actual_checkpoint;
+        crate::compat::evaluate(client, &volume, local)
+    }
+
     /// Returns a refusal for a read or write operation against this policy.
     pub fn check_operations(
         &self,
-        mut volume: VolumeRequirements,
+        volume: VolumeRequirements,
         actual_checkpoint: Option<CheckpointDescriptor>,
         local: &BTreeMap<String, u16>,
         operations: &[crate::compat::Operation],
     ) -> crate::MetaResult<()> {
         use crate::{MetaError, UpgradeRequiredReason};
         self.validate()?;
-        self.apply_to(&mut volume);
-        volume.checkpoint = actual_checkpoint;
         for &operation in operations {
             if operation == crate::compat::Operation::Publication
                 && self.write_requirement > SHARED_WRITE_REQUIREMENT.current
@@ -270,7 +283,12 @@ impl VolumeProtocol {
                 });
             }
         }
-        let decision = crate::compat::evaluate(&ClientCapabilities::current(), &volume, local);
+        let decision = self.compatibility_decision(
+            &ClientCapabilities::current(),
+            volume,
+            actual_checkpoint,
+            local,
+        );
         for &operation in operations {
             if let Some(refusal) = decision.refusal(operation) {
                 return Err(MetaError::UpgradeRequired {
@@ -687,7 +705,7 @@ impl CutoverDryRunReport {
 
 /// Computes the missing capabilities/requirements for a `ClientSession` against `proposed`.
 #[must_use]
-pub(crate) fn missing_capabilities_for_session(
+pub fn missing_capabilities_for_session(
     session: &crate::client_sessions::ClientSession,
     proposed: &VolumeProtocol,
 ) -> Vec<String> {

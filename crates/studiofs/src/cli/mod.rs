@@ -7,6 +7,7 @@ pub(crate) const WRITE_PATH_OBSERVABILITY_FILE: &str = "write_path_observability
 pub mod bench;
 pub(crate) mod benchmark_engine;
 pub mod cache_layout;
+pub mod compatibility;
 pub mod compression;
 pub mod destroy;
 pub mod discovery;
@@ -102,6 +103,9 @@ EXAMPLES:
   Check volume status:
     studiofs status myvolume
 
+  Check what this client can do with a volume (read-only):
+    studiofs compatibility myvolume
+
   Run janitor in dry-run mode:
     studiofs janitor myvolume --dry-run
 
@@ -166,6 +170,8 @@ enum Commands {
     Devbench(bench::DevbenchArgs),
     Init(init::InitArgs),
     Upgrade(upgrade::UpgradeArgs),
+    /// Read-only compatibility report for a volume: versions, operations, sessions and local pending work
+    Compatibility(compatibility::CompatibilityArgs),
     /// Show or change the shared trash retention period in whole days
     TrashDays(trash::TrashDaysArgs),
     /// Show or change the shared logical byte quota
@@ -199,6 +205,7 @@ impl Commands {
             Self::Devbench(args) => args.dispatch(),
             Self::Init(args) => args.dispatch(),
             Self::Upgrade(args) => args.dispatch(),
+            Self::Compatibility(args) => args.dispatch(),
             Self::TrashDays(args) => args.dispatch(),
             Self::Quota(args) => args.dispatch(),
             Self::Compression(args) => args.dispatch(),

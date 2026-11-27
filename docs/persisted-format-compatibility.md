@@ -780,3 +780,31 @@ is no rollback. Format 7 adoption is one-way: once a 0.2.x volume is upgraded,
 0.2.0–0.2.4 binaries are fenced and are not supported again. Restoring a
 PostgreSQL backup taken before Activate is a disaster-recovery action, not a
 supported rollback, and loses events published after the backup.
+
+## Operator-facing migration rules
+
+Operators check a volume with `studiofs compatibility <volume>` and
+`studiofs upgrade <volume> --dry-run` before they upgrade
+([user guide chapter 32](user-guide/en/32-upgrades-and-version-compatibility.md)).
+Every change to a persisted boundary keeps those two reports accurate:
+
+- Every new `ReasonCode` needs an `action()` text an operator can follow. The
+  report prints that text as is.
+- Every migration (a `pg_engine::migrations` step, a local layout or format
+  bump) must be visible in `studiofs upgrade --dry-run`: as a pending step, or
+  as a `Volume format` or `Layout` line. It must also change the evaluator
+  result that `studiofs compatibility` prints. A migration visible in neither
+  is a bug.
+- `studiofs status` stays local only. It makes no PostgreSQL or object-store
+  call and no full scan. Shared checks belong to `compatibility` and
+  `upgrade --dry-run`.
+- Reports never print connection data or secrets: no DSN, password, token, key,
+  or S3 credential. `FormatInfo` must not reach a `Debug` line, an error, or a
+  report. Map backend errors to a fixed operation message, as
+  `read_shared_facts` does.
+- Reports are read-only. They open local redb read-only and take no exclusive
+  lock, so they work while the volume is mounted.
+- Known duplication to remove: the write-requirement-newer refusal is checked
+  in `VolumeProtocol::check_operations` and again as a report override in
+  `cli/compatibility.rs`. Move it into `compatibility_decision` with its own
+  `ReasonCode` when that reason is added to `compat.rs`.

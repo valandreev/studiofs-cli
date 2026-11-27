@@ -1,13 +1,14 @@
 //! Explicit, retryable schema migration and format upgrade for a stopped local
 //! volume cache.
 
+use super::compatibility;
 use anyhow::{Context, bail};
 use clap::{Args, ValueEnum};
 use std::collections::BTreeSet;
 use std::time::Duration;
 use studiofs_meta::RedbMetaEngine;
 use studiofs_meta::compat::ClientCapabilities;
-use studiofs_meta::pg_engine::migrations::{migrate_registered_schema, registered_schema_status};
+use studiofs_meta::pg_engine::migrations::migrate_registered_schema;
 use studiofs_meta::pg_engine::{execute_feature_cutover, inspect_cutover_dry_run};
 use studiofs_meta::schema::{FormatInfo, PostgresConfig};
 use studiofs_meta::volume_protocol::{
@@ -130,14 +131,13 @@ impl UpgradeArgs {
         let runtime = tokio::runtime::Runtime::new()?;
         if self.dry_run {
             // Read-only: the exclusive open below creates missing tables and commits.
-            let format = RedbMetaEngine::read_format_info_for_upgrade_readonly(&path)
-                .context("Cannot read local metadata; nothing was changed")?;
-            let pg = postgres_binding(&format, &self.name)?;
+            let local = compatibility::read_local_facts(&path)?;
+            let pg = postgres_binding(&local.format, &self.name)?;
             let report = runtime
                 .block_on(async {
                     tokio::time::timeout(
                         Duration::from_secs(45),
-                        dry_run_report(&format, pg, self.repair_schema),
+                        dry_run_report(&local, pg, self.repair_schema),
                     )
                     .await
                 })
@@ -337,7 +337,10 @@ fn finish_local_upgrade(
     Ok(())
 }
 
-fn postgres_binding<'a>(format: &'a FormatInfo, name: &str) -> anyhow::Result<&'a PostgresConfig> {
+pub(super) fn postgres_binding<'a>(
+    format: &'a FormatInfo,
+    name: &str,
+) -> anyhow::Result<&'a PostgresConfig> {
     if format.name != name {
         bail!("Local volume name does not match its header; metadata was not changed.");
     }
@@ -349,40 +352,41 @@ fn postgres_binding<'a>(format: &'a FormatInfo, name: &str) -> anyhow::Result<&'
 }
 
 async fn dry_run_report(
-    format: &FormatInfo,
+    local: &compatibility::LocalFacts,
     pg: &PostgresConfig,
     repair_schema: bool,
 ) -> anyhow::Result<String> {
     super::init::with_postgres_client(&pg.url, |client| async move {
-        let (recorded, pending) = registered_schema_status(&client, repair_schema).await?;
-        // Backend error text may echo connection data; keep only the operation.
-        let shared: Option<i16> = client
-            .query_opt(
-                "SELECT metadata_format_version FROM metadata_state WHERE vol=$1",
-                &[&pg.volume_id],
-            )
-            .await
-            .map_err(|_| anyhow::anyhow!("reading the shared volume format failed"))?
-            .map(|row| row.get(0));
+        let shared = compatibility::read_shared_facts(&client, pg.volume_id, repair_schema).await?;
         let mut report = String::from("Dry run: nothing was changed.\nSchema components:\n");
-        for row in &recorded {
+        for row in &shared.recorded {
             report.push_str(&format!("  {} = {}\n", row.component, row.version));
         }
-        if recorded.is_empty() {
+        if shared.recorded.is_empty() {
             report.push_str("  none recorded\n");
         }
         report.push_str("Schema migrations to apply:\n");
-        for step in &pending {
+        for step in &shared.pending {
             report.push_str(&format!("  {step}\n"));
         }
-        if pending.is_empty() {
+        if shared.pending.is_empty() {
             report.push_str("  none\n");
         }
         report.push_str(&format!(
             "Volume format: local {}, shared {}; upgrade writes {}.\n",
-            format.format_version,
-            shared.map_or_else(|| "missing".to_owned(), |v| v.to_string()),
+            local.format.format_version,
+            shared
+                .shared_format
+                .map_or_else(|| "missing".to_owned(), |v| v.to_string()),
             studiofs_meta::schema::CURRENT_FORMAT_VERSION
+        ));
+        report.push_str(&compatibility::format_report(
+            &ClientCapabilities::current(),
+            env!("STUDIOFS_BUILD_VERSION"),
+            local.format.format_version,
+            &local.state,
+            &local.stores,
+            &shared,
         ));
         Ok(report)
     })

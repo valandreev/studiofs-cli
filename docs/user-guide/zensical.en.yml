@@ -44,6 +44,7 @@ nav:
       - "25. Migrating StudioFS Metadata to a New PostgreSQL Server": 25-migrating-studiofs-metadata-to-new-postgresql-server.md
       - "26. Credentials, Encryption and Access": 26-credentials-encryption-and-access.md
       - "27. Maintenance and Removing a Volume": 27-maintenance-and-removing-a-volume.md
+      - "32. Upgrades and Version Compatibility": 32-upgrades-and-version-compatibility.md
   - "Help and Reference":
       - "28. Troubleshooting: When the Cat Stops Purring": 28-troubleshooting-when-the-cat-stops-purring.md
       - "29. Logs, Diagnostics and Asking for Help": 29-logs-diagnostics-and-asking-for-help.md
