@@ -314,6 +314,30 @@ v0.2.2 and v0.2.4, runs the scenario, and copies the artifacts into
 cargo run -p studiofs-e2e -- run published-volume-fixture-capture --studiofs-bin <published studiofs> --infra compose --run-id sfs-1002-capture-v0-2-4 --retain always
 ```
 
+### SFS-1019 Supported-Release Forward-Compatibility Matrix
+
+`mounted-forward-compat-matrix` (alias `forward-compat-matrix`) is the opt-in
+SFS-1019 mounted E2E matrix. It runs the 0.2.5 baseline binary, the compiled
+`test-successor` binary (SFS-1131, verified via
+`python tools/test_successor/build.py --require-complete`), and the published
+`v0.2.4` binary against isolated Docker Compose PostgreSQL and RustFS services
+with a separate local `redb` per client. It writes
+`artifacts/scenarios/mounted-forward-compat-matrix/forward-compat-matrix.json`
+recording binary SHA-256 digests, format/PostgreSQL schema versions,
+event/checkpoint protocol versions, declared successor changes, and per-cell
+pass/fail/skipped outcomes. Future released pairs (such as `0.2.5/0.2.7`,
+SFS-1053) append to the `pairs` array in that report.
+
+```sh
+python tools/test_successor/run_compat_matrix.py --run-id sfs-1019-matrix --retain always
+```
+
+On Windows/WinFSP, native POSIX `setxattr`/`getxattr` syscalls are reported as
+platform-gated (`skipped`), while the xattr capability cutover and refusal
+(`event.set_user_xattr.v1`) run on every platform. On Linux/macOS, pass
+`--v024-bin <path>` to include the fenced `v0.2.4` cell alongside the baseline
+and compiled successor pair.
+
 For SFS-1066, select
 `live_cli_disposable_retires_abandoned_upload_but_protects_delayed_publication`
 to verify actual S3 removal of a retired upload and protection through delayed

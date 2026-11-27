@@ -130,6 +130,7 @@ const FULL_E2E_OPT_IN_SCENARIOS: &[&str] = &[
     "mounted-macos-mmap-exec",
     "janitor-live-benchmark",
     "published-volume-fixture-capture",
+    "mounted-forward-compat-matrix",
 ];
 
 #[test]

@@ -80,6 +80,8 @@ pub struct ClientControllerConfig {
     pub client_env_overrides: BTreeMap<String, Vec<(String, String)>>,
     /// Per-client extra arguments appended to `studiofs mount`.
     pub mount_arg_overrides: BTreeMap<String, Vec<String>>,
+    /// Per-client `studiofs` binary path overrides for multi-binary compatibility scenarios.
+    pub client_bin_overrides: BTreeMap<String, PathBuf>,
 }
 
 impl ClientControllerConfig {
@@ -152,6 +154,7 @@ impl ClientControllerConfig {
             mount_points,
             client_env_overrides: BTreeMap::new(),
             mount_arg_overrides: BTreeMap::new(),
+            client_bin_overrides: BTreeMap::new(),
         })
     }
 
@@ -207,6 +210,7 @@ impl ClientControllerConfig {
             mount_points,
             client_env_overrides: BTreeMap::new(),
             mount_arg_overrides: BTreeMap::new(),
+            client_bin_overrides: BTreeMap::new(),
         })
     }
 }
@@ -392,6 +396,15 @@ pub trait ClientProcess {
 pub trait ClientProcessExecutor {
     /// Run a command and capture output.
     fn run(&self, command: &ClientCommand) -> io::Result<ClientCommandOutput>;
+    /// Run a command with a deadline. In-memory test executors can use the default.
+    fn run_with_timeout(
+        &self,
+        command: &ClientCommand,
+        _timeout: Duration,
+    ) -> io::Result<ClientCommandOutput> {
+        self.run(command)
+    }
+
     /// Spawn a command and return a live process handle.
     fn spawn(&self, command: &ClientCommand) -> io::Result<Box<dyn ClientProcess>>;
     /// Probe if a client mount point is already active.
@@ -434,6 +447,29 @@ impl ClientProcessExecutor for SystemClientProcessExecutor {
             status: output.status.code().unwrap_or(-1),
             stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
             stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        })
+    }
+
+    fn run_with_timeout(
+        &self,
+        command: &ClientCommand,
+        timeout: Duration,
+    ) -> io::Result<ClientCommandOutput> {
+        use crate::infra::{CommandExecutor, CommandSpec, SystemCommandExecutor};
+
+        let output = SystemCommandExecutor.run(&CommandSpec {
+            program: command.program.clone(),
+            args: command.args.clone(),
+            env: command.env.clone(),
+            cwd: None,
+            timeout: Some(timeout),
+        })?;
+        append_log(&command.stdout_log, output.stdout.as_bytes())?;
+        append_log(&command.stderr_log, output.stderr.as_bytes())?;
+        Ok(ClientCommandOutput {
+            status: output.status,
+            stdout: output.stdout,
+            stderr: output.stderr,
         })
     }
 
@@ -860,6 +896,25 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
         self.client(index)
     }
 
+    /// Returns the client by name.
+    pub fn client_by_name(&self, client: &str) -> Result<&ClientSpec, ClientControllerError> {
+        let index = self.client_index(client)?;
+        self.client(index)
+    }
+
+    /// Overrides the `studiofs` binary path for a named client.
+    pub fn set_client_bin_override(
+        &mut self,
+        client: &str,
+        bin: PathBuf,
+    ) -> Result<(), ClientControllerError> {
+        self.client_index(client)?;
+        self.config
+            .client_bin_overrides
+            .insert(client.to_string(), bin);
+        Ok(())
+    }
+
     /// Sets environment variable overrides for a named client.
     pub fn set_client_env_overrides<I, K, V>(
         &mut self,
@@ -1110,10 +1165,30 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
         Ok(output)
     }
 
+    /// Runs an arbitrary `studiofs` CLI command and returns its raw output without failing on non-zero exit.
+    pub fn run_cli_allow_failure(
+        &self,
+        client: &str,
+        action: &str,
+        args: Vec<String>,
+    ) -> Result<ClientCommandOutput, ClientControllerError> {
+        let index = self.client_index(client)?;
+        let command = self.command(index, action, args)?;
+        self.executor.run(&command).map_err(Into::into)
+    }
+
     /// Reads the mounted runtime diagnostics snapshot for a named client.
     pub fn runtime_snapshot(
         &self,
         client: &str,
+    ) -> Result<serde_json::Value, ClientControllerError> {
+        self.runtime_snapshot_with_timeout(client, Duration::from_secs(15))
+    }
+
+    pub(crate) fn runtime_snapshot_with_timeout(
+        &self,
+        client: &str,
+        timeout: Duration,
     ) -> Result<serde_json::Value, ClientControllerError> {
         let index = self.client_index(client)?;
         let spec = self.client(index)?;
@@ -1126,7 +1201,7 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
                 spec.mount_point.display().to_string(),
             ],
         )?;
-        let output = self.executor.run(&command)?;
+        let output = self.executor.run_with_timeout(&command, timeout)?;
         ensure_success(&command, &output)?;
         let payload: serde_json::Value = serde_json::from_str(&output.stdout).map_err(|error| {
             ClientControllerError::Io(io::Error::new(io::ErrorKind::InvalidData, error))
@@ -1608,10 +1683,15 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
         args: Vec<String>,
     ) -> Result<ClientCommand, ClientControllerError> {
         let client = self.client(index)?;
+        let program = self
+            .config
+            .client_bin_overrides
+            .get(client.name.as_str())
+            .unwrap_or(&self.config.studiofs_bin);
         Ok(ClientCommand {
             client: client.name.clone(),
             action: action.to_string(),
-            program: self.config.studiofs_bin.display().to_string(),
+            program: program.display().to_string(),
             args,
             env: client_env_with_overrides(
                 client,
@@ -1899,6 +1979,38 @@ pub fn client_stderr_log(sandbox: &Path, client: &str) -> PathBuf {
 /// Returns the default tracing log path for a client.
 pub fn client_tracing_log(sandbox: &Path, client: &str) -> PathBuf {
     client_artifact_dir(sandbox, client).join("studiofs-tracing.log")
+}
+
+pub(crate) fn client_daemon_log_paths(client: &ClientSpec) -> io::Result<Vec<PathBuf>> {
+    let mut paths = vec![client.stdout_log.clone(), client.stderr_log.clone()];
+    // Daily tracing files live beside the base path in the client artifact directory.
+    if let Some(parent) = client.tracing_log.parent()
+        && let Some(base) = client
+            .tracing_log
+            .file_name()
+            .and_then(|name| name.to_str())
+    {
+        match fs::read_dir(parent) {
+            Ok(entries) => {
+                for entry in entries {
+                    let entry = entry?;
+                    if entry.file_type()?.is_file()
+                        && entry.file_name().to_str().is_some_and(|name| {
+                            name == base
+                                || name
+                                    .strip_prefix(base)
+                                    .is_some_and(|suffix| suffix.starts_with('.'))
+                        })
+                    {
+                        paths.push(entry.path());
+                    }
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => (),
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(paths)
 }
 
 /// Builds a fully populated `ClientSpec` for a client and volume.
@@ -3085,6 +3197,7 @@ mod tests {
             mount_points: vec![temp.path().join("mount")],
             client_env_overrides: BTreeMap::new(),
             mount_arg_overrides: BTreeMap::new(),
+            client_bin_overrides: BTreeMap::new(),
         };
         let mut controller = MultiClientController::new(
             config,

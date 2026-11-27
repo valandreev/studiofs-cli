@@ -79,6 +79,7 @@ pub(super) fn _test_config(root: &Path) -> ClientControllerConfig {
         mount_points: Vec::new(),
         client_env_overrides: std::collections::BTreeMap::new(),
         mount_arg_overrides: std::collections::BTreeMap::new(),
+        client_bin_overrides: std::collections::BTreeMap::new(),
     }
 }
 

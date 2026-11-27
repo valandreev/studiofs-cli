@@ -135,6 +135,52 @@ fn controller_can_discover_and_mount_late_observer_after_warm_clients() {
 }
 
 #[test]
+fn binary_override_routes_cli_and_mount_for_only_the_named_client() {
+    let temp = studiofs_test_support::workspace_target_tempdir("test-");
+    let executor = RecordingExecutor::new();
+    let calls = Rc::clone(&executor.calls);
+    let config = test_config(temp.path());
+    let default_bin = config.studiofs_bin.display().to_string();
+    let successor_bin = temp.path().join("studiofs-successor.exe");
+    let mut controller = MultiClientController::new(config, executor);
+    controller.create_clients(["client-a", "client-b"]).unwrap();
+    controller
+        .set_client_bin_override("client-b", successor_bin.clone())
+        .unwrap();
+
+    controller.init_first_client().unwrap();
+    controller.discover("client-b").unwrap();
+    controller.mount_all().unwrap();
+
+    let calls = calls.borrow();
+    for (call, client, action, program) in [
+        (&calls[0], "client-a", "init", default_bin.as_str()),
+        (
+            &calls[1],
+            "client-b",
+            "discover",
+            successor_bin.to_str().unwrap(),
+        ),
+        (&calls[2], "client-a", "mount", default_bin.as_str()),
+        (
+            &calls[3],
+            "client-b",
+            "mount",
+            successor_bin.to_str().unwrap(),
+        ),
+    ] {
+        assert_eq!(
+            (
+                call.client.as_str(),
+                call.action.as_str(),
+                call.program.as_str()
+            ),
+            (client, action, program)
+        );
+    }
+}
+
+#[test]
 fn mount_env_overrides_are_scoped_to_the_named_client() {
     let temp = studiofs_test_support::workspace_target_tempdir("test-");
     let executor = RecordingExecutor::new();
@@ -1284,6 +1330,7 @@ fn test_config(root: &Path) -> ClientControllerConfig {
         mount_points: Vec::new(),
         client_env_overrides: std::collections::BTreeMap::new(),
         mount_arg_overrides: std::collections::BTreeMap::new(),
+        client_bin_overrides: std::collections::BTreeMap::new(),
     }
 }
 
