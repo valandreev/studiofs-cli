@@ -7,7 +7,16 @@ Two rules apply to every upgrade:
 - Check first. Run the read-only report on each computer before you change anything.
 - Never reinitialize a volume or clear its local cache to "fix" an upgrade. Local cache holds changes that may not be on the shared volume yet.
 
-Supported versions: StudioFS 0.2.5 and later. Clients older than 0.2.5 are not supported and cannot safely share a volume with 0.2.5. StudioFS 0.3.0 upgrades only from 0.2.5 or later.
+The support window starts at StudioFS 0.2.5. When a minor line changes the schema, clients on the previous minor line retain read-write access throughout the new line. Only 0.2.5 and later patches count in the 0.2 line. StudioFS 0.3.0 upgrades only from 0.2.5 or later. See the [release support matrix](../../persisted-format-compatibility.md#version-and-operation-support-matrix).
+
+## Operator checklist
+
+1. **Inventory.** Record the binary, metadata file and cache path on each computer, including offline ones. Identify every volume and Janitor that uses the same PostgreSQL database.
+2. **Preflight.** Run `studiofs compatibility <volume>` and `studiofs upgrade <volume> --dry-run`. Check the session list, pending migrations and unpublished local work. Keep caches with unpublished work and let compatible clients publish before cutover.
+3. **Back up.** Before a schema change or activation, stop affected mounts and Janitors. Take a consistent PostgreSQL backup and copy each stopped local redb metadata file and its payload cache. Retain access to the corresponding S3 objects and the binary needed to restore that backup.
+4. **Roll out in stages.** Start with one client and verify `compatible_rw` and normal file operations before advancing. For a legacy format 5 or 6 volume, follow the [adoption procedure](#upgrading-a-volume-from-02x-to-025) before any client remounts.
+5. **Plan activation.** Run the feature dry run, resolve active and expired session blockers and check the rollback boundary. Keep breaking features inactive while the support window protects affected clients. See [Planning a feature activation](#planning-a-feature-activation).
+6. **Set the rollback boundary.** Follow the successor's documented deactivation procedure when it can preserve compatible persisted state. Format-7 adoption, irreversible activation and Contract have no supported downgrade. Recover from a consistent backup only as a disaster-recovery action.
 
 ## Check before you upgrade
 
@@ -93,8 +102,8 @@ When something needs attention, the *Actions* list names it; for a healthy volum
 
 Volumes written by StudioFS 0.2.0 to 0.2.4 use format 5 or 6. They must be adopted into the 0.2.5 format before 0.2.5 can mount them. Plan this as a short, planned change:
 
-1. Back up the PostgreSQL database, for example with `pg_dump`, and run `studiofs dump` with the release that last opened the volume. Back up the stopped metadata file and cache folder of every computer that uses the volume. While the old release is still installed, `studiofs status myvolume` shows the paths (after you install 0.2.5, `status` cannot open a 0.2.x cache until it is upgraded): the `Metadata` line gives the metadata file, and the `Root` line under `Local Cache` gives the cache folder. Copy both while nothing is running.
-2. Stop every mount and every janitor of the volume, on every computer. `studiofs upgrade` refuses to run while the volume is mounted.
+1. Use `studiofs status myvolume` with the old release to record the `Metadata` file and the `Root` under `Local Cache`. Run `studiofs dump` with the release that last opened the volume if you also want a logical backup.
+2. Stop every mount and Janitor sharing the PostgreSQL database. Take the PostgreSQL and local backups in the checklist before upgrading the shared metadata. `studiofs upgrade` refuses to run while the volume is mounted on that computer.
 3. On each computer, run the check, then the upgrade:
 
 ```bash
@@ -118,17 +127,17 @@ Run the same `studiofs upgrade myvolume` command again. A migration that already
 
 ## Staged rollout of new clients
 
-Clients from 0.2.5 onward can share a volume during a rollout. Before you start, run `studiofs compatibility myvolume` on a stopped computer and read *Sessions*: every build listed there must be 0.2.5 or later, so upgrade older computers first. Then upgrade one computer at a time and check the report after each step:
+Clients in the support window can share a volume during a rollout. Before you start, run `studiofs compatibility myvolume` on a stopped computer and read *Sessions*. Check that every client you plan to keep is in the new release's support window. Then upgrade one computer at a time and check the report after each step:
 
 1. Install the new release on one computer. With the volume unmounted there, run `studiofs compatibility myvolume`. Confirm `Overall` is still `compatible_rw`.
 2. Mount and use the volume there. On another stopped computer, check that the sessions still show `ok`.
 3. Upgrade the remaining computers in the same way.
 
-A feature that needs every computer to upgrade first is not activated until you run the cutover steps below. Until then, computers on 0.2.5 and later keep working together.
+A feature whose activation would take away read-write access from a supported client must stay inactive while that client release is in the support window.
 
 ## Planning a feature activation
 
-Some newer features need an explicit cutover, in phases: expand, migrate, activate, and contract; `deactivate` reverses an activation before contract. Each phase has its own dry run, and you run the dry run first. For activate, `--role` (`read`, `write`, or `maintain`, repeatable) says what the feature becomes required for; the feature's release notes name the roles:
+Some newer features need an explicit cutover in phases. Expand and migrate prepare the volume. Activate makes the capability required, and Contract finalizes retirement. A feature's release notes specify whether `deactivate` can reverse its activation before Contract. Run the dry run for each phase first. For Activate, `--role` (`read`, `write`, or `maintain`, repeatable) selects what the feature becomes required for. The feature's release notes name the roles.
 
 ```bash
 studiofs upgrade myvolume --feature <feature-name> --phase activate --role write --dry-run
@@ -140,10 +149,10 @@ The dry run lists the blocking sessions, the unpublished local work, and the rol
 
 If an upgrade does not finish, do not reinitialize the volume and do not delete the cache. Check the report, stop any process that still has the metadata open, and rerun the same command. For a cutover that stopped after its dry run, rerun the dry run first, because the state may have changed.
 
-## What is not supported
+## Rollback limits
 
 - Clients older than 0.2.5 cannot mount or publish to a volume that 0.2.5 uses. Upgrade them before you rely on the volume.
-- Going back to an older release after an upgrade is not supported. Restore a PostgreSQL backup only as a disaster-recovery step, and expect to lose changes made after that backup.
+- Restore a consistent pre-cutover PostgreSQL, local redb and payload backup with the matching release only as a disaster-recovery step. Expect to lose changes made after that backup. See the [exact rollback boundaries](../../persisted-format-compatibility.md#rollback-limits).
 - StudioFS 0.3.0 upgrades only from 0.2.5 or later. Upgrade to 0.2.5 first.
 
 ## Status is local only

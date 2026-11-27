@@ -3,6 +3,21 @@ use super::*;
 pub(super) const LOCAL_UPGRADE_STAGE: &str = "local_redb_upgrade_stage";
 pub(super) const LOCAL_ADOPTION_STAGE: &str = "local_volume_adoption_stage";
 
+/// Test-only crash hook contract shared with the `studiofs-e2e`
+/// forward-compatibility crash matrix
+/// (`crates/studiofs-e2e/src/scenario/workloads/forward_compat_matrix.rs`).
+/// When this variable is `1`, the test successor exits with
+/// [`EXIT_AFTER_LOCAL_ACTIVATION_CODE`] right after local upgrade stage
+/// [`EXIT_AFTER_LOCAL_ACTIVATION_STAGE`] commits.
+#[cfg(feature = "test-successor")]
+const EXIT_AFTER_LOCAL_ACTIVATION_ENV: &str = "STUDIOFS_E2E_EXIT_AFTER_LOCAL_ACTIVATION";
+/// The irreversible local revision stage after which the hook exits.
+#[cfg(feature = "test-successor")]
+const EXIT_AFTER_LOCAL_ACTIVATION_STAGE: u8 = 3;
+/// Process exit status the E2E runner expects from the hook.
+#[cfg(feature = "test-successor")]
+const EXIT_AFTER_LOCAL_ACTIVATION_CODE: i32 = 86;
+
 pub(super) fn local_header(info: &FormatInfo, previous: Option<&[u8]>) -> MetaResult<Vec<u8>> {
     if cfg!(feature = "test-successor")
         && let Some(previous) = previous
@@ -51,7 +66,16 @@ impl RedbMetaEngine {
     /// Advance the stopped local metadata database to the compiled local revision.
     #[cfg(feature = "test-successor")]
     pub fn upgrade_local_revision(&self) -> MetaResult<()> {
-        self.advance_local_revision(|_| Ok(()))
+        self.advance_local_revision(|stage| {
+            if stage == EXIT_AFTER_LOCAL_ACTIVATION_STAGE
+                && std::env::var(EXIT_AFTER_LOCAL_ACTIVATION_ENV).as_deref() == Ok("1")
+            {
+                // Leave the database unclosed after the irreversible stage
+                // commits, before the marker is removed by the next transaction.
+                std::process::exit(EXIT_AFTER_LOCAL_ACTIVATION_CODE);
+            }
+            Ok(())
+        })
     }
 
     #[cfg(feature = "test-successor")]

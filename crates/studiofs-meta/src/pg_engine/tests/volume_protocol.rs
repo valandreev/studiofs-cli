@@ -582,7 +582,8 @@ fn compatible_epoch_change_during_publication_keeps_local_writer() {
             assert_eq!(next.epoch, 2);
 
             let published = scope.spawn(|| pg.flush_metadata());
-            // Commit only after the stamped publisher is blocked on the version bump.
+            // The fused stamp and bump query can be truncated in pg_stat_activity.
+            // Its leading marker comment remains visible while the bump waits.
             tokio::time::timeout(Duration::from_secs(10), async {
                 loop {
                     activation
@@ -594,9 +595,9 @@ fn compatible_epoch_change_during_publication_keeps_local_writer() {
                             "SELECT EXISTS (
                                 SELECT FROM pg_stat_activity
                                 WHERE pg_backend_pid() = ANY(pg_blocking_pids(pid))
-                                  AND query LIKE '%total_event_payload_bytes = total_event_payload_bytes +%'
+                                  AND starts_with(ltrim(query), $1)
                             )",
-                            &[],
+                            &[&sql::PUBLICATION_STAMP_MARKER],
                         )
                         .await
                         .unwrap()

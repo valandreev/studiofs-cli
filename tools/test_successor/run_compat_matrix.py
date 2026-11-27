@@ -98,8 +98,12 @@ def main() -> int:
     parser.add_argument("--port-range", default=None)
     parser.add_argument("--timeout", default=None)
     parser.add_argument("--v024-bin", default=None)
+    parser.add_argument("--v022-bin", default=None, help="verified native v0.2.2 binary for format-5 adoption")
     parser.add_argument("--skip-v024", action="store_true")
     parser.add_argument("--skip-build", action="store_true")
+    parser.add_argument(
+        "--crash-rollback", action="store_true", help="enable SFS-1020 fault injection"
+    )
     args = parser.parse_args()
 
     repo = Path(__file__).resolve().parents[2]
@@ -155,6 +159,10 @@ def main() -> int:
     env = os.environ.copy()
     env["STUDIOFS_E2E_SUCCESSOR_MANIFEST"] = str(manifest_path)
     env["STUDIOFS_E2E_SUCCESSOR_BIN"] = str(successor_bin)
+    if args.crash_rollback:
+        env["STUDIOFS_E2E_CRASH_ROLLBACK"] = "1"
+    if args.v022_bin:
+        env["STUDIOFS_E2E_V022_BIN"] = str(Path(args.v022_bin).resolve(strict=True))
     if v024_bin is not None:
         env["STUDIOFS_E2E_V024_BIN"] = str(v024_bin)
         env["STUDIOFS_E2E_REQUIRE_V024"] = "1"

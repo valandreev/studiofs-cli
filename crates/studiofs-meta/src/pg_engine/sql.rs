@@ -22,8 +22,9 @@ pub(super) const SELECT_METADATA_HEAD_AND_COMPATIBLE_CHECKPOINT_VERSION: &str = 
     WHERE ms.vol = $1
     "#;
 
-pub(super) const SELECT_CHECKPOINT_FRESHNESS: &str = r#"
-    SELECT
+macro_rules! checkpoint_freshness_columns {
+    () => {
+        r#"
         version,
         checkpoint_version,
         total_event_payload_bytes,
@@ -34,9 +35,15 @@ pub(super) const SELECT_CHECKPOINT_FRESHNESS: &str = r#"
         ) AS checkpoint_age_ms,
         octet_length(format_info) > 0 AS format_info_present,
         metadata_format_version
-    FROM metadata_state
-    WHERE vol = $1
-    "#;
+        "#
+    };
+}
+
+pub(super) const SELECT_CHECKPOINT_FRESHNESS: &str = concat!(
+    "SELECT ",
+    checkpoint_freshness_columns!(),
+    " FROM metadata_state WHERE vol = $1",
+);
 
 pub(super) const SELECT_BOOTSTRAP_CHECKPOINT_DESCRIPTOR: &str = r#"
     SELECT
@@ -168,25 +175,106 @@ pub(super) const SELECT_METADATA_REPLAY_STATE: &str = r#"
 pub(super) const ACQUIRE_METADATA_REPLAY_ADVISORY_LOCK: &str =
     "SELECT pg_advisory_xact_lock_shared($1::BIGINT)";
 
-pub(super) const BUMP_METADATA_VERSION: &str = r#"
-    UPDATE metadata_state
-    SET version = version + 1,
-        total_event_payload_bytes = total_event_payload_bytes + $3,
-        updated_at = now()
-    WHERE vol = $1 AND metadata_format_version = $2 AND write_requirement <= $4
-      AND publication_epoch::TEXT = current_setting('studiofs.policy_epoch', true)
-    RETURNING
-        version,
-        checkpoint_version,
-        total_event_payload_bytes,
-        checkpoint_total_event_bytes,
-        GREATEST(
-            (EXTRACT(EPOCH FROM (clock_timestamp() - checkpoint_updated_at)) * 1000)::BIGINT,
-            0::BIGINT
-        ) AS checkpoint_age_ms,
-        octet_length(format_info) > 0 AS format_info_present,
-        metadata_format_version
-    "#;
+macro_rules! bump_metadata_version {
+    ($format:literal, $bytes:literal, $requirement:literal, $epoch:literal) => {
+        concat!(
+            "UPDATE metadata_state
+             SET version = version + 1,
+                 total_event_payload_bytes = total_event_payload_bytes + ",
+            $bytes,
+            ",
+                 updated_at = now()
+             WHERE vol = $1 AND metadata_format_version = ",
+            $format,
+            " AND write_requirement <= ",
+            $requirement,
+            " AND publication_epoch",
+            $epoch,
+            " RETURNING ",
+            checkpoint_freshness_columns!(),
+        )
+    };
+}
+
+pub(super) const BUMP_METADATA_VERSION: &str = bump_metadata_version!(
+    "$2",
+    "$3",
+    "$4",
+    "::TEXT = current_setting('studiofs.policy_epoch', true)"
+);
+
+/// Leading comment of every publication stamp statement. PostgreSQL keeps it in
+/// `pg_stat_activity.query`, so tests can find a waiting publisher without
+/// depending on the CTE layout.
+macro_rules! publication_stamp_marker {
+    () => {
+        "/* studiofs:publication-stamp */"
+    };
+}
+
+#[cfg(test)]
+pub(super) const PUBLICATION_STAMP_MARKER: &str = publication_stamp_marker!();
+
+// Materialize once so the volatile GUC writes run before the dependent bump
+// or receipt lock. FOR SHARE pins the exact lease generation until tx ends.
+macro_rules! with_publication_stamp {
+    ($($tail:expr),+ $(,)?) => {
+        concat!(
+            publication_stamp_marker!(),
+            r#"
+            WITH locked AS MATERIALIZED (
+                SELECT policy_epoch, lease_expires_at FROM client_sessions
+                WHERE vol = $1 AND session_id = $2 AND owner = $3 AND fencing_token = $4
+                FOR SHARE
+            ),
+            current_policy AS MATERIALIZED (
+                SELECT COALESCE((SELECT policy_epoch FROM volume_protocol WHERE vol = $1), 0) AS epoch
+            ),
+            lease AS MATERIALIZED (
+                -- Read the clock after FOR SHARE: a wait on a concurrent renewal
+                -- must not judge the lease against a pre-lock timestamp.
+                SELECT locked.lease_expires_at > clock_timestamp() AS lease_active,
+                       locked.policy_epoch = current_policy.epoch
+                           AND locked.policy_epoch = $5 AS policy_current,
+                       current_policy.epoch AS current_epoch
+                FROM locked CROSS JOIN current_policy
+            ),
+            stamp AS MATERIALIZED (
+                SELECT lease.*,
+                       CASE WHEN lease_active AND policy_current
+                            THEN set_config('studiofs.session_id', $2, true) END AS stamped_session,
+                       CASE WHEN lease_active AND policy_current
+                            THEN set_config('studiofs.session_fencing_token', $4::BIGINT::TEXT, true)
+                       END AS stamped_token,
+                       CASE WHEN lease_active AND policy_current
+                            THEN set_config('studiofs.policy_epoch', current_epoch::TEXT, true)::BIGINT
+                       END AS stamped_epoch
+                FROM lease
+            )
+            "#,
+            $($tail),+,
+        )
+    };
+}
+
+pub(super) const STAMP_PUBLICATION_SESSION: &str = with_publication_stamp!("SELECT * FROM stamp");
+
+// The epoch predicate is checked again against the latest metadata_state row
+// if the bump waits for an activation to commit under READ COMMITTED.
+pub(super) const STAMP_AND_BUMP_METADATA_VERSION: &str = with_publication_stamp!(
+    ", bumped AS (",
+    bump_metadata_version!("$6", "$7", "$8", " = (SELECT stamped_epoch FROM stamp)"),
+    ") SELECT bumped.*, stamp.* FROM stamp LEFT JOIN bumped ON TRUE",
+);
+
+// Receipt lookup needs a fresh snapshot after acquiring this lock.
+pub(super) const STAMP_AND_LOCK_RETAINED_PUBLICATION: &str = with_publication_stamp!(
+    ", locked_state AS MATERIALIZED (SELECT ",
+    checkpoint_freshness_columns!(),
+    " FROM metadata_state WHERE vol = $1
+      AND (SELECT stamped_epoch FROM stamp) IS NOT NULL FOR UPDATE)
+      SELECT locked_state.*, stamp.* FROM stamp LEFT JOIN locked_state ON TRUE",
+);
 
 pub(super) const INSERT_EVENT_LOG_BATCH: &str = r#"
     INSERT INTO event_log (

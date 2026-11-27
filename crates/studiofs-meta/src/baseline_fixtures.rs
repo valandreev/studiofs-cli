@@ -526,10 +526,12 @@ fn assert_published_namespace(engine: &dyn MetaEngine) {
 #[test]
 fn baseline_format_info_decodes_with_current_binary() {
     let bytes = read_fixture(&fixture_dir().join("format-info.json"));
-    let mut info: FormatInfo = serde_json::from_slice(&bytes).expect("decode pinned FormatInfo");
+    let info: FormatInfo = serde_json::from_slice(&bytes).expect("decode pinned FormatInfo");
     let expected = fixture_format_info();
-    assert_eq!(info.format_version, 6);
-    info.format_version = crate::schema::CURRENT_FORMAT_VERSION;
+    assert_eq!(
+        info.format_version,
+        crate::version::SHARED_VOLUME_FORMAT.current
+    );
     assert_eq!(
         serde_json::to_value(&info).unwrap(),
         serde_json::to_value(&expected).unwrap()
