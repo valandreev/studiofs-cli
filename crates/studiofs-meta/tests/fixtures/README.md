@@ -24,19 +24,30 @@ SHA-256:
 workspace-relative path: the files in `baseline-0.2.5/` and
 `published-v0.2.2/` / `published-v0.2.4/` here, plus fixtures kept in their
 owning crate (`studiofs-data` STFS objects, the `studiofs-cache` payload
-index, the `studiofs` version-4 dump). Each entry records the source commit or
+index, the `studiofs` version-4 and version-5 dumps). Each entry records the source commit or
 release, the generator, the SHA-256, the format identity, and the expected
 behavior. `tests/baseline_fixture_manifest.rs` fails when a file drifts or an
-unlisted file appears; decode tests read each file with the current binary.
+unlisted file appears. Decode and restore checks use the current binary.
 
-The fixtures are provisional until SFS-1020 seals them from the release
-candidate. Regenerate only with the baseline encoder, never a successor build:
+SFS-1020 sealed the candidate fixtures from the working tree based on
+`7fe972358f9e48655249739ae7c8415bcac5504d` with uncommitted changes. The
+manifest records the generator and checksum for each fixture and the
+compiled baseline and successor binary hashes. Final release evidence comes
+from the clean release candidate.
 
-- Baseline: `STUDIOFS_REGENERATE_BASELINE_FIXTURES=1 cargo test -p <crate>
-  <generator> -- --ignored`. Generators are `#[ignore]` and also skip without
-  the variable, so normal and `--ignored` runs never rewrite fixtures. The
-  pinned `studiofs` version 4 dump (`dump-v4-0.2.5.json`) has no generator; it
-  stays only as the input that `load` must refuse.
+- Baseline generators require both `STUDIOFS_REGENERATE_BASELINE_FIXTURES=1`
+  and `--ignored`. Use the exact commands in the fixture entries. The
+  `FormatInfo` fixture uses shared format 7. The published format-5 and
+  format-6 captures cover adoption.
+- Dump v5 comes from the candidate's `studiofs dump` command after
+  `studiofs init` on disposable local PostgreSQL and RustFS. The candidate's
+  `studiofs load` restored the format-7 volume and its published checkpoint
+  into a second disposable PostgreSQL. The v4 dump still covers load refusal.
+  See the [SFS-1020 ExecPlan](../../../../docs/exec-plans/SFS-1020-crash-rollback-validation.md)
+  for the commands.
+- Test successor: `python3 tools/test_successor/build.py --require-complete`.
+  The generated manifest records the source and binary digests. The successor
+  event and checkpoint golden tests verify their bytes in source.
 - Published v0.2.2 / v0.2.4 volumes: `pwsh
   tools/fixtures/capture-published-volume-fixtures.ps1`. It downloads and
   verifies the release binary, runs the opt-in `studiofs-e2e` scenario
@@ -45,6 +56,7 @@ candidate. Regenerate only with the baseline encoder, never a successor build:
   run artifacts here with LF line endings. Needs `gh`, Docker and network. No
   tool or test starts its own Docker stack.
 
-Then copy the new digests from the drift test output into the manifest and
-append the reason to `regenerations`. All keys are throwaway test values;
-see `test_only_secrets` in the manifest.
+Update the digests and append the reason to `regenerations`. Run
+`cargo test --locked -p studiofs-meta --test baseline_fixture_manifest`
+and the fixture decode tests. All keys are throwaway test values. See
+`test_only_secrets` in the manifest.

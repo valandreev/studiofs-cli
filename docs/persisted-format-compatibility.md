@@ -10,15 +10,55 @@ This page lists every boundary where StudioFS persists bytes that another
 binary, another release, or a later process of the same binary reads back. For
 each one it records the current version identity, how strict the reader is
 today, who writes it, what a successor may change, and how the 0.2.5 binary
-must fail when it meets something it does not understand. Every `path:line`
-reference was verified against `main` at `f9e258cf`.
+must fail when it meets something it does not understand. The boundary audit
+retains historical references from `main` at `f9e258cf`. Use the baseline table
+below for the 0.2.5 release identities.
+
+## 0.2.5 baseline identities
+
+| Boundary | Baseline identity and accepted encodings | Source |
+|---|---|---|
+| PostgreSQL schema | `core` 1, `payload_gc` 2, `client_sessions` 1, `checkpoint_encodings` 1, `event_publication_fence` 1 | [`version.rs`](../crates/studiofs-meta/src/version.rs), [`migrations.rs`](../crates/studiofs-meta/src/pg_engine/migrations.rs) |
+| Shared metadata | `FormatInfo.format_version` and `metadata_state.metadata_format_version` 7. Write requirement 1 and initial policy epoch 1. | [`version.rs`](../crates/studiofs-meta/src/version.rs), [`schema.rs`](../crates/studiofs-meta/src/schema.rs), [`volume_protocol.rs`](../crates/studiofs-meta/src/volume_protocol.rs) |
+| Local redb | Layout revision 6, independent of the format-7 volume header | [`version.rs`](../crates/studiofs-meta/src/version.rs) |
+| Metadata events | Writes and reads `SFS-EVT` wire 1. The baseline decoder also reads unframed legacy ordinals. Baseline tags are 1–15 and 18–21. Tags 16–17 are reserved and 18 is local-journal-only. | [`events.rs`](../crates/studiofs-meta/src/events.rs) |
+| Serving checkpoint | Writes untagged format 4, schema 1. Reads formats 1–4 with schema 1. Format 4 remains the baseline replay and prune anchor. | [`version.rs`](../crates/studiofs-meta/src/version.rs), [`snapshot.rs`](../crates/studiofs-meta/src/snapshot.rs) |
+| Payload objects | STFS v2/v3, SFEC v1 and encryption config format 1 | [`object.rs`](../crates/studiofs-data/src/object.rs), [`envelope.rs`](../crates/studiofs-data/src/envelope.rs), [`schema.rs`](../crates/studiofs-meta/src/schema.rs) |
+| Other persisted stores | Payload index format 2 with entry encoding 3, snapshot artifact format 1/schema 1, dump format 5 | [`payload_index.rs`](../crates/studiofs-cache/src/payload_index.rs), [`snapshot_worker.rs`](../crates/studiofs-vfs/src/snapshot_worker.rs), [`dump_load.rs`](../crates/studiofs/src/cli/dump_load.rs) |
+
+The volume policy requires `event.codec.v1`, `payload.stfs.v2`,
+`payload.stfs.v3` and `payload.sfec.v1` for reads. It requires
+`event.codec.v1`, `payload.stfs.v3` and `payload.sfec.v1` for writes and
+`maintenance.payload_gc.v2` for maintenance. The client declares support for
+all four read capabilities in both its read and write sets. New policy records
+mark the five capabilities required and start with no optional capabilities.
+[Capability sets](../crates/studiofs-meta/src/compat.rs) and
+[policy initialization](../crates/studiofs-meta/src/volume_protocol.rs).
+
+### Format freeze
+
+The release-candidate seal records the source commit, generator commands and
+fixture SHA-256 values in the [SFS-1002 manifest](../crates/studiofs-meta/tests/fixtures/baseline-0.2.5/manifest.json).
+It also records the test-successor build manifest with its declared changes
+and the hashes of both binaries. Once sealed, any change to a persisted format
+in 0.2.5 requires a new seal and fresh acceptance evidence for the affected
+boundary. Run the existing `baseline_fixture_manifest` test to catch fixture
+byte drift and unlisted files. Pair it with decode and compiled-binary checks
+to detect changes in format behavior.
+
+SFS-1020 pinned the format-7 `FormatInfo` and v5 dump from the working tree
+based on `7fe972358f9e48655249739ae7c8415bcac5504d` with uncommitted changes.
+The manifest records the fixture seal and the binaries used for local
+acceptance. Final release acceptance requires evidence from the clean candidate.
+
+See the [release acceptance matrix](release-notes/v0.2.5.md#release-acceptance)
+for the current seal status.
 
 ## Scope and binding decisions
 
-- The baseline is 0.2.5. This policy guarantees behavior between 0.2.5 and
-  releases that explicitly declare support for it. Compatibility with pre-0.2.5
-  clients or state is out of scope: there is no guarantee, and such volumes are
-  adopted only through `studiofs upgrade`.
+- The baseline is 0.2.5. This policy guarantees behavior between releases in
+  the window below. Pre-0.2.5 clients have no interoperability with 0.2.5.
+  Volumes from 0.2.0–0.2.4 are adopted only through `studiofs upgrade`.
 - Client support window: a metadata schema change must not break older clients
   immediately; operators get one minor line to upgrade. When minor line 0.N
   changes the schema or volume state, clients of the previous minor line
@@ -617,10 +657,20 @@ successor can fence it safely. "Current state" is what `main` does today.
 
 ## Version and operation support matrix
 
+| Release line | Shared-volume client support | Adoption and evidence |
+|---|---|---|
+| 0.2.5 | 0.2.5 clients are the first supported readers and writers. | Volumes from 0.2.0–0.2.4 must be adopted through 0.2.5. |
+| Later 0.2.x, including 0.2.7 | Keep 0.2.5+ clients read-write on shared volumes in the support window. | Validate each successor on the backends it supports. The compiled test successor exercises the compatibility mechanisms. |
+| 0.3.x | Keep 0.2.5+ clients able to mount, read, write and delete throughout 0.3.x. | Direct upgrades start at 0.2.5. [SFS-982 through SFS-985](release-notes/v0.2.5.md#known-limitations-and-release-blockers) own the actual 0.3.0 migration and cross-release proof. |
+| 0.4.x and later | Each minor line protects the immediately preceding line when changing schema or volume state. | 0.4.x may drop support for 0.2.x. Each release defines and tests its supported migration source versions. |
+
 Rows are release pairs: the first release owns the persisted state or has
 activated the volume; the second is the binary acting on it. "Successor" is
 the compiled test successor
 ([SFS-1131](https://linear.app/valandreev/issue/SFS-1131)) or 0.2.7.
+The fenced rows exercise the refusal behavior for clients outside the support
+window or synthetic test-successor changes. A production activation that would
+remove mount, read, write or delete from clients within the window must wait.
 
 Outcome names map onto the capability evaluator
 (`crates/studiofs-meta/src/compat.rs`): `MaintenanceForbidden` is a refused
@@ -637,7 +687,7 @@ maintenance operation (reason `maintenance_capability_missing`,
 | Successor state, 0.2.5 binary, capability activated as read-incompatible | `UpgradeRequired` at mount and discover; an open mount stops replay at the last applied version | `UpgradeRequired` | `MaintenanceForbidden` | Refused | `UpgradeRequired` (unsupported dump) | Local journal kept; never discarded or reset | None after Activate |
 | 0.2.5 state, successor binary | Supported | Supported until it activates | Supported | Supported | Loads 0.2.5 dumps | Publishes on reconnect | Not applicable |
 | Unknown future ↔ 0.2.5 binary | `UpgradeRequired` for any unknown required capability, tag, checkpoint or payload format; `LocalUpgradeRequired` for an unknown local format | `UpgradeRequired` | `MaintenanceForbidden` | Refused with typed reason | `UpgradeRequired` (unsupported dump) | Local journal kept; refused at publication | No guarantee |
-| Pre-0.2.5 ↔ 0.2.5 binary | No guarantee; adopt via `studiofs upgrade` | No guarantee; adopt via `studiofs upgrade` | No guarantee; adopt via `studiofs upgrade` | No guarantee; adopt via `studiofs upgrade` | No guarantee; adopt via `studiofs upgrade` | No guarantee; adopt via `studiofs upgrade` | No guarantee |
+| Pre-0.2.5 ↔ 0.2.5 binary | Unsupported; adopt via `studiofs upgrade` | Unsupported; format 7 fences old writers | Unsupported | Legacy stores require adoption | v4 `load` is refused | Upgrade the stopped cache in place | No downgrade after adoption |
 
 ## Rules
 
@@ -776,12 +826,31 @@ Operators drive per-volume Expand–Migrate–Activate–Contract transitions th
 
 ### Rollback limits
 
-Rollback is supported only before Activate, or after Activate only until
-Contract when the successor documents a deactivate step. After Contract there
-is no rollback. Format 7 adoption is one-way: once a 0.2.x volume is upgraded,
-0.2.0–0.2.4 binaries are fenced and are not supported again. Restoring a
-PostgreSQL backup taken before Activate is a disaster-recovery action, not a
-supported rollback, and loses events published after the backup.
+- **Before Activate.** Additive Expand/Migrate work leaves the baseline
+  serving format in place. A feature can return from `compatible` to
+  `available`. A committed monotonic schema revision stays applied and can
+  still prevent older binaries from running `init`, `load` or `upgrade`.
+- **After Activate.** A successor may document a `deactivate` transition
+  before Contract. It moves the policy forward to a new epoch and does not
+  translate bytes. Once a required new encoding has been persisted, older
+  readers still need a compatible checkpoint and a replayable retained tail.
+  Downgrade after irreversible activation is unsupported. `retired` is
+  terminal and Contract DDL has no down-migration.
+- **Local test-successor revision.** Prepare and verification leave revision
+  6 readable. The irreversible step commits `local_redb_revision = 7` with
+  `local_redb_upgrade_stage = 3` in the same redb transaction. Retry can
+  clear the stage marker. The revision stays at 7 and the baseline refuses
+  the cache without rewriting it.
+- **0.2.5 adoption.** `studiofs upgrade` first applies pending database-wide
+  migrations, then takes shared format 5 through 6 if needed and commits
+  format 7 and the baseline policy. The format-7 commit fences 0.2.0–0.2.4
+  publication. Each stopped cache then finishes local adoption and any
+  payload-index upgrade. Retry the same command after interruption. The
+  shared format and committed migrations stay applied, and local journals and
+  payloads stay on disk.
+- **Disaster recovery.** Restore a consistent pre-cutover backup of
+  PostgreSQL, local metadata and payload stores with the matching binary.
+  Recovery from that point can lose later published or local changes.
 
 ## Operator-facing migration rules
 
