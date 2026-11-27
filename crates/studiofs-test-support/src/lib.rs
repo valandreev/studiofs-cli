@@ -77,6 +77,8 @@ fn execute_schema_sql(dsn: &str, statement: String) -> Result<(), String> {
                                 .await
                                 .map_err(|_| "connect to PostgreSQL test database".to_owned())?;
                         tokio::spawn(connection);
+                        // A leaked lock holder fails the drop instead of hanging the test.
+                        let statement = format!("SET lock_timeout = '5s'; {statement}");
                         client.batch_execute(&statement).await.map_err(|error| {
                             error.code().map_or_else(
                                 || "execute PostgreSQL schema statement".to_owned(),
