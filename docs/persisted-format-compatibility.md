@@ -349,8 +349,10 @@ that declares support for 0.2.5 (the compiled test successor of
   a volume has a policy. Format 5 and 6 volumes without a policy remain
   writable by their existing clients in the same database. The trigger
   rejects outdated clients that omit the stamp. An operator issuing SQL
-  with a forged valid stamp can bypass it. Separate PostgreSQL roles are
-  outside the scope of this fence.
+  with a forged valid stamp can bypass it, and a hand-written
+  `UPDATE metadata_state` that advances the head without appending events
+  is not fenced. Separate PostgreSQL roles are outside the scope of this
+  fence.
 
 ### 6. Serving checkpoints
 

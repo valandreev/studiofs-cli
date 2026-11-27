@@ -120,9 +120,9 @@ fn pg_event_log_prune_deletes_complete_batches_in_bounded_transactions() {
                 &[&volume.volume_id],
             )
             .await
-            .map_err(|error| crate::engine::MetaError::Storage(error.to_string()))?;        session.finish(&seed_tx, volume.volume_id).await?;
+            .map_err(|error| crate::engine::MetaError::Storage(error.to_string()))?;
+        session.finish(&seed_tx, volume.volume_id).await?;
         seed_tx.commit().await.unwrap();
-
 
         let first = engine
             .run_event_log_prune_once()?
@@ -265,9 +265,9 @@ fn pg_event_log_prune_preserves_retained_snapshot_source_events() {
                 &[&volume.volume_id],
             )
             .await
-            .map_err(|error| crate::engine::MetaError::Storage(error.to_string()))?;        session.finish(&seed_tx, volume.volume_id).await?;
+            .map_err(|error| crate::engine::MetaError::Storage(error.to_string()))?;
+        session.finish(&seed_tx, volume.volume_id).await?;
         seed_tx.commit().await.unwrap();
-
 
         let checkpoint = postcard::to_stdvec(&ServingCheckpoint::default())
             .map_err(|error| crate::engine::MetaError::Serialization(error.to_string()))?;

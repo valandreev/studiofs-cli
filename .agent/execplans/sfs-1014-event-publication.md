@@ -1,5 +1,7 @@
 # Fence metadata publication across policy changes
 
+This ExecPlan is a living document maintained according to `.agent/PLANS.md`.
+
 ## Purpose
 
 An open mount can start publishing under one volume policy while an administrator activates another. PostgreSQL must reject the stale write without committing a new metadata version, payload accounting, or part of the batch. Existing format 5 and 6 volumes without a policy must keep their legacy write path in the same database.
@@ -12,13 +14,19 @@ An open mount can start publishing under one volume policy while an administrato
 - [x] Verify the focused migration, publishing and replay checks, formatting, lint and compile checks.
 - [x] Verify that load survives a lease expiry between event inserts and that mount startup refuses damaged fence triggers until schema repair.
 
+## Surprises & Discoveries
+
+- The shared test PostgreSQL schema already carries schema component `core` at version 2 from another branch, so live tests that use it directly fail with `UpgradeRequired` before reaching this change. Tests in disposable schemas (`IsolatedPgSchema`) are unaffected.
+- The restore session row is uncommitted, so only the restore transaction itself can renew it; a background heartbeat on another connection cannot.
+- rustfmt silently skipped the race test closure while it contained overlong lines; after splitting them by hand `cargo fmt --check` covers it again.
+
 ## Decision Log
 
 The publication epoch lives on `metadata_state`, the row PostgreSQL already locks and rechecks during a version bump. Reading the epoch from a separate policy row in the predicate could retain the statement's old snapshot after a lock wait. The migration initializes the mirror for existing policies and keeps it synchronized for initial provisioning, policy updates, and restored metadata state. Existing dependency versions and checksums stay intact.
 
 The event trigger runs once per insert statement and checks each affected volume. It uses the existing transaction-local session ID, policy epoch, and fencing token to verify a live lease. Direct insert callers serialize with policy changes on the same metadata row. An operator with sufficient SQL access can forge the context. Backend implementations must meet the same atomic publication contract.
 
-Load renews its short-lived session before each event insert in the restore transaction. The session row is visible to that transaction before commit. Renewal uses the existing ownership and fencing-token check and stamps the validated policy epoch and renewed token.
+Load renews its short-lived session inside the restore transaction once 20 s (a third of the 60 s lease) have passed since the last renewal, instead of before every event, so a large restore does not pay two extra round trips per event. Unit tests set the interval to zero so the lease-expiry regression still renews between inserts. The large-history E2E fixture renews once per insert chunk. The session row is visible to that transaction before commit. Renewal uses the existing ownership and fencing-token check and stamps the validated policy epoch and renewed token.
 
 Mount startup checks the event publication fence migration and its epoch column. It checks that each trigger is attached to its expected table and fires for normal writes. The existing repair migration recreates disabled or missing triggers.
 
@@ -32,8 +40,10 @@ From the repository root, run `cargo fmt --all --check`, `cargo clippy -p studio
 
 For the review follow-up, run `cargo clippy -p studiofs-meta -p studiofs --all-targets -- -D warnings`, `cargo test -p studiofs-meta --lib startup_schema -- --ignored`, and `cargo test -p studiofs --bin studiofs dump_load_roundtrip_restores_the_published_baseline -- --ignored`. The load test expires the lease with a test-only PostgreSQL trigger between two event inserts. The startup test damages each fence trigger in turn and checks that schema repair makes mount startup available again.
 
-## Outcomes
+## Outcomes & Retrospective
 
 The two fencing regressions passed on live PostgreSQL. The migration test verified that an existing policy gains its epoch and a legacy volume retains epoch zero. The focused tests also covered format 5 adoption, unrepresentable pending events, replay, pruning, snapshot capture and startup schema validation. Replay and pruning were rerun in a disposable schema because the shared test schema already had a newer core version. Formatting, Clippy and the CLI and E2E compile checks passed. Mounted scenarios and S3-backed integration tests were outside this validation.
 
 For the review follow-up, both new regressions failed before the fix and passed after it. The startup regression verified refusal and repair for a disabled event trigger, a replica-only policy synchronization trigger, and a dropped epoch initialization trigger. The live `startup_schema` and `event_publication_fence` filters each passed three tests, including the same repair regression. The non-ignored startup filter passed five tests. The PostgreSQL dump/load round trip passed with forced lease expiry. Formatting, strict Clippy for both crates, and the diff check passed. The S3-backed `cargo test -p studiofs --test dump_load_test dump_load_restores_volume_and_discovery_reads_data -- --ignored` ran one test and failed in `init` before `load` on both attempts because HTTP requests to the configured S3 endpoint failed.
+
+Revision (second review): fixed two squashed statements in `event_log_pruning.rs` and reformatted the race test, replaced unchecked epoch casts in `refused_publication` with checked conversions, renewed the restore lease on elapsed time, renewed the E2E fixture lease per chunk, added fence cases for an expired lease with an unchanged epoch and for a format-7 volume without a policy, and clarified that a head advance without events is outside the fence. Deferred as judgement calls: a typed SQLSTATE for the fence error, shared test helpers for publication sessions, and deriving the repair list from the migration registry.

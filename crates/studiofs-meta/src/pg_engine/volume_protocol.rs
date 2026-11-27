@@ -246,11 +246,10 @@ where
     if let Some(expected) = row.get::<_, Option<i64>>(3)
         && expected != epoch
     {
-        return ProtocolRejection::EpochConflict {
-            expected: expected as u64,
-            found: epoch as u64,
-        }
-        .into();
+        let (Ok(expected), Ok(found)) = (u64::try_from(expected), u64::try_from(epoch)) else {
+            return MetaError::Storage("postgres policy epoch is negative".into());
+        };
+        return ProtocolRejection::EpochConflict { expected, found }.into();
     }
     MetaError::Storage("postgres metadata version bump requires a current policy stamp".into())
 }

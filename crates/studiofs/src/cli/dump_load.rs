@@ -21,6 +21,13 @@ use studiofs_meta::{
 };
 use thiserror::Error;
 
+/// A third of the 60 s publication lease; tests renew before every event.
+const RESTORE_LEASE_RENEW_INTERVAL: std::time::Duration = if cfg!(test) {
+    std::time::Duration::ZERO
+} else {
+    std::time::Duration::from_secs(20)
+};
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct DumpVolume {
     vol: i64,
@@ -628,9 +635,14 @@ fn apply_dump(postgres_address: &str, dump: &MetadataDump) -> DumpLoadResult<i64
                 })?;
             }
 
+            let mut renewed_at = std::time::Instant::now();
             for event in &dump.event_log {
-                // The restore owns the uncommitted lease row until commit.
-                session.renew(&tx, target_vol).await?;
+                // The restore owns the uncommitted lease row until commit, so it
+                // renews well inside the lease instead of once per event.
+                if renewed_at.elapsed() >= RESTORE_LEASE_RENEW_INTERVAL {
+                    session.renew(&tx, target_vol).await?;
+                    renewed_at = std::time::Instant::now();
+                }
                 tx.execute(
                     r#"
             INSERT INTO event_log (vol, batch_version, event_type, event_payload, client_id, client_timestamp)
