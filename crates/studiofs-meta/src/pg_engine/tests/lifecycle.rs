@@ -2913,11 +2913,12 @@ fn startup_catch_up_drain_honors_shutdown_after_a_page() {
 }
 
 struct StartupCatchUpFaultFixture {
+    stale: Option<std::sync::Arc<PgMetaEngine>>,
     _volume: PgTestVolume,
+    _dsn: PgTestDsn,
     _dir: tempfile::TempDir,
     db: std::path::PathBuf,
     target_version: i64,
-    stale: Option<std::sync::Arc<PgMetaEngine>>,
 }
 
 type StartupCatchUpFaultObservations = std::sync::Arc<std::sync::Mutex<Vec<CatchUpFaultPoint>>>;
@@ -2985,11 +2986,12 @@ fn startup_catch_up_fault_fixture() -> StartupCatchUpFaultFixture {
     .expect("pin replay-tail checkpoint at version zero");
 
     StartupCatchUpFaultFixture {
+        stale: Some(stale),
         _volume: volume,
+        _dsn: dsn,
         _dir: dir,
         db,
         target_version: STARTUP_CATCH_UP_FAULT_PAGES.len() as i64,
-        stale: Some(stale),
     }
 }
 
