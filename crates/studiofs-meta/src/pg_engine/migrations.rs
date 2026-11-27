@@ -24,6 +24,7 @@ use tokio_postgres::GenericClient;
 use super::schema::studiofs_pg_schema_sql;
 use crate::engine::{MetaError, MetaResult, UpgradeRequiredReason};
 use crate::version::POSTGRES_PAYLOAD_GC_SCHEMA;
+use crate::volume_protocol::ProtocolRejection;
 
 /// Transaction-scoped advisory lock key that serializes every schema change
 /// and volume provisioning (`init`, `load`, `upgrade`).
@@ -351,7 +352,7 @@ fn plan(
     Ok(pending)
 }
 
-fn pg_failure(context: &str, error: &tokio_postgres::Error) -> MetaError {
+pub(super) fn pg_failure(context: &str, error: &tokio_postgres::Error) -> MetaError {
     // Backend text may echo connection data, so only the SQLSTATE is kept.
     // A statement PostgreSQL rejected is a storage error, not lost connectivity.
     match error.code() {
@@ -562,15 +563,16 @@ pub(crate) async fn migrate_with(
         };
         if step.phase == MigrationPhase::Contract {
             let feature = step.contract_feature.ok_or_else(|| {
-                MetaError::Storage(format!(
+                ProtocolRejection::CutoverRefused(format!(
                     "contract migration {step} does not name the feature it retires"
                 ))
             })?;
-            let blockers = contract_database_volume_blockers(&tx, Some(feature)).await?;
+            let blockers = contract_database_volume_blockers(&tx, feature).await?;
             if let Some((vol, detail)) = blockers.first() {
-                return Err(MetaError::Storage(format!(
+                return Err(ProtocolRejection::CutoverRefused(format!(
                     "cannot apply contract migration {step}: volume '{vol}' {detail}"
-                )));
+                ))
+                .into());
             }
         }
         apply(&tx, &step, registry).await?;
@@ -581,14 +583,14 @@ pub(crate) async fn migrate_with(
     }
 }
 
-/// Checks every volume in the database before a `Contract` transition or DDL step.
+/// Checks every volume in the database before a `Contract` DDL step.
 ///
 /// Returns `(volume_name, reason)` for every volume that lacks a `volume_protocol`
-/// policy or (when `feature` is `Some`) still has `feature` in `compatible` or
+/// policy or still has `feature` in a required set or in `compatible` or
 /// `required` state.
-pub async fn contract_database_volume_blockers<C>(
+async fn contract_database_volume_blockers<C>(
     client: &C,
-    feature: Option<&str>,
+    feature: &str,
 ) -> MetaResult<Vec<(String, String)>>
 where
     C: GenericClient + Sync,
@@ -602,7 +604,8 @@ where
         )
         .await
         .map_err(|error| pg_failure("check database volumes for contract", &error))?
-        .get(0);
+        .try_get(0)
+        .map_err(|error| pg_failure("decode database volumes for contract", &error))?;
     if !has_volumes {
         return Ok(Vec::new());
     }
@@ -619,10 +622,11 @@ where
         .map_err(|error| pg_failure("inspect database volumes for contract", &error))?;
     let mut blockers = Vec::new();
     for row in rows {
-        let name: String = row.get(0);
-        let epoch: Option<i64> = row.get(1);
-        let write_requirement: Option<i16> = row.get(2);
-        let requirements: Option<String> = row.get(3);
+        let decode = |error| pg_failure("decode database volumes for contract", &error);
+        let name: String = row.try_get(0).map_err(decode)?;
+        let epoch: Option<i64> = row.try_get(1).map_err(decode)?;
+        let write_requirement: Option<i16> = row.try_get(2).map_err(decode)?;
+        let requirements: Option<String> = row.try_get(3).map_err(decode)?;
         let (Some(epoch), Some(write_requirement), Some(requirements)) =
             (epoch, write_requirement, requirements)
         else {
@@ -637,25 +641,23 @@ where
             write_requirement,
             &requirements,
         )?;
-        if let Some(cap) = feature {
-            let state = protocol.requirements.features.get(cap).copied();
-            let in_required_set = protocol.requirements.read.contains(cap)
-                || protocol.requirements.write.contains(cap)
-                || protocol.requirements.maintain.contains(cap);
-            if in_required_set
-                || matches!(
-                    state,
-                    Some(
-                        crate::volume_protocol::FeatureState::Compatible
-                            | crate::volume_protocol::FeatureState::Required
-                    )
+        let state = protocol.requirements.features.get(feature).copied();
+        let in_required_set = protocol.requirements.read.contains(feature)
+            || protocol.requirements.write.contains(feature)
+            || protocol.requirements.maintain.contains(feature);
+        if in_required_set
+            || matches!(
+                state,
+                Some(
+                    crate::volume_protocol::FeatureState::Compatible
+                        | crate::volume_protocol::FeatureState::Required
                 )
-            {
-                blockers.push((
-                    name,
-                    format!("still needs feature `{cap}` (state: {state:?})"),
-                ));
-            }
+            )
+        {
+            blockers.push((
+                name,
+                format!("still needs feature `{feature}` (state: {state:?})"),
+            ));
         }
     }
     Ok(blockers)

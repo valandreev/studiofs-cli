@@ -159,6 +159,9 @@ pub enum ProtocolRejection {
         /// Read capability its oldest faithful encoding needs.
         capability: &'static str,
     },
+    /// An explicit feature cutover (SFS-1017) or Contract DDL step was refused.
+    #[error("feature cutover refused: {0}")]
+    CutoverRefused(String),
 }
 
 impl VolumeProtocol {
@@ -450,7 +453,8 @@ pub enum CutoverPhase {
     Activate,
     /// Pre-Contract rollback: move `required` back to `compatible`, or `compatible` back to `available`.
     Deactivate,
-    /// Terminal retirement (`retired`): allowed only after cutover and database-wide verification.
+    /// Terminal retirement (`retired`) on this volume; allowed only from `available`
+    /// (after `deactivate`). Runs no DDL; the database-wide check gates the Contract DDL step.
     Contract,
 }
 
@@ -500,7 +504,8 @@ pub struct CutoverRequest {
     pub feature: String,
     /// Target lifecycle phase.
     pub phase: CutoverPhase,
-    /// Capability roles required when activating or removed when deactivating.
+    /// Capability roles required when activating. `Deactivate` removes every role
+    /// and rejects a non-empty set; other phases ignore it.
     pub roles: BTreeSet<CapabilityRole>,
     /// Optional explicit `write_requirement` override.
     pub write_requirement: Option<u16>,
@@ -536,8 +541,6 @@ pub struct CutoverSharedState {
     pub snapshot_or_gc_active: bool,
     /// Description of active snapshot/GC work, if any.
     pub active_maintenance_detail: Option<String>,
-    /// For `Contract`: other volumes in the database that still use/require the feature or lack a policy.
-    pub database_volume_blockers: Vec<(String, String)>,
 }
 
 /// A specific readiness blocker preventing a cutover transition.
@@ -577,7 +580,8 @@ pub enum CutoverBlocker {
         /// Remote metadata head version.
         remote_head_version: i64,
     },
-    /// No published serving checkpoint matches the proposed checkpoint descriptor.
+    /// The volume has metadata but no published serving checkpoint with the
+    /// policy's checkpoint descriptor (cutover never changes that descriptor).
     MissingCompatibleCheckpoint {
         /// Required checkpoint descriptor.
         required: CheckpointDescriptor,
@@ -585,13 +589,6 @@ pub enum CutoverBlocker {
     /// Snapshot creation or GC/cleanup maintenance is in progress.
     SnapshotOrGcInProgress {
         /// Detail of the active maintenance or snapshot job.
-        detail: String,
-    },
-    /// Another volume in the database still needs the feature or has no policy.
-    DatabaseVolumeNeedsFeature {
-        /// Volume name or ID.
-        volume: String,
-        /// Reason the volume blocks Contract.
         detail: String,
     },
 }
@@ -632,14 +629,11 @@ impl std::fmt::Display for CutoverBlocker {
             ),
             Self::MissingCompatibleCheckpoint { required } => write!(
                 f,
-                "no compatible published checkpoint for format {} schema {}",
+                "no published serving checkpoint for format {} schema {}",
                 required.format, required.schema
             ),
             Self::SnapshotOrGcInProgress { detail } => {
                 write!(f, "snapshot or GC maintenance in progress: {detail}")
-            }
-            Self::DatabaseVolumeNeedsFeature { volume, detail } => {
-                write!(f, "database volume '{volume}' blocks contract: {detail}")
             }
         }
     }
@@ -693,7 +687,7 @@ impl CutoverDryRunReport {
 
 /// Computes the missing capabilities/requirements for a `ClientSession` against `proposed`.
 #[must_use]
-pub fn missing_capabilities_for_session(
+pub(crate) fn missing_capabilities_for_session(
     session: &crate::client_sessions::ClientSession,
     proposed: &VolumeProtocol,
 ) -> Vec<String> {
@@ -731,7 +725,7 @@ pub fn missing_capabilities_for_session(
 ///
 /// Returns [`ProtocolRejection`] if the requested transition is invalid for the
 /// current feature state or roles.
-pub fn build_proposed_protocol(
+pub(crate) fn build_proposed_protocol(
     current: &VolumeProtocol,
     request: &CutoverRequest,
 ) -> Result<VolumeProtocol, ProtocolRejection> {
@@ -780,12 +774,9 @@ pub fn build_proposed_protocol(
                         proposed.requirements.read.insert(request.feature.clone());
                     }
                     CapabilityRole::Write => {
-                        let newly_added =
-                            proposed.requirements.write.insert(request.feature.clone());
-                        if newly_added {
-                            proposed.write_requirement = request
-                                .write_requirement
-                                .unwrap_or_else(|| current.write_requirement.saturating_add(1));
+                        if proposed.requirements.write.insert(request.feature.clone()) {
+                            proposed.write_requirement =
+                                current.write_requirement.saturating_add(1);
                         }
                     }
                     CapabilityRole::Maintain => {
@@ -796,11 +787,16 @@ pub fn build_proposed_protocol(
                     }
                 }
             }
-            if let Some(wr) = request.write_requirement
-                && !request.roles.contains(&CapabilityRole::Write)
-            {
+            // An explicit value always wins; `check_update` validates it.
+            if let Some(wr) = request.write_requirement {
                 proposed.write_requirement = wr;
             }
+        }
+        CutoverPhase::Deactivate if !request.roles.is_empty() => {
+            return Err(ProtocolRejection::CutoverRefused(format!(
+                "deactivate removes every role of `{}`; do not pass roles",
+                request.feature
+            )));
         }
         CutoverPhase::Deactivate => match current_state {
             Some(FeatureState::Required) => {
@@ -833,6 +829,12 @@ pub fn build_proposed_protocol(
             }
         },
         CutoverPhase::Contract => {
+            if current_state != Some(FeatureState::Available) {
+                return Err(ProtocolRejection::CutoverRefused(format!(
+                    "feature `{}` is {current_state:?}; deactivate it to available before contract",
+                    request.feature
+                )));
+            }
             proposed
                 .requirements
                 .features
@@ -886,11 +888,11 @@ pub fn evaluate_cutover_readiness(
             Err(err @ ProtocolRejection::UnknownCapability(_))
             | Err(err @ ProtocolRejection::UnsupportedCheckpoint { .. }) => {
                 blockers.push(CutoverBlocker::UnsupportedByActor(err.to_string()));
-                Some(proposed)
+                None
             }
             Err(err) => {
                 blockers.push(CutoverBlocker::InvalidTransition(err.to_string()));
-                Some(proposed)
+                None
             }
         },
         Err(err) => {
@@ -909,7 +911,7 @@ pub fn evaluate_cutover_readiness(
     for session in sessions {
         let missing = missing_capabilities_for_session(session, target_protocol);
         if session.active {
-            if session.policy_epoch < current.epoch as i64 {
+            if u64::try_from(session.policy_epoch).map_or(true, |epoch| epoch < current.epoch) {
                 inspection.stale_epoch_active.push(session.clone());
             }
             if missing.is_empty() {
@@ -975,15 +977,6 @@ pub fn evaluate_cutover_readiness(
         if shared.remote_head_version > 0 && !has_chk {
             blockers.push(CutoverBlocker::MissingCompatibleCheckpoint {
                 required: required_chk,
-            });
-        }
-    }
-
-    if request.phase == CutoverPhase::Contract {
-        for (vol, detail) in &shared.database_volume_blockers {
-            blockers.push(CutoverBlocker::DatabaseVolumeNeedsFeature {
-                volume: vol.clone(),
-                detail: detail.clone(),
             });
         }
     }
@@ -1315,7 +1308,6 @@ mod tests {
             available_checkpoints: vec![CheckpointDescriptor::BASELINE],
             snapshot_or_gc_active: false,
             active_maintenance_detail: None,
-            database_volume_blockers: Vec::new(),
         }
     }
 
@@ -1452,18 +1444,19 @@ mod tests {
             )
             .unwrap();
 
-        let contract_req = CutoverRequest {
-            phase: CutoverPhase::Contract,
-            ..expand_req.clone()
-        };
-        let retired = build_proposed_protocol(&migrated, &contract_req).unwrap();
-        assert!(check_update(&migrated, &retired, &actor).unwrap());
-
-        // Deactivation after Retired is refused.
         let deactivate_req = CutoverRequest {
             phase: CutoverPhase::Deactivate,
+            ..expand_req.clone()
+        };
+        let available = build_proposed_protocol(&migrated, &deactivate_req).unwrap();
+        let contract_req = CutoverRequest {
+            phase: CutoverPhase::Contract,
             ..expand_req
         };
+        let retired = build_proposed_protocol(&available, &contract_req).unwrap();
+        assert!(check_update(&available, &retired, &actor).unwrap());
+
+        // Deactivation after Retired is refused.
         let report = evaluate_cutover_readiness(
             &retired,
             &deactivate_req,
@@ -1478,6 +1471,91 @@ mod tests {
                 .blockers
                 .iter()
                 .any(|b| matches!(b, CutoverBlocker::InvalidTransition(_)))
+        );
+    }
+
+    fn request(phase: CutoverPhase, roles: &[CapabilityRole]) -> CutoverRequest {
+        CutoverRequest {
+            feature: FUTURE.to_owned(),
+            phase,
+            roles: roles.iter().copied().collect(),
+            write_requirement: None,
+            offline_client_policy: OfflineClientPolicy::BlockUnknownWork,
+        }
+    }
+
+    #[test]
+    fn contract_requires_explicit_deactivation_to_available() {
+        let contract = request(CutoverPhase::Contract, &[]);
+        for state in [FeatureState::Compatible, FeatureState::Required] {
+            let current = with(&VolumeProtocol::baseline(), set_state(state));
+            let err = build_proposed_protocol(&current, &contract).unwrap_err();
+            assert!(
+                matches!(&err, ProtocolRejection::CutoverRefused(msg) if msg.contains("deactivate it to available")),
+                "{err}"
+            );
+        }
+        let available = with(
+            &VolumeProtocol::baseline(),
+            set_state(FeatureState::Available),
+        );
+        let retired = build_proposed_protocol(&available, &contract).unwrap();
+        assert_eq!(
+            retired.requirements.features.get(FUTURE),
+            Some(&FeatureState::Retired)
+        );
+    }
+
+    #[test]
+    fn deactivate_rejects_roles() {
+        let current = with(
+            &VolumeProtocol::baseline(),
+            set_state(FeatureState::Required),
+        );
+        let err = build_proposed_protocol(
+            &current,
+            &request(CutoverPhase::Deactivate, &[CapabilityRole::Read]),
+        )
+        .unwrap_err();
+        assert!(matches!(err, ProtocolRejection::CutoverRefused(_)), "{err}");
+    }
+
+    #[test]
+    fn activate_applies_explicit_write_requirement_when_write_already_required() {
+        let actor = successor_actor();
+        let mut req = request(CutoverPhase::Activate, &[CapabilityRole::Write]);
+        let compatible = with(
+            &VolumeProtocol::baseline(),
+            set_state(FeatureState::Compatible),
+        );
+        let active = build_proposed_protocol(&compatible, &req).unwrap();
+        assert_eq!(active.write_requirement, 2);
+        req.write_requirement = Some(5);
+        assert_eq!(
+            build_proposed_protocol(&active, &req)
+                .unwrap()
+                .write_requirement,
+            5
+        );
+        // A refused proposal yields no proposal, no epoch bump and no session
+        // blockers measured against the refused policy.
+        let report = evaluate_cutover_readiness(
+            &compatible,
+            &req,
+            &actor,
+            &[make_session(true, false, 1)],
+            &CutoverLocalState::default(),
+            &ready_shared_state(),
+        );
+        assert!(report.proposed.is_none());
+        assert_eq!(report.next_epoch, report.current_epoch);
+        assert!(
+            report
+                .blockers
+                .iter()
+                .all(|b| matches!(b, CutoverBlocker::InvalidTransition(_))),
+            "{:?}",
+            report.blockers
         );
     }
 }

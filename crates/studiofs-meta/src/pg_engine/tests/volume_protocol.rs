@@ -982,6 +982,48 @@ fn cutover_dry_run_blocks_active_and_expired_unsupported_sessions_on_live_postgr
             offline_client_policy: OfflineClientPolicy::AcceptFence,
             ..activate_req
         };
+        // Queued and retry_wait snapshot creation jobs block Activate.
+        client
+            .batch_execute(&format!(
+                "INSERT INTO snapshot_catalog (vol, id, origin, cut_version, captured_at, lifecycle)
+                 VALUES ({vol}, 'sfs1017-job', 'manual', 0, now(), 'creating');
+                 INSERT INTO snapshot_creation_jobs (vol, snapshot_id, state)
+                 VALUES ({vol}, 'sfs1017-job', 'queued');"
+            ))
+            .await
+            .map_err(|e| MetaError::Storage(pg_err(e)))?;
+        for state in ["queued", "retry_wait"] {
+            client
+                .execute(
+                    "UPDATE snapshot_creation_jobs SET state = $2 WHERE vol = $1",
+                    &[&vol, &state],
+                )
+                .await
+                .map_err(|e| MetaError::Storage(pg_err(e)))?;
+            let blocked = inspect_cutover_dry_run(
+                &client,
+                vol,
+                &accepted_req,
+                &actor,
+                &CutoverLocalState::default(),
+            )
+            .await?;
+            assert!(
+                blocked
+                    .blockers
+                    .iter()
+                    .any(|b| matches!(b, CutoverBlocker::SnapshotOrGcInProgress { .. })),
+                "{state}: {:?}",
+                blocked.blockers
+            );
+        }
+        client
+            .execute(
+                "UPDATE snapshot_creation_jobs SET state = 'completed' WHERE vol = $1",
+                &[&vol],
+            )
+            .await
+            .map_err(|e| MetaError::Storage(pg_err(e)))?;
         let ready = execute_feature_cutover(
             &mut client,
             vol,
@@ -1195,9 +1237,12 @@ fn cutover_activate_and_publication_race_fences_stale_writer() {
 
 #[test]
 #[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
-fn contract_refused_when_another_volume_still_needs_feature_and_deactivate_refused_after_retired() {
+fn two_volumes_retire_feature_in_turn_then_contract_ddl_passes() {
     use crate::compat::ClientCapabilities;
     use crate::pg_engine::execute_feature_cutover;
+    use crate::pg_engine::migrations::{
+        CORE_COMPONENT, MIGRATIONS, Migration, MigrationPhase, migrate_with,
+    };
     use crate::volume_protocol::{
         CutoverLocalState, CutoverPhase, CutoverRequest, OfflineClientPolicy, ProtocolRejection,
     };
@@ -1212,108 +1257,73 @@ fn contract_refused_when_another_volume_still_needs_feature_and_deactivate_refus
             .await
             .map_err(|error| MetaError::Storage(pg_err(error)))?;
         let _connection = tokio::spawn(connection);
-        let feature = "metadata.contract.v1";
+        const FEATURE: &str = "metadata.contract.v1";
         let mut actor = ClientCapabilities::current();
-        actor.read.insert(feature);
+        actor.read.insert(FEATURE);
+        let cutover = async |client: &mut tokio_postgres::Client, vol: i64, epoch: u64, phase| {
+            let request = CutoverRequest {
+                feature: FEATURE.to_owned(),
+                phase,
+                roles: BTreeSet::new(),
+                write_requirement: None,
+                offline_client_policy: OfflineClientPolicy::BlockUnknownWork,
+            };
+            execute_feature_cutover(
+                client,
+                vol,
+                Some(epoch),
+                &request,
+                &actor,
+                "sfs1017-test",
+                &CutoverLocalState::default(),
+            )
+            .await
+        };
+        let refused = |err: &MetaError| {
+            matches!(
+                err,
+                MetaError::VolumeProtocolRejected(ProtocolRejection::CutoverRefused(_))
+            )
+        };
 
-        let expand = CutoverRequest {
-            feature: feature.to_owned(),
-            phase: CutoverPhase::Expand,
-            roles: BTreeSet::new(),
-            write_requirement: None,
-            offline_client_policy: OfflineClientPolicy::BlockUnknownWork,
-        };
-        let migrate = CutoverRequest {
-            phase: CutoverPhase::Migrate,
-            ..expand.clone()
-        };
+        // Both volumes use the feature (Compatible).
         for vol in [vol_a.volume_id, vol_b.volume_id] {
-            execute_feature_cutover(
-                &mut client,
-                vol,
-                Some(1),
-                &expand,
-                &actor,
-                "sfs1017-test",
-                &CutoverLocalState::default(),
-            )
-            .await?;
-            execute_feature_cutover(
-                &mut client,
-                vol,
-                Some(2),
-                &migrate,
-                &actor,
-                "sfs1017-test",
-                &CutoverLocalState::default(),
-            )
-            .await?;
+            cutover(&mut client, vol, 1, CutoverPhase::Expand).await?;
+            cutover(&mut client, vol, 2, CutoverPhase::Migrate).await?;
         }
+        // Contract straight from Compatible is refused with a typed rejection.
+        let err = cutover(&mut client, vol_a.volume_id, 3, CutoverPhase::Contract)
+            .await
+            .expect_err("contract from compatible must be refused");
+        assert!(refused(&err), "{err}");
+        // Each volume retires the feature in turn while the other still has it.
+        for vol in [vol_a.volume_id, vol_b.volume_id] {
+            cutover(&mut client, vol, 3, CutoverPhase::Deactivate).await?;
+            cutover(&mut client, vol, 4, CutoverPhase::Contract).await?;
+        }
+        // Deactivate after Retired is refused.
+        let err = cutover(&mut client, vol_a.volume_id, 5, CutoverPhase::Deactivate)
+            .await
+            .expect_err("deactivate after retired must fail");
+        assert!(refused(&err), "{err}");
 
-        // Contracting vol_a while vol_b still has the feature in Compatible must be refused.
-        let contract = CutoverRequest {
-            phase: CutoverPhase::Contract,
-            ..expand.clone()
+        // The database-wide gate now admits the Contract DDL step.
+        let mut registry: Vec<Migration> = MIGRATIONS
+            .iter()
+            .filter(|step| step.component != CORE_COMPONENT || step.version == 1)
+            .copied()
+            .collect();
+        let contract_ddl = Migration {
+            component: "sfs1017_retire",
+            version: 1,
+            name: "drop retired feature",
+            phase: MigrationPhase::Contract,
+            contract_feature: Some(FEATURE),
+            sql: "SELECT 1",
         };
-        let err = execute_feature_cutover(
-            &mut client,
-            vol_a.volume_id,
-            Some(3),
-            &contract,
-            &actor,
-            "sfs1017-test",
-            &CutoverLocalState::default(),
-        )
-        .await
-        .expect_err("contract must fail while vol_b still needs the feature");
-        assert!(err.to_string().contains("sfs1017-vol-b"), "{err}");
-
-        // Move vol_b back to Available, then Contract vol_a succeeds.
-        let deactivate = CutoverRequest {
-            phase: CutoverPhase::Deactivate,
-            ..expand.clone()
-        };
-        execute_feature_cutover(
-            &mut client,
-            vol_b.volume_id,
-            Some(3),
-            &deactivate,
-            &actor,
-            "sfs1017-test",
-            &CutoverLocalState::default(),
-        )
-        .await?;
-        execute_feature_cutover(
-            &mut client,
-            vol_a.volume_id,
-            Some(3),
-            &contract,
-            &actor,
-            "sfs1017-test",
-            &CutoverLocalState::default(),
-        )
-        .await?;
-
-        // Deactivate after Retired on vol_a must be refused.
-        let retired_err = execute_feature_cutover(
-            &mut client,
-            vol_a.volume_id,
-            Some(4),
-            &deactivate,
-            &actor,
-            "sfs1017-test",
-            &CutoverLocalState::default(),
-        )
-        .await
-        .expect_err("deactivate after retired must fail");
-        assert!(
-            retired_err.to_string().contains("invalid transition")
-                || matches!(
-                    retired_err,
-                    MetaError::VolumeProtocolRejected(ProtocolRejection::InvalidTransition { .. })
-                ),
-            "{retired_err}"
-        );
+        registry.push(contract_ddl);
+        let applied = migrate_with(&mut client, &registry, false).await?;
+        assert!(applied.contains(&contract_ddl), "{applied:?}");
         Ok(())
     })
     .unwrap();
@@ -1414,7 +1424,15 @@ fn contract_ddl_step_refused_while_any_volume_needs_feature_and_allowed_once_ret
         let err = migrate_with(&mut client, &registry, false)
             .await
             .expect_err("contract DDL must be refused while vol_a is Compatible");
-        assert!(err.to_string().contains("sfs1017-ddl-a"), "{err}");
+        assert!(
+            matches!(
+                &err,
+                MetaError::VolumeProtocolRejected(
+                    crate::volume_protocol::ProtocolRejection::CutoverRefused(msg)
+                ) if msg.contains("sfs1017-ddl-a")
+            ),
+            "{err}"
+        );
 
         // Refused while vol_a has the feature in Required.
         execute_feature_cutover(
@@ -1432,21 +1450,23 @@ fn contract_ddl_step_refused_while_any_volume_needs_feature_and_allowed_once_ret
             .expect_err("contract DDL must be refused while vol_a is Required");
         assert!(err.to_string().contains("sfs1017-ddl-a"), "{err}");
 
-        // Move vol_a Required -> Compatible -> Retired; vol_b remains Available.
+        // Move vol_a Required -> Compatible -> Available -> Retired; vol_b remains Available.
+        for epoch in [4, 5] {
+            execute_feature_cutover(
+                &mut client,
+                vol_a.volume_id,
+                Some(epoch),
+                &deactivate,
+                &actor,
+                "sfs1017-ddl-test",
+                &CutoverLocalState::default(),
+            )
+            .await?;
+        }
         execute_feature_cutover(
             &mut client,
             vol_a.volume_id,
-            Some(4),
-            &deactivate,
-            &actor,
-            "sfs1017-ddl-test",
-            &CutoverLocalState::default(),
-        )
-        .await?;
-        execute_feature_cutover(
-            &mut client,
-            vol_a.volume_id,
-            Some(5),
+            Some(6),
             &contract,
             &actor,
             "sfs1017-ddl-test",

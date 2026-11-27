@@ -9,13 +9,14 @@
 
 use tokio_postgres::GenericClient;
 
+use super::migrations::pg_failure;
 use super::{PgMetaEngine, sql};
 use crate::compat::{CheckpointDescriptor, ClientCapabilities, Operation, VolumeRequirements};
 use crate::engine::{MetaError, MetaResult, UpgradeRequiredReason};
 use crate::version::SHARED_WRITE_REQUIREMENT;
 use crate::volume_protocol::{
-    CutoverDryRunReport, CutoverLocalState, CutoverPhase, CutoverRequest, CutoverSharedState,
-    ProtocolRejection, VolumeProtocol, check_update, evaluate_cutover_readiness,
+    CutoverDryRunReport, CutoverLocalState, CutoverRequest, CutoverSharedState, ProtocolRejection,
+    VolumeProtocol, check_update, evaluate_cutover_readiness,
 };
 
 const SELECT_PROTOCOL: &str = "
@@ -454,10 +455,9 @@ pub(super) fn check_read_operations(
 async fn collect_cutover_shared_state<C: GenericClient + Sync>(
     client: &C,
     volume: i64,
-    phase: CutoverPhase,
-    feature: &str,
 ) -> MetaResult<(VolumeProtocol, CutoverSharedState)> {
     let failed = |error| PgMetaEngine::classify_pg_error("collect cutover state", error);
+    let decode = |error| pg_failure("decode cutover state", &error);
     let current = read_volume_protocol(client, volume).await?;
     let state_row = client
         .query_opt(
@@ -468,9 +468,9 @@ async fn collect_cutover_shared_state<C: GenericClient + Sync>(
         .await
         .map_err(failed)?
         .ok_or(ProtocolRejection::Missing)?;
-    let remote_head_version: i64 = state_row.get(0);
-    let checkpoint_version: i64 = state_row.get(1);
-    let has_baseline_snapshot: Option<bool> = state_row.get(2);
+    let remote_head_version: i64 = state_row.try_get(0).map_err(decode)?;
+    let checkpoint_version: i64 = state_row.try_get(1).map_err(decode)?;
+    let has_baseline_snapshot: Option<bool> = state_row.try_get(2).map_err(decode)?;
     let checkpoint_ready = checkpoint_version > 0 && has_baseline_snapshot.unwrap_or(false);
     let mut available_checkpoints = Vec::new();
     if checkpoint_ready {
@@ -483,7 +483,8 @@ async fn collect_cutover_shared_state<C: GenericClient + Sync>(
         )
         .await
         .map_err(failed)?
-        .get(0);
+        .try_get(0)
+        .map_err(decode)?;
     if has_encodings_table {
         let rows = client
             .query(
@@ -494,13 +495,16 @@ async fn collect_cutover_shared_state<C: GenericClient + Sync>(
             .await
             .map_err(failed)?;
         for row in rows {
-            let format: i16 = row.get(0);
-            let schema: i16 = row.get(1);
-            if let (Ok(format), Ok(schema)) = (u16::try_from(format), u16::try_from(schema)) {
-                let desc = CheckpointDescriptor { format, schema };
-                if !available_checkpoints.contains(&desc) {
-                    available_checkpoints.push(desc);
-                }
+            let format: i16 = row.try_get(0).map_err(decode)?;
+            let schema: i16 = row.try_get(1).map_err(decode)?;
+            let (Ok(format), Ok(schema)) = (u16::try_from(format), u16::try_from(schema)) else {
+                return Err(MetaError::Storage(format!(
+                    "serving checkpoint encoding has invalid format {format} or schema {schema}"
+                )));
+            };
+            let desc = CheckpointDescriptor { format, schema };
+            if !available_checkpoints.contains(&desc) {
+                available_checkpoints.push(desc);
             }
         }
     }
@@ -519,42 +523,24 @@ async fn collect_cutover_shared_state<C: GenericClient + Sync>(
                 ),
                 EXISTS (
                     SELECT 1 FROM snapshot_creation_jobs
-                    WHERE vol = $1 AND state IN ('pending', 'running')
+                    WHERE vol = $1 AND state IN ('queued', 'running', 'retry_wait')
                 )",
             &[&volume],
         )
         .await
         .map_err(failed)?;
-    let cleanup_active: bool = maint_row.get(0);
-    let gc_active: bool = maint_row.get(1);
-    let snapshot_active: bool = maint_row.get(2);
+    let cleanup_active: bool = maint_row.try_get(0).map_err(decode)?;
+    let gc_active: bool = maint_row.try_get(1).map_err(decode)?;
+    let snapshot_active: bool = maint_row.try_get(2).map_err(decode)?;
     let snapshot_or_gc_active = cleanup_active || gc_active || snapshot_active;
     let active_maintenance_detail = if snapshot_active {
-        Some("snapshot creation job is pending or running".to_owned())
+        Some("snapshot creation job is queued, running or waiting to retry".to_owned())
     } else if cleanup_active {
         Some("snapshot cleanup lease is active".to_owned())
     } else if gc_active {
         Some("payload GC delete_pending lease is active".to_owned())
     } else {
         None
-    };
-
-    let database_volume_blockers = if phase == CutoverPhase::Contract {
-        let target_name: Option<String> = client
-            .query_opt("SELECT name FROM volumes WHERE vol = $1", &[&volume])
-            .await
-            .map_err(failed)?
-            .map(|r| r.get(0));
-        let mut db_blockers =
-            super::migrations::contract_database_volume_blockers(client, Some(feature)).await?;
-        // Exclude the target volume itself from other-volume blockers; its own
-        // state transition is validated by `build_proposed_protocol` + `check_update`.
-        if let Some(ref name) = target_name {
-            db_blockers.retain(|(vol_name, _)| vol_name != name);
-        }
-        db_blockers
-    } else {
-        Vec::new()
     };
 
     Ok((
@@ -566,7 +552,6 @@ async fn collect_cutover_shared_state<C: GenericClient + Sync>(
             available_checkpoints,
             snapshot_or_gc_active,
             active_maintenance_detail,
-            database_volume_blockers,
         },
     ))
 }
@@ -584,8 +569,7 @@ pub async fn inspect_cutover_dry_run<C: GenericClient + Sync>(
     actor: &ClientCapabilities,
     local: &CutoverLocalState,
 ) -> MetaResult<CutoverDryRunReport> {
-    let (current, shared) =
-        collect_cutover_shared_state(client, volume, request.phase, &request.feature).await?;
+    let (current, shared) = collect_cutover_shared_state(client, volume).await?;
     let sessions = super::client_sessions::read_client_sessions(client, volume).await?;
     Ok(evaluate_cutover_readiness(
         &current, request, actor, &sessions, local, &shared,
@@ -597,8 +581,9 @@ pub async fn inspect_cutover_dry_run<C: GenericClient + Sync>(
 ///
 /// # Errors
 ///
-/// Returns `EpochConflict` if `expected_epoch` does not match, `Storage` with
-/// the blocker list if readiness fails, or a classified PostgreSQL error.
+/// Returns `EpochConflict` if `expected_epoch` does not match,
+/// `CutoverRefused` with the blocker list if readiness fails, or a classified
+/// PostgreSQL error.
 pub async fn execute_feature_cutover(
     client: &mut tokio_postgres::Client,
     volume: i64,
@@ -616,8 +601,7 @@ pub async fn execute_feature_cutover(
         .await
         .map_err(failed)?;
     lock_volume_for_protocol_update(&tx, volume, "execute feature cutover").await?;
-    let (current, shared) =
-        collect_cutover_shared_state(&tx, volume, request.phase, &request.feature).await?;
+    let (current, shared) = collect_cutover_shared_state(&tx, volume).await?;
     if let Some(expected) = expected_epoch
         && current.epoch != expected
     {
@@ -636,11 +620,12 @@ pub async fn execute_feature_cutover(
             .map(ToString::to_string)
             .collect::<Vec<_>>()
             .join("; ");
-        return Err(MetaError::Storage(format!(
-            "feature cutover `{}` ({}) blocked: {summary}",
+        return Err(ProtocolRejection::CutoverRefused(format!(
+            "`{}` ({}) blocked: {summary}",
             request.feature,
             request.phase.as_str()
-        )));
+        ))
+        .into());
     }
     if let Some(proposed) = &report.proposed
         && report.next_epoch != report.current_epoch

@@ -281,7 +281,11 @@ impl RedbMetaEngine {
                 )?;
                 crate::volume_protocol::CutoverLocalState {
                     unpublished_events,
-                    local_version: Some(version.min(i64::MAX as u64) as i64),
+                    local_version: Some(i64::try_from(version).map_err(|_| {
+                        MetaError::Storage(format!(
+                            "local PostgreSQL version {version} exceeds i64"
+                        ))
+                    })?),
                 }
             }
             Err(redb::TableError::TableDoesNotExist(_)) => {

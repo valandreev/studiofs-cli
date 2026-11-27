@@ -28,6 +28,26 @@ After this change, an operator can drive a per-volume Expand–Migrate–Activat
 3. **Cutover cleanup (`crates/studiofs-meta/src/pg_engine/volume_protocol.rs`)**: Removed unused `CutoverRequest.checkpoint` and extracted `lock_volume_for_protocol_update` / `apply_locked_volume_protocol_update` so `execute_feature_cutover` locks and validates once.
 4. **Concurrent race test (`crates/studiofs-meta/src/pg_engine/tests/volume_protocol.rs`)**: `cutover_activate_and_publication_race_fences_stale_writer` now runs `execute_feature_cutover` concurrently against an in-flight publication transaction, synchronizing on `pg_blocking_pids` before committing the old-epoch publication and asserting post-commit fencing of stale-epoch `BUMP_METADATA_VERSION`. Added `contract_ddl_step_refused_while_any_volume_needs_feature_and_allowed_once_retired_or_available`.
 
+## Review Round 2 (PR #1071)
+
+Base 5a8372a5. Every item was verified against that head and fixed test-first where practical.
+
+- A: CI `migration_registry_applies_resumes_and_refuses_drift_on_live_postgres` failed because its policy-less `legacy` fixture volume correctly blocks the Contract DDL gate. The blocker is kept (a volume without a policy is not upgraded). The test now asserts the typed refusal, seeds the policy, and applies the step.
+- B1: a non-dry-run `upgrade --feature` refuses a mounted volume; dry-run stays allowed.
+- B2: `Deactivate` rejects non-empty roles (`ProtocolRejection::CutoverRefused`).
+- B3: `Activate` always applies an explicit `write_requirement`; `check_update` validates it.
+- B4: a `check_update` error leaves `proposed = None` (no spurious session blockers, no epoch bump).
+- B5/C3: `Contract` is allowed only from `Available` (after explicit deactivation).
+- B6: the per-volume Contract no longer runs the database-wide check. `database_volume_blockers` and `CutoverBlocker::DatabaseVolumeNeedsFeature` are deleted. The check now gates only the `MigrationPhase::Contract` DDL step, and `contract_database_volume_blockers` became private.
+- B7: every `row.get` in the cutover/contract readers is `try_get` via `pg_failure`.
+- C1: snapshot jobs block in `queued`/`running`/`retry_wait` (the schema has no `pending`). Verified red with the old filter.
+- C2: readiness refusal and Contract DDL refusal return `MetaError::VolumeProtocolRejected(ProtocolRejection::CutoverRefused)`; this is the only new variant.
+- C4: an out-of-range checkpoint encoding row is an error, not silently dropped.
+- C5: the audit actor is the cutover command (feature, phase, roles, write requirement, `--accept-offline-clients`), with no schema change.
+- C6: the docs and blocker text say only that a published serving checkpoint exists for the unchanged descriptor.
+- C7: `missing_capabilities_for_session` and `build_proposed_protocol` are `pub(crate)`. `LOCAL_PG_VERSION_COUNTER` is `pub` and used by the CLI test. The `as i64` casts became `try_from`.
+- Skipped as cosmetic: renaming `CutoverDryRunReport`, the CLI mirror enums, the 45s timeout helper, and repeated switches on `CutoverPhase`.
+
 ## Surprises & Discoveries
 
 - Observation: `git fetch origin` in the worktree required `BypassSandbox: true` because the shared bare/parent `.git/worktrees/.../FETCH_HEAD` path is outside the sandbox root.
@@ -97,7 +117,7 @@ All commands run from the worktree root `C:\Users\valen\.t3\worktrees\studiofs-c
 
 - Dry-run reports blockers when an active session lacks the required feature, when an expired session exists with unknown offline work (unless `--accept-offline-clients` / `OfflineClientPolicy::AcceptFence`), when dirty local operations or replication lag exist, when a compatible checkpoint is missing, or when snapshot/GC work is active.
 - Concurrent activation and publication are serialized by `metadata_state FOR UPDATE`: a stale writer's `BUMP_METADATA_VERSION` is fenced after activation commits.
-- Database-wide `Contract` is refused when any volume in the database still has the feature in `Compatible` or `Required` state or lacks a `volume_protocol` row.
+- The `MigrationPhase::Contract` DDL step is refused while any volume in the database still has the feature in `Compatible` or `Required` state or lacks a `volume_protocol` row. A per-volume `Contract` is allowed only from `Available` and runs no DDL.
 - Deactivation (`Required -> Compatible`) is refused after `Retired` (`InvalidTransition`).
 
 ## Idempotence and Recovery
@@ -121,7 +141,7 @@ In `crates/studiofs-meta/src/volume_protocol.rs`:
 - `pub enum CutoverBlocker`
 - `pub struct SessionInspection`
 - `pub struct CutoverDryRunReport`
-- `pub fn build_proposed_protocol(...) -> Result<VolumeProtocol, ProtocolRejection>`
+- `pub(crate) fn build_proposed_protocol(...) -> Result<VolumeProtocol, ProtocolRejection>`
 - `pub fn evaluate_cutover_readiness(...) -> CutoverDryRunReport`
 
 In `crates/studiofs-meta/src/pg_engine/volume_protocol.rs`:

@@ -207,8 +207,15 @@ fn migration_registry_applies_resumes_and_refuses_drift_on_live_postgres() {
         assert_eq!(scalar(client, "SELECT version::BIGINT FROM studiofs_schema_components WHERE component = 'sfs1005'").await, 1);
         assert_eq!(scalar(client, "SELECT count(*) FROM sfs1005_log").await, 0);
 
-        // Retrying with the fixed step resumes; contract runs only here.
-        assert_eq!(applied(client, &full).await?, [2, 3]);
+        // Retrying with the fixed step resumes the backfill; the contract step
+        // waits until every volume has a policy, then runs only here.
+        let Err(MetaError::VolumeProtocolRejected(crate::volume_protocol::ProtocolRejection::CutoverRefused(message))) = migrate_with(client, &full, false).await else {
+            panic!("contract must wait for the policy-less legacy volume");
+        };
+        assert!(message.contains("'legacy'"), "{message}");
+        assert_eq!(scalar(client, "SELECT version::BIGINT FROM studiofs_schema_components WHERE component = 'sfs1005'").await, 2);
+        crate::pg_engine::insert_initial_volume_protocol(client, 2, "upgraded legacy").await?;
+        assert_eq!(applied(client, &full).await?, [3]);
         assert_eq!(applied(client, &full).await?, Vec::<i32>::new());
         assert_eq!(scalar(client, "SELECT count(*) FROM sfs1005_t WHERE b = 7").await, 1);
         assert_eq!(scalar(client, "SELECT count(*) FROM pg_attribute WHERE attrelid = 'sfs1005_t'::regclass AND attname = 'b' AND attnotnull").await, 1);

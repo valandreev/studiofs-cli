@@ -56,7 +56,7 @@ impl From<CliCapabilityRole> for CapabilityRole {
 
 #[derive(Args, Debug)]
 pub struct UpgradeArgs {
-    /// Locally discovered volume; stop all its mounts and janitors first (except for `--feature` cutover inspection).
+    /// Locally discovered volume; stop all its mounts and janitors first (except for `--feature ... --dry-run`).
     pub name: String,
     /// Report the schema migrations, format upgrade, or feature cutover readiness without changing anything.
     #[arg(long)]
@@ -98,6 +98,13 @@ pub struct UpgradeArgs {
 
 impl UpgradeArgs {
     pub fn dispatch(self) -> anyhow::Result<()> {
+        let cutover = self.feature.clone().zip(self.phase);
+        // A cutover dry run only reads, so it may inspect a mounted volume.
+        if !(cutover.is_some() && self.dry_run)
+            && super::utils::active_mount_record_for_volume(&self.name)?.is_some()
+        {
+            bail!("Unmount this volume before running upgrade.");
+        }
         let path =
             super::utils::get_default_meta_dir(&self.name)?.join(format!("{}.db", self.name));
         if !path.is_file() {
@@ -105,11 +112,8 @@ impl UpgradeArgs {
                 "Local volume metadata is missing; run upgrade where this volume already has a stopped cache."
             );
         }
-        if let (Some(feature), Some(phase)) = (self.feature.clone(), self.phase) {
+        if let Some((feature, phase)) = cutover {
             return self.dispatch_feature_cutover(&path, feature, phase.into());
-        }
-        if super::utils::active_mount_record_for_volume(&self.name)?.is_some() {
-            bail!("Unmount this volume before running upgrade.");
         }
         #[cfg(feature = "test-successor")]
         if self.local_only {
@@ -226,6 +230,7 @@ impl UpgradeArgs {
             return Ok(());
         }
         let expected_epoch = self.expected_epoch;
+        let actor_id = cutover_actor_id(&request);
         let report = runtime
             .block_on(async {
                 tokio::time::timeout(
@@ -237,7 +242,7 @@ impl UpgradeArgs {
                             expected_epoch,
                             &request,
                             &actor,
-                            "studiofs upgrade",
+                            &actor_id,
                             &local_state,
                         )
                         .await?)
@@ -250,6 +255,29 @@ impl UpgradeArgs {
         print!("{}", format_cutover_report(&report, false));
         Ok(())
     }
+}
+
+/// Audit actor stored in `volume_protocol_history`: the cutover command without secrets.
+fn cutover_actor_id(request: &CutoverRequest) -> String {
+    let mut actor = format!(
+        "studiofs upgrade --feature {} --phase {}",
+        request.feature,
+        request.phase.as_str()
+    );
+    for role in &request.roles {
+        actor.push_str(match role {
+            CapabilityRole::Read => " --role read",
+            CapabilityRole::Write => " --role write",
+            CapabilityRole::Maintain => " --role maintain",
+        });
+    }
+    if let Some(write_requirement) = request.write_requirement {
+        actor.push_str(&format!(" --write-requirement {write_requirement}"));
+    }
+    if request.offline_client_policy == OfflineClientPolicy::AcceptFence {
+        actor.push_str(" --accept-offline-clients");
+    }
+    actor
 }
 
 fn format_cutover_report(report: &CutoverDryRunReport, dry_run: bool) -> String {
@@ -454,6 +482,24 @@ mod tests {
     }
 
     #[test]
+    fn cutover_actor_id_records_phase_roles_and_offline_acceptance() {
+        use studiofs_meta::volume_protocol::{
+            CapabilityRole, CutoverPhase, CutoverRequest, OfflineClientPolicy,
+        };
+        let request = CutoverRequest {
+            feature: "metadata.v1".to_owned(),
+            phase: CutoverPhase::Activate,
+            roles: [CapabilityRole::Read, CapabilityRole::Write].into(),
+            write_requirement: Some(2),
+            offline_client_policy: OfflineClientPolicy::AcceptFence,
+        };
+        assert_eq!(
+            super::cutover_actor_id(&request),
+            "studiofs upgrade --feature metadata.v1 --phase activate --role read --role write --write-requirement 2 --accept-offline-clients"
+        );
+    }
+
+    #[test]
     fn cutover_reads_local_redb_unpublished_work_and_lag() {
         use std::collections::BTreeSet;
         use studiofs_meta::compat::ClientCapabilities;
@@ -528,7 +574,6 @@ mod tests {
             available_checkpoints: vec![current.requirements.checkpoint],
             snapshot_or_gc_active: false,
             active_maintenance_detail: None,
-            database_volume_blockers: Vec::new(),
         };
 
         let dirty_report =
@@ -557,7 +602,7 @@ mod tests {
             )
             .expect("ack local event");
         engine
-            .set_counter("pgLastAppliedBatchVersion", 3)
+            .set_counter(studiofs_meta::pg_engine::LOCAL_PG_VERSION_COUNTER, 3)
             .expect("catch up local version");
         drop(engine);
 

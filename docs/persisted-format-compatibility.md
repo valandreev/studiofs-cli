@@ -752,18 +752,25 @@ Operators drive per-volume Expand–Migrate–Activate–Contract transitions th
 `studiofs upgrade <name> --feature <cap> --phase <expand|migrate|activate|deactivate|contract>`:
 
 - `--dry-run` inspects the volume policy, transition epochs, rollback boundary,
-  eligible and blocking active sessions, expired unsupported sessions,
-  compatible checkpoints, snapshot/GC state, and (for `contract`) every volume
-  in the database without mutating anything.
+  eligible and blocking active sessions, expired unsupported sessions, whether
+  a published serving checkpoint exists for the policy's (unchanged) checkpoint
+  descriptor, and snapshot/GC state, without mutating anything. It may run
+  while the volume is mounted; every other cutover requires it unmounted.
 - `expand` (`available`) and `migrate` (`compatible`) keep 0.2.5+ clients writable.
 - `activate` (`required`) atomically checks readiness under the `volumes` and
   `metadata_state` row locks used by publication, raises `write_requirement`
   when gating a write capability, and fences stale writers.
 - `deactivate` rolls back `required -> compatible` or `compatible -> available`
-  before `contract`.
-- `contract` (`retired`, terminal) and `MigrationPhase::Contract` schema steps
-  verify every volume in the PostgreSQL database before retiring a feature or
-  dropping shared objects; `deactivate` is refused after `retired`.
+  before `contract`. It removes every role and refuses `--role`.
+- `contract` (`retired`, terminal) is per volume, runs no DDL and is allowed
+  only from `available`, so a feature in use must be deactivated first;
+  `deactivate` is refused after `retired`.
+- The database-wide check gates the `MigrationPhase::Contract` DDL step: it is
+  refused while any volume in the database lacks a policy or still has the
+  feature `compatible`, `required` or in a required set.
+- Each applied transition is recorded in `volume_protocol_history` with the
+  command (feature, phase, roles, write requirement and
+  `--accept-offline-clients`) as the actor.
 
 ### Rollback limits
 
