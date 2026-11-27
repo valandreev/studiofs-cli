@@ -1111,12 +1111,7 @@ fn setup_pg_volume(
         });
 
         studiofs_meta::pg_engine::schema::ensure_studiofs_pg_schema_committed(&mut client).await?;
-        let initial_vol = 1_i64 << 48 | (Uuid::new_v4().as_u128() >> 80) as i64;
-        client
-            .execute(
-                "SELECT setval(pg_get_serial_sequence('volumes', 'vol'), $1, false)",
-                &[&initial_vol],
-            )
+        studiofs_test_support::seed_isolated_pg_volume_ids(&client)
             .await
             .map_err(|e| {
                 studiofs_meta::MetaError::Storage(format!(
@@ -1298,16 +1293,17 @@ impl Drop for PgTestVolume {
             let conn_task = tokio::spawn(async move {
                 let _ = connection.await;
             });
-            client
+            let result = client
                 .execute("DELETE FROM volumes WHERE vol = $1", &[&self.volume_id])
                 .await
+                .map(|_| ())
                 .map_err(|e| {
                     studiofs_meta::MetaError::Storage(format!("postgres cleanup failed: {e}"))
-                })?;
+                });
             drop(client);
             conn_task.abort();
             let _ = conn_task.await;
-            Ok(())
+            result
         });
     }
 }

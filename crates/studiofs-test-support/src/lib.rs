@@ -58,6 +58,27 @@ impl Drop for IsolatedPgSchema {
     }
 }
 
+/// Seed the volume sequence before inserting fixtures into an isolated schema.
+/// PostgreSQL advisory locks are database-wide, so reserve IDs from the
+/// `2^20`-wide range keyed by the schema's database-local OID.
+///
+/// # Errors
+///
+/// Returns the PostgreSQL error if the schema or volume sequence is unavailable.
+pub async fn seed_isolated_pg_volume_ids(
+    client: &tokio_postgres::Client,
+) -> Result<(), tokio_postgres::Error> {
+    client
+        .query_one(
+            "SELECT setval(pg_get_serial_sequence('volumes', 'vol'),
+                           (1::bigint << 52) + (oid::bigint << 20), false)
+             FROM pg_namespace WHERE nspname = current_schema()",
+            &[],
+        )
+        .await?;
+    Ok(())
+}
+
 fn search_path_dsn(dsn: &str, schema: &str) -> String {
     if dsn.starts_with("postgres://") || dsn.starts_with("postgresql://") {
         let separator = if dsn.contains('?') { '&' } else { '?' };
