@@ -35,7 +35,7 @@ The run publishes a deterministic JSON matrix artifact (`artifacts/scenarios/mou
 - [x] Ran Windows focused checks. The matrix, registry, runner contract, and client controller targets passed 5, 3, 40, and 31 tests. Clippy passed with warnings denied.
 - [x] Ran the clean `ff68e7ad` build as `sfs-1019-windows-r2a`. Cells 1–7 passed. Cell 8 timed out because v0.2.4 reported the format fence in its daily rolled tracing file, while the waiter only checked the base filename. The runner now finds rolled per-client logs through the shared log discovery helper.
 - [x] Ran the clean `b552ef7b` build as `sfs-1019-windows-r2a-retry`. Cells 1–7 passed. Cell 8 still timed out because the v0.2.4 tracing message uses uppercase `PG`. Its first shutdown also showed a pending sentinel upload. The runner now matches the format diagnostic case-insensitively and proves the sentinel was published while the v0.2.4 writer is mounted.
-- [ ] Verify the revised build with two consecutive WinFSP runs.
+- [x] Verified clean source commit `b7c1ebed` in consecutive WinFSP runs `sfs-1019-windows-r2a-fixed` and `sfs-1019-windows-r2b`. Both passed all eight cells on identical binaries. The second used `--skip-build`. The matrix, registry, runner contract, and client controller tests passed 5, 3, 40, and 31 tests on that commit, and Clippy passed with warnings denied.
 
 ## Surprises & Discoveries
 
@@ -143,6 +143,8 @@ Every run uses an isolated `target/e2e-runs/<run-id>` sandbox, a dedicated Docke
 The original WinFSP run `sfs-1019-windows-v3` recorded eight passing cells. The review follow-up retained `sfs-1019-windows-fix1` under `target/e2e-runs/`. Cells 6 and 8 showed that waiting for a remote version increase after unmount could strand a locally durable write. The corrected runner waits for remote sync safety, drained payload uploads, and an advanced PostgreSQL version while the compatible writer is still mounted. It then unmounts the writer before capturing the shared state around refusal probes.
 
 The final report is `target/e2e-runs/sfs-1019-windows-fix3/artifacts/scenarios/mounted-forward-compat-matrix/forward-compat-matrix.json`. Cells 6 and 8 confirmed unchanged PostgreSQL state around the refusals and identical payload bytes on fresh mounts. The v0.2.4 local redb remained present and nonempty. Its hash changed during the attempt. The focused matrix, registry, runner contract, and client controller tests passed 4, 3, 40, and 31 tests respectively.
+
+The second review round retained two 7/8 attempts (`sfs-1019-windows-r2a` and `sfs-1019-windows-r2a-retry`) and two 8/8 results (`sfs-1019-windows-r2a-fixed` and `sfs-1019-windows-r2b`). Each matrix report is under `target/e2e-runs/<run-id>/artifacts/scenarios/mounted-forward-compat-matrix/forward-compat-matrix.json`. Both passing reports record `source_dirty: false` and matching binary hashes. Cells 6 and 8 verified the offline inode, size, and payload map. In both runs the v0.2.4 database hash changed, its write was denied, and a fresh 0.2.5 mount read the three published payloads.
 
 ## Interfaces and Dependencies
 
