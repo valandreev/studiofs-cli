@@ -1665,7 +1665,11 @@ fn test_format6_upgrade_fences_old_publication_and_deletion_claims() {
             .map_err(|error| MetaError::Storage(error.to_string()))?;
         super::super::format_upgrade::upgrade_shared_format5(&mut client, volume_id, &volume_uuid).await?;
         super::super::format_upgrade::upgrade_shared_format5(&mut client, volume_id, &volume_uuid).await?;
-        assert!(client.query_opt(sql::BUMP_METADATA_VERSION, &[&volume_id, &5_i16, &0_i64, &1_i16]).await
+        // The legacy client uses the format predicate without a session stamp.
+        assert!(client.query_opt(
+            "UPDATE metadata_state SET version = version + 1 WHERE vol=$1 AND metadata_format_version=5 RETURNING version",
+            &[&volume_id],
+        ).await
             .map_err(|error| MetaError::Storage(error.to_string()))?.is_none());
         assert!(client.execute("UPDATE snapshot_payload_upload_objects SET reconcile_owner='old-owner',reconcile_fence=2 WHERE vol=$1 AND object_id=7001", &[&volume_id]).await.is_err());
         let tx = client.transaction().await.map_err(|error| MetaError::Storage(error.to_string()))?;

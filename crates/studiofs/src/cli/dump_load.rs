@@ -21,6 +21,13 @@ use studiofs_meta::{
 };
 use thiserror::Error;
 
+/// A third of the 60 s publication lease; tests renew before every event.
+const RESTORE_LEASE_RENEW_INTERVAL: std::time::Duration = if cfg!(test) {
+    std::time::Duration::ZERO
+} else {
+    std::time::Duration::from_secs(20)
+};
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct DumpVolume {
     vol: i64,
@@ -575,7 +582,7 @@ fn apply_dump(postgres_address: &str, dump: &MetadataDump) -> DumpLoadResult<i64
                 ).await?;
             }
             let write_requirement = protocol.write_requirement as i16;
-            let session =
+            let mut session =
                 studiofs_meta::pg_engine::PublicationSession::begin(&tx, target_vol).await?;
             // The volume row lock blocks new FK-backed rows, so the guarded
             // snapshot and accounting tables stay empty until commit.
@@ -628,7 +635,14 @@ fn apply_dump(postgres_address: &str, dump: &MetadataDump) -> DumpLoadResult<i64
                 })?;
             }
 
+            let mut renewed_at = std::time::Instant::now();
             for event in &dump.event_log {
+                // The restore owns the uncommitted lease row until commit, so it
+                // renews well inside the lease instead of once per event.
+                if renewed_at.elapsed() >= RESTORE_LEASE_RENEW_INTERVAL {
+                    session.renew(&tx, target_vol).await?;
+                    renewed_at = std::time::Instant::now();
+                }
                 tx.execute(
                     r#"
             INSERT INTO event_log (vol, batch_version, event_type, event_payload, client_id, client_timestamp)
@@ -1510,8 +1524,8 @@ mod tests {
         dump.metadata_state_snapshot = meta_baseline_fixture("serving-checkpoint.bin");
         dump.metadata_state_checkpoint_sha256 =
             Sha256::digest(&dump.metadata_state_snapshot).to_vec();
-        dump.metadata_state_version = 2;
-        dump.event_log = vec![test_event(2)];
+        dump.metadata_state_version = 3;
+        dump.event_log = vec![test_event(2), test_event(3)];
         refresh_manifest(&mut dump);
         let source_vol = apply_dump(source.dsn(), &dump).unwrap();
 
@@ -1544,6 +1558,20 @@ mod tests {
             tx.query_one("SELECT nextval('volumes_vol_seq')", &[])
                 .await
                 .unwrap();
+            // Statement triggers run in name order. Expire the stamped lease
+            // after the fence accepts the first insert, before the next insert.
+            tx.batch_execute(
+                "CREATE FUNCTION test_expire_load_lease() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+                 BEGIN
+                     UPDATE client_sessions SET lease_expires_at = clock_timestamp()
+                     WHERE session_id = current_setting('studiofs.session_id');
+                     RETURN NULL;
+                 END $$;
+                 CREATE TRIGGER zz_test_expire_load_lease AFTER INSERT ON event_log
+                 FOR EACH STATEMENT EXECUTE FUNCTION test_expire_load_lease();",
+            )
+            .await
+            .unwrap();
             tx.commit().await.unwrap();
             drop(client);
             task.await.unwrap().unwrap();
@@ -1568,13 +1596,12 @@ mod tests {
                 restored.metadata_state_checkpoint_version,
                 restored.metadata_state_version
             ),
-            (1, 2)
+            (1, 3)
         );
-        assert_eq!(restored.event_log.len(), 1);
-        assert_eq!(
-            restored.event_log[0].event_payload,
-            captured.event_log[0].event_payload
-        );
+        assert_eq!(restored.event_log.len(), 2);
+        for (restored, captured) in restored.event_log.iter().zip(&captured.event_log) {
+            assert_eq!(restored.event_payload, captured.event_payload);
+        }
     }
 
     #[test]
@@ -1635,6 +1662,8 @@ mod tests {
             let (mut client, connection) = connect_studiofs_postgres(schema.dsn()).await.unwrap();
             let task = tokio::spawn(connection);
             let tx = client.transaction().await.unwrap();
+            let session = studiofs_meta::pg_engine::PublicationSession::begin(&tx, vol)
+                .await.unwrap();
             tx.execute(
                 "UPDATE metadata_state SET version = $2 WHERE vol = $1",
                 &[&vol, &event.batch_version],
@@ -1643,6 +1672,7 @@ mod tests {
                 "INSERT INTO event_log (vol, batch_version, event_type, event_payload) VALUES ($1, $2, $3, $4)",
                 &[&vol, &event.batch_version, &event.event_type, &event.event_payload],
             ).await.unwrap();
+            session.finish(&tx, vol).await.unwrap();
             tx.commit().await.unwrap();
             drop(client);
             task.await.unwrap().unwrap();

@@ -528,20 +528,24 @@ fn capture_is_one_transaction_and_one_durable_job() {
             .await
             .expect("connect to test postgres");
         let connection_task = tokio::spawn(connection);
-        client
+        let seed_tx = client.transaction().await.unwrap();
+        let session = crate::pg_engine::PublicationSession::begin(&seed_tx, volume.volume_id).await?;
+        seed_tx
             .execute(
                 "INSERT INTO event_log (vol, batch_version, event_type, event_payload, client_id) VALUES ($1, 1, 'test', decode('', 'hex'), 'snapshot-test')",
                 &[&volume.volume_id],
             )
             .await
             .expect("insert retained event row");
-        client
+        seed_tx
             .execute(
                 "UPDATE metadata_state SET version = 1 WHERE vol = $1",
                 &[&volume.volume_id],
             )
             .await
             .expect("advance test metadata version");
+        session.finish(&seed_tx, volume.volume_id).await?;
+        seed_tx.commit().await.unwrap();
         let tx = client
             .transaction()
             .await

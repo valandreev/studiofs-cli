@@ -393,6 +393,7 @@ async fn insert_encoded_event_batch(
         .transaction()
         .await
         .map_err(|error| MetaError::Storage(error.to_string()))?;
+    let session = crate::pg_engine::PublicationSession::begin(&tx, volume_id).await?;
     for event in events {
         let payload = encode_event(event)?;
         tx.execute(
@@ -409,6 +410,7 @@ async fn insert_encoded_event_batch(
         .await
         .map_err(|error| MetaError::Storage(error.to_string()))?;
     }
+    session.finish(&tx, volume_id).await?;
     tx.commit()
         .await
         .map_err(|error| MetaError::Storage(error.to_string()))?;

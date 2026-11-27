@@ -108,6 +108,13 @@ pub const POSTGRES_CHECKPOINT_ENCODINGS_SCHEMA: VersionIdentity = VersionIdentit
     min_supported: 1,
 };
 
+/// Database-wide PostgreSQL event publication fence (SFS-1014).
+pub(crate) const POSTGRES_EVENT_PUBLICATION_FENCE_SCHEMA: VersionIdentity = VersionIdentity {
+    name: "PostgreSQL event publication fence",
+    current: 1,
+    min_supported: 1,
+};
+
 /// Per-volume write requirement (`metadata_state.write_requirement`, SFS-1007).
 /// Publication succeeds only while the volume's value is at most `current`, in
 /// the same UPDATE that bumps the volume version; Activate of a write

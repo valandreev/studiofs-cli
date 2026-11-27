@@ -225,3 +225,47 @@ fn startup_schema_distinguishes_additive_optional_absent_and_incompatible_schema
         "{message}"
     );
 }
+
+#[test]
+#[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
+fn startup_schema_refuses_damaged_event_publication_fence_until_repair() {
+    let dsn = pg_dsn().expect("STUDIOFS_TEST_PG_DSN is required");
+    let schema = IsolatedPgSchema::new(&dsn);
+    let dsn = &schema.dsn;
+    let volume = PgTestVolume::new(dsn, "startup-publication-fence");
+    let vol = volume.volume_id;
+    for (damage, trigger) in [
+        (
+            "ALTER TABLE event_log DISABLE TRIGGER studiofs_event_publication_fence",
+            "studiofs_event_publication_fence",
+        ),
+        (
+            "ALTER TABLE volume_protocol ENABLE REPLICA TRIGGER studiofs_sync_publication_epoch",
+            "studiofs_sync_publication_epoch",
+        ),
+        (
+            "DROP TRIGGER studiofs_initialize_publication_epoch ON metadata_state",
+            "studiofs_initialize_publication_epoch",
+        ),
+    ] {
+        execute_test_sql(dsn, damage.to_owned()).unwrap();
+        let message = refusal(dsn, vol);
+        assert!(
+            message.contains(trigger) && message.contains("--repair-schema"),
+            "{message}"
+        );
+
+        run_async(async {
+            let (mut client, connection) =
+                crate::pg_transport::connect_studiofs_postgres(dsn).await?;
+            let task = tokio::spawn(connection);
+            let result =
+                super::super::migrations::migrate_registered_schema(&mut client, true).await;
+            drop(client);
+            task.await.unwrap().unwrap();
+            result
+        })
+        .unwrap();
+        assert!(validate(dsn, vol, Duration::from_secs(10)).unwrap());
+    }
+}

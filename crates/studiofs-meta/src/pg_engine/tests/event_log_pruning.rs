@@ -97,13 +97,15 @@ fn pg_event_log_prune_deletes_complete_batches_in_bounded_transactions() {
     .expect("open pg engine");
 
     run_async(async {
-        let (client, connection) = tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
+        let (mut client, connection) = tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
             .await
             .map_err(|error| crate::engine::MetaError::Storage(error.to_string()))?;
         let connection_task = tokio::spawn(connection);
+        let seed_tx = client.transaction().await.unwrap();
+        let session = crate::pg_engine::PublicationSession::begin(&seed_tx, volume.volume_id).await?;
         for batch_version in 1_i64..=3 {
             for _ in 0..2 {
-                client
+                seed_tx
                     .execute(
                         "INSERT INTO event_log (vol, batch_version, event_type, event_payload, client_id) VALUES ($1, $2, 'test', decode('00', 'hex'), 'prune-test')",
                         &[&volume.volume_id, &batch_version],
@@ -112,13 +114,15 @@ fn pg_event_log_prune_deletes_complete_batches_in_bounded_transactions() {
                     .map_err(|error| crate::engine::MetaError::Storage(error.to_string()))?;
             }
         }
-        client
+        seed_tx
             .execute(
                 "UPDATE metadata_state SET version = 3, checkpoint_version = 3 WHERE vol = $1",
                 &[&volume.volume_id],
             )
             .await
             .map_err(|error| crate::engine::MetaError::Storage(error.to_string()))?;
+        session.finish(&seed_tx, volume.volume_id).await?;
+        seed_tx.commit().await.unwrap();
 
         let first = engine
             .run_event_log_prune_once()?
@@ -240,12 +244,14 @@ fn pg_event_log_prune_preserves_retained_snapshot_source_events() {
     .expect("open pg engine");
 
     run_async(async {
-        let (client, connection) = tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
+        let (mut client, connection) = tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
             .await
             .map_err(|error| crate::engine::MetaError::Storage(error.to_string()))?;
         let connection_task = tokio::spawn(connection);
+        let seed_tx = client.transaction().await.unwrap();
+        let session = crate::pg_engine::PublicationSession::begin(&seed_tx, volume.volume_id).await?;
         for batch_version in 1_i64..=5 {
-            client
+            seed_tx
                 .execute(
                     "INSERT INTO event_log (vol, batch_version, event_type, event_payload, client_id) VALUES ($1, $2, 'test', decode('00', 'hex'), 'snapshot-prune-test')",
                     &[&volume.volume_id, &batch_version],
@@ -253,13 +259,15 @@ fn pg_event_log_prune_preserves_retained_snapshot_source_events() {
                 .await
                 .map_err(|error| crate::engine::MetaError::Storage(error.to_string()))?;
         }
-        client
+        seed_tx
             .execute(
                 "UPDATE metadata_state SET version = 5, checkpoint_version = 5 WHERE vol = $1",
                 &[&volume.volume_id],
             )
             .await
             .map_err(|error| crate::engine::MetaError::Storage(error.to_string()))?;
+        session.finish(&seed_tx, volume.volume_id).await?;
+        seed_tx.commit().await.unwrap();
 
         let checkpoint = postcard::to_stdvec(&ServingCheckpoint::default())
             .map_err(|error| crate::engine::MetaError::Serialization(error.to_string()))?;

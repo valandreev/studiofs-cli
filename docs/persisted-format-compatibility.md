@@ -174,6 +174,10 @@ that declares support for 0.2.5 (the compiled test successor of
     `metadata_state` checkpoint, prune and `write_requirement` columns.
   - `payload_gc`: the payload upload and reachability ledger that publication
     writes.
+  - `event_publication_fence`: the mirrored `metadata_state.publication_epoch`
+    and the three triggers that initialize the epoch, synchronize policy changes,
+    and fence inserts into `event_log`. A missing trigger or one disabled for
+    ordinary writes requires schema repair before the mount can start.
 
   Each component's `studiofs_schema_components` row must exist and be at least
   its `min_supported`. A newer version or an unknown component is additive for
@@ -327,11 +331,28 @@ that declares support for 0.2.5 (the compiled test successor of
   Publishing a successor tag requires an activated capability and the
   encoding selection from [SFS-1010](https://linear.app/valandreev/issue/SFS-1010).
 - Publication negotiation (SFS-1010): the registry names each tag's read
-  capability. Inside the publication transaction, after the session stamp
-  pins the policy epoch, every event's oldest faithful tag must have its
-  capability in the policy `read` set; otherwise publication returns
+  capability. The publisher validates its session against the policy epoch
+  and checks every event's oldest faithful tag against the policy `read`
+  set. A missing capability returns
   `VolumeProtocolRejected(EventNotRepresentable)` before any write and the
   local journal stays pending. Online settings changes apply the same check.
+- Publication fencing (SFS-1014): the backend must check the authorized
+  writer's epoch atomically with the metadata head advance and the full
+  event batch append. A newer epoch or stale session leaves the head and
+  event log unchanged. A future Redis backend must enforce the same contract.
+- PostgreSQL mirrors the policy epoch on the `metadata_state` row so the
+  version-bump predicate checks the epoch alongside the write requirement
+  and format, including when the update waits for a concurrent activation.
+  The event insert trigger checks the live volume session using transaction-local
+  `studiofs.session_id`, `studiofs.policy_epoch`, and
+  `studiofs.session_fencing_token`. It applies to format 7 and later or when
+  a volume has a policy. Format 5 and 6 volumes without a policy remain
+  writable by their existing clients in the same database. The trigger
+  rejects outdated clients that omit the stamp. An operator issuing SQL
+  with a forged valid stamp can bypass it, and a hand-written
+  `UPDATE metadata_state` that advances the head without appending events
+  is not fenced. Separate PostgreSQL roles are outside the scope of this
+  fence.
 
 ### 6. Serving checkpoints
 
@@ -579,7 +600,7 @@ successor can fence it safely. "Current state" is what `main` does today.
 |---|---|---|
 | Publication checks a per-volume field that a successor can raise at Activate, in the same UPDATE as the version bump. | Present (SFS-1007): `BUMP_METADATA_VERSION` checks `write_requirement <= SHARED_WRITE_REQUIREMENT.current` beside the format predicate (`crates/studiofs-meta/src/pg_engine/sql.rs`); the read gate `metadata_format_version` is separate. | [SFS-1007](https://linear.app/valandreev/issue/SFS-1007) |
 | A refused volume-settings publication reports a typed reason, like event publication. | Present (SFS-1007): both paths call `refused_publication` (`crates/studiofs-meta/src/pg_engine/volume_protocol.rs`), which returns `UnsupportedFormatVersion` or `UpgradeRequired` (`write_requirement_newer`). | [SFS-1007](https://linear.app/valandreev/issue/SFS-1007) |
-| Every publication stamps its session and policy epoch (GUC or column) so a later trigger can reject it. | Missing: publication sets no GUC; `event_log.client_id` exists (`crates/studiofs-meta/src/pg_engine/schema.rs:57`) but there is no session or epoch. | [SFS-1014](https://linear.app/valandreev/issue/SFS-1014), [SFS-1008](https://linear.app/valandreev/issue/SFS-1008) |
+| Every publication stamps its session and policy epoch so the backend can reject stale writers. | Implemented. The PostgreSQL version-bump predicate checks the stamped epoch and the event insert trigger verifies the current session and fencing token. | [SFS-1014](https://linear.app/valandreev/issue/SFS-1014), [SFS-1008](https://linear.app/valandreev/issue/SFS-1008) |
 | Destructive maintenance sets a maintenance capability GUC before deleting. | Partial: Janitor claims set `studiofs.deletion_format` (`crates/studiofs-meta/src/pg_engine/janitor.rs:1089`); snapshot cleanup, event-log pruning and checkpoint pruning set none. | [SFS-1016](https://linear.app/valandreev/issue/SFS-1016) |
 | Unknown required capabilities fail closed with a typed reason. | Present in the pure evaluator (SFS-1004): `compat::evaluate` refuses unknown required capabilities, unknown safety-critical optional ones, unknown events and payload formats with stable reason codes. Not wired into mount, replay or publication until the volume policy and enforcement land. | [SFS-1004](https://linear.app/valandreev/issue/SFS-1004) |
 | Unknown event tags fail closed with a typed reason. | Present: replay preserves `UpgradeRequired` with `UnsupportedEventReason` and leaves the durable cursor at its last applied position. | [SFS-1009](https://linear.app/valandreev/issue/SFS-1009) |

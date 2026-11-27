@@ -1,7 +1,7 @@
 //! Capability-scoped PostgreSQL schema validation at mount startup (SFS-1006).
 //!
 //! A mount checks only the schema components it uses, through their
-//! `studiofs_schema_components` rows, plus the tables and columns its
+//! `studiofs_schema_components` rows, plus the tables, columns and triggers its
 //! bootstrap, replication and publication paths touch. Optional features
 //! (snapshot creation, policies, artifacts, snapshot mounts, Janitor sweeps)
 //! check their own objects when used. Missing snapshot objects surface as
@@ -17,8 +17,8 @@ use crate::compat::ReasonCode;
 use crate::engine::{MetaError, MetaResult};
 use crate::pg_transport::connect_studiofs_postgres;
 use crate::version::{
-    POSTGRES_CLIENT_SESSIONS_SCHEMA, POSTGRES_CORE_SCHEMA, POSTGRES_PAYLOAD_GC_SCHEMA,
-    VersionIdentity,
+    POSTGRES_CLIENT_SESSIONS_SCHEMA, POSTGRES_CORE_SCHEMA, POSTGRES_EVENT_PUBLICATION_FENCE_SCHEMA,
+    POSTGRES_PAYLOAD_GC_SCHEMA, VersionIdentity,
 };
 
 /// One schema component a mount uses, with the objects it relies on.
@@ -28,9 +28,10 @@ struct MountComponent {
     identity: VersionIdentity,
     tables: &'static [&'static str],
     columns: &'static [(&'static str, &'static str)],
+    triggers: &'static [(&'static str, &'static str)],
 }
 
-const MOUNT_COMPONENTS: [MountComponent; 3] = [
+const MOUNT_COMPONENTS: &[MountComponent] = &[
     // Bootstrap, replay, publication, checkpoints, file locks and the event
     // log prune floor, which reads the snapshot source fences.
     MountComponent {
@@ -62,6 +63,7 @@ const MOUNT_COMPONENTS: [MountComponent; 3] = [
             ("metadata_state", "event_log_prune_floor"),
             ("metadata_state", "event_log_pruned_rows"),
         ],
+        triggers: &[],
     },
     // Publication records every payload it uploads or retires in this ledger.
     MountComponent {
@@ -80,6 +82,7 @@ const MOUNT_COMPONENTS: [MountComponent; 3] = [
             "snapshot_artifact_payload_proofs",
         ],
         columns: &[],
+        triggers: &[],
     },
     // Mounts register leases and stamp publication transactions against this registry.
     MountComponent {
@@ -91,6 +94,18 @@ const MOUNT_COMPONENTS: [MountComponent; 3] = [
             ("client_sessions", "fencing_token"),
             ("client_sessions", "lease_expires_at"),
         ],
+        triggers: &[],
+    },
+    MountComponent {
+        name: super::migrations::EVENT_PUBLICATION_FENCE_COMPONENT,
+        identity: POSTGRES_EVENT_PUBLICATION_FENCE_SCHEMA,
+        tables: &[],
+        columns: &[("metadata_state", "publication_epoch")],
+        triggers: &[
+            ("metadata_state", "studiofs_initialize_publication_epoch"),
+            ("volume_protocol", "studiofs_sync_publication_epoch"),
+            ("event_log", "studiofs_event_publication_fence"),
+        ],
     },
 ];
 
@@ -99,41 +114,53 @@ const MISSING_OBJECTS_SQL: &str = r#"
     SELECT to_regclass(quote_ident(current_schema()) || '.studiofs_schema_components') IS NOT NULL,
         ARRAY(
             SELECT required.component || ':' || required.object
-            FROM unnest($1::TEXT[], $2::TEXT[], $3::TEXT[])
-                AS required(component, table_name, object)
-            WHERE NOT EXISTS (
+            FROM unnest($1::TEXT[], $2::TEXT[], $3::TEXT[], $4::BOOL[])
+                AS required(component, table_name, object, is_trigger)
+            WHERE CASE WHEN required.is_trigger THEN NOT EXISTS (
+                SELECT 1 FROM pg_catalog.pg_trigger AS t
+                WHERE t.tgrelid = to_regclass(format('%I.%I', current_schema(), required.table_name))
+                  AND t.tgname = split_part(required.object, '.', 2)
+                  AND t.tgenabled IN ('O', 'A')
+            ) ELSE NOT EXISTS (
                 SELECT 1 FROM information_schema.columns AS info
                 WHERE info.table_schema = current_schema()
                   AND info.table_name = required.table_name
                   AND (required.object = required.table_name
                        OR info.column_name = split_part(required.object, '.', 2))
-            )
+            ) END
             ORDER BY 1
         )
 "#;
 
-/// Mount requirements as the parallel arrays [`MISSING_OBJECTS_SQL`] takes:
-/// component, table and object (`table` or `table.column`).
-fn required_objects() -> [Vec<String>; 3] {
+/// Mount requirements as the parallel arrays [`MISSING_OBJECTS_SQL`] takes.
+fn required_objects() -> ([Vec<String>; 3], Vec<bool>) {
     let mut arrays: [Vec<String>; 3] = Default::default();
-    for component in &MOUNT_COMPONENTS {
+    let mut is_trigger = Vec::new();
+    for component in MOUNT_COMPONENTS {
         let objects = component
             .tables
             .iter()
-            .map(|table| (*table, (*table).to_owned()))
+            .map(|table| (*table, (*table).to_owned(), false))
             .chain(
                 component
                     .columns
                     .iter()
-                    .map(|(table, column)| (*table, format!("{table}.{column}"))),
+                    .map(|(table, column)| (*table, format!("{table}.{column}"), false)),
+            )
+            .chain(
+                component
+                    .triggers
+                    .iter()
+                    .map(|(table, trigger)| (*table, format!("{table}.{trigger}"), true)),
             );
-        for (table, object) in objects {
+        for (table, object, trigger) in objects {
             arrays[0].push(component.name.to_owned());
             arrays[1].push(table.to_owned());
             arrays[2].push(object);
+            is_trigger.push(trigger);
         }
     }
-    arrays
+    (arrays, is_trigger)
 }
 
 /// Diagnostic for every mount component that is absent, too old, or missing
@@ -221,9 +248,9 @@ impl PgMetaEngine {
                 let _ = connection.await;
             });
             let result = tokio::time::timeout(command_timeout, async move {
-                let [components, tables, objects] = required_objects();
+                let ([components, tables, objects], triggers) = required_objects();
                 let row = client
-                    .query_one(MISSING_OBJECTS_SQL, &[&components, &tables, &objects])
+                    .query_one(MISSING_OBJECTS_SQL, &[&components, &tables, &objects, &triggers])
                     .await
                     .map_err(|error| {
                         Self::classify_pg_error("postgres schema validation failed", error)
@@ -282,6 +309,7 @@ mod tests {
             ("core".to_owned(), 1),
             ("payload_gc".to_owned(), 2),
             ("client_sessions".to_owned(), 1),
+            ("event_publication_fence".to_owned(), 1),
         ])
     }
 
@@ -301,6 +329,7 @@ mod tests {
         assert!(absent.contains("schema_component_missing (PostgreSQL core schema)"));
         assert!(absent.contains("schema_component_missing (PostgreSQL payload GC schema)"));
         assert!(absent.contains("schema_component_missing (PostgreSQL client sessions schema)"));
+        assert!(absent.contains("schema_component_missing (PostgreSQL event publication fence)"));
         assert!(absent.contains("studiofs upgrade"));
 
         let mut outdated = baseline();
@@ -333,9 +362,10 @@ mod tests {
 
     #[test]
     fn startup_schema_requires_only_mount_objects() {
-        let [components, tables, objects] = required_objects();
+        let ([components, tables, objects], triggers) = required_objects();
         assert_eq!(components.len(), objects.len());
         assert_eq!(tables.len(), objects.len());
+        assert_eq!(triggers.len(), objects.len());
         assert!(objects.iter().any(|object| object == "file_lock_leases"));
         assert!(
             objects

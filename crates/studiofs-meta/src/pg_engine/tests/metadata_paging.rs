@@ -1,8 +1,9 @@
 use super::{
     DEFAULT_PG_SYNC_MAX_BATCHES_PER_PAGE, DEFAULT_PG_SYNC_MAX_RESPONSE_BYTES_PER_PAGE,
     PG_SYNC_MAX_BATCHES_PER_PAGE_ENV_VAR, PG_SYNC_MAX_RESPONSE_BYTES_PER_PAGE_ENV_VAR,
-    PgOpenOptions, PgTestVolume, pg_dsn, run_async, seed_local, set_test_env,
+    PgOpenOptions, PgTestVolume, pg_dsn, pg_err, run_async, seed_local, set_test_env,
 };
+use crate::engine::{MetaError, MetaResult};
 use crate::events::{MetaEvent, encode_event};
 use crate::pg_engine::PgMetaEngine;
 use crate::pg_engine::janitor::{pg_event_log_prune_lock_key, pg_janitor_lock_key};
@@ -11,20 +12,28 @@ use std::collections::BTreeSet;
 use std::sync::atomic::Ordering;
 
 async fn insert_event_rows(
-    client: &tokio_postgres::Client,
+    client: &mut tokio_postgres::Client,
     volume_id: i64,
     rows: &[(i64, &[u8], &str)],
-) -> Result<(), tokio_postgres::Error> {
+) -> MetaResult<()> {
+    let tx = client
+        .transaction()
+        .await
+        .map_err(|error| MetaError::Storage(pg_err(error)))?;
+    let session = crate::pg_engine::PublicationSession::begin(&tx, volume_id).await?;
     for (batch_version, payload, client_id) in rows {
-        client
-            .execute(
-                "INSERT INTO event_log (vol, batch_version, event_type, event_payload, client_id) \
+        tx.execute(
+            "INSERT INTO event_log (vol, batch_version, event_type, event_payload, client_id) \
              VALUES ($1, $2, 'test', $3, $4)",
-                &[&volume_id, batch_version, payload, client_id],
-            )
-            .await?;
+            &[&volume_id, batch_version, payload, client_id],
+        )
+        .await
+        .map_err(|error| MetaError::Storage(pg_err(error)))?;
     }
-    Ok(())
+    session.finish(&tx, volume_id).await?;
+    tx.commit()
+        .await
+        .map_err(|error| MetaError::Storage(pg_err(error)))
 }
 
 #[test]
@@ -132,12 +141,13 @@ fn pg_foreign_event_pages_respect_cursor_target_and_batch_budget() {
     let volume = PgTestVolume::new(&dsn, "pg-foreign-event-pages");
 
     run_async(async {
-        let (client, connection) = tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
-            .await
-            .map_err(|error| crate::engine::MetaError::Storage(error.to_string()))?;
+        let (mut client, connection) =
+            tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
+                .await
+                .map_err(|error| crate::engine::MetaError::Storage(error.to_string()))?;
         let connection_task = tokio::spawn(connection);
         insert_event_rows(
-            &client,
+            &mut client,
             volume.volume_id,
             &[
                 (1, b"one-a", "remote-a"),
@@ -212,13 +222,18 @@ fn pg_foreign_event_page_rejects_a_pruned_replay_gap() {
     let volume = PgTestVolume::new(&dsn, "pg-foreign-event-gap");
 
     run_async(async {
-        let (client, connection) = tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
-            .await
-            .map_err(|error| crate::engine::MetaError::Storage(error.to_string()))?;
+        let (mut client, connection) =
+            tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
+                .await
+                .map_err(|error| crate::engine::MetaError::Storage(error.to_string()))?;
         let connection_task = tokio::spawn(connection);
-        insert_event_rows(&client, volume.volume_id, &[(51, b"after-gap", "remote")])
-            .await
-            .map_err(|error| crate::engine::MetaError::Storage(error.to_string()))?;
+        insert_event_rows(
+            &mut client,
+            volume.volume_id,
+            &[(51, b"after-gap", "remote")],
+        )
+        .await
+        .map_err(|error| crate::engine::MetaError::Storage(error.to_string()))?;
 
         let error = match PgMetaEngine::query_foreign_event_page(
             &client,
@@ -302,12 +317,13 @@ fn pg_foreign_event_page_stops_before_byte_budget_without_oversizing() {
     let volume = PgTestVolume::new(&dsn, "pg-foreign-event-byte-budget");
 
     run_async(async {
-        let (client, connection) = tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
-            .await
-            .map_err(|error| crate::engine::MetaError::Storage(error.to_string()))?;
+        let (mut client, connection) =
+            tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
+                .await
+                .map_err(|error| crate::engine::MetaError::Storage(error.to_string()))?;
         let connection_task = tokio::spawn(connection);
         insert_event_rows(
-            &client,
+            &mut client,
             volume.volume_id,
             &[
                 (1, b"first", "remote-a"),
@@ -362,12 +378,13 @@ fn pg_foreign_event_page_keeps_oversized_first_batch_atomic() {
     let volume = PgTestVolume::new(&dsn, "pg-foreign-event-oversized-page");
 
     run_async(async {
-        let (client, connection) = tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
-            .await
-            .map_err(|error| crate::engine::MetaError::Storage(error.to_string()))?;
+        let (mut client, connection) =
+            tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
+                .await
+                .map_err(|error| crate::engine::MetaError::Storage(error.to_string()))?;
         let connection_task = tokio::spawn(connection);
         insert_event_rows(
-            &client,
+            &mut client,
             volume.volume_id,
             &[
                 (1, b"oversized-a", "remote-a"),
@@ -407,14 +424,18 @@ fn pg_foreign_event_batch_rejects_mixed_client_identities() {
     let volume = PgTestVolume::new(&dsn, "pg-foreign-event-mixed-clients");
 
     run_async(async {
-        let (client, connection) = tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
-            .await
-            .map_err(|error| crate::engine::MetaError::Storage(error.to_string()))?;
+        let (mut client, connection) =
+            tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
+                .await
+                .map_err(|error| crate::engine::MetaError::Storage(error.to_string()))?;
         let connection_task = tokio::spawn(connection);
         let event = MetaEvent::RemoveAttr { ino: 42 };
         let payload = encode_event(&event)?;
+        let seed_tx = client.transaction().await.unwrap();
+        let session =
+            crate::pg_engine::PublicationSession::begin(&seed_tx, volume.volume_id).await?;
         for client_id in ["remote-a", "remote-b"] {
-            client
+            seed_tx
                 .execute(
                     "INSERT INTO event_log \
                  (vol, batch_version, event_type, event_payload, client_id) \
@@ -424,6 +445,8 @@ fn pg_foreign_event_batch_rejects_mixed_client_identities() {
                 .await
                 .map_err(|error| crate::engine::MetaError::Storage(error.to_string()))?;
         }
+        session.finish(&seed_tx, volume.volume_id).await?;
+        seed_tx.commit().await.unwrap();
 
         let page =
             PgMetaEngine::query_foreign_event_page(&client, volume.volume_id, 0, 1, 8, 1_000)
@@ -449,12 +472,16 @@ fn pg_foreign_event_decode_error_identifies_the_event_log_row() {
     let volume = PgTestVolume::new(&dsn, "pg-foreign-event-decode-error");
 
     run_async(async {
-        let (client, connection) = tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
-            .await
-            .map_err(|error| crate::engine::MetaError::Storage(error.to_string()))?;
+        let (mut client, connection) =
+            tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
+                .await
+                .map_err(|error| crate::engine::MetaError::Storage(error.to_string()))?;
         let connection_task = tokio::spawn(connection);
         let payload = [0x01_u8, 0xff];
-        client
+        let seed_tx = client.transaction().await.unwrap();
+        let session =
+            crate::pg_engine::PublicationSession::begin(&seed_tx, volume.volume_id).await?;
+        seed_tx
             .execute(
                 "INSERT INTO event_log \
                  (vol, batch_version, event_type, event_payload, client_id) \
@@ -463,6 +490,8 @@ fn pg_foreign_event_decode_error_identifies_the_event_log_row() {
             )
             .await
             .map_err(|error| crate::engine::MetaError::Storage(error.to_string()))?;
+        session.finish(&seed_tx, volume.volume_id).await?;
+        seed_tx.commit().await.unwrap();
 
         let page =
             PgMetaEngine::query_foreign_event_page(&client, volume.volume_id, 0, 1, 8, 1_000)
@@ -512,13 +541,17 @@ fn pg_unsupported_event_stops_replay_before_durable_cursor_advance() {
     let known = encode_event(&MetaEvent::SetVolumeSettings { settings }).unwrap();
     let unknown = b"SFS-EVT\x01\xff";
     run_async(async {
-        let (client, connection) = tokio_postgres::connect(&dsn, tokio_postgres::NoTls).await.unwrap();
+        let (mut client, connection) = tokio_postgres::connect(&dsn, tokio_postgres::NoTls).await.unwrap();
         let connection_task = tokio::spawn(connection);
-        client.execute(
+        let seed_tx = client.transaction().await.unwrap();
+        let session = crate::pg_engine::PublicationSession::begin(&seed_tx, volume.volume_id).await?;
+        seed_tx.execute(
             "INSERT INTO event_log (vol, batch_version, event_type, event_payload, client_id)              VALUES ($1, 1, 'set_volume_settings', $2, 'remote'),                     ($1, 2, 'set_volume_settings', $3, 'remote')",
             &[&volume.volume_id, &known, &&unknown[..]],
         ).await.unwrap();
-        client.execute("UPDATE metadata_state SET version=2 WHERE vol=$1", &[&volume.volume_id]).await.unwrap();
+        seed_tx.execute("UPDATE metadata_state SET version=2 WHERE vol=$1", &[&volume.volume_id]).await.unwrap();
+        session.finish(&seed_tx, volume.volume_id).await?;
+        seed_tx.commit().await.unwrap();
         connection_task.abort();
         let _ = connection_task.await;
         Ok(())

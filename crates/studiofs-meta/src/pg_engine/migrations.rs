@@ -36,6 +36,7 @@ pub const CORE_COMPONENT: &str = "core";
 pub const CLIENT_SESSIONS_COMPONENT: &str = "client_sessions";
 pub(super) const CHECKPOINT_ENCODINGS_COMPONENT: &str = "checkpoint_encodings";
 pub(super) const FORMAT_FENCES_COMPONENT: &str = "format_fences";
+pub(super) const EVENT_PUBLICATION_FENCE_COMPONENT: &str = "event_publication_fence";
 
 /// Recorded by the baseline itself and checked exactly by the CLI Janitor.
 const PAYLOAD_GC_COMPONENT: &str = "payload_gc";
@@ -171,6 +172,17 @@ const FORMAT_FENCES: Migration = Migration {
               EXECUTE FUNCTION studiofs_fence_adopted_format_downgrade();",
 };
 
+/// Checks the epoch on the same tuple PostgreSQL rechecks after waiting for a
+/// concurrent policy update. A subquery against volume_protocol in the bump
+/// would still see its original statement snapshot.
+const EVENT_PUBLICATION_FENCE: Migration = Migration {
+    component: EVENT_PUBLICATION_FENCE_COMPONENT,
+    version: crate::version::POSTGRES_EVENT_PUBLICATION_FENCE_SCHEMA.current as i32,
+    name: "fence metadata event publication",
+    phase: MigrationPhase::Additive,
+    sql: super::schema::EVENT_PUBLICATION_FENCE_SQL,
+};
+
 /// Test-successor change (SFS-1131): one additive table that 0.2.5 ignores.
 #[cfg(feature = "test-successor")]
 const SUCCESSOR_PROBE: Migration = Migration {
@@ -191,6 +203,7 @@ pub const MIGRATIONS: &[Migration] = &[
     CLIENT_SESSIONS,
     CHECKPOINT_ENCODINGS,
     FORMAT_FENCES,
+    EVENT_PUBLICATION_FENCE,
 ];
 /// Every migration this binary knows, grouped by component in version order.
 #[cfg(feature = "test-successor")]
@@ -200,6 +213,7 @@ pub const MIGRATIONS: &[Migration] = &[
     CLIENT_SESSIONS,
     CHECKPOINT_ENCODINGS,
     FORMAT_FENCES,
+    EVENT_PUBLICATION_FENCE,
 ];
 
 /// A `studiofs_schema_components` row.
@@ -480,7 +494,12 @@ fn with_repair(
         return pending;
     }
     let mut repairs = Vec::new();
-    for step in [BASELINE, CLIENT_SESSIONS, CHECKPOINT_ENCODINGS] {
+    for step in [
+        BASELINE,
+        CLIENT_SESSIONS,
+        CHECKPOINT_ENCODINGS,
+        EVENT_PUBLICATION_FENCE,
+    ] {
         let at_v1 = recorded
             .iter()
             .any(|row| row.component == step.component && row.version == step.version);
@@ -641,6 +660,7 @@ mod tests {
                 CHECKPOINT_ENCODINGS_COMPONENT,
                 CLIENT_SESSIONS_COMPONENT,
                 CORE_COMPONENT,
+                EVENT_PUBLICATION_FENCE_COMPONENT,
                 FORMAT_FENCES_COMPONENT,
             ]
         );
