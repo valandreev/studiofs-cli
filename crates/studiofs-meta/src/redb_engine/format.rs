@@ -261,6 +261,37 @@ impl RedbMetaEngine {
         Self::read_format_info_for_upgrade_from_read_txn(&txn)
     }
 
+    /// Reads both the volume format header and local cutover readiness state
+    /// (`unpublished_events`, `local_version`) from one read-only snapshot.
+    pub fn read_upgrade_and_cutover_state_readonly(
+        path: impl AsRef<Path>,
+    ) -> MetaResult<(FormatInfo, crate::volume_protocol::CutoverLocalState)> {
+        let txn = Self::open_readonly(path)?
+            .begin_read()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let format = Self::read_format_info_for_upgrade_from_read_txn(&txn)?;
+        let local_state = match txn.open_table(COUNTERS_TABLE) {
+            Ok(_) => {
+                let (local_event_end, durable_cursor) =
+                    Self::local_outbound_ack_positions_from_read_txn(&txn)?;
+                let unpublished_events = local_event_end.saturating_sub(durable_cursor);
+                let version = Self::read_counter_from_read_txn(
+                    &txn,
+                    crate::pg_engine::LOCAL_PG_VERSION_COUNTER,
+                )?;
+                crate::volume_protocol::CutoverLocalState {
+                    unpublished_events,
+                    local_version: Some(version.min(i64::MAX as u64) as i64),
+                }
+            }
+            Err(redb::TableError::TableDoesNotExist(_)) => {
+                crate::volume_protocol::CutoverLocalState::default()
+            }
+            Err(error) => return Err(MetaError::Storage(error.to_string())),
+        };
+        Ok((format, local_state))
+    }
+
     fn open_readonly(path: impl AsRef<Path>) -> MetaResult<ReadOnlyDatabase> {
         match ReadOnlyDatabase::open(path.as_ref()) {
             Ok(db) => Ok(db),

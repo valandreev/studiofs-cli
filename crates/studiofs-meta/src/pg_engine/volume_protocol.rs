@@ -196,27 +196,12 @@ pub(super) fn decode_volume_policy(
     VolumeProtocol::decode(epoch, write_requirement, requirements)
 }
 
-/// Replaces the policy with `proposed` (its `epoch` is ignored) when the
-/// stored epoch is `expected_epoch` and [`check_update`] accepts the change
-/// for a binary declaring `actor`. The epoch rises by one, the write
-/// requirement and an audit row are written in the same transaction. A retry
-/// whose change already committed returns the stored policy; a change that
-/// alters nothing keeps the epoch.
-///
-/// # Errors
-///
-/// `VolumeProtocolRejected` (`EpochConflict`, `Missing` or a violated rule),
-/// `UpgradeRequired` for a policy written by a newer binary, or a classified
-/// PostgreSQL error.
-pub async fn update_volume_protocol(
+async fn lock_volume_for_protocol_update(
     tx: &tokio_postgres::Transaction<'_>,
     volume: i64,
-    expected_epoch: u64,
-    proposed: &VolumeProtocol,
-    actor: &ClientCapabilities,
-    actor_id: &str,
-) -> MetaResult<VolumeProtocol> {
-    let failed = |error| PgMetaEngine::classify_pg_error("update volume protocol", error);
+    context: &str,
+) -> MetaResult<()> {
+    let failed = |error| PgMetaEngine::classify_pg_error(context, error);
     // Use the same lock order as load: its volume lock conflicts with the
     // foreign-key lock needed by the history insert.
     let volume_row = tx
@@ -239,24 +224,18 @@ pub async fn update_volume_protocol(
     if state_row.is_none() {
         return Err(ProtocolRejection::Missing.into());
     }
-    // Under READ COMMITTED a statement that waited for a row lock can still
-    // have a stale snapshot of other tables. Read the policy in a new statement.
-    let current = read_volume_protocol(tx, volume).await?;
-    let same = current.write_requirement == proposed.write_requirement
-        && current.requirements == proposed.requirements;
-    if current.epoch != expected_epoch {
-        if same {
-            return Ok(current);
-        }
-        return Err(ProtocolRejection::EpochConflict {
-            expected: expected_epoch,
-            found: current.epoch,
-        }
-        .into());
-    }
-    if !check_update(&current, proposed, actor)? {
-        return Ok(current);
-    }
+    Ok(())
+}
+
+async fn apply_locked_volume_protocol_update(
+    tx: &tokio_postgres::Transaction<'_>,
+    volume: i64,
+    current: &VolumeProtocol,
+    proposed: &VolumeProtocol,
+    actor_id: &str,
+    context: &str,
+) -> MetaResult<VolumeProtocol> {
+    let failed = |error| PgMetaEngine::classify_pg_error(context, error);
     if current.requirements.maintain != proposed.requirements.maintain {
         // Janitors hold this lock across S3 requests. Try it without waiting
         // because Janitors acquire it before taking the metadata row lock.
@@ -329,6 +308,56 @@ pub async fn update_volume_protocol(
     .await
     .map_err(failed)?;
     Ok(next)
+}
+
+/// Replaces the policy with `proposed` (its `epoch` is ignored) when the
+/// stored epoch is `expected_epoch` and [`check_update`] accepts the change
+/// for a binary declaring `actor`. The epoch rises by one, the write
+/// requirement and an audit row are written in the same transaction. A retry
+/// whose change already committed returns the stored policy; a change that
+/// alters nothing keeps the epoch.
+///
+/// # Errors
+///
+/// `VolumeProtocolRejected` (`EpochConflict`, `Missing` or a violated rule),
+/// `UpgradeRequired` for a policy written by a newer binary, or a classified
+/// PostgreSQL error.
+pub async fn update_volume_protocol(
+    tx: &tokio_postgres::Transaction<'_>,
+    volume: i64,
+    expected_epoch: u64,
+    proposed: &VolumeProtocol,
+    actor: &ClientCapabilities,
+    actor_id: &str,
+) -> MetaResult<VolumeProtocol> {
+    lock_volume_for_protocol_update(tx, volume, "update volume protocol").await?;
+    // Under READ COMMITTED a statement that waited for a row lock can still
+    // have a stale snapshot of other tables. Read the policy in a new statement.
+    let current = read_volume_protocol(tx, volume).await?;
+    let same = current.write_requirement == proposed.write_requirement
+        && current.requirements == proposed.requirements;
+    if current.epoch != expected_epoch {
+        if same {
+            return Ok(current);
+        }
+        return Err(ProtocolRejection::EpochConflict {
+            expected: expected_epoch,
+            found: current.epoch,
+        }
+        .into());
+    }
+    if !check_update(&current, proposed, actor)? {
+        return Ok(current);
+    }
+    apply_locked_volume_protocol_update(
+        tx,
+        volume,
+        &current,
+        proposed,
+        actor_id,
+        "update volume protocol",
+    )
+    .await
 }
 
 /// `SHARED_WRITE_REQUIREMENT` as the `$4` parameter of `BUMP_METADATA_VERSION`.
@@ -510,8 +539,7 @@ async fn collect_cutover_shared_state<C: GenericClient + Sync>(
         None
     };
 
-    let (database_volume_blockers, pending_contract_migrations) = if phase == CutoverPhase::Contract
-    {
+    let database_volume_blockers = if phase == CutoverPhase::Contract {
         let target_name: Option<String> = client
             .query_opt("SELECT name FROM volumes WHERE vol = $1", &[&volume])
             .await
@@ -524,15 +552,9 @@ async fn collect_cutover_shared_state<C: GenericClient + Sync>(
         if let Some(ref name) = target_name {
             db_blockers.retain(|(vol_name, _)| vol_name != name);
         }
-        let (_, pending) = super::migrations::registered_schema_status(client, false).await?;
-        let contract_steps = pending
-            .into_iter()
-            .filter(|step| step.phase == super::migrations::MigrationPhase::Contract)
-            .map(|step| step.to_string())
-            .collect();
-        (db_blockers, contract_steps)
+        db_blockers
     } else {
-        (Vec::new(), Vec::new())
+        Vec::new()
     };
 
     Ok((
@@ -545,7 +567,6 @@ async fn collect_cutover_shared_state<C: GenericClient + Sync>(
             snapshot_or_gc_active,
             active_maintenance_detail,
             database_volume_blockers,
-            pending_contract_migrations,
         },
     ))
 }
@@ -594,26 +615,7 @@ pub async fn execute_feature_cutover(
         .start()
         .await
         .map_err(failed)?;
-    let volume_row = tx
-        .query_opt(
-            "SELECT vol FROM volumes WHERE vol = $1 FOR KEY SHARE",
-            &[&volume],
-        )
-        .await
-        .map_err(failed)?;
-    if volume_row.is_none() {
-        return Err(ProtocolRejection::Missing.into());
-    }
-    let state_row = tx
-        .query_opt(
-            "SELECT vol FROM metadata_state WHERE vol = $1 FOR UPDATE",
-            &[&volume],
-        )
-        .await
-        .map_err(failed)?;
-    if state_row.is_none() {
-        return Err(ProtocolRejection::Missing.into());
-    }
+    lock_volume_for_protocol_update(&tx, volume, "execute feature cutover").await?;
     let (current, shared) =
         collect_cutover_shared_state(&tx, volume, request.phase, &request.feature).await?;
     if let Some(expected) = expected_epoch
@@ -640,8 +642,18 @@ pub async fn execute_feature_cutover(
             request.phase.as_str()
         )));
     }
-    if let Some(proposed) = &report.proposed {
-        update_volume_protocol(&tx, volume, current.epoch, proposed, actor, actor_id).await?;
+    if let Some(proposed) = &report.proposed
+        && report.next_epoch != report.current_epoch
+    {
+        apply_locked_volume_protocol_update(
+            &tx,
+            volume,
+            &current,
+            proposed,
+            actor_id,
+            "execute feature cutover",
+        )
+        .await?;
     }
     tx.commit().await.map_err(failed)?;
     Ok(report)

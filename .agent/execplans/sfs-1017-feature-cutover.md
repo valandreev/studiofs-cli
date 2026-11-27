@@ -19,6 +19,14 @@ After this change, an operator can drive a per-volume Expand–Migrate–Activat
 - [x] (2026-11-27 14:58Z) Extended `studiofs upgrade` in `crates/studiofs/src/cli/upgrade.rs` with `--feature`, `--phase`, `--role`, `--write-requirement`, `--accept-offline-clients`, and `--expected-epoch`.
 - [x] (2026-11-27 14:58Z) Updated `docs/persisted-format-compatibility.md` and `docs/local-first-validation-matrix.md`.
 - [x] (2026-11-27 15:03Z) Verified unit tests, live PostgreSQL integration tests, and clippy.
+- [x] (2026-11-27 15:24Z) Addressed PR #1071 review findings: wired read-only local redb state (`unpublished_events`, `local_version`) into `studiofs upgrade --feature` cutover, dropped unused `dirty_payloads` and `CutoverRequest.checkpoint`, added `Migration.contract_feature` for database-wide `Contract` DDL gating, removed `pending_contract_migrations` from `CutoverPhase::Contract`, deduplicated locking/validation in `execute_feature_cutover`, and made the activation/publication race test concurrent with `pg_blocking_pids` synchronization.
+
+## Review Round (PR #1071)
+
+1. **CLI local state (`crates/studiofs/src/cli/upgrade.rs`, `crates/studiofs-meta/src/redb_engine/format.rs`)**: `dispatch_feature_cutover` now reads `FormatInfo` and `CutoverLocalState` together via `RedbMetaEngine::read_upgrade_and_cutover_state_readonly` (reusing `local_outbound_ack_positions_from_read_txn` and `LOCAL_PG_VERSION_COUNTER`), failing with a clear "stop the mount..." message when redb cannot be opened. Because PostgreSQL event publication requires payload uploads to complete first, `unpublished_events` covers dirty payload work, so `dirty_payloads` was dropped.
+2. **Contract DDL ordering (`crates/studiofs-meta/src/pg_engine/migrations.rs`, `crates/studiofs-meta/src/volume_protocol.rs`)**: Added `Migration::contract_feature: Option<&'static str>`, asserted in registry tests that every `MigrationPhase::Contract` step names its feature, passed `Some(feature)` to `contract_database_volume_blockers` before running Contract DDL, and removed `pending_contract_migrations` from `CutoverPhase::Contract` so per-volume retirement precedes Contract DDL.
+3. **Cutover cleanup (`crates/studiofs-meta/src/pg_engine/volume_protocol.rs`)**: Removed unused `CutoverRequest.checkpoint` and extracted `lock_volume_for_protocol_update` / `apply_locked_volume_protocol_update` so `execute_feature_cutover` locks and validates once.
+4. **Concurrent race test (`crates/studiofs-meta/src/pg_engine/tests/volume_protocol.rs`)**: `cutover_activate_and_publication_race_fences_stale_writer` now runs `execute_feature_cutover` concurrently against an in-flight publication transaction, synchronizing on `pg_blocking_pids` before committing the old-epoch publication and asserting post-commit fencing of stale-epoch `BUMP_METADATA_VERSION`. Added `contract_ddl_step_refused_while_any_volume_needs_feature_and_allowed_once_retired_or_available`.
 
 ## Surprises & Discoveries
 

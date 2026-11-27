@@ -76,6 +76,8 @@ pub struct Migration {
     pub name: &'static str,
     /// Kind of change.
     pub phase: MigrationPhase,
+    /// Feature capability that a `Contract` migration retires; `None` for non-Contract steps.
+    pub contract_feature: Option<&'static str>,
     /// SQL run in the step's transaction.
     pub sql: &'static str,
 }
@@ -101,6 +103,7 @@ const BASELINE: Migration = Migration {
     version: 1,
     name: "0.2.5 baseline",
     phase: MigrationPhase::Additive,
+    contract_feature: None,
     sql: studiofs_pg_schema_sql(),
 };
 
@@ -109,6 +112,7 @@ const CLIENT_SESSIONS: Migration = Migration {
     version: 1,
     name: "per-volume client session leases",
     phase: MigrationPhase::Additive,
+    contract_feature: None,
     sql: super::client_sessions::SCHEMA,
 };
 
@@ -117,6 +121,7 @@ const CHECKPOINT_ENCODINGS: Migration = Migration {
     version: 1,
     name: "independent serving checkpoint encodings",
     phase: MigrationPhase::Additive,
+    contract_feature: None,
     sql: "CREATE TABLE IF NOT EXISTS serving_checkpoint_encodings (
               vol BIGINT NOT NULL REFERENCES metadata_state(vol) ON DELETE CASCADE,
               checkpoint_version BIGINT NOT NULL CHECK (checkpoint_version >= 0),
@@ -137,6 +142,7 @@ const FORMAT_FENCES: Migration = Migration {
     version: 1,
     name: "fence 0.2.x writers on adopted volumes",
     phase: MigrationPhase::Additive,
+    contract_feature: None,
     sql: "CREATE OR REPLACE FUNCTION studiofs_fence_deletion_claim_volume_format()
           RETURNS TRIGGER LANGUAGE plpgsql AS $$
           BEGIN
@@ -181,6 +187,7 @@ const EVENT_PUBLICATION_FENCE: Migration = Migration {
     version: crate::version::POSTGRES_EVENT_PUBLICATION_FENCE_SCHEMA.current as i32,
     name: "fence metadata event publication",
     phase: MigrationPhase::Additive,
+    contract_feature: None,
     sql: super::schema::EVENT_PUBLICATION_FENCE_SQL,
 };
 
@@ -189,6 +196,7 @@ const MAINTENANCE_FENCE: Migration = Migration {
     version: 1,
     name: "fence destructive maintenance claims",
     phase: MigrationPhase::Additive,
+    contract_feature: None,
     sql: super::schema::MAINTENANCE_FENCE_SQL,
 };
 
@@ -199,6 +207,7 @@ const SUCCESSOR_PROBE: Migration = Migration {
     version: 2,
     name: "test successor probe table",
     phase: MigrationPhase::Additive,
+    contract_feature: None,
     sql: "CREATE TABLE IF NOT EXISTS studiofs_successor_probe (
               vol BIGINT PRIMARY KEY REFERENCES volumes(vol) ON DELETE CASCADE,
               note TEXT
@@ -552,7 +561,12 @@ pub(crate) async fn migrate_with(
             return Ok(applied);
         };
         if step.phase == MigrationPhase::Contract {
-            let blockers = contract_database_volume_blockers(&tx, None).await?;
+            let feature = step.contract_feature.ok_or_else(|| {
+                MetaError::Storage(format!(
+                    "contract migration {step} does not name the feature it retires"
+                ))
+            })?;
+            let blockers = contract_database_volume_blockers(&tx, Some(feature)).await?;
             if let Some((vol, detail)) = blockers.first() {
                 return Err(MetaError::Storage(format!(
                     "cannot apply contract migration {step}: volume '{vol}' {detail}"
@@ -722,6 +736,10 @@ mod tests {
             version,
             name: "test",
             phase,
+            contract_feature: match phase {
+                MigrationPhase::Contract => Some("sfs1005.test.v1"),
+                MigrationPhase::Additive | MigrationPhase::Backfill => None,
+            },
             sql,
         }
     }
@@ -787,6 +805,19 @@ mod tests {
             i32::from(crate::version::POSTGRES_CHECKPOINT_ENCODINGS_SCHEMA.current)
         );
         assert_eq!(MIGRATIONS[0], BASELINE);
+        for step in MIGRATIONS {
+            if step.phase == MigrationPhase::Contract {
+                assert!(
+                    step.contract_feature.is_some_and(|f| !f.is_empty()),
+                    "contract migration {step} must name the feature it retires"
+                );
+            } else {
+                assert!(
+                    step.contract_feature.is_none(),
+                    "non-contract migration {step} must not set contract_feature"
+                );
+            }
+        }
     }
 
     /// The baseline is frozen: a schema change is a new migration, not an edit.

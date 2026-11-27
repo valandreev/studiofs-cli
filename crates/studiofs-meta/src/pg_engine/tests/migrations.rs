@@ -13,6 +13,10 @@ const fn step(version: i32, phase: MigrationPhase, sql: &'static str) -> Migrati
         version,
         name: "test",
         phase,
+        contract_feature: match phase {
+            MigrationPhase::Contract => Some("sfs1005.test.v1"),
+            MigrationPhase::Additive | MigrationPhase::Backfill => None,
+        },
         sql,
     }
 }

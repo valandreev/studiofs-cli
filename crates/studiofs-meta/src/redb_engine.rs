@@ -985,14 +985,20 @@ impl RedbMetaEngine {
     /// cursor from one redb MVCC snapshot.
     pub(crate) fn local_outbound_ack_positions(&self) -> MetaResult<(u64, u64)> {
         let txn = self.begin_read_txn()?;
+        Self::local_outbound_ack_positions_from_read_txn(&txn)
+    }
+
+    pub(crate) fn local_outbound_ack_positions_from_read_txn(
+        txn: &ReadTransaction,
+    ) -> MetaResult<(u64, u64)> {
         let local_event_end =
-            Self::read_counter_from_read_txn(&txn, crate::schema::counters::NEXT_EVENT_SEQ)?.max(1);
+            Self::read_counter_from_read_txn(txn, crate::schema::counters::NEXT_EVENT_SEQ)?.max(1);
         let durable_cursor = Self::read_counter_from_read_txn(
-            &txn,
+            txn,
             crate::schema::counters::LOCAL_PG_FLUSHED_EVENT_SEQ,
         )?;
         let pruned_through = Self::read_counter_from_read_txn(
-            &txn,
+            txn,
             crate::schema::counters::LOCAL_EVENT_LOG_PRUNED_THROUGH_SEQ,
         )?;
         let durable_cursor = if pruned_through == 0 {

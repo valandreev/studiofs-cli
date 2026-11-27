@@ -504,19 +504,19 @@ pub struct CutoverRequest {
     pub roles: BTreeSet<CapabilityRole>,
     /// Optional explicit `write_requirement` override.
     pub write_requirement: Option<u16>,
-    /// Optional serving checkpoint descriptor override.
-    pub checkpoint: Option<CheckpointDescriptor>,
     /// Policy for expired sessions that may hold unknown offline local work.
     pub offline_client_policy: OfflineClientPolicy,
 }
 
 /// Local cache observations fed into cutover readiness checks when available.
+///
+/// Event publication to PostgreSQL happens only after the corresponding payload
+/// uploads have completed, so `unpublished_events` covers dirty/unpublished
+/// payload work as well.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CutoverLocalState {
     /// Unpublished local metadata events in the inspected local cache.
     pub unpublished_events: u64,
-    /// Dirty local payload entries in the inspected local payload index.
-    pub dirty_payloads: u64,
     /// Local applied metadata version, if a local cache was inspected.
     pub local_version: Option<i64>,
 }
@@ -538,8 +538,6 @@ pub struct CutoverSharedState {
     pub active_maintenance_detail: Option<String>,
     /// For `Contract`: other volumes in the database that still use/require the feature or lack a policy.
     pub database_volume_blockers: Vec<(String, String)>,
-    /// For `Contract`: pending `MigrationPhase::Contract` steps.
-    pub pending_contract_migrations: Vec<String>,
 }
 
 /// A specific readiness blocker preventing a cutover transition.
@@ -567,12 +565,10 @@ pub enum CutoverBlocker {
         /// Capabilities or requirements missing from the session.
         missing: Vec<String>,
     },
-    /// Local cache has unpublished metadata events or dirty payloads.
+    /// Local cache has unpublished metadata events (or payloads awaiting publication).
     DirtyUnpublishedLocalWork {
         /// Unpublished local metadata event count.
         unpublished_events: u64,
-        /// Dirty local payload entry count.
-        dirty_payloads: u64,
     },
     /// Local cache has not caught up to the remote metadata head.
     ReplicationLag {
@@ -597,11 +593,6 @@ pub enum CutoverBlocker {
         volume: String,
         /// Reason the volume blocks Contract.
         detail: String,
-    },
-    /// A database-wide `MigrationPhase::Contract` step is pending.
-    PendingContractMigration {
-        /// Migration description.
-        migration: String,
     },
 }
 
@@ -628,12 +619,9 @@ impl std::fmt::Display for CutoverBlocker {
                 "expired session {session_id} (build {build}) lacks [{}] and may hold unknown offline local work (pass --accept-offline-clients to fence on reconnect)",
                 missing.join(", ")
             ),
-            Self::DirtyUnpublishedLocalWork {
-                unpublished_events,
-                dirty_payloads,
-            } => write!(
+            Self::DirtyUnpublishedLocalWork { unpublished_events } => write!(
                 f,
-                "local cache has dirty unpublished work ({unpublished_events} unpublished events, {dirty_payloads} dirty payloads)"
+                "local cache has dirty unpublished work ({unpublished_events} unpublished events)"
             ),
             Self::ReplicationLag {
                 local_version,
@@ -652,9 +640,6 @@ impl std::fmt::Display for CutoverBlocker {
             }
             Self::DatabaseVolumeNeedsFeature { volume, detail } => {
                 write!(f, "database volume '{volume}' blocks contract: {detail}")
-            }
-            Self::PendingContractMigration { migration } => {
-                write!(f, "pending contract schema migration: {migration}")
             }
         }
     }
@@ -780,9 +765,6 @@ pub fn build_proposed_protocol(
                 .requirements
                 .features
                 .insert(request.feature.clone(), FeatureState::Compatible);
-            if let Some(checkpoint) = request.checkpoint {
-                proposed.requirements.checkpoint = checkpoint;
-            }
         }
         CutoverPhase::Activate => {
             if request.roles.is_empty() && current_state != Some(FeatureState::Required) {
@@ -818,9 +800,6 @@ pub fn build_proposed_protocol(
                 && !request.roles.contains(&CapabilityRole::Write)
             {
                 proposed.write_requirement = wr;
-            }
-            if let Some(checkpoint) = request.checkpoint {
-                proposed.requirements.checkpoint = checkpoint;
             }
         }
         CutoverPhase::Deactivate => match current_state {
@@ -966,10 +945,9 @@ pub fn evaluate_cutover_readiness(
         request.phase,
         CutoverPhase::Activate | CutoverPhase::Contract
     ) {
-        if local.unpublished_events > 0 || local.dirty_payloads > 0 {
+        if local.unpublished_events > 0 {
             blockers.push(CutoverBlocker::DirtyUnpublishedLocalWork {
                 unpublished_events: local.unpublished_events,
-                dirty_payloads: local.dirty_payloads,
             });
         }
         if let Some(local_version) = local.local_version
@@ -1006,11 +984,6 @@ pub fn evaluate_cutover_readiness(
             blockers.push(CutoverBlocker::DatabaseVolumeNeedsFeature {
                 volume: vol.clone(),
                 detail: detail.clone(),
-            });
-        }
-        for migration in &shared.pending_contract_migrations {
-            blockers.push(CutoverBlocker::PendingContractMigration {
-                migration: migration.clone(),
             });
         }
     }
@@ -1343,7 +1316,6 @@ mod tests {
             snapshot_or_gc_active: false,
             active_maintenance_detail: None,
             database_volume_blockers: Vec::new(),
-            pending_contract_migrations: Vec::new(),
         }
     }
 
@@ -1365,12 +1337,10 @@ mod tests {
             phase: CutoverPhase::Activate,
             roles: BTreeSet::from([CapabilityRole::Read]),
             write_requirement: None,
-            checkpoint: None,
             offline_client_policy: OfflineClientPolicy::BlockUnknownWork,
         };
         let local = CutoverLocalState {
             unpublished_events: 2,
-            dirty_payloads: 1,
             local_version: Some(8),
         };
         let mut shared = ready_shared_state();
@@ -1409,7 +1379,6 @@ mod tests {
             b,
             CutoverBlocker::DirtyUnpublishedLocalWork {
                 unpublished_events: 2,
-                dirty_payloads: 1
             }
         )));
         assert!(report.blockers.iter().any(|b| matches!(
@@ -1455,7 +1424,6 @@ mod tests {
             phase: CutoverPhase::Expand,
             roles: BTreeSet::new(),
             write_requirement: None,
-            checkpoint: None,
             offline_client_policy: OfflineClientPolicy::BlockUnknownWork,
         };
         let expanded = build_proposed_protocol(&baseline, &expand_req).unwrap();

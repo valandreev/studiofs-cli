@@ -11,8 +11,7 @@ use studiofs_meta::pg_engine::migrations::{migrate_registered_schema, registered
 use studiofs_meta::pg_engine::{execute_feature_cutover, inspect_cutover_dry_run};
 use studiofs_meta::schema::{FormatInfo, PostgresConfig};
 use studiofs_meta::volume_protocol::{
-    CapabilityRole, CutoverDryRunReport, CutoverLocalState, CutoverPhase, CutoverRequest,
-    OfflineClientPolicy,
+    CapabilityRole, CutoverDryRunReport, CutoverPhase, CutoverRequest, OfflineClientPolicy,
 };
 
 const BACKUP_GUIDANCE: &str = "Before upgrading: stop every mount and janitor of every volume in this PostgreSQL database, back up the database (for example with pg_dump), and run `studiofs dump` with the version that last opened each volume. Schema migrations are database-wide and never move back.";
@@ -184,8 +183,10 @@ impl UpgradeArgs {
         feature: String,
         phase: CutoverPhase,
     ) -> anyhow::Result<()> {
-        let format = RedbMetaEngine::read_format_info_for_upgrade_readonly(path)
-            .context("Cannot read local metadata; nothing was changed")?;
+        let (format, local_state) = RedbMetaEngine::read_upgrade_and_cutover_state_readonly(path)
+            .context(
+                "Cannot read local metadata; stop the mount or close any process holding the local cache and retry. Nothing was changed",
+            )?;
         let pg = postgres_binding(&format, &self.name)?;
         let roles: BTreeSet<CapabilityRole> = self.roles.into_iter().map(Into::into).collect();
         let request = CutoverRequest {
@@ -193,14 +194,12 @@ impl UpgradeArgs {
             phase,
             roles,
             write_requirement: self.write_requirement,
-            checkpoint: None,
             offline_client_policy: if self.accept_offline_clients {
                 OfflineClientPolicy::AcceptFence
             } else {
                 OfflineClientPolicy::BlockUnknownWork
             },
         };
-        let local_state = CutoverLocalState::default();
         let actor = ClientCapabilities::current();
         let runtime = tokio::runtime::Runtime::new()?;
         if self.dry_run {
@@ -452,5 +451,124 @@ mod tests {
         assert!(parsed.accept_offline_clients);
         assert_eq!(parsed.expected_epoch, Some(3));
         assert!(parsed.dry_run);
+    }
+
+    #[test]
+    fn cutover_reads_local_redb_unpublished_work_and_lag() {
+        use std::collections::BTreeSet;
+        use studiofs_meta::compat::ClientCapabilities;
+        use studiofs_meta::engine::{MetaFormat, MetaFsOps, MetaInodes};
+        use studiofs_meta::schema::{
+            FormatInfo, FormatInfoDataStore, MetadataBackend, PostgresConfig,
+        };
+        use studiofs_meta::volume_protocol::{
+            CapabilityRole, CutoverBlocker, CutoverPhase, CutoverRequest, CutoverSharedState,
+            FeatureState, OfflineClientPolicy, VolumeProtocol, evaluate_cutover_readiness,
+        };
+        use studiofs_meta::{ROOT_INO, RedbMetaEngine};
+
+        let dir = studiofs_test_support::workspace_target_tempdir("upgrade-cutover-local-");
+        let db_path = dir.path().join("cutover.db");
+        let mut info = FormatInfo::new(
+            "cutover-test".to_owned(),
+            uuid::Uuid::new_v4().to_string(),
+            FormatInfoDataStore {
+                endpoint: "http://127.0.0.1:9000".to_owned(),
+                bucket: "bucket".to_owned(),
+                access_key: "ak".to_owned(),
+                secret_key: "sk".to_owned(),
+                region: "us-east-1".to_owned(),
+            },
+            1,
+        )
+        .expect("format info");
+        info.metadata.postgres = Some(PostgresConfig {
+            url: "postgres://user:pass@127.0.0.1:5432/db".to_owned(),
+            volume_id: 1,
+        });
+        info.metadata.backend = MetadataBackend::Postgres;
+
+        let engine = RedbMetaEngine::open(&db_path).expect("open redb");
+        engine.set_format_info(&info).expect("set format info");
+        engine.init_root(0, 0).expect("init root");
+        // Append one local unpublished event and leave local version behind remote head.
+        engine
+            .create_dir(ROOT_INO, b"pending-dir", 0, 0, 0o755)
+            .expect("create local dir");
+        let next_event_seq = engine
+            .get_counter(studiofs_meta::schema::counters::NEXT_EVENT_SEQ)
+            .expect("next event seq");
+        drop(engine);
+
+        let (_read_info, dirty_local) =
+            RedbMetaEngine::read_upgrade_and_cutover_state_readonly(&db_path)
+                .expect("read cutover local state");
+        assert!(dirty_local.unpublished_events > 0);
+        assert_eq!(dirty_local.local_version, Some(0));
+
+        let feature = "metadata.cli_cutover.v1";
+        let mut actor = ClientCapabilities::current();
+        actor.read.insert(feature);
+        let mut current = VolumeProtocol::baseline();
+        current
+            .requirements
+            .features
+            .insert(feature.to_owned(), FeatureState::Compatible);
+        let req = CutoverRequest {
+            feature: feature.to_owned(),
+            phase: CutoverPhase::Activate,
+            roles: BTreeSet::from([CapabilityRole::Read]),
+            write_requirement: None,
+            offline_client_policy: OfflineClientPolicy::BlockUnknownWork,
+        };
+        let shared = CutoverSharedState {
+            remote_head_version: 3,
+            checkpoint_version: 3,
+            checkpoint_ready: true,
+            available_checkpoints: vec![current.requirements.checkpoint],
+            snapshot_or_gc_active: false,
+            active_maintenance_detail: None,
+            database_volume_blockers: Vec::new(),
+        };
+
+        let dirty_report =
+            evaluate_cutover_readiness(&current, &req, &actor, &[], &dirty_local, &shared);
+        assert!(!dirty_report.is_ready());
+        assert!(dirty_report.blockers.iter().any(|b| matches!(
+            b,
+            CutoverBlocker::DirtyUnpublishedLocalWork {
+                unpublished_events
+            } if *unpublished_events > 0
+        )));
+        assert!(dirty_report.blockers.iter().any(|b| matches!(
+            b,
+            CutoverBlocker::ReplicationLag {
+                local_version: 0,
+                remote_head_version: 3
+            }
+        )));
+
+        // Mark all local events flushed and local version caught up to remote head.
+        let engine = RedbMetaEngine::open(&db_path).expect("reopen redb");
+        engine
+            .set_counter(
+                studiofs_meta::schema::counters::LOCAL_PG_FLUSHED_EVENT_SEQ,
+                next_event_seq,
+            )
+            .expect("ack local event");
+        engine
+            .set_counter("pgLastAppliedBatchVersion", 3)
+            .expect("catch up local version");
+        drop(engine);
+
+        let (_read_info, clean_local) =
+            RedbMetaEngine::read_upgrade_and_cutover_state_readonly(&db_path)
+                .expect("read clean cutover local state");
+        assert_eq!(clean_local.unpublished_events, 0);
+        assert_eq!(clean_local.local_version, Some(3));
+
+        let clean_report =
+            evaluate_cutover_readiness(&current, &req, &actor, &[], &clean_local, &shared);
+        assert!(clean_report.is_ready(), "{:?}", clean_report.blockers);
     }
 }
