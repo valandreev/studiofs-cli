@@ -215,6 +215,11 @@ impl PgMetaEngine {
             self.ensure_remote_format_validated()?;
             self.pull_foreign_events_locked_inner(recent_flush, target_version, caller_shutdown)
         })();
+        if let Err(error) = &result
+            && super::volume_protocol::is_volume_read_policy_rejection(error)
+        {
+            self.freeze_mount_policy(PgSyncLifecycle::Degraded);
+        }
         self.record_remote_operation_result(result)
     }
 
@@ -283,7 +288,13 @@ impl PgMetaEngine {
                                     e,
                                 )
                             })?;
-                        crate::ensure_supported_pg_sync_format_version(format_version)?;
+                        let policy = super::volume_protocol::decode_volume_policy(
+                            format_version,
+                            replay_state.get("policy_epoch"),
+                            replay_state.get("write_requirement"),
+                            replay_state.get("policy_requirements"),
+                        )?;
+                        super::volume_protocol::check_read_operations(&policy, None)?;
                         let baseline_checkpoint_version = replay_state
                             .try_get::<_, i64>("checkpoint_version")
                             .map_err(|e| {

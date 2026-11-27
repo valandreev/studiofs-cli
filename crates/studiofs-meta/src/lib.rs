@@ -268,12 +268,12 @@ pub fn ensure_supported_format_version(info: &FormatInfo) -> MetaResult<()> {
     Ok(())
 }
 
-/// Validate the PostgreSQL scalar sync-format version stored with a checkpoint.
+/// Evaluate the persisted PostgreSQL shared volume format independently of its policy.
 ///
 /// PostgreSQL stores this value as `SMALLINT`, so missing, negative, or
 /// otherwise unrepresentable values are converted to the unsupported sentinel
 /// instead of being accepted as a current format.
-pub fn ensure_supported_pg_sync_format_version(found: Option<i16>) -> MetaResult<()> {
+pub fn check_pg_volume_format(found: Option<i16>) -> MetaResult<()> {
     let found = found
         .and_then(|value| u16::try_from(value).ok())
         .unwrap_or_default();
@@ -281,10 +281,17 @@ pub fn ensure_supported_pg_sync_format_version(found: Option<i16>) -> MetaResult
 }
 
 pub(crate) fn check_volume_format(found: u16) -> MetaResult<()> {
-    if compat::MIGRATABLE_VOLUME_FORMATS.contains(&found) {
-        return Err(MetaError::NeedsMigration { found });
+    let supported = version::SHARED_VOLUME_FORMAT;
+    match compat::volume_format_refusal(supported, found) {
+        None => Ok(()),
+        Some(compat::ReasonCode::VolumeFormatNeedsMigration) => {
+            Err(MetaError::NeedsMigration { found })
+        }
+        Some(_) => Err(MetaError::UnsupportedFormatVersion {
+            found,
+            expected: supported.current,
+        }),
     }
-    version::SHARED_VOLUME_FORMAT.check(found)
 }
 
 /// Open metadata engine based on format settings.
@@ -404,12 +411,10 @@ mod tests {
 
     #[test]
     fn pg_sync_format_validator_rejects_missing_or_legacy_values() {
-        assert!(
-            ensure_supported_pg_sync_format_version(Some(CURRENT_FORMAT_VERSION as i16,)).is_ok()
-        );
+        assert!(check_pg_volume_format(Some(CURRENT_FORMAT_VERSION as i16,)).is_ok());
 
         for found in [None, Some(4), Some(-1)] {
-            let err = ensure_supported_pg_sync_format_version(found).unwrap_err();
+            let err = check_pg_volume_format(found).unwrap_err();
             assert!(matches!(
                 err,
                 MetaError::UnsupportedFormatVersion {
@@ -558,9 +563,9 @@ mod tests {
         drop(redb);
         let local = RedbMetaEngine::read_format_info_readonly(&path).unwrap();
         assert_eq!(local.format_version, info.format_version);
-        ensure_supported_pg_sync_format_version(Some(volume_format)).unwrap();
+        check_pg_volume_format(Some(volume_format)).unwrap();
         assert!(matches!(
-            ensure_supported_pg_sync_format_version(Some(checkpoint_format)),
+            check_pg_volume_format(Some(checkpoint_format)),
             Err(MetaError::UnsupportedFormatVersion { .. } | MetaError::NeedsMigration { .. })
         ));
     }

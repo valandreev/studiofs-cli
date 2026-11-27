@@ -574,7 +574,7 @@ impl PgMetaEngine {
                                 match current_session.stamp_checked(&tx, volume_id).await {
                                 Ok(()) => {}
                                 Err(error @ (super::client_sessions::StampError::SessionInactive
-                                    | super::client_sessions::StampError::PolicyStale)) => {
+                                    | super::client_sessions::StampError::PolicyStale { .. })) => {
                                     drop(tx);
                                     return Ok(Err((error, current_checkpoint)));
                                 }

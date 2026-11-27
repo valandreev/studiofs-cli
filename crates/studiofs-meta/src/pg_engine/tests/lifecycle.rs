@@ -3651,6 +3651,8 @@ fn startup_catch_up_rebases_stale_client_from_replay_gap_preserving_pending_over
     let Some(dsn) = pg_dsn() else {
         return;
     };
+    let schema = IsolatedPgSchema::new(&dsn);
+    let dsn = schema.dsn().to_owned();
     let volume = PgTestVolume::new(&dsn, "pg-rebootstrap-checkpoint");
 
     let (_publisher_dir, publisher) = open_pg_publisher(&volume);
@@ -3984,6 +3986,8 @@ fn startup_catch_up_reaches_live_at_frozen_target_while_remote_head_advances() {
     let Some(dsn) = pg_dsn() else {
         return;
     };
+    let schema = IsolatedPgSchema::new(&dsn);
+    let dsn = schema.dsn().to_owned();
     let _page_limit = set_test_env("STUDIOFS_PG_SYNC_MAX_BATCHES_PER_PAGE", "1");
     let volume = PgTestVolume::new(&dsn, "pg-frozen-startup-target");
 
@@ -5585,6 +5589,9 @@ fn remote_pull_requires_remote_identity_validation() {
 fn allocator_ready_client_stays_read_only_until_identity_is_validated() {
     let (_dir, engine) = temp_pg_engine_for_unit();
     engine
+        .remote_format_validated
+        .store(true, std::sync::atomic::Ordering::Release);
+    engine
         .remote_identity_validated
         .store(false, std::sync::atomic::Ordering::Release);
     engine.pg_sync_lifecycle.store(
@@ -5650,6 +5657,34 @@ fn successful_remote_operation_clears_transport_unavailable() {
             .metadata_source_connected
             .load(std::sync::atomic::Ordering::Acquire)
     );
+}
+
+#[test]
+fn publication_epoch_conflict_preserves_offline_write_eligibility() {
+    let (_dir, engine) = temp_pg_engine_for_unit();
+    engine
+        .remote_format_validated
+        .store(true, Ordering::Release);
+    engine.refresh_pg_sync_lifecycle_for_allocator();
+    engine
+        .offline_write_authority
+        .store(OFFLINE_AUTHORITY_ELIGIBLE, Ordering::Release);
+    assert!(engine.pg_sync_status().allows_new_mutations());
+
+    let conflict = crate::volume_protocol::ProtocolRejection::EpochConflict {
+        expected: 1,
+        found: 2,
+    };
+    let _ = engine.record_remote_operation_result::<()>(Err(conflict.into()));
+    assert!(engine.pg_sync_status().allows_new_mutations());
+    let _ = engine.record_remote_operation_result::<()>(Err(MetaError::RemoteUnavailable(
+        "test transport unavailable".into(),
+    )));
+    assert_eq!(
+        engine.offline_write_authority.load(Ordering::Acquire),
+        OFFLINE_AUTHORITY_GRANTED
+    );
+    assert!(engine.pg_sync_status().allows_new_mutations());
 }
 
 #[test]
@@ -5926,6 +5961,9 @@ fn fresh_client_startup_without_client_slot_is_degraded_and_marker_survives_reop
 fn degraded_fresh_client_recovers_after_sync_reaches_remote_head() {
     let (_dir, engine) = temp_pg_engine_for_unit();
     engine
+        .remote_format_validated
+        .store(true, std::sync::atomic::Ordering::Release);
+    engine
         .local
         .set_counter(LOCAL_PG_FRESH_CLIENT_PENDING_COUNTER, 1)
         .expect("set fresh-client marker");
@@ -5966,6 +6004,9 @@ fn degraded_fresh_client_recovers_after_sync_reaches_remote_head() {
 #[test]
 fn catching_up_client_reaches_live_after_sync_reaches_remote_head() {
     let (_dir, engine) = temp_pg_engine_for_unit();
+    engine
+        .remote_format_validated
+        .store(true, std::sync::atomic::Ordering::Release);
     engine.pg_sync_lifecycle.store(
         PgSyncLifecycle::CatchingUp as u8,
         std::sync::atomic::Ordering::Release,
@@ -5991,6 +6032,9 @@ fn catching_up_client_reaches_live_after_sync_reaches_remote_head() {
 #[test]
 fn catchup_completion_uses_frozen_startup_target() {
     let (_dir, engine) = temp_pg_engine_for_unit();
+    engine
+        .remote_format_validated
+        .store(true, std::sync::atomic::Ordering::Release);
     engine.pg_sync_lifecycle.store(
         PgSyncLifecycle::CatchingUp as u8,
         std::sync::atomic::Ordering::Release,
@@ -6049,6 +6093,9 @@ fn catchup_completion_requires_a_new_target_after_recovery() {
 #[test]
 fn concurrent_catchup_completion_preserves_live_lifecycle() {
     let (_dir, engine) = temp_pg_engine_for_unit();
+    engine
+        .remote_format_validated
+        .store(true, std::sync::atomic::Ordering::Release);
     engine.pg_sync_lifecycle.store(
         PgSyncLifecycle::CatchingUp as u8,
         std::sync::atomic::Ordering::Release,
@@ -6083,6 +6130,9 @@ fn concurrent_catchup_completion_preserves_live_lifecycle() {
 #[test]
 fn catching_up_fresh_client_completes_slot_and_allocator_bootstrap() {
     let (_dir, engine) = temp_pg_engine_for_unit();
+    engine
+        .remote_format_validated
+        .store(true, std::sync::atomic::Ordering::Release);
     engine
         .local
         .set_counter(LOCAL_PG_FRESH_CLIENT_PENDING_COUNTER, 1)
@@ -6146,6 +6196,9 @@ fn failed_fresh_allocator_bootstrap_keeps_recovery_marker() {
 
 fn fresh_allocator_recovery_fixture() -> (tempfile::TempDir, PgMetaEngine) {
     let (dir, engine) = temp_pg_engine_for_unit();
+    engine
+        .remote_format_validated
+        .store(true, std::sync::atomic::Ordering::Release);
     engine
         .local
         .write_invalid_allocator_state_for_test()
@@ -6384,6 +6437,9 @@ fn allocator_bootstrap_does_not_hold_retry_lock_during_mint() {
 fn resolved_local_graph_repair_marker_allows_catchup_completion() {
     let (_dir, engine) = temp_pg_engine_for_unit();
     engine
+        .remote_format_validated
+        .store(true, std::sync::atomic::Ordering::Release);
+    engine
         .local
         .set_counter(LOCAL_PG_REPAIR_LOCAL_GRAPH_RECOVERY_COUNTER, 1)
         .expect("set local graph recovery marker");
@@ -6611,6 +6667,9 @@ fn failed_allocator_bootstrap_survives_reopen_and_recovers() {
     .expect("allocator state");
     reopened.set_allocator_bootstrap_hook(std::sync::Arc::new(move || Ok(recovered_state)));
     reopened
+        .remote_format_validated
+        .store(true, std::sync::atomic::Ordering::Release);
+    reopened
         .remote_identity_validated
         .store(true, std::sync::atomic::Ordering::Release);
     reopened
@@ -6649,6 +6708,9 @@ fn snapshot_reachability_bootstrap_skips_after_success() {
 #[test]
 fn degraded_fresh_client_rehydrates_allocator_runtime_before_restoring_write_authority() {
     let (_dir, engine) = temp_pg_engine_for_unit();
+    engine
+        .remote_format_validated
+        .store(true, std::sync::atomic::Ordering::Release);
     engine.clear_allocator_runtime_for_test();
     engine
         .inode_id_headroom_available
@@ -9307,6 +9369,8 @@ fn test_pg_checkpoint_refuses_to_promote_legacy_format() {
     let Some(dsn) = pg_dsn() else {
         return;
     };
+    let schema = IsolatedPgSchema::new(&dsn);
+    let dsn = schema.dsn().to_owned();
 
     let dir = studiofs_test_support::workspace_target_tempdir("test-");
     let db = dir.path().join("meta.redb");
@@ -9362,6 +9426,8 @@ fn test_pg_event_publication_refuses_legacy_format() {
     let Some(dsn) = pg_dsn() else {
         return;
     };
+    let schema = IsolatedPgSchema::new(&dsn);
+    let dsn = schema.dsn().to_owned();
 
     let dir = studiofs_test_support::workspace_target_tempdir("test-");
     let db = dir.path().join("meta.redb");

@@ -906,6 +906,8 @@ pub enum PgSyncLifecycle {
     Degraded = 5,
     /// The local serving view cannot be used safely.
     Fatal = 6,
+    /// The volume may be read and replayed, but its policy refuses publication.
+    ReadOnlyCompatible = 7,
 }
 
 impl PgSyncLifecycle {
@@ -927,6 +929,9 @@ impl PgSyncLifecycle {
     pub const fn can_transition_to(self, next: Self) -> bool {
         if self as u8 == next as u8 {
             return true;
+        }
+        if matches!(next, Self::ReadOnlyCompatible) {
+            return !matches!(self, Self::Fatal);
         }
 
         match self {
@@ -952,6 +957,9 @@ impl PgSyncLifecycle {
             ),
             Self::Live => matches!(next, Self::AllocatorPending | Self::Degraded | Self::Fatal),
             Self::Degraded => matches!(next, Self::LocalReady | Self::CatchingUp | Self::Fatal),
+            Self::ReadOnlyCompatible => {
+                matches!(next, Self::CatchingUp | Self::Degraded | Self::Fatal)
+            }
             Self::Fatal => false,
         }
     }
@@ -1052,6 +1060,13 @@ pub enum PgSyncFailure {
         /// Format version expected by this binary.
         expected: u16,
     },
+    /// The volume must be adopted by the explicit upgrade command.
+    NeedsMigration {
+        /// Legacy volume format found in shared metadata.
+        found: u16,
+    },
+    /// The publication session evaluated a previous volume policy epoch.
+    StalePolicy,
     /// Persisted shared state needs a newer StudioFS release.
     UpgradeRequired,
     /// The local and remote volume identities differ.
@@ -1119,10 +1134,7 @@ impl PgSyncFailure {
                 }
             }
             MetaError::UnsupportedCheckpointEncoding { .. } => Self::UpgradeRequired,
-            MetaError::NeedsMigration { found } => Self::UnsupportedFormat {
-                found: *found,
-                expected: crate::schema::CURRENT_FORMAT_VERSION,
-            },
+            MetaError::NeedsMigration { found } => Self::NeedsMigration { found: *found },
             MetaError::UnsupportedFormatVersion { found, expected } => Self::UnsupportedFormat {
                 found: *found,
                 expected: *expected,
@@ -1133,6 +1145,9 @@ impl PgSyncFailure {
             MetaError::VolumeProtocolRejected(
                 crate::volume_protocol::ProtocolRejection::EventNotRepresentable { .. },
             ) => Self::PublicationBlocked,
+            MetaError::VolumeProtocolRejected(
+                crate::volume_protocol::ProtocolRejection::EpochConflict { .. },
+            ) => Self::StalePolicy,
             MetaError::EventTooLarge { .. }
             | MetaError::RepairRequired(_)
             | MetaError::Serialization(_)
@@ -1215,6 +1230,10 @@ impl std::fmt::Display for PgSyncFailure {
                 formatter,
                 "unsupported format (found {found}, expected {expected})"
             ),
+            Self::NeedsMigration { found } => {
+                write!(formatter, "volume format {found} needs migration via `studiofs upgrade`")
+            }
+            Self::StalePolicy => formatter.write_str("volume policy epoch changed"),
             Self::UpgradeRequired => formatter.write_str("upgrade required"),
             Self::UuidMismatch => formatter.write_str("volume UUID mismatch"),
             Self::LifecycleFatal => formatter.write_str("fatal synchronization lifecycle"),

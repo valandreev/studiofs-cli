@@ -137,7 +137,8 @@ const STAMP: &str = "
            CASE WHEN locked.lease_expires_at > observed.now_ts
                      AND locked.policy_epoch = current_policy.epoch
                 THEN set_config('studiofs.session_fencing_token', $4::BIGINT::TEXT, true) END,
-           locked.policy_epoch
+           locked.policy_epoch,
+           current_policy.epoch
     FROM locked CROSS JOIN observed CROSS JOIN current_policy";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -172,7 +173,7 @@ impl HeartbeatError {
 #[derive(Debug)]
 pub(super) enum StampError {
     SessionInactive,
-    PolicyStale,
+    PolicyStale { expected: i64, found: i64 },
     Other(MetaError),
 }
 
@@ -182,8 +183,12 @@ impl StampError {
             Self::SessionInactive => {
                 MetaError::Storage("publication client session is inactive".into())
             }
-            Self::PolicyStale => {
-                MetaError::Storage("publication client session policy epoch is stale".into())
+            Self::PolicyStale { expected, found } => {
+                let (Ok(expected), Ok(found)) = (u64::try_from(expected), u64::try_from(found))
+                else {
+                    return MetaError::Storage("postgres policy epoch is negative".into());
+                };
+                crate::volume_protocol::ProtocolRejection::EpochConflict { expected, found }.into()
             }
             Self::Other(error) => error,
         }
@@ -225,7 +230,6 @@ pub(super) fn evaluate_protocol_for_role(
             Operation::Bootstrap,
             Operation::Replay,
             Operation::Publication,
-            Operation::Checkpoint,
         ],
         SessionRole::Maintenance => &[
             Operation::Bootstrap,
@@ -235,7 +239,7 @@ pub(super) fn evaluate_protocol_for_role(
     };
     protocol.check_operations(
         VolumeRequirements::baseline(),
-        Some(protocol.requirements.checkpoint),
+        None,
         &BTreeMap::new(),
         required_ops,
     )
@@ -552,7 +556,10 @@ impl SessionLease {
         // A concurrent renewal may have stamped a newer epoch than the policy
         // this lease carries; publication must negotiate against the stamped one.
         if !policy_current || row.get::<_, i64>(5) != self.validated_epoch {
-            return Err(StampError::PolicyStale);
+            return Err(StampError::PolicyStale {
+                expected: self.validated_epoch,
+                found: row.get(6),
+            });
         }
         Ok(())
     }
@@ -696,6 +703,22 @@ impl PublicationSession {
 }
 
 impl PgMetaEngine {
+    pub(super) fn observe_session_policy(&self, epoch: u64, write_allowed: bool) {
+        let mut state = self
+            .client_session_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if (write_allowed && state.policy_error.is_some())
+            || (state.policy_error.is_none()
+                && state
+                    .lease
+                    .as_ref()
+                    .is_some_and(|lease| lease.protocol.epoch != epoch))
+        {
+            state.next_heartbeat = None;
+        }
+    }
+
     pub(super) fn heartbeat_client_session(&self) {
         let _ = self.refresh_client_session_inner(RefreshMode::Background);
     }

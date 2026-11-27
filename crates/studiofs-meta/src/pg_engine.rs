@@ -314,6 +314,9 @@ pub struct PgMetaEngine {
     /// is unavailable; remote pulls and publications also require validated
     /// volume identity.
     remote_format_validated: AtomicBool,
+    /// Publication compatibility from the last observed policy. Startup and
+    /// reconnect still require the independent remote validation gates.
+    remote_write_compatible: AtomicBool,
     /// Whether the PostgreSQL volume UUID was validated for this runtime. A
     /// local-first startup keeps this pending until a later remote probe.
     remote_identity_validated: AtomicBool,
@@ -847,6 +850,7 @@ impl PgMetaEngine {
             4 => PgSyncLifecycle::Live,
             5 => PgSyncLifecycle::Degraded,
             6 => PgSyncLifecycle::Fatal,
+            7 => PgSyncLifecycle::ReadOnlyCompatible,
             value => {
                 warn!(
                     raw_lifecycle = value,
@@ -891,6 +895,7 @@ impl PgMetaEngine {
             // A refused publication stays visible until a publication succeeds.
             if !allocator_retry_suppressed
                 && progress.last_sync_error != Some(PgSyncFailure::PublicationBlocked)
+                && self.current_pg_sync_lifecycle() != PgSyncLifecycle::ReadOnlyCompatible
             {
                 progress.last_sync_error = None;
             }
@@ -987,6 +992,17 @@ impl PgMetaEngine {
         self.transition_pg_sync_lifecycle(PgSyncLifecycle::Degraded);
     }
 
+    fn freeze_mount_policy(&self, lifecycle: PgSyncLifecycle) {
+        self.remote_write_compatible.store(false, Ordering::Release);
+        self.offline_write_authority
+            .store(OFFLINE_AUTHORITY_INELIGIBLE, Ordering::Release);
+        self.metadata_startup_target_version
+            .store(-1, Ordering::Release);
+        if self.update_pg_sync_lifecycle(|_| lifecycle) {
+            self.metadata_invalidation_notify.notify_one();
+        }
+    }
+
     pub(super) fn transition_pg_sync_lifecycle(&self, next: PgSyncLifecycle) {
         self.update_pg_sync_lifecycle(|_| next);
     }
@@ -1001,7 +1017,11 @@ impl PgMetaEngine {
     pub(super) fn refresh_pg_sync_lifecycle_for_allocator(&self) {
         self.update_pg_sync_lifecycle(|current| {
             let authority_available = self.metadata_authority_status().allows_new_mutations();
-            let identity_validated = self.remote_identity_validated.load(Ordering::Acquire)
+            if !self.remote_write_compatible.load(Ordering::Acquire) {
+                return current;
+            }
+            let identity_validated = (self.remote_identity_validated.load(Ordering::Acquire)
+                && self.remote_format_validated.load(Ordering::Acquire))
                 || self.offline_write_authority.load(Ordering::Acquire)
                     == OFFLINE_AUTHORITY_GRANTED;
             match (current, authority_available, identity_validated) {
@@ -1161,6 +1181,14 @@ impl PgMetaEngine {
         if (startup_target < 0 && initial_lifecycle != PgSyncLifecycle::AllocatorPending)
             || (startup_target >= 0 && local_version < startup_target)
         {
+            return Ok(());
+        }
+
+        if !self.remote_write_compatible.load(Ordering::Acquire) {
+            self.freeze_mount_policy(PgSyncLifecycle::ReadOnlyCompatible);
+            if let Ok(mut progress) = self.pg_sync_progress_state.lock() {
+                progress.rebootstrap_required = false;
+            }
             return Ok(());
         }
 
@@ -1375,14 +1403,49 @@ impl PgMetaEngine {
     /// Ensure the remote format and volume identity are validated before a
     /// remote replication operation.
     fn ensure_remote_format_validated(&self) -> MetaResult<()> {
+        self.validate_remote_mount_policy(false).map(|_| ())
+    }
+
+    /// Read head and policy together on the synchronization path, even if no
+    /// events are pending. Other remote operations revalidate after a failure.
+    fn validate_remote_mount_policy(&self, observe_head: bool) -> MetaResult<Option<i64>> {
         let _guard = self
             .remote_validation_lock
             .lock()
             .map_err(|_| MetaError::Storage("pg remote validation lock poisoned".to_string()))?;
-        if !self.remote_format_validated.load(Ordering::Acquire) {
-            let result = self.validate_remote_format_version();
-            if result.is_err() {
-                return self.record_remote_operation_result(result);
+        let mut observed_head = None;
+        if observe_head || !self.remote_format_validated.load(Ordering::Acquire) {
+            let (head, epoch, write_policy) = match self.read_remote_mount_policy() {
+                Ok(policy) => policy,
+                Err(error) => {
+                    if volume_protocol::is_volume_read_policy_rejection(&error) {
+                        self.freeze_mount_policy(PgSyncLifecycle::Degraded);
+                    }
+                    return self.record_remote_operation_result(Err(error));
+                }
+            };
+            observed_head = Some(head);
+            self.observe_session_policy(epoch, write_policy.is_ok());
+            match write_policy {
+                Ok(()) => {
+                    self.remote_write_compatible.store(true, Ordering::Release);
+                    if self.update_pg_sync_lifecycle(|current| match current {
+                        PgSyncLifecycle::ReadOnlyCompatible => PgSyncLifecycle::CatchingUp,
+                        current => current,
+                    }) {
+                        self.metadata_invalidation_notify.notify_one();
+                    }
+                }
+                Err(error) => {
+                    if self.pg_sync_progress_snapshot().rebootstrap_required {
+                        // A readable policy still permits recovering the local
+                        // replay cursor. The allocator remains fenced.
+                        self.remote_write_compatible.store(false, Ordering::Release);
+                    } else {
+                        self.freeze_mount_policy(PgSyncLifecycle::ReadOnlyCompatible);
+                    }
+                    self.record_pg_sync_failure(&error);
+                }
             }
             self.remote_transport_unavailable
                 .store(false, Ordering::Release);
@@ -1392,12 +1455,12 @@ impl PgMetaEngine {
         if self.remote_identity_validated.load(Ordering::Acquire) {
             self.metadata_source_connected
                 .store(true, Ordering::Release);
-            return Ok(());
+            return Ok(observed_head);
         }
 
         let result = self.validate_remote_identity();
-        self.record_metadata_source_result(&result);
-        result
+        self.record_remote_operation_result(result)
+            .map(|()| observed_head)
     }
 
     pub(super) fn check_remote_identity(&self) -> MetaResult<()> {
@@ -1406,8 +1469,7 @@ impl PgMetaEngine {
             .lock()
             .map_err(|_| MetaError::Storage("pg remote validation lock poisoned".to_string()))?;
         let result = self.validate_remote_identity();
-        self.record_metadata_source_result(&result);
-        result
+        self.record_remote_operation_result(result)
     }
 
     fn validate_remote_identity(&self) -> MetaResult<()> {
@@ -1443,7 +1505,7 @@ impl PgMetaEngine {
         Ok(())
     }
 
-    fn validate_remote_format_version(&self) -> MetaResult<()> {
+    fn read_remote_mount_policy(&self) -> MetaResult<(i64, u64, MetaResult<()>)> {
         let command_pool = Arc::clone(&self.command_pool);
         let volume_id = self.volume_id;
         let command_timeout = self.command_timeout;
@@ -1451,8 +1513,22 @@ impl PgMetaEngine {
             Self::with_postgres_client_timeout(
                 command_pool,
                 command_timeout,
-                "validate postgres format",
-                move |client| Box::pin(check_volume_read_policy(client, volume_id, None)),
+                "validate postgres mount policy",
+                move |client| {
+                    Box::pin(async move {
+                        let (policy, head) =
+                            volume_protocol::read_volume_policy_and_head(client, volume_id).await?;
+                        volume_protocol::check_read_operations(&policy, None)?;
+                        Ok((
+                            head,
+                            policy.epoch,
+                            client_sessions::evaluate_protocol_for_role(
+                                &policy,
+                                client_sessions::SessionRole::Mount,
+                            ),
+                        ))
+                    })
+                },
             )
             .await
         })
@@ -1485,15 +1561,30 @@ impl PgMetaEngine {
                 .remote_transport_unavailable
                 .store(false, Ordering::Release),
             Err(error) => {
-                // A protocol refusal of publication says nothing about remote identity.
-                if !matches!(
+                // A stale epoch or an unrepresentable event only rejects this publication.
+                let publication_only_rejection = matches!(
                     error,
-                    MetaError::CatchUpCancelled
-                        | MetaError::CatchUpDeadlineExceeded
-                        | MetaError::VolumeProtocolRejected(
-                            crate::volume_protocol::ProtocolRejection::EventNotRepresentable { .. }
-                        )
-                ) {
+                    MetaError::VolumeProtocolRejected(
+                        crate::volume_protocol::ProtocolRejection::EpochConflict { .. }
+                            | crate::volume_protocol::ProtocolRejection::EventNotRepresentable { .. }
+                    )
+                );
+                if (volume_protocol::is_volume_read_policy_rejection(error)
+                    || matches!(error, MetaError::UuidMismatch { .. }))
+                    && !publication_only_rejection
+                {
+                    // A publish refusal while in compatible read-only mode
+                    // must not interrupt replay or clear the writer refusal.
+                    if self.current_pg_sync_lifecycle() != PgSyncLifecycle::ReadOnlyCompatible {
+                        self.freeze_mount_policy(PgSyncLifecycle::Degraded);
+                    }
+                }
+                if !publication_only_rejection
+                    && !matches!(
+                        error,
+                        MetaError::CatchUpCancelled | MetaError::CatchUpDeadlineExceeded
+                    )
+                {
                     self.invalidate_remote_validation();
                 }
                 self.remote_transport_unavailable
@@ -1759,6 +1850,7 @@ impl PgMetaEngine {
             snapshot_reachability_bootstrap_lock: Mutex::new(()),
             metadata_source_connected: AtomicBool::new(false),
             remote_format_validated: AtomicBool::new(remote_format_validated),
+            remote_write_compatible: AtomicBool::new(true),
             remote_identity_validated: AtomicBool::new(remote_identity_validated),
             offline_write_authority: AtomicU8::new(offline_write_authority),
             remote_transport_unavailable: AtomicBool::new(remote_transport_unavailable),
@@ -1897,7 +1989,7 @@ impl PgMetaEngine {
                                 engine.transition_pg_sync_lifecycle(PgSyncLifecycle::Degraded);
                                 engine.transition_pg_sync_lifecycle(PgSyncLifecycle::CatchingUp);
                             }
-                            PgSyncLifecycle::Fatal => {}
+                            PgSyncLifecycle::ReadOnlyCompatible | PgSyncLifecycle::Fatal => {}
                         }
                     }
                     true

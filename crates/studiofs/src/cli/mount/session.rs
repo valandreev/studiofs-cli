@@ -1856,6 +1856,9 @@ fn mount_record_state(
         }
         PgSyncLifecycle::Live => (utils::MountRecordStatus::Live, "live"),
         PgSyncLifecycle::Degraded => (utils::MountRecordStatus::Degraded, "degraded"),
+        PgSyncLifecycle::ReadOnlyCompatible => {
+            (utils::MountRecordStatus::Degraded, "read_only_compatible")
+        }
         PgSyncLifecycle::Fatal => (utils::MountRecordStatus::Failed, "fatal"),
     };
     (

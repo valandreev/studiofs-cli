@@ -139,7 +139,7 @@ impl PgMetaEngine {
                                 match current_session.stamp_checked(&tx, volume).await {
                                 Ok(()) => {}
                                 Err(error @ (super::client_sessions::StampError::SessionInactive
-                                    | super::client_sessions::StampError::PolicyStale)) => {
+                                    | super::client_sessions::StampError::PolicyStale { .. })) => {
                                     drop(tx);
                                     return Ok(Err((error, current_update)));
                                 }
@@ -320,7 +320,7 @@ async fn update_volume_settings_in_tx(
         )
         .await
         .map_err(|error| PgMetaEngine::classify_pg_error("lock volume settings", error))?;
-    crate::ensure_supported_pg_sync_format_version(row.get(0))?;
+    crate::check_pg_volume_format(row.get(0))?;
     let bytes: Option<Vec<u8>> = row.get(1);
     let mut settings = bytes
         .as_deref()
@@ -415,7 +415,7 @@ pub async fn update_shared_s3_settings(
         )
         .await
         .map_err(|error| PgMetaEngine::classify_pg_error("lock shared volume update", error))?;
-    crate::ensure_supported_pg_sync_format_version(row.get(0))?;
+    crate::check_pg_volume_format(row.get(0))?;
     let uuid: String = row.get(2);
     if uuid != expected_uuid {
         return Err(MetaError::Storage("shared volume identity mismatch".into()));
