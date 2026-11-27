@@ -7365,7 +7365,7 @@ fn pg_checkpoint_encodings_keep_baseline_and_successor_replayable() {
 
     let base_dsn = pg_dsn().expect("STUDIOFS_TEST_PG_DSN is required");
     let schema = IsolatedPgSchema::new(&base_dsn);
-    let dsn = &schema.dsn;
+    let dsn = schema.dsn();
     let volume = PgTestVolume::new(dsn, "pg-dual-checkpoint");
     let volume_id = volume.volume_id;
     let info = volume.format_info();

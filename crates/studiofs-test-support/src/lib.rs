@@ -15,8 +15,7 @@ const REDB_MAGIC: [u8; 9] = *b"redb\x1a\n\xa9\r\n";
 pub struct IsolatedPgSchema {
     base_dsn: String,
     name: String,
-    /// A PostgreSQL DSN with its search path confined to this schema.
-    pub dsn: String,
+    dsn: String,
 }
 
 impl IsolatedPgSchema {
@@ -36,6 +35,12 @@ impl IsolatedPgSchema {
             name,
             dsn,
         }
+    }
+
+    /// A PostgreSQL DSN with its search path confined to this schema.
+    #[must_use]
+    pub fn dsn(&self) -> &str {
+        &self.dsn
     }
 }
 

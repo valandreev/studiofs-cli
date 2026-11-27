@@ -55,9 +55,9 @@ fn volume_protocol_policy_and_write_requirement_on_live_postgres() {
     let schema = IsolatedPgSchema::new(&dsn);
     // The fixture volumes lose their policy below, like volumes provisioned
     // before the policy existed.
-    let existing = PgTestVolume::new(&schema.dsn, "sfs1007-existing");
-    let legacy = PgTestVolume::new(&schema.dsn, "sfs1007-legacy");
-    let dsn = schema.dsn.clone();
+    let existing = PgTestVolume::new(schema.dsn(), "sfs1007-existing");
+    let legacy = PgTestVolume::new(schema.dsn(), "sfs1007-legacy");
+    let dsn = schema.dsn().to_owned();
     let (existing, legacy) = (existing.volume_id, legacy.volume_id);
     run_async(async move {
         let (mut client, connection) = tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
@@ -304,15 +304,15 @@ fn volume_protocol_waiting_update_rechecks_policy_epoch_on_live_postgres() {
 
     let dsn = pg_dsn().expect("STUDIOFS_TEST_PG_DSN is required for this explicit test");
     let schema = IsolatedPgSchema::new(&dsn);
-    let volume = PgTestVolume::new(&schema.dsn, "sfs1007-race");
+    let volume = PgTestVolume::new(schema.dsn(), "sfs1007-race");
     run_async(async {
         let pg_error = |error| MetaError::Storage(pg_err(error));
         let (mut winner_client, winner_connection) =
-            tokio_postgres::connect(&schema.dsn, tokio_postgres::NoTls)
+            tokio_postgres::connect(schema.dsn(), tokio_postgres::NoTls)
                 .await
                 .map_err(pg_error)?;
         let (mut stale_client, stale_connection) =
-            tokio_postgres::connect(&schema.dsn, tokio_postgres::NoTls)
+            tokio_postgres::connect(schema.dsn(), tokio_postgres::NoTls)
                 .await
                 .map_err(pg_error)?;
         let winner_connection = tokio::spawn(winner_connection);
@@ -443,10 +443,10 @@ fn pending_events_stay_unpublished_while_the_policy_cannot_represent_them() {
 
     let dsn = pg_dsn().expect("STUDIOFS_TEST_PG_DSN is required for this explicit test");
     let schema = IsolatedPgSchema::new(&dsn);
-    let volume = PgTestVolume::new(&schema.dsn, "sfs1010-pending");
+    let volume = PgTestVolume::new(schema.dsn(), "sfs1010-pending");
     let vol = volume.volume_id;
     run_async(async {
-        let (client, connection) = tokio_postgres::connect(&schema.dsn, tokio_postgres::NoTls)
+        let (client, connection) = tokio_postgres::connect(schema.dsn(), tokio_postgres::NoTls)
             .await
             .map_err(|e| MetaError::Storage(pg_err(e)))?;
         let connection = tokio::spawn(connection);
@@ -480,7 +480,7 @@ fn pending_events_stay_unpublished_while_the_policy_cannot_represent_them() {
     );
     let set_policy = |epoch: i64, policy: &VolumeProtocol| {
         sql_i64(
-            &schema.dsn,
+            schema.dsn(),
             &format!(
                 "UPDATE volume_protocol SET policy_epoch = {epoch}, requirements = $2::TEXT::JSONB \
                  WHERE vol = $1 RETURNING policy_epoch"
@@ -492,7 +492,7 @@ fn pending_events_stay_unpublished_while_the_policy_cannot_represent_them() {
     assert_eq!(set_policy(2, &narrowed), Some(2));
     let events = "SELECT count(*) FROM event_log WHERE vol = $1";
     let version = "SELECT version FROM metadata_state WHERE vol = $1";
-    let version_before = sql_i64(&schema.dsn, version, vol, None);
+    let version_before = sql_i64(schema.dsn(), version, vol, None);
     let cursor = pg.flushed_event_seq.load(Ordering::SeqCst);
     let pending = pg.replication_backlog().pending_ops;
     assert!(pending > 0);
@@ -508,8 +508,8 @@ fn pending_events_stay_unpublished_while_the_policy_cannot_represent_them() {
         ),
         "{refused:?}"
     );
-    assert_eq!(sql_i64(&schema.dsn, events, vol, None), Some(0));
-    assert_eq!(sql_i64(&schema.dsn, version, vol, None), version_before);
+    assert_eq!(sql_i64(schema.dsn(), events, vol, None), Some(0));
+    assert_eq!(sql_i64(schema.dsn(), version, vol, None), version_before);
     assert_eq!(pg.flushed_event_seq.load(Ordering::SeqCst), cursor);
     assert_eq!(pg.replication_backlog().pending_ops, pending);
     assert_eq!(pg.lookup(ROOT_INO, b"draft").unwrap().ino, draft.ino);
@@ -524,7 +524,7 @@ fn pending_events_stay_unpublished_while_the_policy_cannot_represent_them() {
 
     // Online settings changes negotiate against the same policy.
     let settings = run_async({
-        let dsn = schema.dsn.clone();
+        let dsn = schema.dsn().to_owned();
         async move {
             let (mut client, connection) = tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
                 .await
@@ -548,7 +548,7 @@ fn pending_events_stay_unpublished_while_the_policy_cannot_represent_them() {
         ),
         "{settings:?}"
     );
-    assert_eq!(sql_i64(&schema.dsn, events, vol, None), Some(0));
+    assert_eq!(sql_i64(schema.dsn(), events, vol, None), Some(0));
 
     // Once the policy can carry the encoding again, the retained journal publishes.
     assert_eq!(set_policy(3, &VolumeProtocol::baseline()), Some(3));
@@ -557,6 +557,6 @@ fn pending_events_stay_unpublished_while_the_policy_cannot_represent_them() {
         .expect("publish retained journal");
     assert_eq!(pg.replication_backlog().pending_ops, 0);
     assert_eq!(pg.pg_sync_progress_snapshot().last_sync_error, None);
-    assert!(sql_i64(&schema.dsn, events, vol, None).unwrap() > 0);
+    assert!(sql_i64(schema.dsn(), events, vol, None).unwrap() > 0);
     pg.prepare_for_close().expect("close writer");
 }

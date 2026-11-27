@@ -439,7 +439,7 @@ async fn verify_payload_from_discovered(home: &Path, disk_name: &str, expected: 
 async fn dump_load_restores_volume_and_discovery_reads_data() {
     let env = load_test_env();
     let schema = isolated_pg_schema().await;
-    let pg_dsn = schema.dsn.as_str();
+    let pg_dsn = schema.dsn();
 
     let disk_name = random_name("dump-load-a");
     let home_a = studiofs_test_support::workspace_target_tempdir("home-a-");
@@ -539,7 +539,7 @@ async fn dump_load_restores_volume_and_discovery_reads_data() {
 async fn dump_load_rejects_target_with_snapshot_v2_without_breaking_other_volumes() {
     let env = load_test_env();
     let schema = isolated_pg_schema().await;
-    let pg_dsn = schema.dsn.as_str();
+    let pg_dsn = schema.dsn();
 
     let target = random_name("dump-load-target");
     let extra1 = random_name("dump-load-extra1");
@@ -707,7 +707,7 @@ impl LoadGuardFixture {
     async fn connect(volume_names: Vec<String>) -> Self {
         let env = load_test_env();
         let schema = isolated_pg_schema().await;
-        let (client, connection) = connect_pg(&schema.dsn).await;
+        let (client, connection) = connect_pg(schema.dsn()).await;
         let home = studiofs_test_support::workspace_target_tempdir("home-");
         let dump_path = home.path().join("load-guard.dump.json");
         Self {
@@ -739,7 +739,7 @@ impl LoadGuardFixture {
                 "--region",
                 &self.env.s3_region,
                 "--meta",
-                &self.schema.dsn,
+                self.schema.dsn(),
             ],
         );
         assert_ok(&init, "init volume");
@@ -784,7 +784,7 @@ impl LoadGuardFixture {
             "--path-to-dump",
             self.dump_path_str(),
             "--postgresql-address",
-            &self.schema.dsn,
+            self.schema.dsn(),
         ]
     }
 
@@ -1117,7 +1117,7 @@ fn dump_load_into_new_metadata_server_ignores_other_volume_accounting() {
 
         // The new metadata server has no row for the dumped UUID; dropping
         // the source row cascades its accounting away.
-        delete_volume_by_name(&fixture.schema.dsn, &target).await;
+        delete_volume_by_name(fixture.schema.dsn(), &target).await;
         let bystander_volume = fixture.volume_id(&bystander).await;
         for table in ACCOUNTING_TABLES {
             fixture
@@ -1137,7 +1137,7 @@ fn dump_load_into_new_metadata_server_ignores_other_volume_accounting() {
         let verify_home = studiofs_test_support::workspace_target_tempdir("verify-home-");
         let discover = run_studiofs(
             verify_home.path(),
-            &["discover", &target, "--meta", &fixture.schema.dsn],
+            &["discover", &target, "--meta", fixture.schema.dsn()],
         );
         assert_ok(&discover, "discover loaded target");
         verify_payload_from_discovered(verify_home.path(), &target, payload).await;
@@ -1204,7 +1204,7 @@ fn dump_load_rejects_accounting_row_committed_while_load_waits() {
 
         // Hold the load's advisory lock so `load` finishes its schema DDL and
         // then parks before touching the volume row.
-        let (gate, gate_connection) = connect_pg(&fixture.schema.dsn).await;
+        let (gate, gate_connection) = connect_pg(fixture.schema.dsn()).await;
         gate.batch_execute(&format!(
             "BEGIN; SELECT pg_advisory_xact_lock({LOAD_ADVISORY_LOCK})"
         ))
@@ -1217,7 +1217,7 @@ fn dump_load_rejects_accounting_row_committed_while_load_waits() {
 
         // An uncommitted FK-backed insert holds KEY SHARE on the volume row,
         // which only the load's explicit FOR UPDATE conflicts with.
-        let (writer, writer_connection) = connect_pg(&fixture.schema.dsn).await;
+        let (writer, writer_connection) = connect_pg(fixture.schema.dsn()).await;
         writer.batch_execute("BEGIN").await.expect("begin writer");
         seed_accounting_row(
             &writer,

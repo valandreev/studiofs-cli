@@ -15,9 +15,9 @@ use crate::volume_protocol::{FeatureState, VolumeProtocol};
 fn client_session_leases_fence_expired_generations_on_live_postgres() {
     let dsn = pg_dsn().expect("STUDIOFS_TEST_PG_DSN is required");
     let schema = IsolatedPgSchema::new(&dsn);
-    let volume = PgTestVolume::new(&schema.dsn, "sfs1008-fencing");
+    let volume = PgTestVolume::new(schema.dsn(), "sfs1008-fencing");
     run_async(async {
-        let (mut client, connection) = tokio_postgres::connect(&schema.dsn, tokio_postgres::NoTls)
+        let (mut client, connection) = tokio_postgres::connect(schema.dsn(), tokio_postgres::NoTls)
             .await
             .expect("connect");
         let _connection = tokio::spawn(connection);
@@ -174,9 +174,9 @@ fn client_session_leases_fence_expired_generations_on_live_postgres() {
 fn client_session_leases_validate_policy_epoch_and_role_capabilities() {
     let dsn = pg_dsn().expect("STUDIOFS_TEST_PG_DSN is required");
     let schema = IsolatedPgSchema::new(&dsn);
-    let volume = PgTestVolume::new(&schema.dsn, "sfs1008-policy");
+    let volume = PgTestVolume::new(schema.dsn(), "sfs1008-policy");
     run_async(async {
-        let (mut client, connection) = tokio_postgres::connect(&schema.dsn, tokio_postgres::NoTls)
+        let (mut client, connection) = tokio_postgres::connect(schema.dsn(), tokio_postgres::NoTls)
             .await
             .expect("connect");
         let _connection = tokio::spawn(connection);
@@ -323,10 +323,10 @@ fn client_session_leases_validate_policy_epoch_and_role_capabilities() {
 fn client_session_leases_register_and_close_janitor() {
     let dsn = pg_dsn().expect("STUDIOFS_TEST_PG_DSN is required");
     let schema = IsolatedPgSchema::new(&dsn);
-    let volume = PgTestVolume::new(&schema.dsn, "sfs1008-janitor");
+    let volume = PgTestVolume::new(schema.dsn(), "sfs1008-janitor");
     let sessions = || {
         run_async(async {
-            let (client, connection) = tokio_postgres::connect(&schema.dsn, tokio_postgres::NoTls)
+            let (client, connection) = tokio_postgres::connect(schema.dsn(), tokio_postgres::NoTls)
                 .await
                 .expect("connect");
             let _connection = tokio::spawn(connection);
@@ -335,7 +335,8 @@ fn client_session_leases_register_and_close_janitor() {
         .expect("read janitor sessions")
     };
 
-    let mut janitor = crate::pg_engine::PgJanitorSession::new(schema.dsn.clone(), volume.volume_id);
+    let mut janitor =
+        crate::pg_engine::PgJanitorSession::new(schema.dsn().to_owned(), volume.volume_id);
     assert!(
         janitor
             .try_acquire_global_janitor_lock()
@@ -353,7 +354,7 @@ fn client_session_leases_register_and_close_janitor() {
     // Dropping PgJanitorSession without explicit release also closes its session.
     {
         let mut dropped_janitor =
-            crate::pg_engine::PgJanitorSession::new(schema.dsn.clone(), volume.volume_id);
+            crate::pg_engine::PgJanitorSession::new(schema.dsn().to_owned(), volume.volume_id);
         assert!(
             dropped_janitor
                 .try_acquire_global_janitor_lock()
@@ -365,12 +366,12 @@ fn client_session_leases_register_and_close_janitor() {
 
     // Missing client_sessions schema gives actionable upgrade remediation.
     execute_test_sql(
-        &schema.dsn,
+        schema.dsn(),
         "ALTER TABLE client_sessions RENAME TO hidden_client_sessions".to_owned(),
     )
     .expect("hide client_sessions");
     let mut missing_schema_janitor =
-        crate::pg_engine::PgJanitorSession::new(schema.dsn.clone(), volume.volume_id);
+        crate::pg_engine::PgJanitorSession::new(schema.dsn().to_owned(), volume.volume_id);
     let err = missing_schema_janitor
         .try_acquire_global_janitor_lock()
         .expect_err("missing client_sessions must fail janitor acquire");
@@ -385,7 +386,7 @@ fn client_session_leases_register_and_close_janitor() {
 fn client_session_leases_register_renew_and_close_pg_engines() {
     let dsn = pg_dsn().expect("STUDIOFS_TEST_PG_DSN is required");
     let schema = IsolatedPgSchema::new(&dsn);
-    let volume = PgTestVolume::new(&schema.dsn, "sfs1008-mounts");
+    let volume = PgTestVolume::new(schema.dsn(), "sfs1008-mounts");
     let dir = studiofs_test_support::workspace_target_tempdir("sfs1008-mounts-");
     let first_path = dir.path().join("first");
     let second_path = dir.path().join("second");
@@ -409,7 +410,7 @@ fn client_session_leases_register_renew_and_close_pg_engines() {
 
     let sessions = || {
         run_async(async {
-            let (client, connection) = tokio_postgres::connect(&schema.dsn, tokio_postgres::NoTls)
+            let (client, connection) = tokio_postgres::connect(schema.dsn(), tokio_postgres::NoTls)
                 .await
                 .expect("connect");
             let _connection = tokio::spawn(connection);
@@ -425,7 +426,7 @@ fn client_session_leases_register_renew_and_close_pg_engines() {
             && first.current_pg_sync_lifecycle() == PgSyncLifecycle::Live
     }));
     run_async(async {
-        let (client, connection) = tokio_postgres::connect(&schema.dsn, tokio_postgres::NoTls)
+        let (client, connection) = tokio_postgres::connect(schema.dsn(), tokio_postgres::NoTls)
             .await
             .expect("connect");
         let _connection = tokio::spawn(connection);
@@ -467,7 +468,7 @@ fn client_session_leases_register_renew_and_close_pg_engines() {
     // Forced server-side lease expiry recovers immediately on the next publication
     // without waiting for the 15s heartbeat interval.
     execute_test_sql(
-        &schema.dsn,
+        schema.dsn(),
         format!(
             "UPDATE client_sessions SET lease_expires_at = clock_timestamp() - interval '1 second' WHERE vol = {}",
             volume.volume_id
@@ -508,20 +509,20 @@ fn client_session_leases_register_renew_and_close_pg_engines() {
 fn client_session_leases_failed_heartbeat_preserves_local_reads_and_recovers() {
     let dsn = pg_dsn().expect("STUDIOFS_TEST_PG_DSN is required");
     let schema = IsolatedPgSchema::new(&dsn);
-    let volume = PgTestVolume::new(&schema.dsn, "sfs1008-outage");
+    let volume = PgTestVolume::new(schema.dsn(), "sfs1008-outage");
     let dir = studiofs_test_support::workspace_target_tempdir("sfs1008-outage-");
     let path = dir.path().join("local");
     seed_local(&path, &volume.format_info());
 
     execute_test_sql(
-        &schema.dsn,
+        schema.dsn(),
         "ALTER TABLE client_sessions RENAME TO unavailable_client_sessions".to_owned(),
     )
     .expect("disable session registry in isolated schema");
 
     // Startup schema validation refuses missing client_sessions with upgrade guidance.
     let schema_err = PgMetaEngine::validate_postgres_schema(
-        &schema.dsn,
+        schema.dsn(),
         volume.volume_id,
         Duration::from_secs(5),
         Duration::from_secs(5),
@@ -563,7 +564,7 @@ fn client_session_leases_failed_heartbeat_preserves_local_reads_and_recovers() {
     // Once the table is restored, publication recovers after the short backoff
     // (well under the 15s heartbeat interval).
     execute_test_sql(
-        &schema.dsn,
+        schema.dsn(),
         "ALTER TABLE unavailable_client_sessions RENAME TO client_sessions".to_owned(),
     )
     .expect("restore session registry");
@@ -587,9 +588,9 @@ fn client_session_leases_failed_heartbeat_preserves_local_reads_and_recovers() {
 fn client_session_leases_stamp_shared_format5_upgrade_without_policy() {
     let dsn = pg_dsn().expect("STUDIOFS_TEST_PG_DSN is required");
     let schema = IsolatedPgSchema::new(&dsn);
-    let volume = PgTestVolume::new(&schema.dsn, "sfs1008-fmt5-upgrade");
+    let volume = PgTestVolume::new(schema.dsn(), "sfs1008-fmt5-upgrade");
     run_async(async {
-        let (mut client, connection) = tokio_postgres::connect(&schema.dsn, tokio_postgres::NoTls)
+        let (mut client, connection) = tokio_postgres::connect(schema.dsn(), tokio_postgres::NoTls)
             .await
             .expect("connect");
         let _connection = tokio::spawn(connection);
@@ -644,10 +645,10 @@ fn published_format_adoption_retries_and_fences_legacy_publication() {
 
     let dsn = pg_dsn().expect("STUDIOFS_TEST_PG_DSN is required");
     let schema = IsolatedPgSchema::new(&dsn);
-    let volume5 = PgTestVolume::new(&schema.dsn, "sfs1132-format5");
-    let volume6 = PgTestVolume::new(&schema.dsn, "sfs1132-format6");
+    let volume5 = PgTestVolume::new(schema.dsn(), "sfs1132-format5");
+    let volume6 = PgTestVolume::new(schema.dsn(), "sfs1132-format6");
     run_async(async {
-        let (mut client, connection) = tokio_postgres::connect(&schema.dsn, tokio_postgres::NoTls)
+        let (mut client, connection) = tokio_postgres::connect(schema.dsn(), tokio_postgres::NoTls)
             .await
             .expect("connect");
         let _connection = tokio::spawn(connection);
@@ -756,7 +757,7 @@ fn published_format_adoption_retries_and_fences_legacy_publication() {
 fn client_session_leases_concurrent_refreshes_converge_on_one_live_owner() {
     let dsn = pg_dsn().expect("STUDIOFS_TEST_PG_DSN is required");
     let schema = IsolatedPgSchema::new(&dsn);
-    let volume = PgTestVolume::new(&schema.dsn, "sfs1008-refresh-race");
+    let volume = PgTestVolume::new(schema.dsn(), "sfs1008-refresh-race");
     let dir = studiofs_test_support::workspace_target_tempdir("sfs1008-refresh-race-");
     let path = dir.path().join("mount");
     seed_local(&path, &volume.format_info());
@@ -770,7 +771,7 @@ fn client_session_leases_concurrent_refreshes_converge_on_one_live_owner() {
     .expect("open engine");
     let stale = engine.refresh_client_session().expect("register session");
     execute_test_sql(
-        &schema.dsn,
+        schema.dsn(),
         format!(
             "UPDATE client_sessions SET lease_expires_at = clock_timestamp() - interval '1 second' WHERE vol = {}",
             volume.volume_id
@@ -818,7 +819,7 @@ fn client_session_leases_concurrent_refreshes_converge_on_one_live_owner() {
         "concurrent refreshes must return the same live lease"
     );
     let sessions = run_async(async {
-        let (client, connection) = tokio_postgres::connect(&schema.dsn, tokio_postgres::NoTls)
+        let (client, connection) = tokio_postgres::connect(schema.dsn(), tokio_postgres::NoTls)
             .await
             .expect("connect");
         let _connection = tokio::spawn(connection);
@@ -831,7 +832,7 @@ fn client_session_leases_concurrent_refreshes_converge_on_one_live_owner() {
     assert_eq!(active[0].fencing_token, first.token());
     engine.prepare_for_close().expect("close engine");
     let after_close = run_async(async {
-        let (client, connection) = tokio_postgres::connect(&schema.dsn, tokio_postgres::NoTls)
+        let (client, connection) = tokio_postgres::connect(schema.dsn(), tokio_postgres::NoTls)
             .await
             .expect("connect");
         let _connection = tokio::spawn(connection);
@@ -846,10 +847,10 @@ fn client_session_leases_concurrent_refreshes_converge_on_one_live_owner() {
 fn client_session_leases_prune_skips_row_renewed_concurrently() {
     let dsn = pg_dsn().expect("STUDIOFS_TEST_PG_DSN is required");
     let schema = IsolatedPgSchema::new(&dsn);
-    let volume = PgTestVolume::new(&schema.dsn, "sfs1008-prune-race");
+    let volume = PgTestVolume::new(schema.dsn(), "sfs1008-prune-race");
     run_async(async {
         let connect = || async {
-            let (client, connection) = tokio_postgres::connect(&schema.dsn, tokio_postgres::NoTls)
+            let (client, connection) = tokio_postgres::connect(schema.dsn(), tokio_postgres::NoTls)
                 .await
                 .expect("connect");
             tokio::spawn(connection);
@@ -933,12 +934,12 @@ fn client_session_leases_prune_skips_row_renewed_concurrently() {
 fn event_publication_fence_requires_current_stamp_per_volume() {
     let dsn = pg_dsn().expect("STUDIOFS_TEST_PG_DSN is required");
     let schema = IsolatedPgSchema::new(&dsn);
-    let volume = PgTestVolume::new(&schema.dsn, "sfs1014-stamp");
-    let legacy5 = PgTestVolume::new(&schema.dsn, "sfs1014-legacy5");
-    let legacy6 = PgTestVolume::new(&schema.dsn, "sfs1014-legacy6");
-    let format7 = PgTestVolume::new(&schema.dsn, "sfs1014-format7");
+    let volume = PgTestVolume::new(schema.dsn(), "sfs1014-stamp");
+    let legacy5 = PgTestVolume::new(schema.dsn(), "sfs1014-legacy5");
+    let legacy6 = PgTestVolume::new(schema.dsn(), "sfs1014-legacy6");
+    let format7 = PgTestVolume::new(schema.dsn(), "sfs1014-format7");
     run_async(async {
-        let (mut client, connection) = tokio_postgres::connect(&schema.dsn, tokio_postgres::NoTls)
+        let (mut client, connection) = tokio_postgres::connect(schema.dsn(), tokio_postgres::NoTls)
             .await
             .expect("connect");
         let _connection = tokio::spawn(connection);
@@ -1058,13 +1059,14 @@ fn event_publication_fence_rechecks_epoch_after_waiting_for_activation() {
     const FENCED: &str = "event publication requires a current session and policy epoch";
     let dsn = pg_dsn().expect("STUDIOFS_TEST_PG_DSN is required");
     let schema = IsolatedPgSchema::new(&dsn);
-    let volume = PgTestVolume::new(&schema.dsn, "sfs1014-race");
+    let volume = PgTestVolume::new(schema.dsn(), "sfs1014-race");
     run_async(async {
-        let (mut writer, writer_conn) = tokio_postgres::connect(&schema.dsn, tokio_postgres::NoTls)
-            .await
-            .expect("connect writer");
+        let (mut writer, writer_conn) =
+            tokio_postgres::connect(schema.dsn(), tokio_postgres::NoTls)
+                .await
+                .expect("connect writer");
         let (mut activator, activator_conn) =
-            tokio_postgres::connect(&schema.dsn, tokio_postgres::NoTls)
+            tokio_postgres::connect(schema.dsn(), tokio_postgres::NoTls)
                 .await
                 .expect("connect activator");
         let _writer_conn = tokio::spawn(writer_conn);

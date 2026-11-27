@@ -71,8 +71,8 @@ fn startup_schema_connect_timeout_falls_back_to_local_first() {
 fn startup_schema_command_timeout_falls_back_to_local_first() {
     let dsn = pg_dsn().expect("STUDIOFS_TEST_PG_DSN is required for this explicit test");
     let schema = IsolatedPgSchema::new(&dsn);
-    let volume = PgTestVolume::new(&schema.dsn, "sfs1006-command-timeout");
-    let dsn = &schema.dsn;
+    let volume = PgTestVolume::new(schema.dsn(), "sfs1006-command-timeout");
+    let dsn = schema.dsn();
     let vol = volume.volume_id;
 
     let outcome = run_async(async {
@@ -123,7 +123,7 @@ fn startup_schema_command_timeout_falls_back_to_local_first() {
 fn startup_schema_distinguishes_additive_optional_absent_and_incompatible_schemas() {
     let dsn = pg_dsn().expect("STUDIOFS_TEST_PG_DSN is required for this explicit test");
     let schema = IsolatedPgSchema::new(&dsn);
-    let dsn = schema.dsn.clone();
+    let dsn = schema.dsn().to_owned();
     let sql = |statement: &str| execute_test_sql(&dsn, statement.to_owned()).expect(statement);
 
     // A schema with no StudioFS objects at all is absent, not unreachable.
@@ -231,7 +231,7 @@ fn startup_schema_distinguishes_additive_optional_absent_and_incompatible_schema
 fn startup_schema_refuses_damaged_event_publication_fence_until_repair() {
     let dsn = pg_dsn().expect("STUDIOFS_TEST_PG_DSN is required");
     let schema = IsolatedPgSchema::new(&dsn);
-    let dsn = &schema.dsn;
+    let dsn = schema.dsn();
     let volume = PgTestVolume::new(dsn, "startup-publication-fence");
     let vol = volume.volume_id;
     for (damage, trigger) in [

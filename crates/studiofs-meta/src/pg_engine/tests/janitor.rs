@@ -1219,7 +1219,7 @@ fn janitor_refuses_missing_interrupted_drifted_or_unsupported_gc_schema() {
     use crate::pg_engine::schema::{PAYLOAD_GC_SCHEMA_VERSION, studiofs_pg_schema_sql};
     let dsn = pg_dsn().expect("STUDIOFS_TEST_PG_DSN is required for this explicit test");
     let schema = IsolatedPgSchema::new(&dsn);
-    let isolated_dsn = schema.dsn.clone();
+    let isolated_dsn = schema.dsn().to_owned();
     // The janitor lock registers a maintenance client session, which needs the
     // session table and a volume row; both are created after first deployment.
     let volume_id = i64::from(rand::random::<u32>()) + 1_000_000_000;
