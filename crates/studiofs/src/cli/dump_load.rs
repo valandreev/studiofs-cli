@@ -580,6 +580,8 @@ fn apply_dump(postgres_address: &str, dump: &MetadataDump) -> DumpLoadResult<i64
                 studiofs_meta::pg_engine::insert_restored_volume_protocol(
                     &tx, target_vol, protocol, "studiofs load",
                 ).await?;
+            } else {
+                studiofs_meta::pg_engine::fence_maintenance(&tx, target_vol).await?;
             }
             let write_requirement = protocol.write_requirement as i16;
             let mut session =
@@ -1577,6 +1579,8 @@ mod tests {
             task.await.unwrap().unwrap();
         });
         load(&input, target.dsn()).unwrap();
+        // A compatible replacement clears and restores the existing replay tail.
+        load(&input, target.dsn()).unwrap();
 
         let restored = load_remote_dump(target.dsn(), 2, LOCAL_METADATA_LAYOUT.current).unwrap();
         let format_info = decode_format_info(&restored.metadata_state_format_info).unwrap();
@@ -1685,6 +1689,52 @@ mod tests {
             crate::cli::discovery::DiscoveryError::Meta(MetaError::UpgradeRequired { .. })
         ));
         assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    #[ignore = "requires the PostgreSQL test database"]
+    fn replacement_load_refuses_missing_maintenance_capability() {
+        use studiofs_meta::compat::ReasonCode;
+        use studiofs_meta::volume_protocol::{FeatureState, ProtocolRejection};
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let dsn = test_pg_dsn().expect("STUDIOFS_TEST_PG_DSN is required");
+        let dsn = rt
+            .block_on(ensure_studiofs_database(&dsn))
+            .unwrap()
+            .metadata_dsn;
+        let schema = crate::cli::pg_test_schema::PgTestSchema::new(&dsn).unwrap();
+        let mut dump = test_dump();
+        dump.metadata_state_version = 2;
+        dump.event_log.push(test_event(2));
+        let capability = "maintenance.payload_gc.v3";
+        let protocol = &mut dump.manifest.volume_protocol;
+        protocol.epoch = 2;
+        protocol.requirements.maintain.insert(capability.into());
+        protocol
+            .requirements
+            .features
+            .insert(capability.into(), FeatureState::Required);
+        refresh_manifest(&mut dump);
+        let volume = apply_dump(schema.dsn(), &dump).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("dump.json");
+        write_dump_output(&input, &dump).unwrap();
+
+        let result = load(&input, schema.dsn());
+        assert!(
+            matches!(
+                &result,
+                Err(DumpLoadError::Meta(MetaError::VolumeProtocolRejected(
+                    ProtocolRejection::MaintenanceForbidden { reason, capability: required }
+                ))) if *reason == ReasonCode::MaintenanceCapabilityMissing.as_str()
+                    && required == capability
+            ),
+            "expected a typed maintenance refusal, got {result:?}"
+        );
+        let preserved =
+            load_remote_dump(schema.dsn(), volume, LOCAL_METADATA_LAYOUT.current).unwrap();
+        assert_eq!(preserved.event_log.len(), 1);
     }
 
     #[test]

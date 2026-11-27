@@ -155,6 +155,7 @@ impl PgMetaEngine {
                             return Ok(None);
                         };
 
+                        super::volume_protocol::fence_maintenance(&tx, volume_id).await?;
                         let checkpoint_version = nonnegative(
                             state.try_get(0).map_err(|error| {
                                 Self::classify_pg_error(

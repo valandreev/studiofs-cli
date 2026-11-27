@@ -73,7 +73,7 @@ static ABANDONED_UPLOADS_PREDICATE: LazyLock<String> = LazyLock::new(|| {
 /// because an `uploading` object may still have a PUT in flight in that process.
 /// `$4` holds each object's local deletion time in epoch seconds, from which the
 /// Janitor grace window then counts; a NULL counts it from the retirement, as
-/// the mount does. It runs after [`super::janitor::CLAIM_PUBLICATION_FENCE_SQL`] in
+/// the mount does. It runs after [`super::volume_protocol::fence_maintenance`] in
 /// the same transaction.
 pub(super) static RETIRE_ABANDONED_UPLOADS_SQL: LazyLock<String> = LazyLock::new(|| {
     format!(
@@ -572,22 +572,7 @@ impl PgMetaEngine {
                                     error,
                                 )
                             })?;
-                            tx.query_opt(
-                                super::janitor::CLAIM_PUBLICATION_FENCE_SQL,
-                                &[&volume_id],
-                            )
-                            .await
-                            .map_err(|error| {
-                                Self::classify_pg_error(
-                                    "postgres abandoned upload publication fence failed",
-                                    error,
-                                )
-                            })?
-                            .ok_or_else(|| {
-                                MetaError::Storage(
-                                    "PostgreSQL volume binding is missing".to_owned(),
-                                )
-                            })?;
+                            super::volume_protocol::fence_maintenance(&tx, volume_id).await?;
                             tx.execute(
                                 RETIRE_ABANDONED_UPLOADS_SQL.as_str(),
                                 &[&volume_id, &object_ids, &vec!["uploaded"], &deleted_at],
@@ -1562,17 +1547,7 @@ impl PgMetaEngine {
                         let fencing_token = super::janitor::claim_object_deletion_in(
                             tx, volume_id, object_id, &owner,
                         )
-                        .await
-                        .map_err(|error| match error {
-                            super::janitor::ObjectDeletionClaimError::VolumeBindingMissing => {
-                                MetaError::Storage(
-                                    "PostgreSQL volume binding is missing".to_owned(),
-                                )
-                            }
-                            super::janitor::ObjectDeletionClaimError::Postgres(context, error) => {
-                                Self::classify_pg_error(context, error)
-                            }
-                        })?;
+                        .await?;
                         Ok(fencing_token
                             .map_or(UploadedObjectDeletionClaim::Protected, |fencing_token| {
                                 UploadedObjectDeletionClaim::Claimed { fencing_token }

@@ -1,5 +1,6 @@
 use super::client_sessions::{HEARTBEAT_INTERVAL, HeartbeatError, SessionOwner, SessionRole};
 use super::runtime::PgConnectionPool;
+use super::volume_protocol::{check_maintenance_policy, fence_maintenance};
 use super::{PgMetaEngine, PgTimeoutContext};
 use crate::engine::{MetaError, MetaResult};
 use crate::janitor::{
@@ -50,8 +51,10 @@ pub(super) static BATCH_PIN_QUERY: LazyLock<String> = LazyLock::new(|| {
 /// state; every other schema gap makes a janitor statement fail closed. Only
 /// `O` (origin) and `A` (always) triggers fire in a normal session: `D` is
 /// disabled and `R` fires only under `session_replication_role = replica`.
-const PAYLOAD_GC_GUARD_TRIGGERS: [&str; 7] = [
+const PAYLOAD_GC_GUARD_TRIGGERS: [&str; 9] = [
     "snapshot_payload_upload_objects.studiofs_legacy_deletion_claim_fence",
+    "snapshot_payload_upload_objects.studiofs_maintenance_claim_insert_fence",
+    "snapshot_payload_upload_objects.studiofs_maintenance_claim_update_fence",
     "event_log.studiofs_snapshot_source_event_prune_guard",
     "event_log.studiofs_snapshot_source_event_truncate_guard",
     "snapshot_source_checkpoints.studiofs_snapshot_source_prune_guard",
@@ -61,6 +64,28 @@ const PAYLOAD_GC_GUARD_TRIGGERS: [&str; 7] = [
 ];
 
 const PAYLOAD_GC_SCHEMA_PROBE_SQL: &str = "SELECT (SELECT version FROM studiofs_schema_components WHERE component = 'payload_gc'), (SELECT count(DISTINCT tgrelid::regclass::text || '.' || tgname) FROM pg_trigger WHERE tgenabled IN ('O', 'A') AND tgrelid::regclass::text || '.' || tgname = ANY($1::TEXT[]))";
+
+async fn probe_payload_gc_schema(client: &Client) -> Result<(), JanitorMetadataError> {
+    let guard_names: &[&str] = &PAYLOAD_GC_GUARD_TRIGGERS;
+    let row = client
+        .query_one(PAYLOAD_GC_SCHEMA_PROBE_SQL, &[&guard_names])
+        .await
+        .map_err(|error| janitor_pg_error("payload GC schema probe failed", error))?;
+    let version: Option<i32> = row.get(0);
+    let guards: i64 = row.get(1);
+    let expected = crate::pg_engine::schema::PAYLOAD_GC_SCHEMA_VERSION;
+    let problem = match version {
+        None => "payload GC schema version is not recorded",
+        Some(version) if version != expected => "payload GC schema version is unsupported",
+        Some(_) if usize::try_from(guards) != Ok(PAYLOAD_GC_GUARD_TRIGGERS.len()) => {
+            "payload GC schema is incomplete: a deletion guard trigger is missing or disabled"
+        }
+        Some(_) => return Ok(()),
+    };
+    Err(JanitorMetadataError::SchemaUnavailable(format!(
+        "{problem} (expected version {expected}); stop mounts and janitors, then run `studiofs upgrade NAME` with this binary to deploy the schema, adding `--repair-schema` to restore a dropped guard"
+    )))
+}
 
 pub(crate) struct PgJanitorSession {
     postgres_url: String,
@@ -179,7 +204,7 @@ fn validate_sweep_checkpoint(
 }
 
 async fn persist_sweep_checkpoint(
-    client: &Client,
+    client: &mut Client,
     statements: &mut HashMap<String, Statement>,
     volume_id: i64,
     scope: &JanitorSweepScope<'_>,
@@ -197,7 +222,14 @@ async fn persist_sweep_checkpoint(
             "INSERT INTO snapshot_payload_sweep_checkpoints (vol, schema_version, volume_uuid, endpoint, bucket, data_prefix, listing_strategy, after_key, pending_object_id, pending_key) VALUES ($1, 1, $2, $3, $4, $5, $6, $7, $8, $9) ON CONFLICT (vol) DO UPDATE SET schema_version = EXCLUDED.schema_version, volume_uuid = EXCLUDED.volume_uuid, endpoint = EXCLUDED.endpoint, bucket = EXCLUDED.bucket, data_prefix = EXCLUDED.data_prefix, listing_strategy = EXCLUDED.listing_strategy, after_key = EXCLUDED.after_key, pending_object_id = EXCLUDED.pending_object_id, pending_key = EXCLUDED.pending_key WHERE snapshot_payload_sweep_checkpoints.schema_version = 1",
     ])
     .await?;
-    let affected = client
+    let tx = client
+        .transaction()
+        .await
+        .map_err(|error| janitor_pg_error("begin janitor sweep checkpoint write", error))?;
+    fence_maintenance(&tx, volume_id)
+        .await
+        .map_err(janitor_policy_error)?;
+    let affected = tx
         .execute(
             &statement,
             &[
@@ -219,7 +251,9 @@ async fn persist_sweep_checkpoint(
             "janitor sweep checkpoint schema is unsupported",
         ));
     }
-    Ok(())
+    tx.commit()
+        .await
+        .map_err(|error| janitor_pg_error("commit janitor sweep checkpoint", error))
 }
 
 impl PgJanitorSession {
@@ -420,10 +454,13 @@ impl PgJanitorSession {
         let volume = self.volume_id;
         let timeout = self.command_timeout;
         let (lease, _) = runtime.block_on(async {
-            tokio::time::timeout(
-                timeout,
-                owner.heartbeat(client, volume, None, SessionRole::Maintenance),
-            )
+            tokio::time::timeout(timeout, async {
+                check_maintenance_policy(client, volume).await?;
+                owner
+                    .heartbeat(client, volume, None, SessionRole::Maintenance)
+                    .await
+                    .map_err(HeartbeatError::into_meta_error)
+            })
             .await
             .map_err(|_| {
                 PgMetaEngine::pg_timeout_error(
@@ -431,7 +468,6 @@ impl PgJanitorSession {
                     timeout,
                 )
             })?
-            .map_err(HeartbeatError::into_meta_error)
         })?;
         // The advisory-lock connection runs pipelined transactions. A separate,
         // lazy connection keeps heartbeats outside those transactions.
@@ -519,14 +555,9 @@ impl PgJanitorSession {
             ));
         };
         let timeout = self.command_timeout;
-        let guard_names: &[&str] = &PAYLOAD_GC_GUARD_TRIGGERS;
-        let row = runtime
+        runtime
             .block_on(async {
-                tokio::time::timeout(
-                    timeout,
-                    client.query_one(PAYLOAD_GC_SCHEMA_PROBE_SQL, &[&guard_names]),
-                )
-                .await
+                tokio::time::timeout(timeout, probe_payload_gc_schema(client)).await
             })
             .map_err(|_| {
                 JanitorMetadataError::BackendUnavailable(format!(
@@ -534,27 +565,6 @@ impl PgJanitorSession {
                     timeout.as_secs()
                 ))
             })?
-            .map_err(|error| janitor_pg_error("payload GC schema probe failed", error))?;
-        let version: Option<i32> = row.get(0);
-        let guards: i64 = row.get(1);
-        let expected = crate::pg_engine::schema::PAYLOAD_GC_SCHEMA_VERSION;
-        let problem = match version {
-            None => "payload GC schema version is not recorded",
-            Some(version)
-                if !u16::try_from(version).is_ok_and(|version| {
-                    crate::version::POSTGRES_PAYLOAD_GC_SCHEMA.supports(version)
-                }) =>
-            {
-                "payload GC schema version is unsupported"
-            }
-            Some(_) if usize::try_from(guards) != Ok(PAYLOAD_GC_GUARD_TRIGGERS.len()) => {
-                "payload GC schema is incomplete: a deletion guard trigger is missing or disabled"
-            }
-            Some(_) => return Ok(()),
-        };
-        Err(JanitorMetadataError::SchemaUnavailable(format!(
-            "{problem} (expected version {expected}); stop mounts and janitors, then run `studiofs upgrade NAME` with this binary to deploy the schema, adding `--repair-schema` to restore a dropped guard"
-        )))
     }
 
     pub(crate) fn release_global_janitor_lock(&mut self) -> MetaResult<()> {
@@ -881,7 +891,7 @@ impl PgJanitorSession {
                 pending.map_err(page_error)?;
                 let rows = rows.map_err(page_error)?;
                 commit.map_err(page_error)?;
-                Ok(rows)
+                Ok::<_, JanitorMetadataError>(rows)
             })
             .await
         });
@@ -924,34 +934,18 @@ impl PgJanitorSession {
         let lease_secs = super::snapshot_reachability::SNAPSHOT_UPLOADED_FRAGMENT_LEASE_SECS as f64;
         let result = runtime.block_on(async {
             tokio::time::timeout(self.command_timeout, async {
-                let [fence, claim] = prepare_statements(
-                    client,
-                    statements,
-                    [CLAIM_PUBLICATION_FENCE_SQL, &CLAIM_OBJECT_DELETIONS_SQL],
-                )
-                .await?;
-                // Two round trips. The claim is sent only after the share lock is granted:
-                // a claim pipelined behind a waiting lock would still commit, and keep its
-                // lease, after this process died.
+                let [claim] =
+                    prepare_statements(client, statements, [&CLAIM_OBJECT_DELETIONS_SQL]).await?;
+                // Wait for policy and reachability authority before sending the claim.
                 let (begin, fence) = tokio::join!(
-                    // Each request is sent on its first poll; `biased` keeps that in order.
                     biased;
                     client.batch_execute("BEGIN"),
-                    async { client.query_opt(&fence, &[&volume_id]).await },
+                    fence_maintenance(client, volume_id),
                 );
-                let fenced = begin
+                let authorized = begin
                     .map_err(|error| janitor_pg_error("janitor claim transaction failed", error))
-                    .and_then(|()| {
-                        fence.map_err(|error| {
-                            janitor_pg_error("janitor claim publication fence failed", error)
-                        })
-                    })
-                    .and_then(|row| {
-                        row.map(drop).ok_or(JanitorMetadataError::UnsafeToDelete(
-                            "PostgreSQL volume binding is missing",
-                        ))
-                    });
-                if let Err(error) = fenced {
+                    .and(fence.map_err(janitor_policy_error));
+                if let Err(error) = authorized {
                     // Leave the connection outside a transaction; the fence error wins.
                     let _ = client.batch_execute("ROLLBACK").await;
                     return Err(error);
@@ -1091,14 +1085,10 @@ impl PgJanitorSession {
                 .collect();
             let chunk = runtime.block_on(async {
                 tokio::time::timeout(timeout, async {
-                    let [fence, retire, count] = prepare_statements(
+                    let [retire, count] = prepare_statements(
                         client,
                         statements,
-                        [
-                            CLAIM_PUBLICATION_FENCE_SQL,
-                            &RETIRE_ABANDONED_UPLOADS_SQL,
-                            &COUNT_ABANDONED_UPLOADS_SQL,
-                        ],
+                        [&RETIRE_ABANDONED_UPLOADS_SQL, &COUNT_ABANDONED_UPLOADS_SQL],
                     )
                     .await?;
                     if dry_run {
@@ -1110,13 +1100,9 @@ impl PgJanitorSession {
                     }
                     client.batch_execute("BEGIN").await.map_err(retire_error)?;
                     let retired = async {
-                        client
-                            .query_opt(&fence, &[&volume_id])
+                        fence_maintenance(client, volume_id)
                             .await
-                            .map_err(retire_error)?
-                            .ok_or(JanitorMetadataError::UnsafeToDelete(
-                                "PostgreSQL volume binding is missing",
-                            ))?;
+                            .map_err(janitor_policy_error)?;
                         let row = client
                             .query_one(&retire, &[&volume_id, &object_ids, &states, &deleted_at])
                             .await
@@ -1149,7 +1135,7 @@ impl PgJanitorSession {
     pub(crate) fn prune_object_deletion_fences(&mut self) -> Result<u64, JanitorMetadataError> {
         const BATCH_ROWS: i64 = 1_024;
         const MAX_BATCHES: usize = 64;
-        let (Some(client), Some(runtime)) = (self.client.as_ref(), self.runtime.as_ref()) else {
+        let (Some(client), Some(runtime)) = (self.client.as_mut(), self.runtime.as_ref()) else {
             return Err(JanitorMetadataError::UnsafeToDelete(
                 "PostgreSQL janitor lock is not held",
             ));
@@ -1173,19 +1159,29 @@ impl PgJanitorSession {
                 .await?;
                 let mut pruned = 0_u64;
                 for _ in 0..MAX_BATCHES {
-                    let rows = client
+                    let tx = client.transaction().await
+                        .map_err(|error| janitor_pg_error("begin janitor fence prune", error))?;
+                    fence_maintenance(&tx, volume_id).await.map_err(janitor_policy_error)?;
+                    let rows = tx
                         .execute(&fence_prune, &[&volume_id, &BATCH_ROWS])
                         .await
                         .map_err(|error| janitor_pg_error("janitor fence prune failed", error))?;
+                    tx.commit().await
+                        .map_err(|error| janitor_pg_error("commit janitor fence prune", error))?;
                     pruned += rows;
                     if rows < BATCH_ROWS as u64 {
                         break;
                     }
                 }
-                client
+                let tx = client.transaction().await
+                    .map_err(|error| janitor_pg_error("begin janitor queue prune", error))?;
+                fence_maintenance(&tx, volume_id).await.map_err(janitor_policy_error)?;
+                tx
                     .execute(&queue_prune, &[&volume_id, &(BATCH_ROWS * MAX_BATCHES as i64)])
                     .await
                     .map_err(|error| janitor_pg_error("janitor queue prune failed", error))?;
+                tx.commit().await
+                    .map_err(|error| janitor_pg_error("commit janitor queue prune", error))?;
                 Ok(pruned)
             })
             .await
@@ -1210,15 +1206,11 @@ fn janitor_object_ids<'a>(
         .collect()
 }
 
-/// Publication bumps `metadata_state` before it records references, so this share
-/// lock, taken before the claim statement starts, makes the claim's reference and pin
-/// checks authoritative.
-pub(super) const CLAIM_PUBLICATION_FENCE_SQL: &str = "SELECT set_config('studiofs.deletion_format', '6', true), set_config('studiofs.deletion_volume_format', '7', true) FROM metadata_state WHERE vol = $1 FOR SHARE";
-
 /// Claims every object in `$2` that is neither referenced nor snapshot-pinned, under
 /// its object-level fence, and returns `(object_id, fencing_token)` per claim
 /// (`$3` owner, `$4` lease seconds). Shared by the CLI and mounted Janitors; run it
-/// after [`CLAIM_PUBLICATION_FENCE_SQL`] in the same transaction.
+/// after [`fence_maintenance`] in the same transaction. Its metadata row lock
+/// also protects the claim's reference and pin checks against publication.
 ///
 /// A protected object keeps its prior ledger state. An untracked object receives a
 /// `delete_pending` ledger row. Upload registration keeps that state and publication
@@ -1241,11 +1233,6 @@ pub(super) static CLAIM_OBJECT_DELETIONS_SQL: LazyLock<String> = LazyLock::new(|
 /// flagged queue row by 60 seconds. Returns the finished object IDs.
 const SETTLE_OBJECT_DELETIONS_SQL: &str = "WITH settled AS (SELECT * FROM unnest($2::BIGINT[], $4::BIGINT[], $5::TEXT[], $6::BOOLEAN[]) AS settled(object_id, fence, error, defer)), finished AS (UPDATE snapshot_payload_upload_objects AS uploaded SET closed_at = COALESCE(uploaded.closed_at, clock_timestamp()), next_retry_at = NULL, last_error = settled.error, reconcile_owner = NULL, reconcile_lease_expires_at = NULL FROM settled WHERE uploaded.vol = $1 AND uploaded.object_id = settled.object_id AND uploaded.reconcile_owner = $3::TEXT AND uploaded.reconcile_fence = settled.fence AND uploaded.state = 'delete_pending' RETURNING uploaded.object_id, settled.error IS NULL AS deleted), acknowledged AS (UPDATE snapshot_payload_gc_candidates AS candidate SET acknowledged_at = clock_timestamp(), next_attempt_at = NULL, last_error = NULL FROM finished WHERE candidate.vol = $1 AND candidate.object_id = finished.object_id AND finished.deleted AND candidate.acknowledged_at IS NULL), deferred AS (UPDATE snapshot_payload_gc_candidates AS candidate SET next_attempt_at = clock_timestamp() + interval '60 seconds', last_error = 'cli janitor deletion retry required' FROM settled WHERE candidate.vol = $1 AND candidate.object_id = settled.object_id AND settled.defer AND candidate.acknowledged_at IS NULL AND NOT EXISTS (SELECT 1 FROM finished WHERE finished.object_id = settled.object_id AND finished.deleted)) SELECT object_id FROM finished";
 
-pub(super) enum ObjectDeletionClaimError {
-    VolumeBindingMissing,
-    Postgres(&'static str, tokio_postgres::Error),
-}
-
 /// Claims one object for deletion in `tx` with [`CLAIM_OBJECT_DELETIONS_SQL`] for
 /// the mounted Janitor. Returns the fencing token, or `None` when the object is
 /// protected.
@@ -1254,24 +1241,27 @@ pub(super) async fn claim_object_deletion_in(
     volume_id: i64,
     object_id: i64,
     owner: &str,
-) -> Result<Option<i64>, ObjectDeletionClaimError> {
-    use ObjectDeletionClaimError::Postgres;
+) -> MetaResult<Option<i64>> {
     let lease_secs = super::snapshot_reachability::SNAPSHOT_UPLOADED_FRAGMENT_LEASE_SECS as f64;
-    tx.query_opt(CLAIM_PUBLICATION_FENCE_SQL, &[&volume_id])
-        .await
-        .map_err(|error| Postgres("janitor claim publication fence failed", error))?
-        .ok_or(ObjectDeletionClaimError::VolumeBindingMissing)?;
+    fence_maintenance(&tx, volume_id).await?;
     let claimed = tx
         .query_opt(
             CLAIM_OBJECT_DELETIONS_SQL.as_str(),
             &[&volume_id, &vec![object_id], &owner, &lease_secs],
         )
         .await
-        .map_err(|error| Postgres("janitor claim lease failed", error))?;
+        .map_err(|error| PgMetaEngine::classify_pg_error("janitor claim lease failed", error))?;
     tx.commit()
         .await
-        .map_err(|error| Postgres("janitor claim commit failed", error))?;
+        .map_err(|error| PgMetaEngine::classify_pg_error("janitor claim commit failed", error))?;
     Ok(claimed.map(|row| row.get::<_, i64>(1)))
+}
+
+fn janitor_policy_error(error: MetaError) -> JanitorMetadataError {
+    match error {
+        MetaError::VolumeProtocolRejected(reason) => reason.into(),
+        other => JanitorMetadataError::BackendUnavailable(other.to_string()),
+    }
 }
 
 /// Keeps only the SQLSTATE code: the error text may carry connection details, the
@@ -1365,6 +1355,21 @@ impl PgMetaEngine {
             return Ok(false);
         }
 
+        runtime.block_on(async {
+            tokio::time::timeout(self.command_timeout, async {
+                check_maintenance_policy(&client, self.volume_id).await?;
+                probe_payload_gc_schema(&client)
+                    .await
+                    .map_err(|error| MetaError::RemoteUnavailable(error.to_string()))
+            })
+            .await
+            .map_err(|_| {
+                Self::pg_timeout_error(
+                    PgTimeoutContext::Command("janitor maintenance policy"),
+                    self.command_timeout,
+                )
+            })?
+        })?;
         *state = Some(PgJanitorLock {
             _runtime: runtime,
             _client: client,

@@ -9,8 +9,237 @@ use crate::snapshot::{
     MAX_RETENTION_SECS, SnapshotCreationState, SnapshotId, SnapshotLifecycle, SnapshotOrigin,
     SnapshotRetention, SnapshotSha256,
 };
-use crate::snapshot_ports::{SnapshotMountStore, SnapshotPortError};
+use crate::snapshot_ports::{
+    SnapshotCleanupStore, SnapshotMountStore, SnapshotPortError, SnapshotWorkerId,
+};
 use chrono::{TimeZone, Utc};
+
+#[test]
+#[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
+fn pg_maintenance_policy_preserves_snapshot_and_replay_history() {
+    use crate::compat::ClientCapabilities;
+    use crate::pg_engine::{PublicationSession, read_volume_protocol, update_volume_protocol};
+    use crate::volume_protocol::{FeatureState, ProtocolRejection};
+
+    let dsn = pg_dsn().expect("STUDIOFS_TEST_PG_DSN is required");
+    let schema = IsolatedPgSchema::new(&dsn);
+    let dsn = schema.dsn();
+    let volume = PgTestVolume::new(dsn, "maintenance-history");
+    let snapshot = capture_entry_once(
+        dsn,
+        snapshot_request(volume.volume_id, SnapshotOrigin::Manual),
+    );
+    set_snapshot_state(
+        dsn,
+        volume.volume_id,
+        snapshot.snapshot_id.as_str(),
+        "ready",
+        "completed",
+        Some(Utc::now()),
+        None,
+    );
+    let compatible_snapshot = capture_entry_once(
+        dsn,
+        snapshot_request(volume.volume_id, SnapshotOrigin::Automatic),
+    );
+    set_snapshot_state(
+        dsn,
+        volume.volume_id,
+        compatible_snapshot.snapshot_id.as_str(),
+        "ready",
+        "completed",
+        Some(Utc::now()),
+        None,
+    );
+    let dir = studiofs_test_support::workspace_target_tempdir("maintenance-history-");
+    let db = dir.path().join("meta.redb");
+    seed_local(&db, &volume.format_info());
+    let engine = PgMetaEngine::open_with_options(
+        &db,
+        PgOpenOptions {
+            background_poll: false,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    run_async(async {
+        let (mut client, connection) = tokio_postgres::connect(dsn, tokio_postgres::NoTls).await
+            .map_err(|error| MetaError::Storage(pg_err(error)))?;
+        let _connection = tokio::spawn(connection);
+        let vol = volume.volume_id;
+        let id = snapshot.snapshot_id.as_str();
+        let worker = SnapshotWorkerId::new("maintenance-worker").unwrap();
+        engine.request_delete(&compatible_snapshot.snapshot_id).await.unwrap();
+        let claim = engine.claim_next(&worker, Duration::from_secs(60)).await.unwrap().unwrap();
+        assert_eq!(claim.catalog.snapshot_id, compatible_snapshot.snapshot_id);
+        let finalized = engine.finalize_deleted(&claim).await.unwrap();
+        assert_eq!(finalized.lifecycle, SnapshotLifecycle::Deleted);
+        engine.request_delete(&snapshot.snapshot_id).await.unwrap();
+
+        let tx = client.transaction().await.unwrap();
+        let publisher = PublicationSession::begin(&tx, vol).await?;
+        tx.execute("INSERT INTO event_log (vol, batch_version, event_type, event_payload, client_id)
+                    VALUES ($1, 1, 'test', decode('00', 'hex'), 'maintenance-test')", &[&vol]).await.unwrap();
+        tx.execute("UPDATE metadata_state SET version = 1, checkpoint_version = 1 WHERE vol = $1", &[&vol]).await.unwrap();
+        publisher.finish(&tx, vol).await?;
+        tx.commit().await.unwrap();
+
+        let capability = "maintenance.payload_gc.v3";
+        let mut actor = ClientCapabilities::current();
+        actor.maintain.insert(capability);
+        let mut policy = read_volume_protocol(&client, vol).await?;
+        for state in [FeatureState::Available, FeatureState::Compatible] {
+            policy.requirements.features.insert(capability.to_owned(), state);
+            let tx = client.transaction().await.unwrap();
+            policy = update_volume_protocol(&tx, vol, policy.epoch, &policy, &actor, "test").await?;
+            tx.commit().await.unwrap();
+        }
+        policy.requirements.features.insert(capability.to_owned(), FeatureState::Required);
+        policy.requirements.maintain.insert(capability.to_owned());
+
+        // A live lease blocks activation. Its expired owner can remain recorded.
+        client.execute("INSERT INTO snapshot_cleanup_leases
+                        (vol, snapshot_id, owner, fencing_token, lease_expires_at)
+                        VALUES ($1, $2, 'admitted', 1, clock_timestamp() + interval '1 hour')",
+            &[&vol, &id]).await.unwrap();
+        let tx = client.transaction().await.unwrap();
+        assert!(matches!(
+            update_volume_protocol(&tx, vol, policy.epoch, &policy, &actor, "test").await,
+            Err(MetaError::VolumeProtocolRejected(ProtocolRejection::MaintenanceInProgress))
+        ));
+        tx.rollback().await.unwrap();
+        assert_eq!(read_volume_protocol(&client, vol).await?.epoch, policy.epoch);
+        client.execute("UPDATE snapshot_cleanup_leases SET lease_expires_at = clock_timestamp() - interval '1 second' WHERE vol = $1 AND snapshot_id = $2", &[&vol, &id]).await.unwrap();
+        client.execute(
+            "INSERT INTO serving_checkpoint_encodings
+                (vol, checkpoint_version, checkpoint_format, checkpoint_schema, publication_generation,
+                 snapshot, checkpoint_sha256)
+             SELECT vol, checkpoint_version, 4, 1, 1, snapshot, checkpoint_sha256 FROM metadata_state WHERE vol = $1",
+            &[&vol],
+        ).await.unwrap();
+        let tx = client.transaction().await.unwrap();
+        let active = update_volume_protocol(&tx, vol, policy.epoch, &policy, &actor, "test").await?;
+        tx.commit().await.unwrap();
+
+        // Emulate a worker that already mounted before the fence was installed.
+        // Each statement runs without the maintenance GUCs used by current code.
+        let one = 1_i64;
+        let vol_param: &[&(dyn tokio_postgres::types::ToSql + Sync)] = &[&vol];
+        let lease_params: &[&(dyn tokio_postgres::types::ToSql + Sync)] = &[&vol, &id];
+        let prune_params: &[&(dyn tokio_postgres::types::ToSql + Sync)] = &[&vol, &one, &one];
+        let legacy_finalization = client.transaction().await.unwrap();
+        assert_eq!(legacy_finalization.execute(
+            "DELETE FROM snapshot_source_checkpoints WHERE vol = $1 AND snapshot_id = $2",
+            lease_params,
+        ).await.unwrap(), 1);
+        let error = legacy_finalization.execute(
+            "UPDATE snapshot_catalog SET lifecycle = 'deleted', updated_at = clock_timestamp()
+             WHERE vol = $1 AND id = $2 AND lifecycle = 'deleting'",
+            lease_params,
+        ).await.expect_err("pre-fence finalization must be refused");
+        assert_eq!(error.code(), Some(&tokio_postgres::error::SqlState::RESTRICT_VIOLATION));
+        legacy_finalization.rollback().await.unwrap();
+        for (sql, params) in [
+            (
+                "INSERT INTO snapshot_cleanup_leases
+                    (vol, snapshot_id, owner, lease_expires_at)
+                 VALUES ($1, $2, 'legacy', clock_timestamp() + interval '1 hour')
+                 ON CONFLICT (vol, snapshot_id) DO UPDATE SET owner = EXCLUDED.owner,
+                     lease_expires_at = EXCLUDED.lease_expires_at",
+                lease_params,
+            ),
+            (
+                "UPDATE snapshot_cleanup_leases SET lease_expires_at = clock_timestamp() + interval '1 hour'
+                 WHERE vol = $1 AND snapshot_id = $2",
+                lease_params,
+            ),
+            (sql::DELETE_EVENT_LOG_PRUNE_BATCH, prune_params),
+            (sql::UPDATE_EVENT_LOG_PRUNE_STATE, prune_params),
+            ("DELETE FROM serving_checkpoint_encodings WHERE vol = $1", vol_param),
+        ] {
+            let error = client.query(sql, params).await
+                .expect_err("pre-fence maintenance must be refused");
+            assert_eq!(error.code(), Some(&tokio_postgres::error::SqlState::RESTRICT_VIOLATION));
+        }
+        let lease = client.query_one(
+            "SELECT owner, lease_expires_at <= clock_timestamp() FROM snapshot_cleanup_leases WHERE vol = $1 AND snapshot_id = $2",
+            lease_params,
+        ).await.unwrap();
+        assert_eq!(lease.get::<_, String>(0), "admitted");
+        assert!(lease.get::<_, bool>(1));
+        client.execute(
+            "DELETE FROM snapshot_cleanup_leases WHERE vol = $1 AND snapshot_id = $2", lease_params,
+        ).await.unwrap();
+        let error = client.execute(
+            "INSERT INTO snapshot_cleanup_leases (vol, snapshot_id, owner, lease_expires_at)
+             VALUES ($1, $2, 'legacy', clock_timestamp() + interval '1 hour')",
+            lease_params,
+        ).await.expect_err("pre-fence worker must not acquire a new lease");
+        assert_eq!(error.code(), Some(&tokio_postgres::error::SqlState::RESTRICT_VIOLATION));
+        assert_eq!(client.query_one(
+            "SELECT count(*) FROM snapshot_cleanup_leases WHERE vol = $1 AND snapshot_id = $2",
+            lease_params,
+        ).await.unwrap().get::<_, i64>(0), 0);
+
+        let worker = SnapshotWorkerId::new("stale-worker").unwrap();
+        for error in [
+            SnapshotCleanupStore::claim_next(engine.as_ref(), &worker, Duration::from_secs(60)).await.unwrap_err(),
+            SnapshotCleanupStore::request_delete(engine.as_ref(), &snapshot.snapshot_id).await.unwrap_err(),
+        ] {
+            assert!(matches!(error, SnapshotPortError::Permanent { code, .. } if code.as_str() == "maintenance_capability_missing"));
+        }
+        let worker_engine = engine.clone();
+        tokio::task::spawn_blocking(move || {
+            assert!(matches!(
+                worker_engine.run_event_log_prune_once(),
+                Err(MetaError::VolumeProtocolRejected(ProtocolRejection::MaintenanceForbidden { .. }))
+            ));
+            assert!(matches!(
+                worker_engine.try_acquire_pg_janitor_lock(),
+                Err(MetaError::VolumeProtocolRejected(ProtocolRejection::MaintenanceForbidden { .. }))
+            ));
+        }).await.unwrap();
+        let unchanged = client.query_one(
+            "SELECT lifecycle, event_log_prune_floor,
+                    (SELECT count(*) FROM event_log WHERE vol = $1),
+                    (SELECT count(*) FROM snapshot_source_checkpoints WHERE vol = $1 AND snapshot_id = $2),
+                    (SELECT count(*) FROM serving_checkpoint_encodings WHERE vol = $1)
+             FROM snapshot_catalog JOIN metadata_state USING (vol) WHERE vol = $1 AND id = $2",
+            &[&vol, &id],
+        ).await.unwrap();
+        assert_eq!(unchanged.get::<_, String>(0), "deleting");
+        assert_eq!(unchanged.get::<_, i64>(1), 0);
+        assert_eq!(unchanged.get::<_, i64>(2), 1);
+        assert_eq!(unchanged.get::<_, i64>(3), 1);
+        assert_eq!(unchanged.get::<_, i64>(4), 1);
+
+        tokio::task::spawn_blocking(move || {
+            let name = b"foreground-file";
+            let file = engine.create_file(ROOT_INO, name, 0, 0, 0o644).unwrap();
+            assert_eq!(engine.lookup(ROOT_INO, name).unwrap().ino, file.ino);
+            assert_eq!(engine.unlink(ROOT_INO, name).unwrap().ino, file.ino);
+        }).await.unwrap();
+        let successor = client.transaction().await.unwrap();
+        let capabilities: Vec<_> = actor.maintain.into_iter().collect();
+        successor.query_one(
+            "SELECT set_config('studiofs.maintenance_epoch', $1, true),
+                    set_config('studiofs.maintenance_capabilities', to_jsonb($2::text[])::text, true)",
+            &[&active.epoch.to_string(), &capabilities],
+        ).await.unwrap();
+        successor.execute(
+            "DELETE FROM snapshot_source_checkpoints WHERE vol = $1 AND snapshot_id = $2",
+            lease_params,
+        ).await.unwrap();
+        assert_eq!(successor.execute(
+            "UPDATE snapshot_catalog SET lifecycle = 'deleted' WHERE vol = $1 AND id = $2",
+            lease_params,
+        ).await.unwrap(), 1);
+        successor.commit().await.unwrap();
+        assert_eq!(client.execute("DELETE FROM volumes WHERE vol = $1", vol_param).await.unwrap(), 1);
+        Ok(())
+    }).unwrap();
+}
 
 #[test]
 #[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
@@ -425,6 +654,8 @@ fn mount_renewal_is_fenced_by_active_cleanup_claim() {
     let Some(dsn) = pg_dsn() else {
         return;
     };
+    let schema = IsolatedPgSchema::new(&dsn);
+    let dsn = schema.dsn().to_owned();
     let volume = PgTestVolume::new(&dsn, "snapshot-control-mount-renewal");
     let snapshot = capture_entry_once(
         &dsn,

@@ -21,7 +21,7 @@ async fn cli_waits_at_claim_fence(
 ) -> anyhow::Result<bool> {
     Ok(client
         .query_one(
-            "SELECT EXISTS (SELECT 1 FROM pg_stat_activity AS activity WHERE activity.wait_event_type = 'Lock' AND activity.query LIKE 'SELECT set_config(''studiofs.deletion_format''%FROM metadata_state%FOR SHARE' AND $1 = ANY(pg_blocking_pids(activity.pid)) AND activity.pid IN (SELECT pid FROM pg_locks WHERE locktype = 'advisory' AND granted))",
+            "SELECT EXISTS (SELECT 1 FROM pg_stat_activity AS activity WHERE activity.wait_event_type = 'Lock' AND activity.query LIKE 'WITH locked AS MATERIALIZED%FOR SHARE%studiofs.maintenance_epoch%' AND $1 = ANY(pg_blocking_pids(activity.pid)) AND activity.pid IN (SELECT pid FROM pg_locks WHERE locktype = 'advisory' AND granted))",
             &[&blocker_pid],
         )
         .await?

@@ -3,8 +3,8 @@
 use super::*;
 use crate::pg_engine::migrations::{
     CHECKPOINT_ENCODINGS_COMPONENT, CLIENT_SESSIONS_COMPONENT, CORE_COMPONENT,
-    EVENT_PUBLICATION_FENCE_COMPONENT, FORMAT_FENCES_COMPONENT, MIGRATIONS, Migration,
-    MigrationPhase, ensure_with, migrate_with,
+    EVENT_PUBLICATION_FENCE_COMPONENT, FORMAT_FENCES_COMPONENT, MAINTENANCE_FENCE_COMPONENT,
+    MIGRATIONS, Migration, MigrationPhase, ensure_with, migrate_with,
 };
 
 const fn step(version: i32, phase: MigrationPhase, sql: &'static str) -> Migration {
@@ -115,6 +115,7 @@ fn migration_registry_applies_resumes_and_refuses_drift_on_live_postgres() {
         let encodings = migration(CHECKPOINT_ENCODINGS_COMPONENT);
         let format_fences = migration(FORMAT_FENCES_COMPONENT);
         let event_fence = migration(EVENT_PUBLICATION_FENCE_COMPONENT);
+        let maintenance_fence = migration(MAINTENANCE_FENCE_COMPONENT);
         ensure_in_tx(client, &[baseline]).await?;
         client.batch_execute(
             "INSERT INTO volumes (vol, name, uuid, block_size) VALUES
@@ -126,7 +127,7 @@ fn migration_registry_applies_resumes_and_refuses_drift_on_live_postgres() {
                  (2, 6, 0, ''::bytea, decode(repeat('00', 32), 'hex'), 'pending', 0);"
         ).await.map_err(|e| MetaError::Storage(pg_err(e)))?;
         crate::pg_engine::insert_initial_volume_protocol(client, 1, "existing baseline").await?;
-        assert_eq!(migrate_with(client, &migrations, false).await?, [sessions, encodings, format_fences, event_fence]);
+        assert_eq!(migrate_with(client, &migrations, false).await?, [sessions, encodings, format_fences, event_fence, maintenance_fence]);
         assert_eq!(scalar(client, "SELECT publication_epoch FROM metadata_state WHERE vol = 1").await, 1);
         assert_eq!(scalar(client, "SELECT publication_epoch FROM metadata_state WHERE vol = 2").await, 0);
         ensure_in_tx(client, &migrations).await?;
@@ -140,7 +141,7 @@ fn migration_registry_applies_resumes_and_refuses_drift_on_live_postgres() {
         let sessions_table = "SELECT count(*) FROM pg_class WHERE relname = 'client_sessions' AND relnamespace = current_schema()::regnamespace";
         let encodings_table = "SELECT count(*) FROM pg_class WHERE relname = 'serving_checkpoint_encodings' AND relnamespace = current_schema()::regnamespace";
         client
-            .batch_execute("DROP TABLE file_lock_leases; DROP TABLE client_sessions; DROP TABLE serving_checkpoint_encodings")
+            .batch_execute("DROP TABLE file_lock_leases; DROP TABLE client_sessions; DROP TABLE serving_checkpoint_encodings; DROP TRIGGER studiofs_maintenance_claim_insert_fence ON snapshot_payload_upload_objects")
             .await
             .map_err(|e| MetaError::Storage(pg_err(e)))?;
         ensure_in_tx(client, &migrations).await?;
@@ -151,14 +152,14 @@ fn migration_registry_applies_resumes_and_refuses_drift_on_live_postgres() {
         // `--repair-schema` re-applies each idempotent component once.
         assert_eq!(
             migrate_with(client, &migrations, true).await?,
-            [baseline, sessions, encodings, event_fence]
+            [baseline, sessions, encodings, event_fence, maintenance_fence]
         );
         assert_eq!(scalar(client, lock_table).await, 1);
         assert_eq!(scalar(client, sessions_table).await, 1);
         assert_eq!(scalar(client, encodings_table).await, 1);
         // Baseline DDL (also what a 0.2.x `init` re-applies) must not touch these.
-        let current_fence = "SELECT count(*) FROM pg_trigger WHERE tgrelid IN ('snapshot_payload_upload_objects'::regclass, 'metadata_state'::regclass, 'event_log'::regclass) AND tgname IN ('studiofs_deletion_claim_volume_format_fence', 'studiofs_adopted_format_downgrade_fence', 'studiofs_event_publication_fence') AND tgenabled IN ('O', 'A')";
-        assert_eq!(scalar(client, current_fence).await, 3);
+        let current_fence = "SELECT count(*) FROM pg_trigger WHERE tgrelid IN ('snapshot_payload_upload_objects'::regclass, 'metadata_state'::regclass, 'event_log'::regclass) AND tgname IN ('studiofs_deletion_claim_volume_format_fence', 'studiofs_adopted_format_downgrade_fence', 'studiofs_event_publication_fence', 'studiofs_maintenance_claim_insert_fence', 'studiofs_maintenance_claim_update_fence') AND tgenabled IN ('O', 'A')";
+        assert_eq!(scalar(client, current_fence).await, 5);
         client
             .batch_execute("DROP TABLE file_lock_leases")
             .await
@@ -173,7 +174,7 @@ fn migration_registry_applies_resumes_and_refuses_drift_on_live_postgres() {
         assert!(matches!(ensure_in_tx(client, &migrations).await, Err(MetaError::RepairRequired(_))));
         assert_eq!(migrate_with(client, &migrations, false).await?, [baseline]);
         assert_eq!(scalar(client, lock_table).await, 1);
-        assert_eq!(scalar(client, current_fence).await, 3);
+        assert_eq!(scalar(client, current_fence).await, 5);
 
         // A newer core is refused before any DDL runs.
         client.batch_execute("DROP TABLE file_lock_leases; UPDATE studiofs_schema_components SET version = 99 WHERE component = 'core'").await.map_err(|e| MetaError::Storage(pg_err(e)))?;

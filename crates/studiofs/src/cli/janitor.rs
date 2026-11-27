@@ -4322,6 +4322,25 @@ mod tests {
                 )
                 .await
                 .unwrap();
+            client
+                .execute(
+                    "INSERT INTO metadata_state (vol, metadata_format_version, version, snapshot,
+                        checkpoint_sha256, checkpoint_publication_state, checkpoint_generation)
+                     VALUES ($1, $2, 0, ''::bytea, decode(repeat('00', 32), 'hex'), 'pending', 0)",
+                    &[
+                        &volume_id,
+                        &(studiofs_meta::schema::CURRENT_FORMAT_VERSION as i16),
+                    ],
+                )
+                .await
+                .unwrap();
+            studiofs_meta::pg_engine::insert_initial_volume_protocol(
+                &client,
+                volume_id,
+                "test fixture",
+            )
+            .await
+            .unwrap();
             drop(client);
             let _ = connection_task.await;
         }

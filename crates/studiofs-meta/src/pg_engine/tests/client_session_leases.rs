@@ -744,9 +744,10 @@ fn published_format_adoption_retries_and_fences_legacy_publication() {
                 refused.as_db_error().unwrap().message(),
                 "deletion claim requires current volume format capability"
             );
-            client.query_one("SELECT set_config('studiofs.deletion_format', '6', false), set_config('studiofs.deletion_volume_format', '7', false)", &[])
-                .await.unwrap();
-            assert_eq!(client.execute(claim, &[&vol]).await.unwrap(), 1);
+            let tx = client.transaction().await.unwrap();
+            crate::pg_engine::volume_protocol::fence_maintenance(&tx, vol).await?;
+            assert_eq!(tx.execute(claim, &[&vol]).await.unwrap(), 1);
+            tx.commit().await.unwrap();
         }
         Ok(())
     }).expect("retry shared adoption");
