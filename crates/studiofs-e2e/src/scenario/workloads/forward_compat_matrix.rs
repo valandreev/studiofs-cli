@@ -49,6 +49,15 @@ const V024_BIN_ENV: &str = "STUDIOFS_E2E_V024_BIN";
 const V022_BIN_ENV: &str = "STUDIOFS_E2E_V022_BIN";
 const REQUIRE_V024_ENV: &str = "STUDIOFS_E2E_REQUIRE_V024";
 const CRASH_ROLLBACK_ENV: &str = "STUDIOFS_E2E_CRASH_ROLLBACK";
+/// Test-successor process-exit hook. These three values mirror the
+/// `EXIT_AFTER_LOCAL_ACTIVATION_*` constants that only the `test-successor`
+/// feature compiles into `crates/studiofs-meta/src/redb_engine/format.rs`;
+/// change both sides together.
+const EXIT_AFTER_LOCAL_ACTIVATION_ENV: &str = "STUDIOFS_E2E_EXIT_AFTER_LOCAL_ACTIVATION";
+/// The successor exits after this local upgrade stage commits (documented here
+/// for the report; the hook itself selects the stage).
+const EXIT_AFTER_LOCAL_ACTIVATION_STAGE: u8 = 3;
+const EXIT_AFTER_LOCAL_ACTIVATION_CODE: i32 = 86;
 const DEFAULT_SUCCESSOR_MANIFEST: &str = "target/test-successor/manifest.json";
 const EXPECTED_SUCCESSOR_MARKER: &str = "STUDIOFS-TEST-SUCCESSOR-BUILD";
 const SUCCESSOR_XATTR_CAPABILITY: &str = "event.set_user_xattr.v1";
@@ -79,8 +88,175 @@ fn crash_rollback_enabled() -> bool {
     env::var(CRASH_ROLLBACK_ENV).as_deref() == Ok("1")
 }
 
-fn recovered_payload_matches(actual: &[u8], expected: &[u8]) -> bool {
-    Sha256::digest(actual) == Sha256::digest(expected)
+/// A PostgreSQL fault installed for one interrupted step. `remove` must be
+/// idempotent (`IF EXISTS`) because a step may drop part of it early.
+struct SqlFault {
+    name: &'static str,
+    install: &'static str,
+    remove: &'static str,
+}
+
+/// Installs `fault`, runs `step`, and always removes the fault. A failure of
+/// `step` stays the primary error; a removal failure is still reported.
+fn with_sql_fault<T>(
+    config: &ClientControllerConfig,
+    fault: &SqlFault,
+    step: impl FnOnce() -> Result<T, ScenarioError>,
+) -> Result<T, ScenarioError> {
+    matrix_sql(config, &format!("install {}", fault.name), fault.install)?;
+    let result = step();
+    let removed = matrix_sql(config, &format!("remove {}", fault.name), fault.remove);
+    finish_cleanup(fault.name, result, removed)
+}
+
+const CORE_MIGRATION_FAULT: SqlFault = SqlFault {
+    name: "core migration cancellation",
+    // The trigger runs after the migration SQL and marker update in the same
+    // transaction. A cancelled statement must roll both back.
+    install: "CREATE FUNCTION sfs1020_cancel_core() RETURNS trigger LANGUAGE plpgsql AS $$
+         BEGIN
+             IF NEW.component = 'core' AND NEW.version = 2 THEN
+                 RAISE EXCEPTION USING ERRCODE = '57014', MESSAGE = 'SFS-1020 core cancellation';
+             END IF;
+             RETURN NEW;
+         END $$;
+         CREATE TRIGGER sfs1020_cancel_core AFTER UPDATE ON studiofs_schema_components
+         FOR EACH ROW EXECUTE FUNCTION sfs1020_cancel_core();",
+    remove: "DROP TRIGGER IF EXISTS sfs1020_cancel_core ON studiofs_schema_components;
+         DROP FUNCTION IF EXISTS sfs1020_cancel_core();",
+};
+
+const ADOPTION_FAULT: SqlFault = SqlFault {
+    name: "format-7 adoption cancellation",
+    install: "CREATE FUNCTION sfs1020_cancel_adoption() RETURNS trigger LANGUAGE plpgsql AS $$
+         BEGIN
+             RAISE EXCEPTION USING ERRCODE = '57014', MESSAGE = 'SFS-1020 adoption cancellation';
+         END $$;
+         CREATE TRIGGER sfs1020_cancel_adoption AFTER UPDATE OF metadata_format_version
+         ON metadata_state FOR EACH ROW WHEN (OLD.metadata_format_version = 6 AND NEW.metadata_format_version = 7)
+         EXECUTE FUNCTION sfs1020_cancel_adoption();",
+    remove: "DROP TRIGGER IF EXISTS sfs1020_cancel_adoption ON metadata_state;
+         DROP FUNCTION IF EXISTS sfs1020_cancel_adoption();",
+};
+
+const ACTIVATION_FAULT: SqlFault = SqlFault {
+    name: "cutover cancellation",
+    install: "CREATE FUNCTION sfs1020_cancel_activation() RETURNS trigger LANGUAGE plpgsql AS $$
+         BEGIN
+             RAISE EXCEPTION USING ERRCODE = '57014', MESSAGE = 'SFS-1020 cutover cancellation';
+         END $$;
+         CREATE TRIGGER sfs1020_cancel_activation AFTER UPDATE OF policy_epoch ON volume_protocol
+         FOR EACH ROW EXECUTE FUNCTION sfs1020_cancel_activation();",
+    remove: "DROP TRIGGER IF EXISTS sfs1020_cancel_activation ON volume_protocol;
+         DROP FUNCTION IF EXISTS sfs1020_cancel_activation();",
+};
+
+/// Cancels every lease renewal (the heartbeat moves `lease_expires_at`
+/// forward) and counts attempts in a nontransactional sequence. Publication
+/// stamps only read `client_sessions`, so they are unaffected.
+const RENEWAL_FAULT: SqlFault = SqlFault {
+    name: "session renewal cancellation",
+    install: "CREATE SEQUENCE sfs1020_renewal_attempt;
+         CREATE FUNCTION sfs1020_cancel_renewal() RETURNS trigger LANGUAGE plpgsql AS $$
+         BEGIN
+             PERFORM nextval('sfs1020_renewal_attempt');
+             RAISE EXCEPTION USING ERRCODE = '57014', MESSAGE = 'SFS-1020 renewal cancellation';
+         END $$;
+         CREATE TRIGGER sfs1020_cancel_renewal AFTER UPDATE ON client_sessions
+         FOR EACH ROW WHEN (NEW.lease_expires_at > OLD.lease_expires_at)
+         EXECUTE FUNCTION sfs1020_cancel_renewal();",
+    remove: "DROP TRIGGER IF EXISTS sfs1020_cancel_renewal ON client_sessions;
+         DROP FUNCTION IF EXISTS sfs1020_cancel_renewal();
+         DROP SEQUENCE IF EXISTS sfs1020_renewal_attempt;",
+};
+
+/// Policy and publication epochs. Either can be absent on a pre-adoption
+/// legacy schema.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ProtocolEpochs {
+    policy: Option<i64>,
+    publication: Option<i64>,
+}
+
+/// Describes a regression from `before` to `after`, if any. An epoch that
+/// existed must still exist and must not decrease; a newly created epoch is
+/// an advance.
+fn epoch_regression(before: ProtocolEpochs, after: ProtocolEpochs) -> Option<String> {
+    let regressed = |label: &str, before: Option<i64>, after: Option<i64>| match (before, after) {
+        (Some(before), Some(after)) if after < before => {
+            Some(format!("{label} epoch decreased from {before} to {after}"))
+        }
+        (Some(before), None) => Some(format!("{label} epoch {before} disappeared")),
+        _ => None,
+    };
+    regressed("policy", before.policy, after.policy)
+        .or_else(|| regressed("publication", before.publication, after.publication))
+}
+
+fn observe_protocol_epochs(
+    config: &ClientControllerConfig,
+) -> Result<ProtocolEpochs, ScenarioError> {
+    let volume_name = config.volume_name.clone();
+    with_pg_timeout(
+        config,
+        "observe protocol epochs",
+        Some(Duration::from_secs(15)),
+        |client| async move {
+            // The policy table and publication column are absent before adoption.
+            let policy = optional_pg_observation(
+                client
+                    .query_opt(
+                        "SELECT p.policy_epoch FROM volume_protocol p JOIN volumes v ON v.vol = p.vol
+                         WHERE v.name = $1",
+                        &[&volume_name],
+                    )
+                    .await,
+                "select policy epoch",
+            )?
+            .flatten()
+            .map(|row| row.try_get::<_, i64>(0))
+            .transpose()
+            .map_err(pg_err("decode policy epoch"))?;
+            let publication = optional_pg_observation(
+                client
+                    .query_opt(
+                        "SELECT m.publication_epoch FROM metadata_state m JOIN volumes v ON v.vol = m.vol
+                         WHERE v.name = $1",
+                        &[&volume_name],
+                    )
+                    .await,
+                "select publication epoch",
+            )?
+            .flatten()
+            .map(|row| row.try_get::<_, i64>(0))
+            .transpose()
+            .map_err(pg_err("decode publication epoch"))?;
+            Ok(ProtocolEpochs {
+                policy,
+                publication,
+            })
+        },
+    )
+}
+
+/// Asserts that no protocol epoch decreased since `before` and records it.
+fn assert_epochs_monotonic(
+    config: &ClientControllerConfig,
+    before: ProtocolEpochs,
+    action: &str,
+    ops: &mut Vec<OperationRecord>,
+) -> Result<ProtocolEpochs, ScenarioError> {
+    let after = observe_protocol_epochs(config)?;
+    if let Some(regression) = epoch_regression(before, after) {
+        return Err(io::Error::other(format!("{action}: {regression}")).into());
+    }
+    record_op(
+        ops,
+        &format!("protocol_epochs_monotonic_{action}"),
+        CellStatus::Passed,
+        format!("{before:?} -> {after:?}"),
+    );
+    Ok(after)
 }
 
 fn exercise_migration_restart(
@@ -98,34 +274,16 @@ fn exercise_migration_restart(
     wait_for_published_write(controller, CLIENT_SUCCESSOR, config, before_write)?;
     controller.unmount(CLIENT_SUCCESSOR)?;
     let before = observe_shared_state(config)?;
+    let epochs_before = observe_protocol_epochs(config)?;
     controller.set_client_bin_override(CLIENT_SUCCESSOR, binaries.successor_bin.clone())?;
 
-    // The trigger runs after the migration SQL and marker update in the same
-    // transaction. A cancelled statement must roll both back.
-    matrix_sql(
-        config,
-        "install core migration cancellation",
-        "CREATE FUNCTION sfs1020_cancel_core() RETURNS trigger LANGUAGE plpgsql AS $$
-         BEGIN
-             IF NEW.component = 'core' AND NEW.version = 2 THEN
-                 RAISE EXCEPTION USING ERRCODE = '57014', MESSAGE = 'SFS-1020 core cancellation';
-             END IF;
-             RETURN NEW;
-         END $$;
-         CREATE TRIGGER sfs1020_cancel_core AFTER UPDATE ON studiofs_schema_components
-         FOR EACH ROW EXECUTE FUNCTION sfs1020_cancel_core();",
-    )?;
     let args = vec!["upgrade".into(), config.volume_name.clone()];
-    let interrupted =
-        controller.run_cli_allow_failure(CLIENT_SUCCESSOR, "cancel-core-migration", args.clone());
-    let remove_fault = matrix_sql(
-        config,
-        "remove core migration cancellation",
-        "DROP TRIGGER sfs1020_cancel_core ON studiofs_schema_components;
-         DROP FUNCTION sfs1020_cancel_core();",
-    );
-    remove_fault?;
-    assert_refusal("cancelled core migration", &interrupted?, &["57014"])?;
+    let interrupted = with_sql_fault(config, &CORE_MIGRATION_FAULT, || {
+        controller
+            .run_cli_allow_failure(CLIENT_SUCCESSOR, "cancel-core-migration", args.clone())
+            .map_err(ScenarioError::from)
+    })?;
+    assert_refusal("cancelled core migration", &interrupted, &["57014"])?;
     with_pg_timeout(
         config,
         "verify migration rollback",
@@ -153,25 +311,34 @@ fn exercise_migration_restart(
     assert_shared_state_unchanged(config, &before, "retried core migration")?;
     let local_args = [args, vec!["--local-only".into()]].concat();
     let mut env = fast_sync_env();
-    env.push((
-        "STUDIOFS_E2E_EXIT_AFTER_LOCAL_ACTIVATION".into(),
-        "1".into(),
-    ));
+    env.push((EXIT_AFTER_LOCAL_ACTIVATION_ENV.into(), "1".into()));
     controller.set_client_env_overrides(CLIENT_SUCCESSOR, env)?;
-    let exited = controller.run_cli_allow_failure(
-        CLIENT_SUCCESSOR,
-        "interrupt-local-revision-after-activation",
-        local_args.clone(),
-    );
-    controller.set_client_env_overrides(CLIENT_SUCCESSOR, fast_sync_env())?;
-    if exited?.status != 86 {
-        return Err(io::Error::other(
-            "test-successor did not exit at the irreversible local revision marker",
+    let exited = controller
+        .run_cli_allow_failure(
+            CLIENT_SUCCESSOR,
+            "interrupt-local-revision-after-activation",
+            local_args.clone(),
         )
+        .map_err(ScenarioError::from);
+    let restored = controller
+        .set_client_env_overrides(CLIENT_SUCCESSOR, fast_sync_env())
+        .map_err(ScenarioError::from);
+    let exited = finish_cleanup("local revision exit hook", exited, restored)?;
+    if exited.status != EXIT_AFTER_LOCAL_ACTIVATION_CODE {
+        return Err(io::Error::other(format!(
+            "test-successor did not exit with {EXIT_AFTER_LOCAL_ACTIVATION_CODE} after local revision stage {EXIT_AFTER_LOCAL_ACTIVATION_STAGE} (exit {})",
+            exited.status
+        ))
         .into());
     }
     assert_shared_state_unchanged(config, &before, "interrupted local revision")?;
     controller.run_cli(CLIENT_SUCCESSOR, "retry-local-revision", local_args)?;
+    assert_epochs_monotonic(
+        config,
+        epochs_before,
+        "core_migration_and_local_revision_restart",
+        ops,
+    )?;
     record_op(
         ops,
         "local_revision_restart_after_irreversible_marker",
@@ -205,33 +372,21 @@ fn exercise_legacy_adoption_cancellation(
     config: &ClientControllerConfig,
     client_name: &str,
     ops: &mut Vec<OperationRecord>,
-) -> Result<(), ScenarioError> {
+) -> Result<ProtocolEpochs, ScenarioError> {
     let before = observe_protocol_state(config)?;
-    matrix_sql(
-        config,
-        "install format-7 adoption cancellation",
-        "CREATE FUNCTION sfs1020_cancel_adoption() RETURNS trigger LANGUAGE plpgsql AS $$
-         BEGIN
-             RAISE EXCEPTION USING ERRCODE = '57014', MESSAGE = 'SFS-1020 adoption cancellation';
-         END $$;
-         CREATE TRIGGER sfs1020_cancel_adoption AFTER UPDATE OF metadata_format_version
-         ON metadata_state FOR EACH ROW WHEN (OLD.metadata_format_version = 6 AND NEW.metadata_format_version = 7)
-         EXECUTE FUNCTION sfs1020_cancel_adoption();",
-    )?;
-    let interrupted = controller.run_cli_allow_failure(
-        client_name,
-        "cancel-format7-adoption",
-        vec!["upgrade".into(), config.volume_name.clone()],
-    );
-    matrix_sql(
-        config,
-        "remove format-7 adoption cancellation",
-        "DROP TRIGGER sfs1020_cancel_adoption ON metadata_state;
-         DROP FUNCTION sfs1020_cancel_adoption();",
-    )?;
+    let epochs_before = observe_protocol_epochs(config)?;
+    let interrupted = with_sql_fault(config, &ADOPTION_FAULT, || {
+        controller
+            .run_cli_allow_failure(
+                client_name,
+                "cancel-format7-adoption",
+                vec!["upgrade".into(), config.volume_name.clone()],
+            )
+            .map_err(ScenarioError::from)
+    })?;
     assert_refusal(
         "cancelled format-7 adoption",
-        &interrupted?,
+        &interrupted,
         &["57014", "upgrade shared format"],
     )?;
     let after = observe_protocol_state(config)?;
@@ -251,8 +406,17 @@ fn exercise_legacy_adoption_cancellation(
         CellStatus::Passed,
         "the failed upgrade preserved format 6, its absent policy epoch, checkpoint version, and prune floor",
     );
-    Ok(())
+    Ok(epochs_before)
 }
+
+const CHECKPOINT_AND_PRUNE_FAULT: SqlFault = SqlFault {
+    name: "checkpoint and prune cancellation",
+    install: INSTALL_CHECKPOINT_AND_PRUNE_FAULTS,
+    remove: "DROP TRIGGER IF EXISTS sfs1020_cancel_checkpoint ON metadata_state;
+     DROP TRIGGER IF EXISTS sfs1020_cancel_prune ON metadata_state;
+     DROP FUNCTION IF EXISTS sfs1020_cancel_maintenance();
+     DROP SEQUENCE IF EXISTS sfs1020_checkpoint_attempt, sfs1020_prune_attempt;",
+};
 
 const INSTALL_CHECKPOINT_AND_PRUNE_FAULTS: &str = "CREATE SEQUENCE sfs1020_checkpoint_attempt;
      CREATE SEQUENCE sfs1020_prune_attempt;
@@ -294,6 +458,228 @@ fn wait_for_cancelled_transaction(
             },
         )
     })
+}
+
+/// Cancels lease renewal on every mounted client of the volume, proves the
+/// baseline keeps serving local reads and accepting writes, then removes the
+/// fault and requires both mounted clients to renew and publish again.
+fn exercise_mounted_renewal_fault(
+    controller: &MultiClientController<SystemClientProcessExecutor>,
+    context: &ScenarioContext,
+    config: &ClientControllerConfig,
+    succ_mount: &Path,
+    base_mount: &Path,
+    ops: &mut Vec<OperationRecord>,
+) -> Result<(), ScenarioError> {
+    let relative = "compat-dir/during-renewal-fault.txt";
+    let bytes: &[u8] = b"accepted-while-lease-renewal-cancelled-sfs-1020\n";
+    let before_write = observe_metadata_version(config, Duration::from_secs(15))?;
+    let fault_clock = with_sql_fault(config, &RENEWAL_FAULT, || {
+        // The background heartbeat runs every 15 s, inside the 60 s lease.
+        wait_for_cancelled_transaction(
+            config,
+            "cancelled mounted lease renewal",
+            "SELECT is_called FROM sfs1020_renewal_attempt",
+        )?;
+        write_sync(&base_mount.join(relative), bytes)?;
+        let local = bounded_mounted_read(
+            base_mount.join(relative),
+            "local read during renewal fault",
+            CONVERGENCE_TIMEOUT,
+        )?;
+        if local != bytes {
+            return Err(
+                io::Error::other("baseline local readback mismatch during renewal fault").into(),
+            );
+        }
+        // No renewal can commit while the trigger exists, so a later heartbeat
+        // proves a renewal after the fault was removed.
+        observe_pg_clock_seconds(config)
+    })?;
+    wait_for_matrix_state(
+        "mounted lease renewal after the renewal fault was removed",
+        CONVERGENCE_TIMEOUT,
+        |deadline| {
+            let volume_name = config.volume_name.clone();
+            with_pg_timeout(
+                config,
+                "poll renewed sessions",
+                Some(remaining_observation_time(deadline)),
+                |client| async move {
+                    let row = client
+                        .query_one(
+                            "SELECT count(*) FROM client_sessions s JOIN volumes v ON v.vol = s.vol
+                             WHERE v.name = $1 AND s.lease_expires_at > clock_timestamp()
+                               AND extract(epoch FROM s.heartbeat_at)::float8 > $2",
+                            &[&volume_name, &fault_clock],
+                        )
+                        .await
+                        .map_err(pg_err("poll renewed sessions"))?;
+                    Ok(row.get::<_, i64>(0) >= 2)
+                },
+            )
+        },
+    )?;
+    wait_for_published_write(controller, CLIENT_BASELINE, config, before_write)?;
+    wait_pair_converged(
+        context,
+        succ_mount,
+        base_mount,
+        "cell04-after-renewal-fault",
+    )?;
+    if fs::read(succ_mount.join(relative))? != bytes {
+        return Err(io::Error::other("successor readback mismatch after renewal fault").into());
+    }
+    record_op(
+        ops,
+        "mounted_session_renewal_fault_and_recovery",
+        CellStatus::Passed,
+        "cancelled lease renewals kept local reads and writes available; both mounts renewed after the fault and the write published",
+    );
+    Ok(())
+}
+
+fn observe_pg_clock_seconds(config: &ClientControllerConfig) -> Result<f64, ScenarioError> {
+    with_pg_timeout(
+        config,
+        "read PostgreSQL clock",
+        Some(Duration::from_secs(15)),
+        |client| async move {
+            let row = client
+                .query_one("SELECT extract(epoch FROM clock_timestamp())::float8", &[])
+                .await
+                .map_err(pg_err("read PostgreSQL clock"))?;
+            row.try_get::<_, f64>(0)
+                .map_err(pg_err("decode PostgreSQL clock"))
+        },
+    )
+}
+
+const REPLAY_KILL_FILES: u8 = 8;
+const REPLAY_KILL_FILE_BYTES: usize = 64 * 1024;
+
+/// Parses the local replay cursor from `studiofs status`.
+fn parse_local_applied_version(status: &str) -> Option<u64> {
+    status.lines().map(str::trim).find_map(|line| {
+        if let Some(value) = line.strip_prefix("Local applied/target:") {
+            value.split_once('/')?.0.trim().parse().ok()
+        } else {
+            line.strip_prefix("Local applied version:")?
+                .trim()
+                .parse()
+                .ok()
+        }
+    })
+}
+
+fn observe_local_applied_version(
+    controller: &MultiClientController<SystemClientProcessExecutor>,
+    client: &str,
+) -> Result<Option<u64>, ScenarioError> {
+    Ok(parse_local_applied_version(
+        &controller.status(client)?.stdout,
+    ))
+}
+
+/// Force-kills the baseline while its warm restart replay is pending behind
+/// an `event_log` lock, then restarts it and requires checksum-verified
+/// convergence with a replay cursor that never moved backwards.
+///
+/// Checkpoint publication and pruning are cancelled while the replay is
+/// pending, so the baseline's cursor stays above the prune floor and its
+/// restart must replay from `event_log` rather than adopt a newer checkpoint.
+fn exercise_replay_kill(
+    controller: &mut MultiClientController<SystemClientProcessExecutor>,
+    context: &ScenarioContext,
+    config: &ClientControllerConfig,
+    succ_mount: &Path,
+    ops: &mut Vec<OperationRecord>,
+) -> Result<(), ScenarioError> {
+    controller.unmount(CLIENT_BASELINE)?;
+    let files = (0..REPLAY_KILL_FILES)
+        .map(|index| {
+            (
+                format!("compat-dir/replay-kill-{index}.bin"),
+                deterministic_bytes(REPLAY_KILL_FILE_BYTES, index.wrapping_mul(17)),
+            )
+        })
+        .collect::<Vec<_>>();
+    let (target, pre_kill_applied) = with_sql_fault(config, &CHECKPOINT_AND_PRUNE_FAULT, || {
+        let before = observe_metadata_version(config, Duration::from_secs(15))?;
+        for (relative, bytes) in &files {
+            write_sync(&succ_mount.join(relative), bytes)?;
+        }
+        wait_for_published_write(controller, CLIENT_SUCCESSOR, config, before)?;
+        let target = u64::try_from(observe_metadata_version(config, Duration::from_secs(15))?)
+            .map_err(|_| io::Error::other("negative metadata version"))?;
+        let gate = super::advanced_mounted::LargeHistoryReplayGate::acquire(&config.meta_dsn)?;
+        let killed = (|| -> Result<u64, ScenarioError> {
+            controller.mount_until_lifecycle_ready(CLIENT_BASELINE)?;
+            let mut pending = None;
+            wait_for_matrix_state(
+                "baseline replay pending behind the event-log lock",
+                CONVERGENCE_TIMEOUT,
+                |_| {
+                    pending = observe_local_applied_version(controller, CLIENT_BASELINE)?
+                        .filter(|applied| *applied < target);
+                    Ok(pending.is_some())
+                },
+            )?;
+            controller.force_kill(CLIENT_BASELINE)?;
+            pending.ok_or_else(|| io::Error::other("replay cursor was not observed").into())
+        })();
+        let released = gate.release();
+        let pre_kill = finish_cleanup("kill during replay", killed, released)?;
+        Ok((target, pre_kill))
+    })?;
+    controller.remount(CLIENT_BASELINE)?;
+    let mut recovered_applied = None;
+    wait_for_matrix_state(
+        "baseline replay cursor reaches the published head after restart",
+        CONVERGENCE_TIMEOUT,
+        |_| {
+            recovered_applied = observe_local_applied_version(controller, CLIENT_BASELINE)?;
+            Ok(recovered_applied.is_some_and(|applied| applied >= target))
+        },
+    )?;
+    let recovered_applied = recovered_applied.unwrap_or_default();
+    if recovered_applied < pre_kill_applied {
+        return Err(io::Error::other(format!(
+            "replay cursor regressed from {pre_kill_applied} to {recovered_applied} after restart"
+        ))
+        .into());
+    }
+    let base_mount = controller
+        .client_by_name(CLIENT_BASELINE)?
+        .mount_point
+        .clone();
+    let mut digests = Vec::with_capacity(files.len());
+    for (relative, expected) in &files {
+        let actual = bounded_mounted_read(
+            base_mount.join(relative),
+            format!("read {relative} after kill during replay"),
+            CONVERGENCE_TIMEOUT,
+        )?;
+        if actual != *expected {
+            return Err(io::Error::other(format!(
+                "baseline readback mismatch for {relative} after kill during replay"
+            ))
+            .into());
+        }
+        digests.push(hex_lower(&Sha256::digest(&actual)));
+    }
+    wait_pair_converged(context, succ_mount, &base_mount, "cell04-after-replay-kill")?;
+    record_op(
+        ops,
+        "kill_during_replay_and_restart",
+        CellStatus::Passed,
+        format!(
+            "killed with cursor {pre_kill_applied} < head {target}; restart reached {recovered_applied} and verified {} file SHA-256 digests (first {})",
+            digests.len(),
+            digests.first().map_or("none", String::as_str)
+        ),
+    );
+    Ok(())
 }
 
 pub(in crate::scenario) struct MountedForwardCompatMatrix;
@@ -1098,9 +1484,7 @@ fn run_baseline_successor_pair(
                             "read recovered pre-migration payload".to_string(),
                             remaining_observation_time(deadline),
                         ) {
-                            Ok(actual) => {
-                                Ok(recovered_payload_matches(&actual, PRE_MIGRATION_PAYLOAD))
-                            }
+                            Ok(actual) => Ok(actual == PRE_MIGRATION_PAYLOAD),
                             Err(ScenarioError::Io(error))
                                 if error.kind() == io::ErrorKind::NotFound =>
                             {
@@ -1246,78 +1630,79 @@ fn run_baseline_successor_pair(
                     .mount_point
                     .clone();
 
-                let before = if crash_rollback_enabled() {
-                    matrix_sql(
-                        config,
-                        "install checkpoint and prune cancellation",
-                        INSTALL_CHECKPOINT_AND_PRUNE_FAULTS,
-                    )?;
-                    Some(observe_protocol_state(config)?)
-                } else {
-                    None
-                };
                 // Generate a few batches so checkpoint coordinator publishes format 4 + format 5 and prunes.
-                for idx in 0..4 {
-                    let path = succ_mount.join(format!("compat-dir/ckpt-batch-{idx}.txt"));
-                    write_sync(&path, format!("checkpoint-batch-{idx}\n").as_bytes())?;
-                }
-                wait_pair_converged(context, &succ_mount, &base_mount, "cell02-pre-checkpoint")?;
-
-                if let Some(before) = &before {
-                    wait_for_cancelled_transaction(
-                        config,
-                        "checkpoint publication cancellation",
-                        "SELECT is_called FROM sfs1020_checkpoint_attempt",
-                    )?;
-                    let cancelled = observe_protocol_state(config)?;
-                    if before.checkpoint_version != cancelled.checkpoint_version
-                        || before.checkpoint_formats_observed
-                            != cancelled.checkpoint_formats_observed
-                    {
-                        return Err(io::Error::other(
-                            "cancelled checkpoint replaced persisted checkpoint state",
-                        )
-                        .into());
+                let write_checkpoint_batches = || -> Result<(), ScenarioError> {
+                    for idx in 0..4 {
+                        let path = succ_mount.join(format!("compat-dir/ckpt-batch-{idx}.txt"));
+                        write_sync(&path, format!("checkpoint-batch-{idx}\n").as_bytes())?;
                     }
-                    controller.force_kill(CLIENT_SUCCESSOR)?;
-                    matrix_sql(
-                        config,
-                        "remove checkpoint cancellation",
-                        "DROP TRIGGER sfs1020_cancel_checkpoint ON metadata_state",
-                    )?;
-                    controller.remount(CLIENT_SUCCESSOR)?;
-                    record_op(
-                        ops,
-                        "checkpoint_cancellation_and_restart",
-                        CellStatus::Passed,
-                        "a cancelled checkpoint transaction preserved the prior checkpoint and formats; the successor remounted",
-                    );
-
-                    wait_for_cancelled_transaction(
-                        config,
-                        "event-log pruning cancellation",
-                        "SELECT is_called FROM sfs1020_prune_attempt",
-                    )?;
-                    let cancelled = observe_protocol_state(config)?;
-                    if before.event_log_prune_floor != cancelled.event_log_prune_floor {
-                        return Err(
-                            io::Error::other("cancelled pruning advanced the prune floor").into(),
+                    wait_pair_converged(context, &succ_mount, &base_mount, "cell02-pre-checkpoint")
+                };
+                let before = if crash_rollback_enabled() {
+                    let epochs_before = observe_protocol_epochs(config)?;
+                    let before = with_sql_fault(config, &CHECKPOINT_AND_PRUNE_FAULT, || {
+                        let before = observe_protocol_state(config)?;
+                        write_checkpoint_batches()?;
+                        wait_for_cancelled_transaction(
+                            config,
+                            "checkpoint publication cancellation",
+                            "SELECT is_called FROM sfs1020_checkpoint_attempt",
+                        )?;
+                        let cancelled = observe_protocol_state(config)?;
+                        if before.checkpoint_version != cancelled.checkpoint_version
+                            || before.checkpoint_formats_observed
+                                != cancelled.checkpoint_formats_observed
+                        {
+                            return Err(io::Error::other(
+                                "cancelled checkpoint replaced persisted checkpoint state",
+                            )
+                            .into());
+                        }
+                        controller.force_kill(CLIENT_SUCCESSOR)?;
+                        matrix_sql(
+                            config,
+                            "remove checkpoint cancellation",
+                            "DROP TRIGGER sfs1020_cancel_checkpoint ON metadata_state",
+                        )?;
+                        controller.remount(CLIENT_SUCCESSOR)?;
+                        record_op(
+                            ops,
+                            "checkpoint_cancellation_and_restart",
+                            CellStatus::Passed,
+                            "a cancelled checkpoint transaction preserved the prior checkpoint and formats; the successor remounted",
                         );
-                    }
-                    matrix_sql(
-                        config,
-                        "remove prune cancellation",
-                        "DROP TRIGGER sfs1020_cancel_prune ON metadata_state;
-                         DROP FUNCTION sfs1020_cancel_maintenance();
-                         DROP SEQUENCE sfs1020_checkpoint_attempt, sfs1020_prune_attempt;",
-                    )?;
+
+                        wait_for_cancelled_transaction(
+                            config,
+                            "event-log pruning cancellation",
+                            "SELECT is_called FROM sfs1020_prune_attempt",
+                        )?;
+                        let cancelled = observe_protocol_state(config)?;
+                        if before.event_log_prune_floor != cancelled.event_log_prune_floor {
+                            return Err(io::Error::other(
+                                "cancelled pruning advanced the prune floor",
+                            )
+                            .into());
+                        }
+                        Ok(before)
+                    })?;
                     record_op(
                         ops,
                         "prune_floor_preserved_after_cancellation",
                         CellStatus::Passed,
                         "prune transaction was cancelled before commit and left the previous floor unchanged",
                     );
-                }
+                    assert_epochs_monotonic(
+                        config,
+                        epochs_before,
+                        "checkpoint_and_prune_restart",
+                        ops,
+                    )?;
+                    Some(before)
+                } else {
+                    write_checkpoint_batches()?;
+                    None
+                };
                 let proto = wait_for_dual_checkpoint_and_prune(
                     config,
                     CONVERGENCE_TIMEOUT,
@@ -1501,16 +1886,21 @@ fn run_baseline_successor_pair(
                     .mount_point
                     .clone();
 
+                let crash_rollback = crash_rollback_enabled();
+                let epochs_before = if crash_rollback {
+                    Some(observe_protocol_epochs(config)?)
+                } else {
+                    None
+                };
                 let executor = SystemCommandExecutor;
                 compose.stop_service(POSTGRES_SERVICE_NAME, &executor)?;
                 let offline_bytes = b"accepted-while-postgres-down-sfs-1019\n";
-                let crash_rollback = crash_rollback_enabled();
                 let outage_result = (|| -> Result<(), ScenarioError> {
                     let path = base_mount.join("compat-dir/offline-baseline.txt");
                     write_sync(&path, offline_bytes)?;
                     let local_read =
                         bounded_mounted_read(path, "offline local readback", CONVERGENCE_TIMEOUT)?;
-                    if !recovered_payload_matches(&local_read, offline_bytes) {
+                    if local_read != offline_bytes {
                         return Err(io::Error::other(
                             "offline local readback mismatch on baseline",
                         )
@@ -1539,7 +1929,7 @@ fn run_baseline_successor_pair(
                         "read recovered unpublished payload".to_string(),
                         CONVERGENCE_TIMEOUT,
                     )?;
-                    if !recovered_payload_matches(&recovered, offline_bytes) {
+                    if recovered != offline_bytes {
                         return Err(io::Error::other(
                             "baseline lost the unpublished payload after restart",
                         )
@@ -1567,6 +1957,27 @@ fn run_baseline_successor_pair(
                     "baseline reconnected after PostgreSQL restart and published pending write to successor",
                 );
 
+                if let Some(epochs_before) = epochs_before {
+                    let epochs = assert_epochs_monotonic(
+                        config,
+                        epochs_before,
+                        "outage_force_kill_restart",
+                        ops,
+                    )?;
+                    exercise_mounted_renewal_fault(
+                        &controller,
+                        context,
+                        config,
+                        &succ_mount,
+                        &base_mount,
+                        ops,
+                    )?;
+                    let epochs =
+                        assert_epochs_monotonic(config, epochs, "session_renewal_fault", ops)?;
+                    exercise_replay_kill(&mut controller, context, config, &succ_mount, ops)?;
+                    assert_epochs_monotonic(config, epochs, "replay_kill_restart", ops)?;
+                    return Ok("PostgreSQL outage reconnect, pending local write publication, renewal fault, and kill during replay passed".to_string());
+                }
                 Ok(
                     "PostgreSQL outage reconnect and pending local write publication passed"
                         .to_string(),
@@ -1796,26 +2207,18 @@ fn run_baseline_successor_pair(
                     "read".into(),
                     "--accept-offline-clients".into(),
                 ];
+                let activation_epochs = observe_protocol_epochs(config)?;
                 if crash_rollback_enabled() {
-                    matrix_sql(config, "install cutover cancellation",
-                        "CREATE FUNCTION sfs1020_cancel_activation() RETURNS trigger LANGUAGE plpgsql AS $$
-                         BEGIN
-                             RAISE EXCEPTION USING ERRCODE = '57014', MESSAGE = 'SFS-1020 cutover cancellation';
-                         END $$;
-                         CREATE TRIGGER sfs1020_cancel_activation AFTER UPDATE OF policy_epoch ON volume_protocol
-                         FOR EACH ROW EXECUTE FUNCTION sfs1020_cancel_activation();")?;
-                    let interrupted = controller.run_cli_allow_failure(
-                        CLIENT_SUCCESSOR,
-                        "cancel-cutover-activation",
-                        activate.clone(),
-                    );
-                    matrix_sql(
-                        config,
-                        "remove cutover cancellation",
-                        "DROP TRIGGER sfs1020_cancel_activation ON volume_protocol;
-                         DROP FUNCTION sfs1020_cancel_activation();",
-                    )?;
-                    assert_refusal("cancelled feature activation", &interrupted?, &["57014"])?;
+                    let interrupted = with_sql_fault(config, &ACTIVATION_FAULT, || {
+                        controller
+                            .run_cli_allow_failure(
+                                CLIENT_SUCCESSOR,
+                                "cancel-cutover-activation",
+                                activate.clone(),
+                            )
+                            .map_err(ScenarioError::from)
+                    })?;
+                    assert_refusal("cancelled feature activation", &interrupted, &["57014"])?;
                     assert_shared_state_unchanged(
                         config,
                         &before_activation,
@@ -1842,6 +2245,9 @@ fn run_baseline_successor_pair(
                     return Err(
                         io::Error::other("activation did not advance the policy epoch").into(),
                     );
+                }
+                if crash_rollback_enabled() {
+                    assert_epochs_monotonic(config, activation_epochs, "activation_retry", ops)?;
                 }
                 record_op(
                     ops,
@@ -2192,7 +2598,8 @@ fn run_format5_adoption_pair(
 
                 // The first run commits 5 -> 6 and cancels only 6 -> 7.
                 controller.set_client_bin_override(writer, binaries.baseline_bin.clone())?;
-                exercise_legacy_adoption_cancellation(&controller, &config, writer, ops)?;
+                let epochs_before =
+                    exercise_legacy_adoption_cancellation(&controller, &config, writer, ops)?;
                 if RedbMetaEngine::read_format_info_for_upgrade_readonly(&local_db)
                     .map_err(io::Error::other)?
                     .format_version
@@ -2208,6 +2615,7 @@ fn run_format5_adoption_pair(
                     "retry-format5-adoption",
                     vec!["upgrade".into(), config.volume_name.clone()],
                 )?;
+                assert_epochs_monotonic(&config, epochs_before, "format5_adoption_retry", ops)?;
                 let adopted = observe_protocol_state(&config)?;
                 if adopted.metadata_format_version != Some(7) || adopted.policy_epoch != Some(1) {
                     return Err(io::Error::other(
@@ -2223,7 +2631,7 @@ fn run_format5_adoption_pair(
                     "read original format-5 cache after adoption",
                     CONVERGENCE_TIMEOUT,
                 )?;
-                if !recovered_payload_matches(&local, payload) {
+                if local != payload {
                     return Err(
                         io::Error::other("adoption changed the original format-5 payload").into(),
                     );
@@ -2393,19 +2801,24 @@ fn run_fenced_v024_pair(
                 // 2. Switch client-v024-a to 0.2.5 baseline binary and run `studiofs upgrade` (format 6 -> 7).
                 controller
                     .set_client_bin_override("client-v024-a", binaries.baseline_bin.clone())?;
-                if crash_rollback_enabled() {
-                    exercise_legacy_adoption_cancellation(
+                let adoption_epochs = if crash_rollback_enabled() {
+                    Some(exercise_legacy_adoption_cancellation(
                         &controller,
                         &v024_config,
                         "client-v024-a",
                         ops,
-                    )?;
-                }
+                    )?)
+                } else {
+                    None
+                };
                 controller.run_cli(
                     "client-v024-a",
                     "v025-upgrade-format6-to-7",
                     vec!["upgrade".into(), v024_config.volume_name.clone()],
                 )?;
+                if let Some(before) = adoption_epochs {
+                    assert_epochs_monotonic(&v024_config, before, "format6_adoption_retry", ops)?;
+                }
                 let post_proto = observe_protocol_state(&v024_config)?;
                 if post_proto.metadata_format_version != Some(7) {
                     return Err(io::Error::other(format!(
@@ -3477,6 +3890,85 @@ pub(crate) fn validate_matrix_report(report: &ForwardCompatMatrixReport) -> Vec<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn epoch_regression_allows_creation_and_advance_but_rejects_decrease_or_loss() {
+        let epochs = |policy, publication| ProtocolEpochs {
+            policy,
+            publication,
+        };
+        assert_eq!(
+            epoch_regression(epochs(None, None), epochs(Some(1), Some(1))),
+            None
+        );
+        assert_eq!(
+            epoch_regression(epochs(Some(2), Some(3)), epochs(Some(2), Some(4))),
+            None
+        );
+        assert!(
+            epoch_regression(epochs(Some(3), Some(3)), epochs(Some(2), Some(3)))
+                .is_some_and(|detail| detail.contains("policy epoch decreased from 3 to 2"))
+        );
+        assert!(
+            epoch_regression(epochs(Some(3), Some(3)), epochs(Some(3), Some(1)))
+                .is_some_and(|detail| detail.contains("publication epoch decreased"))
+        );
+        assert!(
+            epoch_regression(epochs(Some(1), Some(1)), epochs(None, Some(1)))
+                .is_some_and(|detail| detail.contains("disappeared"))
+        );
+    }
+
+    #[test]
+    fn local_applied_version_parses_both_status_layouts() {
+        let catching_up = "PostgreSQL Sync\n  Lifecycle:              CatchingUp\n  Local applied/target:   41/57\n";
+        assert_eq!(parse_local_applied_version(catching_up), Some(41));
+        let live = "  Local applied version:  57\n  Remote head:            57\n";
+        assert_eq!(parse_local_applied_version(live), Some(57));
+        assert_eq!(
+            parse_local_applied_version("  Local applied version:  unknown\n"),
+            None
+        );
+        assert_eq!(parse_local_applied_version("Lifecycle: Live\n"), None);
+    }
+
+    #[test]
+    fn fault_cleanup_keeps_the_primary_failure_and_reports_cleanup() {
+        let primary: Result<(), ScenarioError> = Err(io::Error::other("step failed").into());
+        let cleanup: Result<(), ScenarioError> = Err(io::Error::other("drop failed").into());
+        match finish_cleanup("fault", primary, cleanup) {
+            Err(ScenarioError::CleanupAfterFailure {
+                primary, cleanup, ..
+            }) => {
+                assert!(primary.to_string().contains("step failed"));
+                assert!(cleanup.to_string().contains("drop failed"));
+            }
+            other => panic!("unexpected result: {other:?}"),
+        }
+        let cleanup_only = finish_cleanup(
+            "fault",
+            Ok(7),
+            Err::<(), ScenarioError>(io::Error::other("drop failed").into()),
+        );
+        assert!(cleanup_only.is_err_and(|error| error.to_string().contains("drop failed")));
+        for fault in [
+            &CORE_MIGRATION_FAULT,
+            &ADOPTION_FAULT,
+            &ACTIVATION_FAULT,
+            &RENEWAL_FAULT,
+            &CHECKPOINT_AND_PRUNE_FAULT,
+        ] {
+            assert!(
+                fault
+                    .remove
+                    .split(';')
+                    .filter(|statement| !statement.trim().is_empty())
+                    .all(|statement| statement.contains("IF EXISTS")),
+                "{} removal must be idempotent",
+                fault.name
+            );
+        }
+    }
 
     #[test]
     fn refusal_requires_a_failing_exit_and_the_expected_diagnostic() {

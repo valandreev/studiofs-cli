@@ -351,7 +351,11 @@ cargo run -p studiofs-e2e --locked -- run janitor-postgres-restart-recovery --sc
 The crash run records cancellation and recovery operations in the matrix
 report. PostgreSQL faults are installed only inside the runner's disposable
 Compose database. An unclean exit at the redb revision marker is available
-only in the compiled test successor. Each platform uses its native
+only in the compiled test successor. Cell 4 also cancels lease renewal on
+both mounted clients and force-kills the baseline while its restart replay
+waits behind an `event_log` lock. Every crash and restart step records an
+operation showing that the policy and publication epochs did not decrease.
+Each platform uses its native
 `studiofs` executable name. See
 [the SFS-1020 ExecPlan](exec-plans/SFS-1020-crash-rollback-validation.md)
 for the exact evidence commands and remaining failures.
