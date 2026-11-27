@@ -23,7 +23,11 @@ The run publishes a deterministic JSON matrix artifact (`artifacts/scenarios/mou
 - [x] (2026-11-27 17:39Z) Implemented `mounted-forward-compat-matrix` scenario in `crates/studiofs-e2e/src/scenario/workloads/forward_compat_matrix.rs`, registered it in `registry.rs`, and added it to `FULL_E2E_OPT_IN_SCENARIOS` in `runner_contract.rs`.
 - [x] (2026-11-27 17:40Z) Added `tools/test_successor/run_compat_matrix.py` repeatable entrypoint and updated `docs/tests.md` and `docs/persisted-format-compatibility.md`.
 - [x] (2026-11-27 18:01Z) Verified `cargo fmt`, `cargo clippy -p studiofs-e2e --all-targets -- -D warnings`, `forward_compat_matrix` unit tests (3 passed), `registry::tests` (3 passed), `runner_contract` (40 passed), `client_controller` (30 passed), `tools/test_successor/build.py --require-complete` (5 declared changes verified), and live Windows/WinFSP mounted matrix run `sfs-1019-windows-v3` (8/8 cells passed, `passed: true`).
-- [ ] Commit, push branch, and open ready PR against `main`.
+- [x] Opened PR #1073 against `main`.
+- [x] Implemented PR review follow-up with specific refusal diagnostics, unchanged shared-state checks, fresh-client payload reads, and retained probe logs.
+- [x] Ran the first review follow-up on WinFSP. Five cells passed, two timed out waiting for publication, and one was not reached. Moved the publication wait before writer shutdown.
+- [x] Ran the second follow-up on WinFSP. Six cells passed. The retained logs identified the exact revision-7 redb diagnostic and showed that v0.2.4 delivered its startup diagnostic through redirected stderr.
+- [x] Validated the review follow-up with `sfs-1019-windows-fix3` on WinFSP. All eight cells passed. The POSIX xattr operation was skipped on Windows.
 
 ## Surprises & Discoveries
 
@@ -78,7 +82,7 @@ Key files involved in this change:
 
 1. **Extend `crates/studiofs-e2e/src/client.rs`**:
    - Add `pub client_bin_overrides: BTreeMap<String, PathBuf>` to `ClientControllerConfig` and initialize it to `BTreeMap::new()` in all constructors.
-   - Add `set_client_bin_override(&mut self, client: &str, bin: PathBuf)` and `run_cli_allow_failure(&self, client: &str, action: &str, args: Vec<String>)` and `mount_command_for(&self, client: &str)` to `MultiClientController`.
+   - Add per-client binary overrides and `run_cli_allow_failure` to `MultiClientController`. Both CLI and mount commands use the same binary selection.
    - Use `self.config.client_bin_overrides.get(client.name.as_str()).unwrap_or(&self.config.studiofs_bin)` in `MultiClientController::command`.
    - Add focused unit test verifying per-client binary override routing.
 
@@ -94,7 +98,7 @@ Key files involved in this change:
      - Cell 5: Session expiry and SFS-1017 activation workflow (`expand`, `migrate`, active-session activation refusal, expired-session activation refusal without `--accept-offline-clients`, reversible `deactivate` rollback + baseline remount proof, re-`migrate` and `activate --role read --accept-offline-clients`).
      - Cell 6: Fail-closed baseline refusal after read-incompatible activation (`compatibility`, `mount`, fresh `discover`) while successor remains healthy and PG/S3/local redb stay uncorrupted.
      - Cell 7: Irreversible local redb revision 7 upgrade (`upgrade --local-only` by successor) -> successor mounts cleanly, baseline fails closed on revision-7 local redb without corrupting it, successor remounts cleanly.
-     - Cell 8: Fenced published `v0.2.4` client in isolated PG database `sfs_v024_fenced`: `v0.2.4` `init` + mount + write + second `v0.2.4` client discover -> `0.2.5` `studiofs upgrade` (format 6 -> 7) + mount + read/write -> `v0.2.4` attempts mount/discover and fails closed without corrupting PG, S3, or its local redb.
+     - Cell 8: Fenced published `v0.2.4` client on a dedicated `<volume>-v024` volume in the same Compose PostgreSQL database, before the successor migration: `v0.2.4` `init` + mount + write + second `v0.2.4` client discover -> `0.2.5` `studiofs upgrade` (format 6 -> 7) + mount + read/write -> `v0.2.4` attempts mount/discover and fails closed without corrupting PG, S3, or its local redb.
    - Write `forward-compat-matrix.json` in `context.scenario_dir` and validate all cells in `Scenario::validate`.
    - Add unit tests for matrix schema validation, binary identity verification, and redaction.
 
@@ -124,11 +128,13 @@ All commands run from the repository root:
 
 ## Idempotence and Recovery
 
-Every run uses an isolated `target/e2e-runs/<run-id>` sandbox, a dedicated Docker Compose project with dynamic ports, and a fresh S3 bucket and PostgreSQL database(s). Failed runs retain full diagnostics under `target/e2e-runs/<run-id>/` and clean up Docker containers and mount processes via `MultiClientController` and runner supervision. Re-running with a new `--run-id` is safe and idempotent.
+Every run uses an isolated `target/e2e-runs/<run-id>` sandbox, a dedicated Docker Compose project with dynamic ports, and a fresh S3 bucket and PostgreSQL database. Failed runs retain full diagnostics under `target/e2e-runs/<run-id>/` and clean up Docker containers and mount processes via `MultiClientController` and runner supervision. Re-running with a new `--run-id` is safe and idempotent.
 
 ## Artifacts and Notes
 
-Will be updated with exact command transcripts and matrix artifact summary after execution.
+The original WinFSP run `sfs-1019-windows-v3` recorded eight passing cells. The review follow-up retained `sfs-1019-windows-fix1` under `target/e2e-runs/`. Cells 6 and 8 showed that waiting for a remote version increase after unmount could strand a locally durable write. The corrected runner waits for remote sync safety, drained payload uploads, and an advanced PostgreSQL version while the compatible writer is still mounted. It then unmounts the writer before capturing the shared state around refusal probes.
+
+The final report is `target/e2e-runs/sfs-1019-windows-fix3/artifacts/scenarios/mounted-forward-compat-matrix/forward-compat-matrix.json`. Cells 6 and 8 confirmed unchanged PostgreSQL state around the refusals and identical payload bytes on fresh mounts. The v0.2.4 local redb remained present and nonempty. Its hash changed during the attempt. The focused matrix, registry, runner contract, and client controller tests passed 4, 3, 40, and 31 tests respectively.
 
 ## Interfaces and Dependencies
 

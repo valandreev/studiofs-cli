@@ -16,7 +16,6 @@ import argparse
 import hashlib
 import json
 import os
-import shutil
 import subprocess
 import sys
 import zipfile
@@ -44,11 +43,6 @@ def ensure_v024_binary(repo: Path, explicit: str | None, skip: bool) -> Path | N
             raise FileNotFoundError(f"v0.2.4 binary not found: {path}")
         return path
 
-    exe_name = "studiofs.exe" if sys.platform == "win32" else "studiofs"
-    cached = repo / "target" / "sfs-1002-published" / V024_TAG / "bin" / exe_name
-    if cached.is_file():
-        return cached
-
     if sys.platform != "win32":
         print(
             "note: automatic v0.2.4 download is pinned for Windows; pass --v024-bin on Unix to include cell_08",
@@ -58,38 +52,39 @@ def ensure_v024_binary(repo: Path, explicit: str | None, skip: bool) -> Path | N
 
     work_dir = repo / "target" / "sfs-1002-published" / V024_TAG
     work_dir.mkdir(parents=True, exist_ok=True)
-    subprocess.run(
-        [
-            "gh",
-            "release",
-            "download",
-            V024_TAG,
-            "--pattern",
-            V024_WINDOWS_ASSET,
-            "--pattern",
-            f"{V024_WINDOWS_ASSET}.sha256",
-            "--dir",
-            str(work_dir),
-            "--clobber",
-        ],
-        cwd=repo,
-        check=True,
-    )
     zip_path = work_dir / V024_WINDOWS_ASSET
+    if not zip_path.is_file():
+        subprocess.run(
+            [
+                "gh",
+                "release",
+                "download",
+                V024_TAG,
+                "--pattern",
+                V024_WINDOWS_ASSET,
+                "--dir",
+                str(work_dir),
+            ],
+            cwd=repo,
+            check=True,
+        )
+
     actual = sha256_file(zip_path)
     if actual != V024_WINDOWS_SHA256:
         raise ValueError(
             f"{V024_WINDOWS_ASSET} SHA-256 mismatch: expected {V024_WINDOWS_SHA256}, got {actual}"
         )
-    bin_dir = work_dir / "bin"
-    if bin_dir.exists():
-        shutil.rmtree(bin_dir)
     with zipfile.ZipFile(zip_path) as zf:
-        zf.extractall(bin_dir)
-    matches = list(bin_dir.rglob(exe_name))
-    if not matches:
-        raise FileNotFoundError(f"{exe_name} not found inside {zip_path}")
-    return matches[0]
+        matches = [name for name in zf.namelist() if Path(name).name == "studiofs.exe"]
+        if len(matches) != 1:
+            raise ValueError(f"expected one studiofs.exe inside {zip_path}, found {len(matches)}")
+        verified_exe = zf.read(matches[0])
+
+    cached = work_dir / "bin" / "studiofs.exe"
+    if not cached.is_file() or sha256_file(cached) != hashlib.sha256(verified_exe).hexdigest():
+        cached.parent.mkdir(parents=True, exist_ok=True)
+        cached.write_bytes(verified_exe)
+    return cached
 
 
 def main() -> int:
@@ -126,7 +121,7 @@ def main() -> int:
         print(f"missing test-successor manifest: {manifest_path}", file=sys.stderr)
         return 1
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    if not manifest.get("verified"):
+    if manifest.get("verified") is not True:
         print("test-successor manifest is not verified", file=sys.stderr)
         return 1
 
