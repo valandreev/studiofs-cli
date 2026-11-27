@@ -346,6 +346,11 @@ async fn insert_fixture_events(
     volume_id: i64,
     events: &[FixtureEvent],
 ) -> Result<(), ScenarioError> {
+    let session = studiofs_meta::pg_engine::PublicationSession::begin(transaction, volume_id)
+        .await
+        .map_err(|_| {
+            ScenarioError::Io(io::Error::other("large-history publication session failed"))
+        })?;
     for chunk in events.chunks(LARGE_HISTORY_FIXTURE_INSERT_CHUNK_ROWS) {
         let batch_versions = chunk
             .iter()
@@ -377,6 +382,11 @@ async fn insert_fixture_events(
                 ))
             })?;
     }
+    session.finish(transaction, volume_id).await.map_err(|_| {
+        ScenarioError::Io(io::Error::other(
+            "large-history publication session cleanup failed",
+        ))
+    })?;
     Ok(())
 }
 

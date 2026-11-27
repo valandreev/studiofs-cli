@@ -7116,14 +7116,17 @@ fn test_pg_conflicting_batch_does_not_block_later_foreign_batch() {
     let dentry_payload = encode_event(&dentry_event).expect("encode unrelated dentry event");
 
     run_async(async move {
-        let (client, connection) = tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
+        let (mut client, connection) = tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
             .await
             .map_err(|e| MetaError::Storage(e.to_string()))?;
         let conn_task = tokio::spawn(async move {
             let _ = connection.await;
         });
 
-        client
+        let seed_tx = client.transaction().await.unwrap();
+        let session =
+            crate::pg_engine::PublicationSession::begin(&seed_tx, volume.volume_id).await?;
+        seed_tx
             .execute(
                 "INSERT INTO event_log (vol, batch_version, event_type, event_payload, client_id) \
                     VALUES ($1, 1, $2, $3, 'manual-foreign')",
@@ -7132,7 +7135,7 @@ fn test_pg_conflicting_batch_does_not_block_later_foreign_batch() {
             .await
             .map_err(|e| MetaError::Storage(format!("insert conflict event failed: {e}")))?;
 
-        client
+        seed_tx
             .execute(
                 "INSERT INTO event_log (vol, batch_version, event_type, event_payload, client_id) \
                     VALUES ($1, 2, $2, $3, 'manual-foreign'), \
@@ -7148,7 +7151,7 @@ fn test_pg_conflicting_batch_does_not_block_later_foreign_batch() {
             .await
             .map_err(|e| MetaError::Storage(format!("insert remote batch failed: {e}")))?;
 
-        client
+        seed_tx
             .execute(
                 "UPDATE metadata_state SET version = 2 WHERE vol = $1",
                 &[&volume.volume_id],
@@ -7157,6 +7160,8 @@ fn test_pg_conflicting_batch_does_not_block_later_foreign_batch() {
             .map_err(|e| {
                 MetaError::Storage(format!("advance remote metadata version failed: {e}"))
             })?;
+        session.finish(&seed_tx, volume.volume_id).await?;
+        seed_tx.commit().await.unwrap();
         conn_task.abort();
         Ok(())
     })

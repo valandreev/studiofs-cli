@@ -1635,6 +1635,8 @@ mod tests {
             let (mut client, connection) = connect_studiofs_postgres(schema.dsn()).await.unwrap();
             let task = tokio::spawn(connection);
             let tx = client.transaction().await.unwrap();
+            let session = studiofs_meta::pg_engine::PublicationSession::begin(&tx, vol)
+                .await.unwrap();
             tx.execute(
                 "UPDATE metadata_state SET version = $2 WHERE vol = $1",
                 &[&vol, &event.batch_version],
@@ -1643,6 +1645,7 @@ mod tests {
                 "INSERT INTO event_log (vol, batch_version, event_type, event_payload) VALUES ($1, $2, $3, $4)",
                 &[&vol, &event.batch_version, &event.event_type, &event.event_payload],
             ).await.unwrap();
+            session.finish(&tx, vol).await.unwrap();
             tx.commit().await.unwrap();
             drop(client);
             task.await.unwrap().unwrap();

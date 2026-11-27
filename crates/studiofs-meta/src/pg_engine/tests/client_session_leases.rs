@@ -927,3 +927,175 @@ fn client_session_leases_prune_skips_row_renewed_concurrently() {
     })
     .expect("prune race");
 }
+
+#[test]
+#[ignore = "requires a disposable PostgreSQL instance"]
+fn event_publication_fence_requires_current_stamp_per_volume() {
+    let dsn = pg_dsn().expect("STUDIOFS_TEST_PG_DSN is required");
+    let schema = IsolatedPgSchema::new(&dsn);
+    let volume = PgTestVolume::new(&schema.dsn, "sfs1014-stamp");
+    let legacy5 = PgTestVolume::new(&schema.dsn, "sfs1014-legacy5");
+    let legacy6 = PgTestVolume::new(&schema.dsn, "sfs1014-legacy6");
+    run_async(async {
+        let (mut client, connection) = tokio_postgres::connect(&schema.dsn, tokio_postgres::NoTls)
+            .await
+            .expect("connect");
+        let _connection = tokio::spawn(connection);
+        let vol = volume.volume_id;
+        let insert = "INSERT INTO event_log (vol, batch_version, event_type, event_payload)
+                      VALUES ($1, 1, 'test', ''::bytea)";
+
+        let unstamped = client.transaction().await.unwrap();
+        assert!(
+            unstamped
+                .query_opt(sql::BUMP_METADATA_VERSION, &[&vol, &7_i16, &0_i64, &1_i16])
+                .await
+                .unwrap()
+                .is_none()
+        );
+        unstamped
+            .execute(
+                "UPDATE metadata_state SET version = 1 WHERE vol = $1",
+                &[&vol],
+            )
+            .await
+            .unwrap();
+        let error = unstamped.execute(insert, &[&vol]).await.unwrap_err();
+        assert_eq!(
+            error.as_db_error().unwrap().message(),
+            "event publication requires a current session and policy epoch"
+        );
+        unstamped.rollback().await.unwrap();
+        let head: i64 = client
+            .query_one("SELECT version FROM metadata_state WHERE vol = $1", &[&vol])
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(head, 0);
+
+        let tx = client.transaction().await.unwrap();
+        let session = PublicationSession::begin(&tx, vol).await?;
+        assert!(
+            tx.query_opt(sql::BUMP_METADATA_VERSION, &[&vol, &7_i16, &0_i64, &1_i16])
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(tx.execute(insert, &[&vol]).await.unwrap(), 1);
+        session.finish(&tx, vol).await?;
+        tx.commit().await.unwrap();
+        assert!(
+            client.execute(insert, &[&vol]).await.is_err(),
+            "stamp leaked across transactions"
+        );
+
+        let tx = client.transaction().await.unwrap();
+        let _session = PublicationSession::begin(&tx, vol).await?;
+        tx.execute(
+            "UPDATE client_sessions SET fencing_token = fencing_token + 1 WHERE vol = $1",
+            &[&vol],
+        )
+        .await
+        .unwrap();
+        let error = tx.execute(insert, &[&vol]).await.unwrap_err();
+        assert_eq!(
+            error.as_db_error().unwrap().message(),
+            "event publication requires a current session and policy epoch"
+        );
+        tx.rollback().await.unwrap();
+
+        for (legacy, format) in [(legacy5.volume_id, 5_i16), (legacy6.volume_id, 6)] {
+            drop_volume_protocol(&client, legacy).await?;
+            client
+                .execute(
+                    "UPDATE metadata_state SET metadata_format_version = $2 WHERE vol = $1",
+                    &[&legacy, &format],
+                )
+                .await
+                .unwrap();
+            assert_eq!(client.execute(insert, &[&legacy]).await.unwrap(), 1);
+        }
+        Ok(())
+    })
+    .expect("publication stamp scenario");
+}
+
+#[test]
+#[ignore = "requires a disposable PostgreSQL instance"]
+fn event_publication_fence_rechecks_epoch_after_waiting_for_activation() {
+    use crate::compat::ClientCapabilities;
+    use crate::pg_engine::{read_volume_protocol, update_volume_protocol};
+
+    let dsn = pg_dsn().expect("STUDIOFS_TEST_PG_DSN is required");
+    let schema = IsolatedPgSchema::new(&dsn);
+    let volume = PgTestVolume::new(&schema.dsn, "sfs1014-race");
+    run_async(async {
+        let (mut writer, writer_conn) = tokio_postgres::connect(&schema.dsn, tokio_postgres::NoTls)
+            .await.expect("connect writer");
+        let (mut activator, activator_conn) = tokio_postgres::connect(&schema.dsn, tokio_postgres::NoTls)
+            .await.expect("connect activator");
+        let _writer_conn = tokio::spawn(writer_conn);
+        let _activator_conn = tokio::spawn(activator_conn);
+        let vol = volume.volume_id;
+        let feature = "metadata.test.v1";
+        let mut actor = ClientCapabilities::current();
+        actor.read.insert(feature);
+        let expand = activator.transaction().await.unwrap();
+        let mut next = read_volume_protocol(&expand, vol).await?;
+        next.requirements.features.insert(feature.into(), FeatureState::Available);
+        update_volume_protocol(&expand, vol, 1, &next, &actor, "expand").await?;
+        expand.commit().await.unwrap();
+
+        let writer_pid: i32 = writer.query_one("SELECT pg_backend_pid()", &[]).await.unwrap().get(0);
+        let publication = writer.transaction().await.unwrap();
+        let _session = PublicationSession::begin(&publication, vol).await?;
+
+        let activation = activator.transaction().await.unwrap();
+        let mut next = read_volume_protocol(&activation, vol).await?;
+        next.requirements.features.insert(feature.into(), FeatureState::Compatible);
+        let next = update_volume_protocol(
+            &activation, vol, 2, &next, &actor, "activate",
+        ).await?;
+        assert_eq!(next.epoch, 3);
+
+        // The unchanged write requirement and metadata format still admit the
+        // old UPDATE. Force its statement snapshot to precede activation COMMIT.
+        let args: &[&(dyn tokio_postgres::types::ToSql + Sync)] = &[&vol, &7_i16, &10_i64, &1_i16];
+        let (bumped, ()) = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            tokio::join!(
+                publication.query_opt(sql::BUMP_METADATA_VERSION, args),
+                async {
+                    loop {
+                        let waiting: bool = activation.query_one(
+                            "SELECT pg_backend_pid() = ANY(pg_blocking_pids($1))",
+                            &[&writer_pid],
+                        ).await.unwrap().get(0);
+                        if waiting {
+                            break;
+                        }
+                    }
+                    activation.commit().await.unwrap();
+                }
+            )
+        }).await.expect("publisher did not wait for activation");
+        assert!(bumped.unwrap().is_none(), "stale publisher advanced the head");
+        assert!(matches!(
+            crate::pg_engine::volume_protocol::refused_publication(&publication, vol).await,
+            MetaError::VolumeProtocolRejected(crate::volume_protocol::ProtocolRejection::EpochConflict { expected: 2, found: 3 })
+        ));
+        let error = publication.execute(
+            "INSERT INTO event_log (vol, batch_version, event_type, event_payload)
+             VALUES ($1, 1, 'test', ''::bytea), ($1, 1, 'test', ''::bytea)",
+            &[&vol],
+        ).await.unwrap_err();
+        assert_eq!(error.as_db_error().unwrap().message(), "event publication requires a current session and policy epoch");
+        publication.rollback().await.unwrap();
+        let row = writer.query_one(
+            "SELECT version, total_event_payload_bytes, (SELECT count(*) FROM event_log WHERE vol = $1)
+             FROM metadata_state WHERE vol = $1",
+            &[&vol],
+        ).await.unwrap();
+        assert_eq!((row.get::<_, i64>(0), row.get::<_, i64>(1), row.get::<_, i64>(2)), (0, 0, 0));
+        Ok(())
+    }).expect("publication activation race");
+}

@@ -942,6 +942,81 @@ pub const fn studiofs_pg_schema_sql() -> &'static str {
     "#
 }
 
+pub(super) const EVENT_PUBLICATION_FENCE_SQL: &str = r#"
+    ALTER TABLE metadata_state
+        ADD COLUMN IF NOT EXISTS publication_epoch BIGINT NOT NULL DEFAULT 0
+            CHECK (publication_epoch >= 0);
+    UPDATE metadata_state AS m SET publication_epoch = p.policy_epoch
+        FROM volume_protocol AS p
+        WHERE m.vol = p.vol AND m.publication_epoch IS DISTINCT FROM p.policy_epoch;
+
+    -- Initialization and load can insert either row first.
+    CREATE OR REPLACE FUNCTION studiofs_initialize_publication_epoch()
+    RETURNS TRIGGER LANGUAGE plpgsql AS $$
+    BEGIN
+        NEW.publication_epoch := COALESCE(
+            (SELECT policy_epoch FROM volume_protocol WHERE vol = NEW.vol), 0);
+        RETURN NEW;
+    END $$;
+    DROP TRIGGER IF EXISTS studiofs_initialize_publication_epoch ON metadata_state;
+    CREATE TRIGGER studiofs_initialize_publication_epoch
+        BEFORE INSERT ON metadata_state FOR EACH ROW
+        EXECUTE FUNCTION studiofs_initialize_publication_epoch();
+
+    CREATE OR REPLACE FUNCTION studiofs_sync_publication_epoch()
+    RETURNS TRIGGER LANGUAGE plpgsql AS $$
+    BEGIN
+        IF TG_OP = 'DELETE' THEN
+            UPDATE metadata_state SET publication_epoch = 0 WHERE vol = OLD.vol;
+            RETURN OLD;
+        END IF;
+        UPDATE metadata_state SET publication_epoch = NEW.policy_epoch
+            WHERE vol = NEW.vol AND publication_epoch IS DISTINCT FROM NEW.policy_epoch;
+        RETURN NEW;
+    END $$;
+    DROP TRIGGER IF EXISTS studiofs_sync_publication_epoch ON volume_protocol;
+    CREATE TRIGGER studiofs_sync_publication_epoch
+        AFTER INSERT OR UPDATE OF policy_epoch OR DELETE ON volume_protocol FOR EACH ROW
+        EXECUTE FUNCTION studiofs_sync_publication_epoch();
+
+    CREATE OR REPLACE FUNCTION studiofs_fence_event_publication()
+    RETURNS TRIGGER LANGUAGE plpgsql AS $$
+    DECLARE
+        volume_id BIGINT;
+        volume_format SMALLINT;
+        epoch BIGINT;
+    BEGIN
+        FOR volume_id IN SELECT DISTINCT vol FROM published_events ORDER BY vol LOOP
+            -- The ordinary publisher already holds this row through its bump.
+            -- A direct insert also has to serialize with policy activation.
+            SELECT metadata_format_version, publication_epoch INTO volume_format, epoch
+                FROM metadata_state WHERE vol = volume_id FOR SHARE;
+            IF NOT FOUND THEN
+                SELECT policy_epoch INTO epoch FROM volume_protocol WHERE vol = volume_id;
+            END IF;
+            IF volume_format >= 7 OR epoch > 0 THEN
+                -- The lease identifies the publisher. Event client_id identifies
+                -- the author and can differ, for example during dump restore.
+                PERFORM 1 FROM client_sessions
+                    WHERE vol = volume_id
+                      AND session_id = current_setting('studiofs.session_id', true)
+                      AND policy_epoch = epoch
+                      AND fencing_token::TEXT = current_setting('studiofs.session_fencing_token', true)
+                      AND lease_expires_at > clock_timestamp()
+                    FOR SHARE;
+                IF NOT FOUND OR epoch::TEXT IS DISTINCT FROM current_setting('studiofs.policy_epoch', true) THEN
+                    RAISE EXCEPTION 'event publication requires a current session and policy epoch';
+                END IF;
+            END IF;
+        END LOOP;
+        RETURN NULL;
+    END $$;
+    DROP TRIGGER IF EXISTS studiofs_event_publication_fence ON event_log;
+    CREATE TRIGGER studiofs_event_publication_fence
+        AFTER INSERT ON event_log REFERENCING NEW TABLE AS published_events
+        FOR EACH STATEMENT EXECUTE FUNCTION studiofs_fence_event_publication();
+"#;
+
 /// Version of the payload GC queue, sweep-checkpoint and upload-fence schema
 /// that this binary creates and that the CLI Janitor requires before deleting.
 pub const PAYLOAD_GC_SCHEMA_VERSION: i32 =

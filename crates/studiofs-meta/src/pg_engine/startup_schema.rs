@@ -53,6 +53,7 @@ const MOUNT_COMPONENTS: [MountComponent; 3] = [
         columns: &[
             ("metadata_state", "metadata_format_version"),
             ("metadata_state", "write_requirement"),
+            ("metadata_state", "publication_epoch"),
             ("metadata_state", "total_event_payload_bytes"),
             ("metadata_state", "checkpoint_total_event_bytes"),
             ("metadata_state", "checkpoint_sha256"),

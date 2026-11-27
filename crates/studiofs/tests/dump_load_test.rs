@@ -857,23 +857,28 @@ impl LoadGuardFixture {
 
     /// Makes the target observably newer than its dump: identity fields,
     /// metadata version, a counter, and an event row.
-    async fn advance_past_dump(&self, volume_id: i64, newer_name: &str) -> TargetVolumeState {
-        self.client
-            .execute(
-                "INSERT INTO counters (vol, name, value) VALUES ($1, $2, $3)",
-                &[&volume_id, &NEWER_STATE_MARKER, &NEWER_STATE_COUNTER_VALUE],
-            )
-            .await
-            .expect("seed newer counter");
-        self.client
-            .execute(
-                "UPDATE volumes SET name = $2, block_size = $3 WHERE vol = $1",
-                &[&volume_id, &newer_name, &NEWER_BLOCK_SIZE],
-            )
-            .await
-            .expect("advance volume identity fields");
-        let metadata_version: i64 = self
+    async fn advance_past_dump(&mut self, volume_id: i64, newer_name: &str) -> TargetVolumeState {
+        let tx = self
             .client
+            .transaction()
+            .await
+            .expect("begin fixture publication");
+        let session = studiofs_meta::pg_engine::PublicationSession::begin(&tx, volume_id)
+            .await
+            .expect("stamp fixture publication");
+        tx.execute(
+            "INSERT INTO counters (vol, name, value) VALUES ($1, $2, $3)",
+            &[&volume_id, &NEWER_STATE_MARKER, &NEWER_STATE_COUNTER_VALUE],
+        )
+        .await
+        .expect("seed newer counter");
+        tx.execute(
+            "UPDATE volumes SET name = $2, block_size = $3 WHERE vol = $1",
+            &[&volume_id, &newer_name, &NEWER_BLOCK_SIZE],
+        )
+        .await
+        .expect("advance volume identity fields");
+        let metadata_version: i64 = tx
             .query_one(
                 "UPDATE metadata_state SET version = version + 1 WHERE vol = $1 RETURNING version",
                 &[&volume_id],
@@ -881,7 +886,7 @@ impl LoadGuardFixture {
             .await
             .expect("advance metadata version")
             .get(0);
-        self.client
+        tx
             .execute(
                 "INSERT INTO event_log (vol, batch_version, event_type, event_payload) VALUES ($1, $2, $3, $4)",
                 &[&volume_id, &metadata_version, &NEWER_STATE_MARKER, &Vec::<u8>::new()],
@@ -889,6 +894,11 @@ impl LoadGuardFixture {
             .await
             .expect("seed newer event");
 
+        session
+            .finish(&tx, volume_id)
+            .await
+            .expect("finish fixture publication");
+        tx.commit().await.expect("commit fixture publication");
         let state = self.target_state(volume_id).await;
         assert_eq!(
             state,
@@ -1080,11 +1090,14 @@ fn combined_output(output: &Output) -> String {
 
 /// Runs `scenario` and then cleans the fixture's volumes, re-raising a
 /// scenario panic only after cleanup.
-fn run_load_guard_test(volume_names: Vec<String>, scenario: impl AsyncFnOnce(&LoadGuardFixture)) {
+fn run_load_guard_test(
+    volume_names: Vec<String>,
+    scenario: impl AsyncFnOnce(&mut LoadGuardFixture),
+) {
     let runtime = tokio::runtime::Runtime::new().expect("build test runtime");
-    let fixture = runtime.block_on(LoadGuardFixture::connect(volume_names));
+    let mut fixture = runtime.block_on(LoadGuardFixture::connect(volume_names));
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        runtime.block_on(scenario(&fixture));
+        runtime.block_on(scenario(&mut fixture));
     }));
     let cleanup_failures = runtime.block_on(fixture.cleanup());
     if let Err(panic) = outcome {

@@ -3,8 +3,9 @@
 //! The policy record is `volume_protocol` (epoch, required sets, checkpoint
 //! identity and feature states). Its write requirement lives in the
 //! `metadata_state` row that `BUMP_METADATA_VERSION` already updates.
-//! Publication checks it in the same UPDATE. A policy update locks that row to serialize
-//! with publication and appends to `volume_protocol_history`.
+//! Publication checks it and the mirrored epoch in the same UPDATE. A policy
+//! update locks that row to serialize with publication and appends to
+//! `volume_protocol_history`.
 
 use tokio_postgres::GenericClient;
 
@@ -208,8 +209,8 @@ pub(super) const PUBLICATION_WRITE_REQUIREMENT: i16 =
     SHARED_WRITE_REQUIREMENT.current_pg_smallint();
 
 /// Explains a `BUMP_METADATA_VERSION` that matched no row: an unsupported
-/// format or a raised write requirement is a typed refusal, so the caller
-/// keeps its journal as unpublished local work.
+/// format, raised write requirement, or changed epoch is a typed refusal,
+/// so the caller keeps its journal as unpublished local work.
 pub(super) async fn refused_publication<C>(client: &C, volume: i64) -> MetaError
 where
     C: GenericClient + Sync,
@@ -226,12 +227,13 @@ where
             );
         }
     };
-    if let Err(error) =
-        crate::ensure_supported_pg_sync_format_version(row.as_ref().and_then(|row| row.get(0)))
-    {
+    let Some(row) = row else {
+        return ProtocolRejection::Missing.into();
+    };
+    if let Err(error) = crate::ensure_supported_pg_sync_format_version(row.get(0)) {
         return error;
     }
-    let found = row.map_or(0, |row| row.get::<_, i16>(1));
+    let found: i16 = row.get(1);
     if found > PUBLICATION_WRITE_REQUIREMENT {
         return MetaError::UpgradeRequired {
             reason: UpgradeRequiredReason::WriteRequirementNewer {
@@ -240,9 +242,17 @@ where
             },
         };
     }
-    MetaError::Storage(
-        "postgres metadata version bump did not update the current-format row".into(),
-    )
+    let epoch: i64 = row.get(2);
+    if let Some(expected) = row.get::<_, Option<i64>>(3)
+        && expected != epoch
+    {
+        return ProtocolRejection::EpochConflict {
+            expected: expected as u64,
+            found: epoch as u64,
+        }
+        .into();
+    }
+    MetaError::Storage("postgres metadata version bump requires a current policy stamp".into())
 }
 
 pub(super) fn is_volume_read_policy_rejection(error: &MetaError) -> bool {
