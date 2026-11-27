@@ -14,6 +14,7 @@ use studiofs_meta::{
     MetadataBackend, MetadataConfig, PgSnapshotBackend, PostgresConfig, RedbMetaEngine,
     ensure_studiofs_database,
 };
+use studiofs_test_support::IsolatedPgSchema;
 use uuid::Uuid;
 
 fn run_snapshot(root: &std::path::Path, args: &[&str]) -> Output {
@@ -60,33 +61,21 @@ fn configured_test_setting(setting: &str) -> Option<String> {
         })
 }
 
-struct PgVolumeCleanup {
-    dsn: String,
-    names: Vec<String>,
+fn isolated_pg_schema() -> IsolatedPgSchema {
+    let raw_dsn = configured_test_pg_dsn()
+        .expect("STUDIOFS_TEST_PG_DSN must be set or configured in workspace .env");
+    let runtime = tokio::runtime::Runtime::new().expect("create test runtime");
+    let base_dsn = runtime
+        .block_on(ensure_studiofs_database(&raw_dsn))
+        .unwrap_or_else(|_| panic!("prepare PostgreSQL test database"))
+        .metadata_dsn;
+    IsolatedPgSchema::new(&base_dsn)
 }
 
-impl Drop for PgVolumeCleanup {
-    fn drop(&mut self) {
-        if let Ok(runtime) = tokio::runtime::Runtime::new() {
-            let _ = runtime.block_on(async {
-                let (client, connection) =
-                    tokio_postgres::connect(&self.dsn, tokio_postgres::NoTls)
-                        .await
-                        .ok()?;
-                let connection_task = tokio::spawn(connection);
-                let result = client
-                    .execute("DELETE FROM volumes WHERE name = ANY($1)", &[&self.names])
-                    .await;
-                // Dropping the client lets the connection terminate cleanly before joining it.
-                drop(client);
-                let _ = connection_task.await;
-                result.ok()
-            });
-        }
-    }
-}
-
-async fn insert_pg_volume(client: &tokio_postgres::Client, name: &str) -> (i64, String) {
+async fn insert_pg_volume_without_protocol(
+    client: &tokio_postgres::Client,
+    name: &str,
+) -> (i64, String) {
     let uuid = Uuid::new_v4().to_string();
     let row = client
         .query_one(
@@ -96,6 +85,11 @@ async fn insert_pg_volume(client: &tokio_postgres::Client, name: &str) -> (i64, 
         .await
         .expect("insert PostgreSQL volume");
     let volume_id = row.get::<_, i64>(0);
+    (volume_id, uuid)
+}
+
+async fn insert_pg_volume(client: &tokio_postgres::Client, name: &str) -> (i64, String) {
+    let (volume_id, uuid) = insert_pg_volume_without_protocol(client, name).await;
     studiofs_meta::pg_engine::insert_initial_volume_protocol(client, volume_id, "test fixture")
         .await
         .expect("insert PostgreSQL volume protocol");
@@ -208,14 +202,11 @@ fn exercise_upgrade_retry(with_rustfs: bool) {
         }
     }
 
-    let raw_dsn = configured_test_pg_dsn().expect("configured PostgreSQL test service");
+    let schema = isolated_pg_schema();
+    let dsn = schema.dsn();
     let runtime = tokio::runtime::Runtime::new().unwrap();
-    let dsn = runtime
-        .block_on(ensure_studiofs_database(&raw_dsn))
-        .unwrap()
-        .metadata_dsn;
     let (mut client, connection) = runtime
-        .block_on(tokio_postgres::connect(&dsn, tokio_postgres::NoTls))
+        .block_on(tokio_postgres::connect(dsn, tokio_postgres::NoTls))
         .unwrap();
     let connection_task = runtime.spawn(connection);
     runtime
@@ -224,13 +215,9 @@ fn exercise_upgrade_retry(with_rustfs: bool) {
         )
         .unwrap();
     let name = format!("upgrade-cli-{}", Uuid::new_v4().simple());
-    let _cleanup = PgVolumeCleanup {
-        dsn: dsn.clone(),
-        names: vec![name.clone()],
-    };
-    let (id, uuid) = runtime.block_on(insert_pg_volume(&client, &name));
+    let (id, uuid) = runtime.block_on(insert_pg_volume_without_protocol(&client, &name));
     let root = studiofs_test_support::workspace_target_tempdir("upgrade-cli-");
-    let (checkpoint, bytes) = create_local_volume_metadata(root.path(), &name, &dsn, id, &uuid);
+    let (checkpoint, bytes) = create_local_volume_metadata(root.path(), &name, dsn, id, &uuid);
     runtime.block_on(seed_pg_metadata_state(&client, id, &checkpoint, &bytes));
     let mut legacy: FormatInfo = serde_json::from_slice(&bytes).unwrap();
     let contents = b"StudioFS format adoption payload fixture".as_slice();
@@ -310,7 +297,7 @@ fn exercise_upgrade_retry(with_rustfs: bool) {
     let failed = run();
     assert!(!failed.status.success());
     let failure = output_text(&failed);
-    assert!(!failure.contains(&dsn));
+    assert!(!failure.contains(dsn));
     assert!(!failure.contains(&legacy.secret_key));
     assert!(failure.contains("Shared format is upgraded"));
     assert_eq!(
@@ -357,14 +344,11 @@ fn exercise_upgrade_retry(with_rustfs: bool) {
 #[test]
 #[ignore = "requires PostgreSQL test service; isolated trash-days command, no S3"]
 fn trash_days_cli_updates_shared_setting_and_client_converges() {
-    let raw_dsn = configured_test_pg_dsn().expect("configured PostgreSQL test service");
+    let schema = isolated_pg_schema();
+    let dsn = schema.dsn();
     let runtime = tokio::runtime::Runtime::new().unwrap();
-    let dsn = runtime
-        .block_on(ensure_studiofs_database(&raw_dsn))
-        .unwrap()
-        .metadata_dsn;
     let (mut client, connection) = runtime
-        .block_on(tokio_postgres::connect(&dsn, tokio_postgres::NoTls))
+        .block_on(tokio_postgres::connect(dsn, tokio_postgres::NoTls))
         .unwrap();
     let connection_task = runtime.spawn(connection);
     runtime
@@ -373,13 +357,9 @@ fn trash_days_cli_updates_shared_setting_and_client_converges() {
         )
         .unwrap();
     let name = format!("trash-days-cli-{}", Uuid::new_v4().simple());
-    let _cleanup = PgVolumeCleanup {
-        dsn: dsn.clone(),
-        names: vec![name.clone()],
-    };
     let (id, uuid) = runtime.block_on(insert_pg_volume(&client, &name));
     let root = studiofs_test_support::workspace_target_tempdir("trash-days-cli-");
-    let (checkpoint, bytes) = create_local_volume_metadata(root.path(), &name, &dsn, id, &uuid);
+    let (checkpoint, bytes) = create_local_volume_metadata(root.path(), &name, dsn, id, &uuid);
     runtime.block_on(seed_pg_metadata_state(&client, id, &checkpoint, &bytes));
     let run = |args: &[&str]| {
         Command::new(env!("CARGO_BIN_EXE_studiofs"))
@@ -422,7 +402,7 @@ fn trash_days_cli_updates_shared_setting_and_client_converges() {
         "{}",
         output_text(&disabled)
     );
-    assert!(!output_text(&disabled).contains(&dsn));
+    assert!(!output_text(&disabled).contains(dsn));
     let shared = shared_revision().unwrap();
     assert_eq!(shared.revision, 2);
     assert!(!shared.trash.enabled());
@@ -455,14 +435,11 @@ fn trash_days_cli_updates_shared_setting_and_client_converges() {
 fn compression_cli_updates_shared_setting_handles_cas_conflict_and_converges() {
     use studiofs_meta::trash::{CompressionPolicy, VolumeSettings};
 
-    let raw_dsn = configured_test_pg_dsn().expect("configured PostgreSQL test service");
+    let schema = isolated_pg_schema();
+    let dsn = schema.dsn();
     let runtime = tokio::runtime::Runtime::new().unwrap();
-    let dsn = runtime
-        .block_on(ensure_studiofs_database(&raw_dsn))
-        .unwrap()
-        .metadata_dsn;
     let (mut client, connection) = runtime
-        .block_on(tokio_postgres::connect(&dsn, tokio_postgres::NoTls))
+        .block_on(tokio_postgres::connect(dsn, tokio_postgres::NoTls))
         .unwrap();
     let connection_task = runtime.spawn(connection);
     runtime
@@ -471,13 +448,9 @@ fn compression_cli_updates_shared_setting_handles_cas_conflict_and_converges() {
         )
         .unwrap();
     let name = format!("compression-cli-{}", Uuid::new_v4().simple());
-    let _cleanup = PgVolumeCleanup {
-        dsn: dsn.clone(),
-        names: vec![name.clone()],
-    };
     let (id, uuid) = runtime.block_on(insert_pg_volume(&client, &name));
     let root = studiofs_test_support::workspace_target_tempdir("compression-cli-");
-    let (checkpoint, bytes) = create_local_volume_metadata(root.path(), &name, &dsn, id, &uuid);
+    let (checkpoint, bytes) = create_local_volume_metadata(root.path(), &name, dsn, id, &uuid);
     runtime.block_on(seed_pg_metadata_state(&client, id, &checkpoint, &bytes));
     let run = |args: &[&str]| {
         Command::new(env!("CARGO_BIN_EXE_studiofs"))
@@ -531,7 +504,7 @@ fn compression_cli_updates_shared_setting_handles_cas_conflict_and_converges() {
     let off = run(&["off"]);
     assert!(off.status.success(), "{}", output_text(&off));
     assert!(output_text(&off).contains("compression is off."));
-    assert!(!output_text(&off).contains(&dsn));
+    assert!(!output_text(&off).contains(dsn));
 
     let shared = shared_settings(&client).unwrap();
     assert_eq!(shared.revision, 3);
@@ -540,7 +513,7 @@ fn compression_cli_updates_shared_setting_handles_cas_conflict_and_converges() {
     // Deterministic concurrent CAS conflict: hold the metadata_state row lock while the CLI
     // reads revision 3 and waits on SELECT ... FOR UPDATE, then advance revision to 4 and commit.
     let (observer, observer_conn) = runtime
-        .block_on(tokio_postgres::connect(&dsn, tokio_postgres::NoTls))
+        .block_on(tokio_postgres::connect(dsn, tokio_postgres::NoTls))
         .unwrap();
     let observer_task = runtime.spawn(observer_conn);
     let cli_output = runtime.block_on(async {
@@ -707,15 +680,11 @@ fn compression_cli_updates_shared_setting_handles_cas_conflict_and_converges() {
 #[test]
 #[ignore = "requires PostgreSQL test service via STUDIOFS_TEST_PG_DSN; does not use S3"]
 fn snapshot_cli_scopes_catalog_and_policy_to_the_named_volume() {
-    let raw_dsn = configured_test_pg_dsn()
-        .expect("STUDIOFS_TEST_PG_DSN must be set or configured in workspace .env");
+    let schema = isolated_pg_schema();
+    let dsn = schema.dsn();
     let runtime = tokio::runtime::Runtime::new().expect("create test runtime");
-    let dsn = runtime
-        .block_on(ensure_studiofs_database(&raw_dsn))
-        .expect("prepare PostgreSQL test database")
-        .metadata_dsn;
     let (mut client, connection) = runtime
-        .block_on(tokio_postgres::connect(&dsn, tokio_postgres::NoTls))
+        .block_on(tokio_postgres::connect(dsn, tokio_postgres::NoTls))
         .expect("connect to PostgreSQL test database");
     let connection_task = runtime.spawn(connection);
     runtime
@@ -727,18 +696,14 @@ fn snapshot_cli_scopes_catalog_and_policy_to_the_named_volume() {
     let suffix = Uuid::new_v4().simple().to_string();
     let alpha_name = format!("snapshot-cli-a-{suffix}");
     let beta_name = format!("snapshot-cli-b-{suffix}");
-    let _cleanup = PgVolumeCleanup {
-        dsn: dsn.clone(),
-        names: vec![alpha_name.clone(), beta_name.clone()],
-    };
     let (alpha_id, alpha_uuid) = runtime.block_on(insert_pg_volume(&client, &alpha_name));
     let (beta_id, beta_uuid) = runtime.block_on(insert_pg_volume(&client, &beta_name));
 
     let root = studiofs_test_support::workspace_target_tempdir("snapshot-cli-pg-");
     let (alpha_checkpoint, alpha_format_info) =
-        create_local_volume_metadata(root.path(), &alpha_name, &dsn, alpha_id, &alpha_uuid);
+        create_local_volume_metadata(root.path(), &alpha_name, dsn, alpha_id, &alpha_uuid);
     let (beta_checkpoint, beta_format_info) =
-        create_local_volume_metadata(root.path(), &beta_name, &dsn, beta_id, &beta_uuid);
+        create_local_volume_metadata(root.path(), &beta_name, dsn, beta_id, &beta_uuid);
     runtime.block_on(seed_pg_metadata_state(
         &client,
         alpha_id,
@@ -753,9 +718,8 @@ fn snapshot_cli_scopes_catalog_and_policy_to_the_named_volume() {
     ));
     drop(client);
     let _ = runtime.block_on(connection_task);
-    let alpha =
-        PgSnapshotBackend::open(&dsn, alpha_id).expect("open first volume snapshot backend");
-    let beta = PgSnapshotBackend::open(&dsn, beta_id).expect("open second volume snapshot backend");
+    let alpha = PgSnapshotBackend::open(dsn, alpha_id).expect("open first volume snapshot backend");
+    let beta = PgSnapshotBackend::open(dsn, beta_id).expect("open second volume snapshot backend");
 
     let alpha_entry = alpha
         .create_snapshot_v2(

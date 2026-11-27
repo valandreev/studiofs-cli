@@ -7115,7 +7115,7 @@ fn test_pg_conflicting_batch_does_not_block_later_foreign_batch() {
     let add_payload = encode_event(&add_event).expect("encode add attr event");
     let dentry_payload = encode_event(&dentry_event).expect("encode unrelated dentry event");
 
-    run_async(async move {
+    run_async(async {
         let (mut client, connection) = tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
             .await
             .map_err(|e| MetaError::Storage(e.to_string()))?;
@@ -7162,7 +7162,9 @@ fn test_pg_conflicting_batch_does_not_block_later_foreign_batch() {
             })?;
         session.finish(&seed_tx, volume.volume_id).await?;
         seed_tx.commit().await.unwrap();
+        drop(client);
         conn_task.abort();
+        let _ = conn_task.await;
         Ok(())
     })
     .expect("write synthetic remote batches");

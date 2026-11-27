@@ -22,6 +22,7 @@ use studiofs_meta::{
     FormatInfo, MetaFormat, MetadataBackend, MetadataConfig, PostgresConfig, RedbMetaEngine,
     ensure_studiofs_database,
 };
+use studiofs_test_support::IsolatedPgSchema;
 use uuid::Uuid;
 
 struct TestEnv {
@@ -37,10 +38,16 @@ struct InfraFixture {
     home_dir: tempfile::TempDir,
     meta_dir: PathBuf,
     marker_key: String,
-    pg_dsn: String,
+    pg_schema: IsolatedPgSchema,
     pg_volume_id: i64,
     pg_uuid: String,
     env: TestEnv,
+}
+
+impl InfraFixture {
+    fn pg_dsn(&self) -> &str {
+        self.pg_schema.dsn()
+    }
 }
 
 fn workspace_root() -> &'static Path {
@@ -358,16 +365,17 @@ fn build_infra_fixture(prefix: &str) -> InfraFixture {
     let rt = tokio::runtime::Runtime::new().expect("build runtime");
     let studio_dsn = rt
         .block_on(async { ensure_studiofs_database(&raw_pg).await })
-        .expect("connect to PostgreSQL test service")
+        .unwrap_or_else(|_| panic!("connect to PostgreSQL test service"))
         .metadata_dsn;
+    let pg_schema = IsolatedPgSchema::new(&studio_dsn);
 
-    ensure_pg_schema(&studio_dsn);
+    ensure_pg_schema(pg_schema.dsn());
 
     let name = random_name(prefix);
     let home_dir = studiofs_test_support::workspace_target_tempdir("home-");
     let meta_dir = home_meta_dir(home_dir.path(), &name);
 
-    let (pg_volume_id, pg_uuid) = insert_pg_volume(&studio_dsn, &name);
+    let (pg_volume_id, pg_uuid) = insert_pg_volume(pg_schema.dsn(), &name);
 
     let store = make_datastore(env, &name, &pg_uuid);
     let marker_key = format!("{name}/objects/destroy-marker.txt");
@@ -379,7 +387,7 @@ fn build_infra_fixture(prefix: &str) -> InfraFixture {
         home_dir,
         meta_dir,
         marker_key,
-        pg_dsn: studio_dsn,
+        pg_schema,
         pg_volume_id,
         pg_uuid,
         env: TestEnv {
@@ -613,7 +621,7 @@ fn destroy_fails_cleanly_with_incorrect_s3_permissions() {
     create_local_metadata_with_bad_s3_secret(
         &fixture.meta_dir,
         &fixture.name,
-        &fixture.pg_dsn,
+        fixture.pg_dsn(),
         fixture.pg_volume_id,
         &fixture.env,
     );
@@ -641,7 +649,7 @@ fn destroy_fails_cleanly_with_incorrect_s3_permissions() {
         "remote S3 marker should remain after failed destroy"
     );
     assert!(
-        pg_volume_exists(&fixture.pg_dsn, fixture.pg_volume_id),
+        pg_volume_exists(fixture.pg_dsn(), fixture.pg_volume_id),
         "postgres metadata should remain after failed destroy"
     );
 }
@@ -654,7 +662,7 @@ fn destroy_local_only_removes_local_state_and_keeps_remote() {
     create_local_metadata(
         &fixture.meta_dir,
         &fixture.name,
-        &fixture.pg_dsn,
+        fixture.pg_dsn(),
         fixture.pg_volume_id,
         &fixture.env,
         &fixture.pg_uuid,
@@ -685,7 +693,7 @@ fn destroy_local_only_removes_local_state_and_keeps_remote() {
         "--local destroy must not delete remote S3 data"
     );
     assert!(
-        pg_volume_exists(&fixture.pg_dsn, fixture.pg_volume_id),
+        pg_volume_exists(fixture.pg_dsn(), fixture.pg_volume_id),
         "--local destroy must not delete postgres metadata"
     );
 }
@@ -698,7 +706,7 @@ fn destroy_full_removes_local_s3_and_postgres_state() {
     create_local_metadata(
         &fixture.meta_dir,
         &fixture.name,
-        &fixture.pg_dsn,
+        fixture.pg_dsn(),
         fixture.pg_volume_id,
         &fixture.env,
         &fixture.pg_uuid,
@@ -725,7 +733,7 @@ fn destroy_full_removes_local_s3_and_postgres_state() {
         "full destroy should remove remote S3 data for the volume"
     );
     assert!(
-        !pg_volume_exists(&fixture.pg_dsn, fixture.pg_volume_id),
+        !pg_volume_exists(fixture.pg_dsn(), fixture.pg_volume_id),
         "full destroy should delete postgres volume metadata"
     );
 }
@@ -737,7 +745,7 @@ fn destroy_full_refuses_active_local_metadata_before_deleting_remote_state() {
     create_local_metadata(
         &fixture.meta_dir,
         &fixture.name,
-        &fixture.pg_dsn,
+        fixture.pg_dsn(),
         fixture.pg_volume_id,
         &fixture.env,
         &fixture.pg_uuid,
@@ -861,7 +869,7 @@ fn destroy_full_refuses_active_local_metadata_before_deleting_remote_state() {
         "S3 marker content should remain unchanged"
     );
     assert!(
-        pg_volume_exists(&fixture.pg_dsn, fixture.pg_volume_id),
+        pg_volume_exists(fixture.pg_dsn(), fixture.pg_volume_id),
         "PostgreSQL volume row should remain after refused destroy"
     );
 }

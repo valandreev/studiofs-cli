@@ -4,6 +4,22 @@ use super::*;
 use crate::snapshot_ports::{SnapshotPolicyStore, SnapshotPortError};
 use std::net::{Ipv4Addr, TcpListener};
 
+#[test]
+#[ignore = "requires PostgreSQL test service via STUDIOFS_TEST_PG_DSN"]
+fn isolated_pg_volumes_use_schema_specific_id_ranges() {
+    let first = pg_dsn().expect("STUDIOFS_TEST_PG_DSN is required");
+    let second = pg_dsn().expect("STUDIOFS_TEST_PG_DSN is required");
+    let a = PgTestVolume::new(&first, "id-range-a");
+    let b = PgTestVolume::new(&first, "id-range-b");
+    let c = PgTestVolume::new(&second, "id-range-c");
+
+    let range_size = 1 << 20;
+    assert_eq!(a.volume_id % range_size, 0);
+    assert_eq!(b.volume_id, a.volume_id + 1);
+    assert_eq!(c.volume_id % range_size, 0);
+    assert_ne!(a.volume_id / range_size, c.volume_id / range_size);
+}
+
 fn validate(dsn: &str, volume_id: i64, connect_timeout: Duration) -> MetaResult<bool> {
     PgMetaEngine::validate_postgres_schema(dsn, volume_id, connect_timeout, Duration::from_secs(10))
         .map(|outcome| match outcome {

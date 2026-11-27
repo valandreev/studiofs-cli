@@ -41,6 +41,7 @@ use studiofs_meta::{
     schema::{InodeLifecycleState, PayloadRefState},
     types::{AccessLevel, BlockFlags, Ino, PayloadRef, UploadState},
 };
+use studiofs_test_support::IsolatedPgSchema;
 use studiofs_vfs::{
     KernelInvalidator, LockKind, OpenFlags, StudioVfs, VfsConfigRaw, VfsConfigValidated, VfsError,
     VfsForegroundReadProtectionStats, VfsIngressLane, VfsUploadState, parse_size_bytes,
@@ -1042,7 +1043,24 @@ fn wait_until_blocking(timeout: Duration, mut cond: impl FnMut() -> bool) -> boo
 }
 
 #[allow(dead_code)]
-fn pg_dsn() -> Option<String> {
+struct PgTestDsn(IsolatedPgSchema);
+
+impl std::ops::Deref for PgTestDsn {
+    type Target = str;
+
+    fn deref(&self) -> &Self::Target {
+        self.0.dsn()
+    }
+}
+
+impl AsRef<str> for PgTestDsn {
+    fn as_ref(&self) -> &str {
+        self.0.dsn()
+    }
+}
+
+#[allow(dead_code)]
+fn pg_dsn() -> Option<PgTestDsn> {
     load_test_env();
     let raw = locked_env_var("STUDIOFS_TEST_PG_DSN")
         .or_else(|| workspace_dotenv_var("STUDIOFS_TEST_PG_DSN"))
@@ -1052,12 +1070,13 @@ fn pg_dsn() -> Option<String> {
         .enable_all()
         .build()
         .ok()?;
-    rt.block_on(async {
+    let base_dsn = rt.block_on(async {
         ensure_studiofs_database(&raw)
             .await
             .ok()
             .map(|v| v.metadata_dsn)
-    })
+    })?;
+    Some(PgTestDsn(IsolatedPgSchema::new(&base_dsn)))
 }
 
 #[allow(dead_code)]
@@ -1090,6 +1109,15 @@ fn setup_pg_volume(
         let conn_task = tokio::spawn(async move {
             let _ = connection.await;
         });
+
+        studiofs_meta::pg_engine::schema::ensure_studiofs_pg_schema_committed(&mut client).await?;
+        studiofs_test_support::seed_isolated_pg_volume_ids(&client)
+            .await
+            .map_err(|e| {
+                studiofs_meta::MetaError::Storage(format!(
+                    "postgres seed volume sequence failed: {e}"
+                ))
+            })?;
 
         let tx = client.transaction().await.map_err(|e| {
             studiofs_meta::MetaError::Storage(format!("postgres begin tx failed: {e}"))
@@ -1160,7 +1188,9 @@ fn setup_pg_volume(
         tx.commit().await.map_err(|e| {
             studiofs_meta::MetaError::Storage(format!("postgres commit failed: {e}"))
         })?;
+        drop(client);
         conn_task.abort();
+        let _ = conn_task.await;
         Ok(volume_id)
     })
 }
@@ -1263,14 +1293,17 @@ impl Drop for PgTestVolume {
             let conn_task = tokio::spawn(async move {
                 let _ = connection.await;
             });
-            client
+            let result = client
                 .execute("DELETE FROM volumes WHERE vol = $1", &[&self.volume_id])
                 .await
+                .map(|_| ())
                 .map_err(|e| {
                     studiofs_meta::MetaError::Storage(format!("postgres cleanup failed: {e}"))
-                })?;
+                });
+            drop(client);
             conn_task.abort();
-            Ok(())
+            let _ = conn_task.await;
+            result
         });
     }
 }
@@ -5172,7 +5205,12 @@ fn retained_restore_losing_to_settled_peer_purge_preserves_inode_and_bytes() {
         .await;
         if let Ok(Err(error)) = &probe {
             let mut redacted = format!("{error:?}");
-            for secret in [&info.endpoint, &info.access_key, &info.secret_key, &dsn] {
+            for secret in [
+                info.endpoint.as_str(),
+                info.access_key.as_str(),
+                info.secret_key.as_str(),
+                &dsn,
+            ] {
                 if !secret.is_empty() { redacted = redacted.replace(secret, "<redacted>"); }
             }
             eprintln!("restore PUT prerequisite: {redacted}");
