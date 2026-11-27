@@ -696,8 +696,8 @@ impl PgJanitorSession {
                         "PostgreSQL storage binding is incomplete",
                     ));
                 }
-                crate::check_pg_volume_format(metadata_format_version).map_err(|error| {
-                    JanitorMetadataError::SchemaUnavailable(error.to_string())
+                crate::check_pg_volume_format(metadata_format_version).map_err(|_| {
+                    JanitorMetadataError::UnsafeToDelete("PostgreSQL format is unsupported")
                 })?;
                 let remote_info = crate::decode_format_info(&remote_format_bytes).map_err(|_| {
                     JanitorMetadataError::UnsafeToDelete("PostgreSQL storage binding is invalid")

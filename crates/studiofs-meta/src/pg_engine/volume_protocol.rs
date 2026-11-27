@@ -102,13 +102,7 @@ pub(super) async fn read_volume_policy_and_head<C: GenericClient + Sync>(
     let row = client
         .query_opt(SELECT_PROTOCOL, &[&volume])
         .await
-        .map_err(|error| match error.code().map(|code| code.code()) {
-            Some("42P01" | "42703") => MetaError::RepairRequired(
-                "PostgreSQL volume policy schema is incomplete. Stop mounts and run `studiofs upgrade --repair-schema`"
-                    .into(),
-            ),
-            _ => PgMetaEngine::classify_pg_error("read volume protocol", error),
-        })?;
+        .map_err(|error| PgMetaEngine::classify_pg_error("read volume protocol", error))?;
     let Some(row) = row else {
         return Err(ProtocolRejection::Missing.into());
     };
