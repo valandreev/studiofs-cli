@@ -10,3 +10,6 @@ workspace = true
 
 [dependencies]
 tempfile.workspace = true
+tokio.workspace = true
+tokio-postgres.workspace = true
+uuid.workspace = true

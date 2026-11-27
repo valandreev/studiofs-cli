@@ -1219,7 +1219,7 @@ fn janitor_refuses_missing_interrupted_drifted_or_unsupported_gc_schema() {
     use crate::pg_engine::schema::{PAYLOAD_GC_SCHEMA_VERSION, studiofs_pg_schema_sql};
     let dsn = pg_dsn().expect("STUDIOFS_TEST_PG_DSN is required for this explicit test");
     let schema = IsolatedPgSchema::new(&dsn);
-    let isolated_dsn = schema.dsn.clone();
+    let isolated_dsn = schema.dsn().to_owned();
     // The janitor lock registers a maintenance client session, which needs the
     // session table and a volume row; both are created after first deployment.
     let volume_id = i64::from(rand::random::<u32>()) + 1_000_000_000;
@@ -1380,24 +1380,5 @@ fn janitor_refuses_missing_interrupted_drifted_or_unsupported_gc_schema() {
         refused("version is unsupported");
         sql(studiofs_pg_schema_sql().to_owned()).expect("older application");
         refused("version is unsupported");
-    }
-}
-
-#[test]
-fn search_path_dsn_confines_url_and_key_value_dsns() {
-    for dsn in [
-        "postgres://user@127.0.0.1:5432/db",
-        "postgres://user@127.0.0.1:5432/db?sslmode=disable",
-        "host=127.0.0.1 port=5432 user=postgres dbname=db sslmode=disable",
-    ] {
-        let config: tokio_postgres::Config = search_path_dsn(dsn, "sfs_test_x")
-            .parse()
-            .unwrap_or_else(|error| panic!("{dsn}: {error}"));
-        assert_eq!(
-            config.get_options(),
-            Some("-csearch_path=sfs_test_x"),
-            "{dsn}"
-        );
-        assert_eq!(config.get_dbname(), Some("db"), "{dsn}");
     }
 }

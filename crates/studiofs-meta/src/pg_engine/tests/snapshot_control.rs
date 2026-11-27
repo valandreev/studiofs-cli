@@ -17,7 +17,7 @@ use chrono::{TimeZone, Utc};
 fn missing_snapshot_does_not_discard_healthy_pool_connection() {
     let dsn = pg_dsn().expect("STUDIOFS_TEST_PG_DSN is required");
     let schema = IsolatedPgSchema::new(&dsn);
-    let volume = PgTestVolume::new(&schema.dsn, "snapshot-mount-pool");
+    let volume = PgTestVolume::new(schema.dsn(), "snapshot-mount-pool");
     let dir = studiofs_test_support::workspace_target_tempdir("snapshot-mount-pool-");
     let db = dir.path().join("meta.redb");
     seed_local(&db, &volume.format_info());

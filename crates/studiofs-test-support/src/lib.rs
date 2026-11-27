@@ -10,6 +10,94 @@ use std::sync::atomic::{AtomicU64, Ordering};
 const TARGET_TEST_DIR: &str = "studiofs-tests";
 const REDB_MAGIC: [u8; 9] = *b"redb\x1a\n\xa9\r\n";
 
+/// A disposable PostgreSQL schema. Keep the guard alive while using its DSN.
+/// Dropping the guard removes the schema and all its objects.
+pub struct IsolatedPgSchema {
+    base_dsn: String,
+    name: String,
+    dsn: String,
+}
+
+impl IsolatedPgSchema {
+    /// Creates an empty schema in the database selected by `base_dsn`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the database is unreachable or schema creation fails.
+    #[must_use]
+    pub fn new(base_dsn: &str) -> Self {
+        let name = format!("sfs_test_{}", uuid::Uuid::new_v4().simple());
+        let dsn = search_path_dsn(base_dsn, &name);
+        execute_schema_sql(base_dsn, format!("CREATE SCHEMA {name}"))
+            .unwrap_or_else(|error| panic!("create isolated PostgreSQL schema: {error}"));
+        Self {
+            base_dsn: base_dsn.to_owned(),
+            name,
+            dsn,
+        }
+    }
+
+    /// A PostgreSQL DSN with its search path confined to this schema.
+    #[must_use]
+    pub fn dsn(&self) -> &str {
+        &self.dsn
+    }
+}
+
+impl Drop for IsolatedPgSchema {
+    fn drop(&mut self) {
+        // A cleanup failure must not mask a test panic during unwinding.
+        if let Err(error) =
+            execute_schema_sql(&self.base_dsn, format!("DROP SCHEMA {} CASCADE", self.name))
+        {
+            eprintln!(
+                "failed to drop isolated PostgreSQL schema {}: {error}",
+                self.name
+            );
+        }
+    }
+}
+
+fn search_path_dsn(dsn: &str, schema: &str) -> String {
+    if dsn.starts_with("postgres://") || dsn.starts_with("postgresql://") {
+        let separator = if dsn.contains('?') { '&' } else { '?' };
+        format!("{dsn}{separator}options=-csearch_path%3D{schema}")
+    } else {
+        format!("{dsn} options='-csearch_path={schema}'")
+    }
+}
+
+fn execute_schema_sql(dsn: &str, statement: String) -> Result<(), String> {
+    // A separate runtime lets Drop complete even inside a Tokio test.
+    std::thread::scope(|scope| {
+        std::thread::Builder::new()
+            .spawn_scoped(scope, || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|_| "build PostgreSQL test runtime".to_owned())?
+                    .block_on(async {
+                        let (client, connection) =
+                            tokio_postgres::connect(dsn, tokio_postgres::NoTls)
+                                .await
+                                .map_err(|_| "connect to PostgreSQL test database".to_owned())?;
+                        tokio::spawn(connection);
+                        // A leaked lock holder fails the drop instead of hanging the test.
+                        let statement = format!("SET lock_timeout = '5s'; {statement}");
+                        client.batch_execute(&statement).await.map_err(|error| {
+                            error.code().map_or_else(
+                                || "execute PostgreSQL schema statement".to_owned(),
+                                |code| format!("PostgreSQL SQLSTATE {}", code.code()),
+                            )
+                        })
+                    })
+            })
+            .map_err(|_| "start PostgreSQL test thread".to_owned())?
+            .join()
+            .map_err(|_| "PostgreSQL test thread panicked".to_owned())?
+    })
+}
+
 /// Copies a file's contents to a new destination without copying its permissions.
 pub fn copy_file_contents(
     source: impl AsRef<Path>,
@@ -150,6 +238,27 @@ fn cargo_target_dir(cargo_target_dir: Option<std::ffi::OsString>) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn search_path_dsn_confines_url_and_key_value_dsns() {
+        for dsn in [
+            "postgres://user@127.0.0.1:5432/db",
+            "postgres://user@127.0.0.1:5432/db?sslmode=disable",
+            "host=127.0.0.1 port=5432 user=postgres dbname=db sslmode=disable",
+            "postgresql://user@127.0.0.1:5432/db?options=-csearch_path%3Dpublic",
+            "host=127.0.0.1 user=postgres dbname=db options='-csearch_path=public'",
+        ] {
+            let config: tokio_postgres::Config = search_path_dsn(dsn, "sfs_test_x")
+                .parse()
+                .unwrap_or_else(|error| panic!("{dsn}: {error}"));
+            assert_eq!(
+                config.get_options(),
+                Some("-csearch_path=sfs_test_x"),
+                "{dsn}"
+            );
+            assert_eq!(config.get_dbname(), Some("db"), "{dsn}");
+        }
+    }
 
     #[test]
     fn copy_file_contents_keeps_destination_writable_for_read_only_source() {

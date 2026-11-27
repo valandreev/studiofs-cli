@@ -102,7 +102,7 @@ async fn applied(
 fn migration_registry_applies_resumes_and_refuses_drift_on_live_postgres() {
     let dsn = pg_dsn().expect("STUDIOFS_TEST_PG_DSN is required for this explicit test");
     let schema = IsolatedPgSchema::new(&dsn);
-    let dsn = schema.dsn.clone();
+    let dsn = schema.dsn().to_owned();
     run_async(async move {
         let mut connection = connect(&dsn).await?;
         let client = &mut connection.client;
