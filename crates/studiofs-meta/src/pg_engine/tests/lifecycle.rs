@@ -3651,6 +3651,8 @@ fn startup_catch_up_rebases_stale_client_from_replay_gap_preserving_pending_over
     let Some(dsn) = pg_dsn() else {
         return;
     };
+    let schema = IsolatedPgSchema::new(&dsn);
+    let dsn = schema.dsn().to_owned();
     let volume = PgTestVolume::new(&dsn, "pg-rebootstrap-checkpoint");
 
     let (_publisher_dir, publisher) = open_pg_publisher(&volume);
@@ -3984,6 +3986,8 @@ fn startup_catch_up_reaches_live_at_frozen_target_while_remote_head_advances() {
     let Some(dsn) = pg_dsn() else {
         return;
     };
+    let schema = IsolatedPgSchema::new(&dsn);
+    let dsn = schema.dsn().to_owned();
     let _page_limit = set_test_env("STUDIOFS_PG_SYNC_MAX_BATCHES_PER_PAGE", "1");
     let volume = PgTestVolume::new(&dsn, "pg-frozen-startup-target");
 
@@ -9307,6 +9311,8 @@ fn test_pg_checkpoint_refuses_to_promote_legacy_format() {
     let Some(dsn) = pg_dsn() else {
         return;
     };
+    let schema = IsolatedPgSchema::new(&dsn);
+    let dsn = schema.dsn().to_owned();
 
     let dir = studiofs_test_support::workspace_target_tempdir("test-");
     let db = dir.path().join("meta.redb");
@@ -9362,6 +9368,8 @@ fn test_pg_event_publication_refuses_legacy_format() {
     let Some(dsn) = pg_dsn() else {
         return;
     };
+    let schema = IsolatedPgSchema::new(&dsn);
+    let dsn = schema.dsn().to_owned();
 
     let dir = studiofs_test_support::workspace_target_tempdir("test-");
     let db = dir.path().join("meta.redb");

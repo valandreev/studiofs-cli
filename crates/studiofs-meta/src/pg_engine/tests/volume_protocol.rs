@@ -276,7 +276,7 @@ fn volume_protocol_policy_and_write_requirement_on_live_postgres() {
             .await
             .map_err(|e| MetaError::Storage(pg_err(e)))?
             .get(0);
-        crate::ensure_supported_pg_sync_format_version(Some(format))?;
+        crate::check_pg_volume_format(Some(format))?;
         client
             .execute(
                 "UPDATE metadata_state SET write_requirement = 1 WHERE vol = $1",
@@ -434,6 +434,96 @@ fn sql_i64(dsn: &str, sql: &str, volume: i64, text: Option<String>) -> Option<i6
         Ok(rows.first().map(|row| row.get::<_, i64>(0)))
     })
     .expect(sql)
+}
+
+#[test]
+#[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
+fn mount_policy_change_freezes_local_writer() {
+    let dsn = pg_dsn().expect("STUDIOFS_TEST_PG_DSN is required");
+    let schema = IsolatedPgSchema::new(&dsn);
+    let volume = PgTestVolume::new(schema.dsn(), "sfs1015-policy");
+    let vol = volume.volume_id;
+    let dir = studiofs_test_support::workspace_target_tempdir("test-");
+    let path = dir.path().join("meta.redb");
+    seed_local(&path, &volume.format_info());
+    let pg = PgMetaEngine::open_with_options(
+        &path,
+        PgOpenOptions {
+            background_poll: false,
+            ..Default::default()
+        },
+    )
+    .expect("open writer");
+    assert!(pg.pg_sync_status().allows_new_mutations());
+    let draft = pg.create_dir(ROOT_INO, b"draft", 0, 0, 0o755).unwrap();
+    let pending = pg.replication_backlog().pending_ops;
+    assert!(pending > 0);
+
+    let set_policy = |epoch: i64, write_requirement: u16| {
+        run_async(async {
+            let (mut client, connection) =
+                tokio_postgres::connect(schema.dsn(), tokio_postgres::NoTls)
+                    .await
+                    .map_err(|e| MetaError::Storage(pg_err(e)))?;
+            let connection = tokio::spawn(connection);
+            let tx = client.transaction().await.unwrap();
+            tx.execute(
+                "UPDATE volume_protocol SET policy_epoch = $2 WHERE vol = $1",
+                &[&vol, &epoch],
+            )
+            .await
+            .unwrap();
+            tx.execute(
+                "UPDATE metadata_state SET write_requirement = $2 WHERE vol = $1",
+                &[&vol, &(write_requirement as i16)],
+            )
+            .await
+            .unwrap();
+            tx.commit().await.unwrap();
+            connection.abort();
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            sql_i64(
+                schema.dsn(),
+                "SELECT publication_epoch FROM metadata_state WHERE vol = $1",
+                vol,
+                None
+            ),
+            Some(epoch)
+        );
+    };
+    let baseline = crate::version::SHARED_WRITE_REQUIREMENT.current;
+    set_policy(2, baseline + 1);
+    pg.sync_metadata()
+        .expect("read-compatible policy still syncs");
+    assert!(!pg.pg_sync_status().allows_new_mutations());
+    assert_eq!(
+        pg.pg_sync_status().lifecycle,
+        PgSyncLifecycle::ReadOnlyCompatible
+    );
+    assert_eq!(
+        pg.pg_sync_diagnostics().last_sync_error,
+        Some(PgSyncFailure::UpgradeRequired)
+    );
+    assert_eq!(pg.lookup(ROOT_INO, b"draft").unwrap().ino, draft.ino);
+    assert!(matches!(
+        pg.flush_metadata(),
+        Err(MetaError::UpgradeRequired {
+            reason: UpgradeRequiredReason::WriteRequirementNewer { .. }
+        })
+    ));
+    assert_eq!(pg.replication_backlog().pending_ops, pending);
+    let events = "SELECT count(*) FROM event_log WHERE vol = $1";
+    assert_eq!(sql_i64(schema.dsn(), events, vol, None), Some(0));
+
+    set_policy(3, baseline);
+    pg.sync_metadata().expect("revalidate restored policy");
+    assert!(pg.pg_sync_status().allows_new_mutations());
+    pg.flush_metadata().expect("publish retained event journal");
+    assert_eq!(pg.replication_backlog().pending_ops, 0);
+    assert!(sql_i64(schema.dsn(), events, vol, None).unwrap() > 0);
 }
 
 #[test]

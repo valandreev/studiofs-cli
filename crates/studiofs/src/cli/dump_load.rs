@@ -16,8 +16,8 @@ use studiofs_meta::version::{
 use studiofs_meta::volume_protocol::VolumeProtocol;
 use studiofs_meta::{
     BootstrapCheckpointDescriptor, CheckpointEncoding, MetaError, RedbMetaEngine,
-    connect_studiofs_postgres, decode_format_info, ensure_studiofs_database,
-    ensure_supported_pg_sync_format_version, open_meta_engine, validate_checkpoint_descriptor,
+    check_pg_volume_format, connect_studiofs_postgres, decode_format_info,
+    ensure_studiofs_database, open_meta_engine, validate_checkpoint_descriptor,
 };
 use thiserror::Error;
 
@@ -540,7 +540,7 @@ fn apply_dump(postgres_address: &str, dump: &MetadataDump) -> DumpLoadResult<i64
                 .map_err(|source| postgres_operation("lock load target format", source))?;
             let protocol = &dump.manifest.volume_protocol;
             if let Some(row) = &previous_state {
-                ensure_supported_pg_sync_format_version(row.get(0))?;
+                check_pg_volume_format(row.get(0))?;
                 let target = read_volume_protocol(&tx, target_vol).await?;
                 if target.requirements != protocol.requirements
                     || target.write_requirement != protocol.write_requirement
@@ -850,7 +850,7 @@ fn validate_manifest(dump: &MetadataDump, for_restore: bool) -> DumpLoadResult<(
 }
 
 fn validate_dump(dump: &MetadataDump) -> DumpLoadResult<()> {
-    ensure_supported_pg_sync_format_version(Some(dump.metadata_state_format_version))?;
+    check_pg_volume_format(Some(dump.metadata_state_format_version))?;
     decode_format_info(&dump.metadata_state_format_info)?;
     validate_checkpoint_descriptor(
         &dump.metadata_state_snapshot,

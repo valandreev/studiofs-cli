@@ -16,7 +16,8 @@ use crate::version::SHARED_WRITE_REQUIREMENT;
 use crate::volume_protocol::{ProtocolRejection, VolumeProtocol, check_update};
 
 const SELECT_PROTOCOL: &str = "
-    SELECT p.policy_epoch, m.write_requirement, p.requirements::TEXT
+    SELECT p.policy_epoch, m.write_requirement, p.requirements::TEXT,
+           m.metadata_format_version, m.version
     FROM metadata_state m LEFT JOIN volume_protocol p ON p.vol = m.vol
     WHERE m.vol = $1";
 
@@ -89,20 +90,43 @@ pub async fn read_volume_protocol<C>(client: &C, volume: i64) -> MetaResult<Volu
 where
     C: GenericClient + Sync,
 {
+    read_volume_policy_and_head(client, volume)
+        .await
+        .map(|(policy, _)| policy)
+}
+
+pub(super) async fn read_volume_policy_and_head<C: GenericClient + Sync>(
+    client: &C,
+    volume: i64,
+) -> MetaResult<(VolumeProtocol, i64)> {
     let row = client
         .query_opt(SELECT_PROTOCOL, &[&volume])
         .await
-        .map_err(|error| PgMetaEngine::classify_pg_error("read volume protocol", error))?;
+        .map_err(|error| match error.code().map(|code| code.code()) {
+            Some("42P01" | "42703") => MetaError::RepairRequired(
+                "PostgreSQL volume policy schema is incomplete. Stop mounts and run `studiofs upgrade --repair-schema`"
+                    .into(),
+            ),
+            _ => PgMetaEngine::classify_pg_error("read volume protocol", error),
+        })?;
     let Some(row) = row else {
         return Err(ProtocolRejection::Missing.into());
     };
-    let (Some(epoch), Some(requirements)) = (
-        row.get::<_, Option<i64>>(0),
-        row.get::<_, Option<String>>(2),
-    ) else {
+    let protocol = decode_volume_policy(row.get(3), row.get(0), row.get(1), row.get(2))?;
+    Ok((protocol, row.get(4)))
+}
+
+pub(super) fn decode_volume_policy(
+    format: Option<i16>,
+    epoch: Option<i64>,
+    write_requirement: i16,
+    requirements: Option<&str>,
+) -> MetaResult<VolumeProtocol> {
+    crate::check_pg_volume_format(format)?;
+    let (Some(epoch), Some(requirements)) = (epoch, requirements) else {
         return Err(ProtocolRejection::Missing.into());
     };
-    VolumeProtocol::decode(epoch, row.get(1), &requirements)
+    VolumeProtocol::decode(epoch, write_requirement, requirements)
 }
 
 /// Replaces the policy with `proposed` (its `epoch` is ignored) when the
@@ -230,7 +254,7 @@ where
     let Some(row) = row else {
         return ProtocolRejection::Missing.into();
     };
-    if let Err(error) = crate::ensure_supported_pg_sync_format_version(row.get(0)) {
+    if let Err(error) = crate::check_pg_volume_format(row.get(0)) {
         return error;
     }
     let found: i16 = row.get(1);
@@ -271,17 +295,14 @@ pub async fn check_volume_read_policy<C: GenericClient + Sync>(
     volume: i64,
     checkpoint: Option<&crate::BootstrapCheckpointDescriptor>,
 ) -> MetaResult<()> {
-    if checkpoint.is_none() {
-        let found = client
-            .query_opt(sql::SELECT_METADATA_FORMAT_VERSION, &[&volume])
-            .await
-            .map_err(|error| {
-                PgMetaEngine::classify_pg_error("read volume format for policy", error)
-            })?
-            .and_then(|row| row.get(0));
-        crate::ensure_supported_pg_sync_format_version(found)?;
-    }
     let protocol = read_volume_protocol(client, volume).await?;
+    check_read_operations(&protocol, checkpoint)
+}
+
+pub(super) fn check_read_operations(
+    protocol: &VolumeProtocol,
+    checkpoint: Option<&crate::BootstrapCheckpointDescriptor>,
+) -> MetaResult<()> {
     protocol.check_operations(
         VolumeRequirements::baseline(),
         checkpoint.map(|descriptor| {

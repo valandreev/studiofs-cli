@@ -566,7 +566,7 @@ pub(super) fn checkpoint_freshness_observation_from_row(
             error,
         )
     })?;
-    crate::ensure_supported_pg_sync_format_version(metadata_format_version)?;
+    crate::check_pg_volume_format(metadata_format_version)?;
 
     Ok(CheckpointFreshnessObservation {
         head_version,
@@ -826,11 +826,9 @@ impl PgMetaEngine {
     }
 
     pub(super) fn remote_metadata_head_version(&self) -> MetaResult<i64> {
-        let result = (|| {
-            self.ensure_remote_format_validated()?;
-            self.read_remote_metadata_head_version_unrecorded()
-        })();
-        self.record_remote_operation_result(result)
+        self.validate_remote_mount_policy(true)?.ok_or_else(|| {
+            MetaError::Storage("postgres mount policy observation is missing the head".into())
+        })
     }
 
     #[cfg(test)]
@@ -908,7 +906,7 @@ impl PgMetaEngine {
                             match current_session.stamp_checked(&tx, volume_id).await {
                                 Ok(()) => {}
                                 Err(error @ (super::client_sessions::StampError::SessionInactive
-                                    | super::client_sessions::StampError::PolicyStale)) => {
+                                    | super::client_sessions::StampError::PolicyStale { .. })) => {
                                     drop(tx);
                                     return Ok(Err((error, current_batches)));
                                 }
@@ -932,7 +930,7 @@ impl PgMetaEngine {
                                     &format!("{} FOR UPDATE", sql::SELECT_CHECKPOINT_FRESHNESS),
                                     &[&volume_id],
                                 ).await.map_err(|e| Self::classify_pg_error("lock retained publication", e))?;
-                                crate::ensure_supported_pg_sync_format_version(row.get::<_, Option<i16>>(6))?;
+                                crate::check_pg_volume_format(row.get::<_, Option<i16>>(6))?;
                                 if let Some(receipt) = tx.query_opt(
                                     "SELECT version FROM trash_publication_receipts WHERE vol=$1 AND digest=$2",
                                     &[&volume_id, digest],

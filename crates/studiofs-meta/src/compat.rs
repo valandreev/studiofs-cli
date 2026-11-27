@@ -409,6 +409,18 @@ impl CompatibilityDecision {
     }
 }
 
+pub(crate) fn volume_format_refusal(supported: VersionIdentity, found: u16) -> Option<ReasonCode> {
+    if supported.supports(found) {
+        None
+    } else if MIGRATABLE_VOLUME_FORMATS.contains(&found) {
+        Some(ReasonCode::VolumeFormatNeedsMigration)
+    } else if found > supported.current {
+        Some(ReasonCode::VolumeFormatNewer)
+    } else {
+        Some(ReasonCode::VolumeFormatUnsupported)
+    }
+}
+
 /// Decides every operation for `client` on `volume`. `local` maps the local
 /// store identities found on disk (by `VersionIdentity::name`) to their
 /// versions; it is empty for a fresh cache.
@@ -443,14 +455,7 @@ pub fn evaluate(
     };
 
     let format = volume.format;
-    if !client.volume_format.supports(format) {
-        let reason = if MIGRATABLE_VOLUME_FORMATS.contains(&format) {
-            ReasonCode::VolumeFormatNeedsMigration
-        } else if format > client.volume_format.current {
-            ReasonCode::VolumeFormatNewer
-        } else {
-            ReasonCode::VolumeFormatUnsupported
-        };
+    if let Some(reason) = volume_format_refusal(client.volume_format, format) {
         refuse(
             ALL,
             reason,

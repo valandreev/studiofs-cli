@@ -147,6 +147,7 @@ pub(super) const DELETE_SUPERSEDED_CHECKPOINT_ENCODINGS: &str = r#"
       AND checkpoint_version < $2
     "#;
 
+#[cfg(test)]
 pub(super) const SELECT_METADATA_FORMAT_VERSION: &str =
     "SELECT metadata_format_version FROM metadata_state WHERE vol = $1";
 
@@ -157,9 +158,11 @@ pub(super) const SELECT_PUBLICATION_GATES: &str = "
     FROM metadata_state WHERE vol = $1";
 
 pub(super) const SELECT_METADATA_REPLAY_STATE: &str = r#"
-    SELECT metadata_format_version, checkpoint_version, event_log_prune_floor, checkpoint_publication_state
-    FROM metadata_state
-    WHERE vol = $1
+    SELECT m.metadata_format_version, m.checkpoint_version, m.event_log_prune_floor,
+           m.checkpoint_publication_state, p.policy_epoch, m.write_requirement,
+           p.requirements::TEXT AS policy_requirements
+    FROM metadata_state m LEFT JOIN volume_protocol p ON p.vol = m.vol
+    WHERE m.vol = $1
     "#;
 
 pub(super) const ACQUIRE_METADATA_REPLAY_ADVISORY_LOCK: &str =
