@@ -1,6 +1,6 @@
 use super::{
-    DEFAULT_PG_EVENT_LOG_PRUNE_BATCHES, PG_EVENT_LOG_PRUNE_BATCHES_ENV_VAR, PgOpenOptions,
-    PgTestVolume, pg_dsn, run_async, seed_local, set_test_env,
+    DEFAULT_PG_EVENT_LOG_PRUNE_BATCHES, IsolatedPgSchema, PG_EVENT_LOG_PRUNE_BATCHES_ENV_VAR,
+    PgOpenOptions, PgTestVolume, pg_dsn, run_async, seed_local, set_test_env,
 };
 use crate::pg_engine::PgMetaEngine;
 use crate::pg_engine::event_log_pruning::{
@@ -82,6 +82,8 @@ fn event_log_prune_batch_limit_falls_back_for_invalid_environment_values() {
 #[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
 fn pg_event_log_prune_deletes_complete_batches_in_bounded_transactions() {
     let dsn = pg_dsn().expect("STUDIOFS_TEST_PG_DSN is required for this ignored test");
+    let schema = IsolatedPgSchema::new(&dsn);
+    let dsn = schema.dsn().to_owned();
     let _limit = set_test_env(PG_EVENT_LOG_PRUNE_BATCHES_ENV_VAR, "1");
     let volume = PgTestVolume::new(&dsn, "pg-event-log-prune-bounded");
     let dir = studiofs_test_support::workspace_target_tempdir("test-");
@@ -184,6 +186,8 @@ fn pg_event_log_prune_deletes_complete_batches_in_bounded_transactions() {
 #[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
 fn pg_event_log_prune_defers_when_its_lock_is_contended() {
     let dsn = pg_dsn().expect("STUDIOFS_TEST_PG_DSN is required for this ignored test");
+    let schema = IsolatedPgSchema::new(&dsn);
+    let dsn = schema.dsn().to_owned();
     let volume = PgTestVolume::new(&dsn, "pg-event-log-prune-contended");
     let dir = studiofs_test_support::workspace_target_tempdir("test-");
     let db = dir.path().join("meta.redb");
@@ -229,6 +233,8 @@ fn pg_event_log_prune_defers_when_its_lock_is_contended() {
 #[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
 fn pg_event_log_prune_preserves_retained_snapshot_source_events() {
     let dsn = pg_dsn().expect("STUDIOFS_TEST_PG_DSN is required for this ignored test");
+    let schema = IsolatedPgSchema::new(&dsn);
+    let dsn = schema.dsn().to_owned();
     let _limit = set_test_env(PG_EVENT_LOG_PRUNE_BATCHES_ENV_VAR, "64");
     let volume = PgTestVolume::new(&dsn, "pg-event-log-prune-snapshot");
     let dir = studiofs_test_support::workspace_target_tempdir("test-");

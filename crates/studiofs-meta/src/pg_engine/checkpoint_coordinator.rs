@@ -702,12 +702,21 @@ async fn publish_successor_encoding(
             reason: crate::CheckpointDescriptorFailure::EnvelopeIdentity,
         });
     }
-    tx.execute(
-        sql::DELETE_SUPERSEDED_CHECKPOINT_ENCODINGS,
-        &[&volume_id, &version, &format, &schema],
-    )
-    .await
-    .map_err(classify)?;
+    match super::volume_protocol::fence_maintenance(tx, volume_id).await {
+        Ok(()) => {
+            tx.execute(
+                sql::DELETE_SUPERSEDED_CHECKPOINT_ENCODINGS,
+                &[&volume_id, &version, &format, &schema],
+            )
+            .await
+            .map_err(classify)?;
+        }
+        // Publishing a new encoding is safe even if pruning must wait.
+        Err(MetaError::VolumeProtocolRejected(
+            crate::volume_protocol::ProtocolRejection::MaintenanceForbidden { .. },
+        )) => {}
+        Err(error) => return Err(error),
+    }
     Ok(())
 }
 

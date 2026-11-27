@@ -1017,6 +1017,59 @@ pub(super) const EVENT_PUBLICATION_FENCE_SQL: &str = r#"
         FOR EACH STATEMENT EXECUTE FUNCTION studiofs_fence_event_publication();
 "#;
 
+pub(super) const MAINTENANCE_FENCE_SQL: &str = r#"
+    CREATE OR REPLACE FUNCTION studiofs_fence_maintenance_claim()
+    RETURNS TRIGGER LANGUAGE plpgsql AS $$
+    DECLARE
+        volumes BIGINT[];
+        volume_id BIGINT;
+        epoch BIGINT;
+        required JSONB;
+        declared JSONB;
+    BEGIN
+        IF TG_OP = 'UPDATE' THEN
+            SELECT array_agg(DISTINCT n.vol ORDER BY n.vol) INTO volumes
+            FROM maintenance_claims n JOIN prior_claims o USING (vol, object_id)
+            WHERE n.state = 'delete_pending' AND n.reconcile_owner IS NOT NULL
+                AND ((n.state, n.reconcile_owner, n.reconcile_fence)
+                    IS DISTINCT FROM (o.state, o.reconcile_owner, o.reconcile_fence)
+                    OR n.reconcile_lease_expires_at >
+                        COALESCE(o.reconcile_lease_expires_at, '-infinity'::timestamptz));
+        ELSE
+            SELECT array_agg(DISTINCT vol ORDER BY vol) INTO volumes FROM maintenance_claims
+            WHERE state = 'delete_pending' AND reconcile_owner IS NOT NULL;
+        END IF;
+        FOREACH volume_id IN ARRAY COALESCE(volumes, ARRAY[]::BIGINT[]) LOOP
+            SELECT publication_epoch INTO epoch
+            FROM metadata_state WHERE vol = volume_id FOR SHARE;
+            SELECT requirements->'maintain' INTO required
+            FROM volume_protocol WHERE vol = volume_id AND policy_epoch = epoch;
+            declared := NULLIF(current_setting('studiofs.maintenance_capabilities', true), '')::jsonb;
+            IF epoch IS NULL OR epoch::text IS DISTINCT FROM current_setting('studiofs.maintenance_epoch', true)
+                OR required IS NULL OR declared IS NULL
+                OR NOT (declared @> required AND declared ? 'maintenance.payload_gc.v2')
+                OR (SELECT version FROM studiofs_schema_components WHERE component = 'payload_gc')
+                    IS DISTINCT FROM 2
+            THEN
+                RAISE EXCEPTION 'maintenance_forbidden: deletion claim requires current maintenance epoch and capabilities'
+                    USING ERRCODE = 'restrict_violation';
+            END IF;
+        END LOOP;
+        RETURN NULL;
+    END $$;
+
+    DROP TRIGGER IF EXISTS studiofs_maintenance_claim_insert_fence ON snapshot_payload_upload_objects;
+    CREATE TRIGGER studiofs_maintenance_claim_insert_fence
+        AFTER INSERT ON snapshot_payload_upload_objects
+        REFERENCING NEW TABLE AS maintenance_claims
+        FOR EACH STATEMENT EXECUTE FUNCTION studiofs_fence_maintenance_claim();
+    DROP TRIGGER IF EXISTS studiofs_maintenance_claim_update_fence ON snapshot_payload_upload_objects;
+    CREATE TRIGGER studiofs_maintenance_claim_update_fence
+        AFTER UPDATE ON snapshot_payload_upload_objects
+        REFERENCING OLD TABLE AS prior_claims NEW TABLE AS maintenance_claims
+        FOR EACH STATEMENT EXECUTE FUNCTION studiofs_fence_maintenance_claim();
+"#;
+
 /// Version of the payload GC queue, sweep-checkpoint and upload-fence schema
 /// that this binary creates and that the CLI Janitor requires before deleting.
 pub const PAYLOAD_GC_SCHEMA_VERSION: i32 =

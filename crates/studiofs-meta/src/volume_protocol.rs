@@ -92,6 +92,17 @@ pub struct VolumeProtocol {
 /// Why a policy change or a stored policy was rejected.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ProtocolRejection {
+    /// An operation requires a maintenance capability this binary lacks.
+    #[error("maintenance_forbidden: {reason} ({capability})")]
+    MaintenanceForbidden {
+        /// Stable compatibility reason.
+        reason: &'static str,
+        /// Required capability or version identity.
+        capability: String,
+    },
+    /// Previously admitted remote maintenance must drain before activation.
+    #[error("maintenance is in progress; retry the policy change after it drains")]
+    MaintenanceInProgress,
     /// The volume has no policy record.
     #[error("the volume has no protocol policy; run `studiofs upgrade NAME` to create it")]
     Missing,

@@ -348,8 +348,8 @@ evidence that must exist before the gate closes.
 | `discover` refuses an unsupported format with a typed reason before any local write | planned CLI tests (SFS-1013) |
 | Snapshot mount, cleanup and re-verify refuse an artifact version they cannot decode with a typed reason | planned snapshot tests (SFS-1013, SFS-1016) |
 | `load` refuses an unsupported dump version with a typed reason before any DDL or write | planned dump/load tests (SFS-1013) |
-| Janitor, GC, snapshot cleanup and pruning declare a maintenance capability that a backend guard checks before any deletion | planned maintenance-guard tests (SFS-1016) |
-| The deletion-claim trigger compares the Janitor's GUC with the volume's current format or capability, so a 0.2.3/0.2.4 Janitor is rejected on a format 7 volume | planned PostgreSQL trigger tests (SFS-1132, SFS-1016) |
+| A stale epoch or missing maintenance capability preserves payload claims, snapshot sources, event history and the sweep cursor | `cargo test -p studiofs-meta --lib pg_maintenance_ -- --ignored` and `cargo test -p studiofs --bin studiofs live_cli_maintenance_refusal -- --ignored` |
+| The deletion-claim trigger checks the current policy epoch and required maintenance capabilities alongside the volume format and payload GC schema version | `cargo test -p studiofs-meta --lib pg_maintenance_stale_claim -- --ignored` |
 | A database-wide Contract is refused while any volume in the database still needs the object | planned cutover tests (SFS-1017) |
 | The operator report and Activate preflight list, per volume, the sessions that would be fenced and whether pending 0.2.5 work survives Activate | planned report tests and operator documentation (SFS-1018) |
 | A mount revalidates the policy epoch after reconnect and keeps unpublished local work when publication is refused | planned lifecycle tests (SFS-1015) |

@@ -527,23 +527,21 @@ serving checkpoint used for live mounts.
   `snapshot_payload_sweep_checkpoints`, `snapshot_payload_upload_watermarks`
   (`crates/studiofs-meta/src/pg_engine/schema.rs:543` onward), versioned as the
   `payload_gc` component (SFS-980).
-- Existing fences: the claim statement first runs
-  `CLAIM_PUBLICATION_FENCE_SQL`, which sets the transaction GUC
-  `studiofs.deletion_format = '6'` under a share lock on `metadata_state`
-  (`crates/studiofs-meta/src/pg_engine/janitor.rs:1089`). The trigger
-  `studiofs_fence_legacy_deletion_claim` rejects a deletion claim on a volume
-  with `metadata_format_version >= 6` when that GUC is not `'6'`
-  (`crates/studiofs-meta/src/pg_engine/schema.rs:574`,
-  `crates/studiofs-meta/src/pg_engine/schema.rs:575`). The GUC is compared
-  with the constant `'6'`, so a 0.2.3 or 0.2.4 Janitor passes the trigger on a
-  format 7 volume; only the app-side format check
-  (`crates/studiofs-meta/src/pg_engine/janitor.rs:571`) fences it. SFS-1132 and
-  SFS-1016 must make the trigger compare the GUC with the volume's current
-  format or maintenance capability, not a constant. The schema probe
-  requires the exact component version and enabled guards
-  (`crates/studiofs-meta/src/pg_engine/janitor.rs:60`).
-  `upgrade_shared_format5` takes the Janitor advisory lock and requires settled
-  deletion owners (`crates/studiofs-meta/src/pg_engine/format_upgrade.rs:20`).
+- Existing fences: `fence_maintenance` locks `metadata_state`, checks the
+  volume policy and sets the transaction-local maintenance epoch and capability
+  GUCs before destructive SQL. The deletion-claim trigger checks them against
+  the current policy and the `payload_gc` version alongside the volume-format
+  trigger. CLI and mounted Janitors require the recorded component version and
+  enabled deletion guards before starting.
+- A change to required maintenance capabilities returns a retryable policy
+  refusal while a Janitor holds the per-volume lock or a snapshot or payload
+  deletion claim remains unsettled. A compatible worker can recover an
+  expired claim before retrying activation. This protects S3 work admitted
+  before the new policy takes effect.
+  Snapshot cleanup rechecks policy on claim, renewal and finalization. Event
+  pruning checks it under the lock that protects the replay floor. Compatible
+  checkpoint publication can retain superseded encodings until an authorized
+  worker can prune them.
 - Successor may change: raise `payload_gc`, which fences 0.2.5 Janitors through
   the exact-version probe. That is fail-closed but blocks GC on every volume in
   the database until all Janitors are upgraded.
@@ -601,7 +599,7 @@ successor can fence it safely. "Current state" is what `main` does today.
 | Publication checks a per-volume field that a successor can raise at Activate, in the same UPDATE as the version bump. | Present (SFS-1007): `BUMP_METADATA_VERSION` checks `write_requirement <= SHARED_WRITE_REQUIREMENT.current` beside the format predicate (`crates/studiofs-meta/src/pg_engine/sql.rs`); the read gate `metadata_format_version` is separate. | [SFS-1007](https://linear.app/valandreev/issue/SFS-1007) |
 | A refused volume-settings publication reports a typed reason, like event publication. | Present (SFS-1007): both paths call `refused_publication` (`crates/studiofs-meta/src/pg_engine/volume_protocol.rs`), which returns `UnsupportedFormatVersion` or `UpgradeRequired` (`write_requirement_newer`). | [SFS-1007](https://linear.app/valandreev/issue/SFS-1007) |
 | Every publication stamps its session and policy epoch so the backend can reject stale writers. | Implemented. The PostgreSQL version-bump predicate checks the stamped epoch and the event insert trigger verifies the current session and fencing token. | [SFS-1014](https://linear.app/valandreev/issue/SFS-1014), [SFS-1008](https://linear.app/valandreev/issue/SFS-1008) |
-| Destructive maintenance sets a maintenance capability GUC before deleting. | Partial: Janitor claims set `studiofs.deletion_format` (`crates/studiofs-meta/src/pg_engine/janitor.rs:1089`); snapshot cleanup, event-log pruning and checkpoint pruning set none. | [SFS-1016](https://linear.app/valandreev/issue/SFS-1016) |
+| Destructive maintenance sets a maintenance capability GUC before deleting. | Payload claims, snapshot cleanup and shared event/checkpoint pruning use the transaction-bound epoch and capability check. | [SFS-1016](https://linear.app/valandreev/issue/SFS-1016) |
 | Unknown required capabilities fail closed with a typed reason. | Present in the pure evaluator (SFS-1004): `compat::evaluate` refuses unknown required capabilities, unknown safety-critical optional ones, unknown events and payload formats with stable reason codes. Not wired into mount, replay or publication until the volume policy and enforcement land. | [SFS-1004](https://linear.app/valandreev/issue/SFS-1004) |
 | Unknown event tags fail closed with a typed reason. | Present: replay preserves `UpgradeRequired` with `UnsupportedEventReason` and leaves the durable cursor at its last applied position. | [SFS-1009](https://linear.app/valandreev/issue/SFS-1009) |
 | Unknown checkpoint formats fail closed with a typed reason. | Tagged serving checkpoints and retained sources report unsupported format or schema separately from invalid bytes or a missing compatible cut. | [SFS-1011](https://linear.app/valandreev/issue/SFS-1011) |

@@ -531,6 +531,7 @@ pub(crate) async fn request_snapshot_delete_in_transaction<C>(
 where
     C: GenericClient + Sync,
 {
+    super::volume_protocol::fence_maintenance(client, volume_id).await?;
     let snapshot_id_text = snapshot_id.to_string();
     let row = client
         .query_opt(

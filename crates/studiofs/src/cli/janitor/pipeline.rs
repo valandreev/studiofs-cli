@@ -72,6 +72,7 @@ pub(super) fn classify_error(error: &anyhow::Error) -> JanitorFailureClass {
         if let Some(error) = cause.downcast_ref::<JanitorMetadataError>() {
             return match error {
                 JanitorMetadataError::UnsafeToDelete(_)
+                | JanitorMetadataError::Policy(_)
                 | JanitorMetadataError::SchemaUnavailable(_) => JanitorFailureClass::Terminal,
                 // A lost connection or fenced-out claim leaves durable state to a later cycle.
                 JanitorMetadataError::BackendUnavailable(_) | JanitorMetadataError::StaleClaim => {

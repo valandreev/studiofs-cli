@@ -243,6 +243,8 @@ fn pruned_deletion_fences_stay_fenced_below_the_payload_watermark() {
     let Some(dsn) = pg_dsn() else {
         return;
     };
+    let schema = IsolatedPgSchema::new(&dsn);
+    let dsn = schema.dsn().to_owned();
     let volume = PgTestVolume::new(&dsn, "snapshot-reachability-fence-prune");
     let dir = studiofs_test_support::workspace_target_tempdir("test-");
     let db_path = dir.path().join("meta.redb");
@@ -259,19 +261,19 @@ fn pruned_deletion_fences_stay_fenced_below_the_payload_watermark() {
     let sql = |statement: String| {
         let dsn = dsn.clone();
         run_async(async move {
-            let (client, connection) = tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
+            let (mut client, connection) = tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
                 .await
                 .expect("connect to test postgres");
             let connection_task = tokio::spawn(connection);
-            // Fixture rows model a current-format claimer.
-            client
-                .batch_execute("SELECT set_config('studiofs.deletion_format', '6', false), set_config('studiofs.deletion_volume_format', '7', false)")
+            let tx = client
+                .transaction()
                 .await
-                .expect("declare current deletion capability");
-            client
-                .execute(&statement, &[&volume_id])
+                .expect("begin fixture transaction");
+            crate::pg_engine::volume_protocol::fence_maintenance(&tx, volume_id).await?;
+            tx.execute(&statement, &[&volume_id])
                 .await
                 .expect("run fixture statement");
+            tx.commit().await.expect("commit fixture statement");
             connection_task.abort();
             Ok::<_, MetaError>(())
         })

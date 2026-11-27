@@ -37,6 +37,7 @@ pub const CLIENT_SESSIONS_COMPONENT: &str = "client_sessions";
 pub(super) const CHECKPOINT_ENCODINGS_COMPONENT: &str = "checkpoint_encodings";
 pub(super) const FORMAT_FENCES_COMPONENT: &str = "format_fences";
 pub(super) const EVENT_PUBLICATION_FENCE_COMPONENT: &str = "event_publication_fence";
+pub(super) const MAINTENANCE_FENCE_COMPONENT: &str = "maintenance_fence";
 
 /// Recorded by the baseline itself and checked exactly by the CLI Janitor.
 const PAYLOAD_GC_COMPONENT: &str = "payload_gc";
@@ -183,6 +184,14 @@ const EVENT_PUBLICATION_FENCE: Migration = Migration {
     sql: super::schema::EVENT_PUBLICATION_FENCE_SQL,
 };
 
+const MAINTENANCE_FENCE: Migration = Migration {
+    component: MAINTENANCE_FENCE_COMPONENT,
+    version: 1,
+    name: "fence destructive maintenance claims",
+    phase: MigrationPhase::Additive,
+    sql: super::schema::MAINTENANCE_FENCE_SQL,
+};
+
 /// Test-successor change (SFS-1131): one additive table that 0.2.5 ignores.
 #[cfg(feature = "test-successor")]
 const SUCCESSOR_PROBE: Migration = Migration {
@@ -204,6 +213,7 @@ pub const MIGRATIONS: &[Migration] = &[
     CHECKPOINT_ENCODINGS,
     FORMAT_FENCES,
     EVENT_PUBLICATION_FENCE,
+    MAINTENANCE_FENCE,
 ];
 /// Every migration this binary knows, grouped by component in version order.
 #[cfg(feature = "test-successor")]
@@ -214,6 +224,7 @@ pub const MIGRATIONS: &[Migration] = &[
     CHECKPOINT_ENCODINGS,
     FORMAT_FENCES,
     EVENT_PUBLICATION_FENCE,
+    MAINTENANCE_FENCE,
 ];
 
 /// A `studiofs_schema_components` row.
@@ -499,6 +510,7 @@ fn with_repair(
         CLIENT_SESSIONS,
         CHECKPOINT_ENCODINGS,
         EVENT_PUBLICATION_FENCE,
+        MAINTENANCE_FENCE,
     ] {
         let at_v1 = recorded
             .iter()
@@ -662,6 +674,7 @@ mod tests {
                 CORE_COMPONENT,
                 EVENT_PUBLICATION_FENCE_COMPONENT,
                 FORMAT_FENCES_COMPONENT,
+                MAINTENANCE_FENCE_COMPONENT,
             ]
         );
         for (component, versions) in &by_component {

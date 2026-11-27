@@ -25,6 +25,72 @@ const INSERT_HISTORY: &str = "
     INSERT INTO volume_protocol_history (vol, policy_epoch, write_requirement, requirements, changed_by)
     VALUES ($1, $2, $3, $4::TEXT::JSONB, $5)";
 
+pub(super) async fn check_maintenance_policy<C: GenericClient + Sync>(
+    client: &C,
+    volume: i64,
+) -> MetaResult<()> {
+    evaluate_maintenance(&read_volume_protocol(client, volume).await?)
+}
+
+fn evaluate_maintenance(policy: &VolumeProtocol) -> MetaResult<()> {
+    let mut requirements = VolumeRequirements::baseline();
+    policy.apply_to(&mut requirements);
+    let decision = crate::compat::evaluate(
+        &ClientCapabilities::current(),
+        &requirements,
+        &Default::default(),
+    );
+    if let Some(refusal) = decision.refusal(Operation::Maintenance) {
+        return Err(ProtocolRejection::MaintenanceForbidden {
+            reason: refusal.reason.as_str(),
+            capability: refusal.subject.clone(),
+        }
+        .into());
+    }
+    Ok(())
+}
+
+/// The caller owns the transaction. The locked metadata row supplies the
+/// epoch. If we waited behind activation, the joined policy can come from an
+/// older statement snapshot, so re-read it under the acquired lock.
+pub(super) async fn fence_maintenance<C: GenericClient + Sync>(
+    tx: &C,
+    volume: i64,
+) -> MetaResult<()> {
+    let classify = |error| PgMetaEngine::classify_pg_error("fence maintenance", error);
+    let capabilities: Vec<&str> = ClientCapabilities::current().maintain.into_iter().collect();
+    let row = tx
+        .query_opt(
+            "WITH locked AS MATERIALIZED (
+             SELECT vol, publication_epoch, write_requirement, metadata_format_version
+             FROM metadata_state WHERE vol = $1 FOR SHARE
+         )
+         SELECT m.publication_epoch, p.policy_epoch, m.write_requirement,
+                p.requirements::text, m.metadata_format_version,
+                set_config('studiofs.maintenance_epoch', m.publication_epoch::text, true),
+                set_config('studiofs.maintenance_capabilities', to_jsonb($2::text[])::text, true),
+                set_config('studiofs.deletion_format', '6', true),
+                set_config('studiofs.deletion_volume_format', $3, true)
+         FROM locked m LEFT JOIN volume_protocol p ON p.vol = m.vol",
+            &[
+                &volume,
+                &capabilities,
+                &crate::version::SHARED_VOLUME_FORMAT.current.to_string(),
+            ],
+        )
+        .await
+        .map_err(classify)?
+        .ok_or(ProtocolRejection::Missing)?;
+    let epoch: i64 = row.get(0);
+    let policy_epoch: Option<i64> = row.get(1);
+    let policy = if policy_epoch != Some(epoch) {
+        read_volume_protocol(tx, volume).await?
+    } else {
+        decode_volume_policy(row.get(4), policy_epoch, row.get(2), row.get(3))?
+    };
+    evaluate_maintenance(&policy)
+}
+
 fn epoch_i64(epoch: u64) -> MetaResult<i64> {
     i64::try_from(epoch).map_err(|_| MetaError::Storage("volume policy epoch overflow".into()))
 }
@@ -183,6 +249,41 @@ pub async fn update_volume_protocol(
     }
     if !check_update(&current, proposed, actor)? {
         return Ok(current);
+    }
+    if current.requirements.maintain != proposed.requirements.maintain {
+        // Janitors hold this lock across S3 requests. Try it without waiting
+        // because Janitors acquire it before taking the metadata row lock.
+        let idle: bool = tx
+            .query_one(
+                "SELECT pg_try_advisory_xact_lock($1)",
+                &[&super::janitor::pg_janitor_lock_key(volume)],
+            )
+            .await
+            .map_err(failed)?
+            .get(0);
+        if !idle {
+            return Err(ProtocolRejection::MaintenanceInProgress.into());
+        }
+        // Artifact cleanup uses a separate lease. Claims and renewals take
+        // the metadata share lock, so no lease can start or extend past this check.
+        // Lease expiry permits retry but does not prove that a remote DELETE drained.
+        let leased: bool = tx
+            .query_one(
+                "SELECT EXISTS (
+                    SELECT 1 FROM snapshot_cleanup_leases
+                    WHERE vol = $1 AND owner <> ''
+                 ) OR EXISTS (
+                    SELECT 1 FROM snapshot_payload_upload_objects
+                    WHERE vol = $1 AND state = 'delete_pending' AND reconcile_owner IS NOT NULL
+                 )",
+                &[&volume],
+            )
+            .await
+            .map_err(failed)?
+            .get(0);
+        if leased {
+            return Err(ProtocolRejection::MaintenanceInProgress.into());
+        }
     }
     let next = VolumeProtocol {
         epoch: current

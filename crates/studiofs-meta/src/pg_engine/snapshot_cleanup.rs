@@ -30,6 +30,9 @@ fn lease_millis(lease_for: Duration) -> Result<i64, SnapshotPortError> {
 
 fn map_error(operation: &'static str, error: MetaError) -> SnapshotPortError {
     match &error {
+        MetaError::VolumeProtocolRejected(
+            crate::volume_protocol::ProtocolRejection::MaintenanceForbidden { reason, .. },
+        ) => SnapshotPortError::permanent(reason, &error.to_string()),
         MetaError::Storage(message) if message == STALE_LEASE => {
             SnapshotPortError::permanent("stale_lease", "snapshot cleanup lease is no longer owned")
         }
@@ -114,6 +117,7 @@ impl SnapshotCleanupStore for PgMetaEngine {
                             .transaction()
                             .await
                             .map_err(|_| pg_failure("begin snapshot cleanup claim"))?;
+                        super::volume_protocol::fence_maintenance(&tx, volume_id).await?;
                         let expired_row = tx
                             .query_opt(
                                 "SELECT c.id
@@ -230,7 +234,10 @@ impl SnapshotCleanupStore for PgMetaEngine {
                 "renew snapshot cleanup lease",
                 |client| {
                     Box::pin(async move {
-                        let row = client
+                        let tx = client.transaction().await
+                            .map_err(|_| pg_failure("begin snapshot cleanup renewal"))?;
+                        super::volume_protocol::fence_maintenance(&tx, volume_id).await?;
+                        let row = tx
                             .query_opt(
                                 "UPDATE snapshot_cleanup_leases SET lease_expires_at = clock_timestamp() + ($5::bigint * interval '1 millisecond'), renewed_at = clock_timestamp() WHERE vol = $1 AND snapshot_id = $2 AND owner = $3 AND fencing_token = $4 AND lease_expires_at > clock_timestamp() RETURNING lease_expires_at, fencing_token",
                                 &[
@@ -244,6 +251,8 @@ impl SnapshotCleanupStore for PgMetaEngine {
                             .await
                             .map_err(|_| pg_failure("renew snapshot cleanup lease"))?
                             .ok_or_else(|| MetaError::Storage(STALE_LEASE.to_string()))?;
+                        tx.commit().await
+                            .map_err(|_| pg_failure("commit snapshot cleanup renewal"))?;
                         let mut renewed = claim;
                         renewed.lease.expires_at = row.get(0);
                         renewed.lease.fencing_token = row.get(1);
@@ -313,6 +322,7 @@ impl SnapshotCleanupStore for PgMetaEngine {
                             .transaction()
                             .await
                             .map_err(|_| pg_failure("begin snapshot finalization"))?;
+                        super::volume_protocol::fence_maintenance(&tx, volume_id).await?;
                         let lifecycle = tx
                             .query_opt(
                                 "SELECT lifecycle FROM snapshot_catalog WHERE vol = $1 AND id = $2 FOR UPDATE",

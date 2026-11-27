@@ -235,12 +235,80 @@ async fn connection(
     Ok((client, tokio::spawn(connection)))
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires local STUDIOFS_TEST_PG_DSN and a live STUDIOFS_S3_* bucket"]
+async fn live_cli_maintenance_refusal_preserves_object_and_cursor() -> anyhow::Result<()> {
+    use studiofs_meta::compat::ClientCapabilities;
+    use studiofs_meta::pg_engine::{read_volume_protocol, update_volume_protocol};
+    use studiofs_meta::volume_protocol::FeatureState;
+
+    let stack = LiveStack::start()?;
+    let id = object_id(0)?;
+    let prefix = format!("sfs1016/{id:016x}/objects/");
+    seed_live_object(&stack, &prefix, id).await?;
+    let meta_dir = stack.root.join("meta/janitor-live");
+    let (volume, _, _) = create_live_postgres_janitor_fixture(
+        stack.postgres.dsn(),
+        &stack.s3(&prefix),
+        &meta_dir,
+        id,
+    )
+    .await?;
+    let (mut client, task) = connection(&stack).await?;
+    client
+        .execute(
+            "INSERT INTO snapshot_payload_sweep_checkpoints
+         (vol, schema_version, volume_uuid, endpoint, bucket, data_prefix, listing_strategy)
+         SELECT vol, 1, uuid, $2, $3, $4, 'start_after' FROM volumes WHERE vol = $1",
+            &[&volume, &stack.endpoint, &stack.bucket, &prefix],
+        )
+        .await?;
+    let before = durable_janitor_state(&client, volume).await?;
+
+    let capability = "maintenance.payload_gc.v3";
+    let mut actor = ClientCapabilities::current();
+    actor.maintain.insert(capability);
+    let mut policy = read_volume_protocol(&client, volume).await?;
+    for state in [
+        FeatureState::Available,
+        FeatureState::Compatible,
+        FeatureState::Required,
+    ] {
+        policy
+            .requirements
+            .features
+            .insert(capability.to_owned(), state);
+        if state == FeatureState::Required {
+            policy.requirements.maintain.insert(capability.to_owned());
+        }
+        let tx = client.transaction().await?;
+        policy = update_volume_protocol(&tx, volume, policy.epoch, &policy, &actor, "test").await?;
+        tx.commit().await?;
+    }
+
+    let output = stack.cli(&cli_args(false, 1), &stack.root)?;
+    assert!(!output.status.success());
+    assert!(
+        [&output.stderr, &output.stdout]
+            .iter()
+            .any(|bytes| String::from_utf8_lossy(bytes).contains("maintenance_capability_missing"))
+    );
+    assert_eq!(durable_janitor_state(&client, volume).await?, before);
+    let writer = stack.writer()?;
+    for key in object_keys(&prefix, id) {
+        assert_eq!(writer.read(&key).await?.to_vec(), b"janitor fixture");
+        writer.delete(&key).await?;
+    }
+    task.abort();
+    Ok(())
+}
+
 async fn seed_protection_matrix(
     stack: &LiveStack,
     volume_id: i64,
     base: u64,
 ) -> anyhow::Result<()> {
-    let (client, task) = connection(stack).await?;
+    let (mut client, task) = connection(stack).await?;
     let current = i64::try_from(base)?;
     client
         .execute(
@@ -257,19 +325,24 @@ async fn seed_protection_matrix(
         ).await?;
     }
 
-    // Leased rows model a current claimer, which both deletion fences admit.
-    client
-        .batch_execute("SELECT set_config('studiofs.deletion_format', '6', false), set_config('studiofs.deletion_volume_format', '7', false)")
+    // Leased rows model a current claimer at the fixture's active epoch.
+    let tx = client.transaction().await?;
+    tx.query_one(
+        "SELECT set_config('studiofs.deletion_format', '6', true),
+                set_config('studiofs.deletion_volume_format', '7', true),
+                set_config('studiofs.maintenance_epoch', publication_epoch::text, true),
+                set_config('studiofs.maintenance_capabilities', to_jsonb(ARRAY[$2::text])::text, true)
+         FROM metadata_state WHERE vol = $1",
+        &[&volume_id, &studiofs_meta::compat::CAP_MAINTENANCE_PAYLOAD_GC_V2],
+    )
         .await?;
     for (offset, lease) in [(11_i64, "5 minutes"), (12, "-5 minutes")] {
-        client.execute(
+        tx.execute(
             "INSERT INTO snapshot_payload_upload_objects (vol, object_id, state, reconcile_owner, reconcile_lease_expires_at, created_at) VALUES ($1, $2, 'delete_pending', 'fixture-reconciler', clock_timestamp() + $3::text::interval, clock_timestamp() - interval '1 hour')",
             &[&volume_id, &(i64::try_from(base)? + offset), &lease],
         ).await?;
     }
-    client
-        .batch_execute("RESET studiofs.deletion_format; RESET studiofs.deletion_volume_format")
-        .await?;
+    tx.commit().await?;
 
     for (offset, lifecycle) in [
         (3_i64, "creating"),

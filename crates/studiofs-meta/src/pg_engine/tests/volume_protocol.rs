@@ -50,6 +50,100 @@ const HISTORY: &str = "SELECT count(*) FROM volume_protocol_history WHERE vol = 
 
 #[test]
 #[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
+fn pg_maintenance_stale_claim_is_rejected() {
+    let dsn = pg_dsn().expect("STUDIOFS_TEST_PG_DSN is required");
+    let schema = IsolatedPgSchema::new(&dsn);
+    let volume = PgTestVolume::new(schema.dsn(), "maintenance-stale");
+    run_async(async {
+        let (mut client, connection) =
+            tokio_postgres::connect(schema.dsn(), tokio_postgres::NoTls)
+                .await
+                .map_err(|error| MetaError::Storage(pg_err(error)))?;
+        let _connection = tokio::spawn(connection);
+        let vol = volume.volume_id;
+        let capability = "maintenance.payload_gc.v3";
+        let baseline = read_volume_protocol(&client, vol).await?;
+        let mut available = baseline.clone();
+        available.requirements.features.insert(capability.to_owned(), FeatureState::Available);
+        let available = update(&mut client, vol, baseline.epoch, &available).await?;
+        let mut successor = ClientCapabilities::current();
+        successor.maintain.insert(capability);
+        let mut compatible = available.clone();
+        compatible.requirements.features.insert(capability.to_owned(), FeatureState::Compatible);
+        let prepare = client.transaction().await.unwrap();
+        let compatible = update_volume_protocol(&prepare, vol, available.epoch, &compatible, &successor, "test")
+            .await?;
+        prepare.commit().await.unwrap();
+        let mut next = compatible.clone();
+        next.requirements.features.insert(capability.to_owned(), FeatureState::Required);
+        next.requirements.maintain.insert(capability.to_owned());
+        update(&mut client, vol, compatible.epoch, &next).await
+            .expect_err("baseline cannot activate a capability it lacks");
+        let activation = client.transaction().await.unwrap();
+        let active = update_volume_protocol(&activation, vol, compatible.epoch, &next, &successor, "test")
+            .await?;
+        let (mut worker, worker_connection) =
+            tokio_postgres::connect(schema.dsn(), tokio_postgres::NoTls)
+                .await
+                .map_err(|error| MetaError::Storage(pg_err(error)))?;
+        let _worker_connection = tokio::spawn(worker_connection);
+        let pid: i32 = worker.query_one("SELECT pg_backend_pid()", &[]).await.unwrap().get(0);
+        let waiting = worker.transaction().await.unwrap();
+        let (decision, ()) = tokio::time::timeout(Duration::from_secs(15), async {
+            tokio::join!(
+                crate::pg_engine::volume_protocol::fence_maintenance(&waiting, vol),
+                async {
+                    loop {
+                        let blocked: bool = activation.query_one(
+                            "SELECT pg_backend_pid() = ANY(pg_blocking_pids($1))",
+                            &[&pid],
+                        ).await.unwrap().get(0);
+                        if blocked {
+                            break;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                    activation.commit().await.unwrap();
+                },
+            )
+        }).await.expect("worker did not wait behind policy activation");
+        assert!(matches!(
+            decision,
+            Err(MetaError::VolumeProtocolRejected(ProtocolRejection::MaintenanceForbidden { .. }))
+        ));
+        waiting.rollback().await.unwrap();
+
+        let claim_sql =
+            "INSERT INTO snapshot_payload_upload_objects
+             (vol, object_id, state, reconcile_owner, reconcile_fence)
+             VALUES ($1, 42, 'delete_pending', 'stale', 1)";
+        let baseline_capabilities: Vec<_> = ClientCapabilities::current().maintain.into_iter().collect();
+        let successor_capabilities: Vec<_> = successor.maintain.into_iter().collect();
+        for (epoch, capabilities) in [
+            ("".to_owned(), &Vec::new()),
+            (compatible.epoch.to_string(), &successor_capabilities),
+            (active.epoch.to_string(), &baseline_capabilities),
+        ] {
+            let stale = client.transaction().await.unwrap();
+            stale.query_one(
+                "SELECT set_config('studiofs.deletion_format', '6', true),
+                        set_config('studiofs.deletion_volume_format', '7', true),
+                        set_config('studiofs.maintenance_epoch', $1, true),
+                        set_config('studiofs.maintenance_capabilities', to_jsonb($2::text[])::text, true)",
+                &[&epoch, capabilities],
+            ).await.unwrap();
+            let error = stale.execute(claim_sql, &[&vol]).await
+                .expect_err("stale maintenance claim succeeded");
+            assert_eq!(error.code(), Some(&tokio_postgres::error::SqlState::RESTRICT_VIOLATION));
+            stale.rollback().await.unwrap();
+        }
+        assert_eq!(scalar(&client, "SELECT count(*) FROM snapshot_payload_upload_objects WHERE vol = $1", vol).await, 0);
+        Ok(())
+    }).unwrap();
+}
+
+#[test]
+#[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
 fn volume_protocol_policy_and_write_requirement_on_live_postgres() {
     let dsn = pg_dsn().expect("STUDIOFS_TEST_PG_DSN is required for this explicit test");
     let schema = IsolatedPgSchema::new(&dsn);

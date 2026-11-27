@@ -140,6 +140,8 @@ fn janitor_session_fences_object_deletion_claims() {
     let Some(dsn) = pg_dsn() else {
         return;
     };
+    let schema = IsolatedPgSchema::new(&dsn);
+    let dsn = schema.dsn().to_owned();
     let dir = studiofs_test_support::workspace_target_tempdir("test-");
     let db_path = dir.path().join("meta.redb");
     let volume = PgTestVolume::new(&dsn, "pg-janitor-claims");
@@ -1216,7 +1218,10 @@ fn pg_janitor_sweep_checkpoint_restart_scope_dry_run_and_version() {
 #[test]
 #[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
 fn janitor_refuses_missing_interrupted_drifted_or_unsupported_gc_schema() {
-    use crate::pg_engine::schema::{PAYLOAD_GC_SCHEMA_VERSION, studiofs_pg_schema_sql};
+    use crate::pg_engine::schema::{
+        EVENT_PUBLICATION_FENCE_SQL, MAINTENANCE_FENCE_SQL, PAYLOAD_GC_SCHEMA_VERSION,
+        studiofs_pg_schema_sql,
+    };
     let dsn = pg_dsn().expect("STUDIOFS_TEST_PG_DSN is required for this explicit test");
     let schema = IsolatedPgSchema::new(&dsn);
     let isolated_dsn = schema.dsn().to_owned();
@@ -1288,7 +1293,7 @@ fn janitor_refuses_missing_interrupted_drifted_or_unsupported_gc_schema() {
 
     {
         // Empty database: nothing deployed.
-        lock_refused("SQLSTATE 42P01");
+        lock_refused("sqlstate=42P01");
 
         // Interrupted application: the final marker insert fails, and the
         // single-transaction batch leaves no partial GC table behind.
@@ -1302,16 +1307,30 @@ fn janitor_refuses_missing_interrupted_drifted_or_unsupported_gc_schema() {
             ),
             0
         );
-        lock_refused("SQLSTATE 42P01");
+        lock_refused("sqlstate=42P01");
         sql("DROP VIEW studiofs_schema_components".to_owned()).expect("remove the conflict");
 
         // Retry and repeatable application on empty and populated databases.
         sql(studiofs_pg_schema_sql().to_owned()).expect("first application");
         sql(format!(
-            "{} INSERT INTO volumes (vol, name, uuid, block_size) VALUES ({volume_id}, 'sfs980', 'sfs980', 8192);",
+            "{} {EVENT_PUBLICATION_FENCE_SQL} {MAINTENANCE_FENCE_SQL}
+             INSERT INTO volumes (vol, name, uuid, block_size) VALUES ({volume_id}, 'sfs980', 'sfs980', 8192);
+             INSERT INTO metadata_state (vol, metadata_format_version, version, snapshot,
+                 checkpoint_sha256, checkpoint_publication_state, checkpoint_generation)
+             VALUES ({volume_id}, 7, 0, ''::bytea, decode(repeat('00', 32), 'hex'), 'pending', 0);",
             crate::pg_engine::client_sessions::SCHEMA
         ))
-        .expect("deploy session registry and volume");
+        .expect("deploy session registry, maintenance guards and volume");
+        run_async(async {
+            let (client, connection) =
+                tokio_postgres::connect(&isolated_dsn, tokio_postgres::NoTls)
+                    .await
+                    .map_err(|error| MetaError::Storage(pg_err(error)))?;
+            let _task = tokio::spawn(connection);
+            crate::pg_engine::insert_initial_volume_protocol(&client, volume_id, "test fixture")
+                .await
+        })
+        .expect("seed baseline protocol policy");
         verdict().expect("deployed schema is accepted");
         sql(format!(
             "INSERT INTO snapshot_payload_gc_candidates (vol, object_id) VALUES ({volume_id}, 7); \

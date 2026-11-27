@@ -93,6 +93,9 @@ pub struct JanitorSweepScope<'a> {
 /// A categorized error from the standalone janitor's read-only metadata gate.
 #[derive(Debug, thiserror::Error)]
 pub enum JanitorMetadataError {
+    /// The current shared policy refuses this maintenance operation.
+    #[error(transparent)]
+    Policy(#[from] crate::volume_protocol::ProtocolRejection),
     /// The available metadata does not prove that deletion is safe.
     #[error("unsafe_to_delete: {0}")]
     UnsafeToDelete(&'static str),
@@ -213,10 +216,13 @@ impl JanitorMetadataSession {
     /// The lock is released again when the deployed payload GC schema is
     /// missing, incomplete or of another version, so no cycle runs against it.
     pub fn try_acquire_global_janitor_lock(&mut self) -> Result<bool, JanitorMetadataError> {
-        let acquired = self
-            .postgres
-            .try_acquire_global_janitor_lock()
-            .map_err(|_| pg_backend_unavailable())?;
+        let acquired =
+            self.postgres
+                .try_acquire_global_janitor_lock()
+                .map_err(|error| match error {
+                    crate::MetaError::VolumeProtocolRejected(reason) => reason.into(),
+                    _ => pg_backend_unavailable(),
+                })?;
         if acquired && let Err(error) = self.postgres.verify_payload_gc_schema() {
             // The schema verdict matters more than a failed unlock; closing the
             // session drops the advisory lock either way.

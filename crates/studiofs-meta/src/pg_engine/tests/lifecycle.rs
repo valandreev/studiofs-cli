@@ -1631,6 +1631,8 @@ fn test_pg_retained_restore_purge_conflict_preserves_local_loser() {
 #[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
 fn test_format6_upgrade_fences_old_publication_and_deletion_claims() {
     let dsn = pg_dsn().expect("STUDIOFS_TEST_PG_DSN is required");
+    let schema = IsolatedPgSchema::new(&dsn);
+    let dsn = schema.dsn().to_owned();
     let volume = PgTestVolume::new(&dsn, "format6-upgrade");
     let mut legacy = volume.format_info();
     legacy.format_version = 5;
@@ -1655,8 +1657,12 @@ fn test_format6_upgrade_fences_old_publication_and_deletion_claims() {
         let _ = connection_task.await;
         // A claim made by old code before the transition must block it, even
         // when its lease expired; an S3 request may still be in flight.
+        client.batch_execute("ALTER TABLE snapshot_payload_upload_objects DISABLE TRIGGER studiofs_maintenance_claim_insert_fence").await
+            .map_err(|error| MetaError::Storage(pg_err(error)))?;
         client.execute("INSERT INTO snapshot_payload_upload_objects(vol,object_id,state,reconcile_owner,reconcile_lease_expires_at,reconcile_fence) VALUES($1,7001,'delete_pending','old-owner',now()-interval '1 hour',1)", &[&volume_id]).await
             .map_err(|error| MetaError::Storage(error.to_string()))?;
+        client.batch_execute("ALTER TABLE snapshot_payload_upload_objects ENABLE TRIGGER studiofs_maintenance_claim_insert_fence").await
+            .map_err(|error| MetaError::Storage(pg_err(error)))?;
         assert!(super::super::format_upgrade::upgrade_shared_format5(&mut client, volume_id, &volume_uuid).await.is_err());
         let row = client.query_one("SELECT metadata_format_version FROM metadata_state WHERE vol=$1", &[&volume_id]).await
             .map_err(|error| MetaError::Storage(error.to_string()))?;
@@ -1672,9 +1678,9 @@ fn test_format6_upgrade_fences_old_publication_and_deletion_claims() {
         ).await
             .map_err(|error| MetaError::Storage(error.to_string()))?.is_none());
         assert!(client.execute("UPDATE snapshot_payload_upload_objects SET reconcile_owner='old-owner',reconcile_fence=2 WHERE vol=$1 AND object_id=7001", &[&volume_id]).await.is_err());
+        super::super::format_upgrade::upgrade_shared_format6(&mut client, volume_id, &volume_uuid).await?;
         let tx = client.transaction().await.map_err(|error| MetaError::Storage(error.to_string()))?;
-        tx.query_one(super::super::janitor::CLAIM_PUBLICATION_FENCE_SQL, &[&volume_id]).await
-            .map_err(|error| MetaError::Storage(error.to_string()))?;
+        super::super::volume_protocol::fence_maintenance(&tx, volume_id).await?;
         assert_eq!(tx.execute("UPDATE snapshot_payload_upload_objects SET reconcile_owner='new-owner',reconcile_fence=2 WHERE vol=$1 AND object_id=7001", &[&volume_id]).await
             .map_err(|error| MetaError::Storage(error.to_string()))?, 1);
         tx.rollback().await.map_err(|error| MetaError::Storage(error.to_string()))?;
