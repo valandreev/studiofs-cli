@@ -2,11 +2,12 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tokio_postgres::{GenericClient, Transaction};
+use tokio_postgres::{GenericClient, Row, Transaction, types::ToSql};
 use uuid::Uuid;
 
 use super::PgMetaEngine;
 use super::runtime::PgConnectionPool;
+use super::{sql, volume_protocol::PUBLICATION_WRITE_REQUIREMENT};
 use crate::client_sessions::{ClientSession, SessionCapabilities};
 use crate::compat::{ClientCapabilities, Operation, VolumeRequirements};
 use crate::engine::{MetaError, MetaResult};
@@ -115,31 +116,6 @@ const PRUNE_EXPIRED: &str = "
     WHERE s.vol = expired.vol AND s.session_id = expired.session_id
       -- Rechecked on the latest row version so a concurrent renewal survives.
       AND s.lease_expires_at < observed.now_ts - ($2::INT * interval '1 second')";
-
-const STAMP: &str = "
-    WITH observed AS MATERIALIZED (SELECT clock_timestamp() AS now_ts),
-    locked AS MATERIALIZED (
-        SELECT policy_epoch, lease_expires_at FROM client_sessions
-        WHERE vol = $1 AND session_id = $2 AND owner = $3 AND fencing_token = $4
-        FOR SHARE
-    ),
-    current_policy AS MATERIALIZED (
-        SELECT COALESCE((SELECT policy_epoch FROM volume_protocol WHERE vol = $1), 0) AS epoch
-    )
-    SELECT locked.lease_expires_at > observed.now_ts AS lease_active,
-           locked.policy_epoch = current_policy.epoch AS policy_current,
-           CASE WHEN locked.lease_expires_at > observed.now_ts
-                     AND locked.policy_epoch = current_policy.epoch
-                THEN set_config('studiofs.session_id', $2, true) END,
-           CASE WHEN locked.lease_expires_at > observed.now_ts
-                     AND locked.policy_epoch = current_policy.epoch
-                THEN set_config('studiofs.policy_epoch', locked.policy_epoch::TEXT, true) END,
-           CASE WHEN locked.lease_expires_at > observed.now_ts
-                     AND locked.policy_epoch = current_policy.epoch
-                THEN set_config('studiofs.session_fencing_token', $4::BIGINT::TEXT, true) END,
-           locked.policy_epoch,
-           current_policy.epoch
-    FROM locked CROSS JOIN observed CROSS JOIN current_policy";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum SessionRole {
@@ -535,33 +511,94 @@ impl SessionLease {
         tx: &Transaction<'_>,
         volume: i64,
     ) -> Result<(), StampError> {
-        let row = tx
-            .query_opt(
-                STAMP,
-                &[&volume, &self.owner.id, &self.owner.owner, &self.token],
+        self.stamp_query(
+            tx,
+            sql::STAMP_PUBLICATION_SESSION,
+            &[
+                &volume,
+                &self.owner.id,
+                &self.owner.owner,
+                &self.token,
+                &self.validated_epoch,
+            ],
+        )
+        .await
+        .map(|_| ())
+    }
+
+    pub(super) async fn stamp_and_bump(
+        &self,
+        tx: &Transaction<'_>,
+        volume: i64,
+        format: i16,
+        payload_bytes: i64,
+    ) -> Result<Option<Row>, StampError> {
+        let row = self
+            .stamp_query(
+                tx,
+                sql::STAMP_AND_BUMP_METADATA_VERSION,
+                &[
+                    &volume,
+                    &self.owner.id,
+                    &self.owner.owner,
+                    &self.token,
+                    &self.validated_epoch,
+                    &format,
+                    &payload_bytes,
+                    &PUBLICATION_WRITE_REQUIREMENT,
+                ],
             )
+            .await?;
+        Ok(row.get::<_, Option<i64>>(0).map(|_| row))
+    }
+
+    pub(super) async fn stamp_and_lock_retained(
+        &self,
+        tx: &Transaction<'_>,
+        volume: i64,
+    ) -> Result<Option<Row>, StampError> {
+        let row = self
+            .stamp_query(
+                tx,
+                sql::STAMP_AND_LOCK_RETAINED_PUBLICATION,
+                &[
+                    &volume,
+                    &self.owner.id,
+                    &self.owner.owner,
+                    &self.token,
+                    &self.validated_epoch,
+                ],
+            )
+            .await?;
+        Ok(row.get::<_, Option<i64>>(0).map(|_| row))
+    }
+
+    async fn stamp_query(
+        &self,
+        tx: &Transaction<'_>,
+        query: &str,
+        params: &[&(dyn ToSql + Sync)],
+    ) -> Result<Row, StampError> {
+        let row = tx
+            .query_opt(query, params)
             .await
             .map_err(|error| {
                 StampError::Other(classify_session_pg_error(
-                    "stamp publication session",
+                    "stamp publication session and check publication state",
                     error,
                 ))
             })?
             .ok_or(StampError::SessionInactive)?;
-        let lease_active: bool = row.get(0);
-        if !lease_active {
+        if !row.get::<_, bool>("lease_active") {
             return Err(StampError::SessionInactive);
         }
-        let policy_current: bool = row.get(1);
-        // A concurrent renewal may have stamped a newer epoch than the policy
-        // this lease carries; publication must negotiate against the stamped one.
-        if !policy_current || row.get::<_, i64>(5) != self.validated_epoch {
+        if !row.get::<_, bool>("policy_current") {
             return Err(StampError::PolicyStale {
                 expected: self.validated_epoch,
-                found: row.get(6),
+                found: row.get("current_epoch"),
             });
         }
-        Ok(())
+        Ok(row)
     }
 
     pub(super) async fn stamp(&self, tx: &Transaction<'_>, volume: i64) -> MetaResult<()> {

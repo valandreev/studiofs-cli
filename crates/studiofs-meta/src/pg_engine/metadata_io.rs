@@ -904,8 +904,26 @@ impl PgMetaEngine {
                                 .await
                                 .map_err(|e| Self::classify_pg_error("postgres begin tx failed", e))?;
 
-                            match current_session.stamp_checked(&tx, volume_id).await {
-                                Ok(()) => {}
+                            let first_batch = current_batches.first().ok_or_else(|| {
+                                MetaError::Storage("encoded event batches unexpectedly empty".into())
+                            })?;
+                            let publishable = crate::events::ensure_publishable(
+                                current_batches.iter().flat_map(|batch| &batch.events),
+                                current_session.protocol(),
+                            );
+                            // Negotiate every event before writing. The SQL stamp accepts
+                            // exactly the epoch that this encoding check used.
+                            let first_row = if publishable.is_err() {
+                                current_session.stamp_checked(&tx, volume_id).await.map(|()| None)
+                            } else if current_retained_digest.is_some() {
+                                current_session.stamp_and_lock_retained(&tx, volume_id).await
+                            } else {
+                                current_session.stamp_and_bump(
+                                    &tx, volume_id, expected_metadata_format_version, first_batch.payload_bytes,
+                                ).await
+                            };
+                            let mut first_row = match first_row {
+                                Ok(row) => row,
                                 Err(error @ (super::client_sessions::StampError::SessionInactive
                                     | super::client_sessions::StampError::PolicyStale { .. })) => {
                                     drop(tx);
@@ -914,23 +932,18 @@ impl PgMetaEngine {
                                 Err(super::client_sessions::StampError::Other(error)) => {
                                     return Err(error);
                                 }
-                            }
-                            // The stamp pinned the policy epoch; refuse before any write
-                            // so the caller keeps the whole batch as local work.
-                            crate::events::ensure_publishable(
-                                current_batches.iter().flat_map(|batch| &batch.events),
-                                current_session.protocol(),
-                            )?;
+                            };
+                            publishable?;
+
                             let mut last_batch_version = None;
                             let mut retained_locked = std::collections::HashMap::new();
                             let mut last_observation = None;
                             if let Some(digest) = &current_retained_digest {
-                                // Serialize receipt lookup with publication. A lost response
-                                // retries the whole transaction without replaying namespace data.
-                                let row = tx.query_one(
-                                    &format!("{} FOR UPDATE", sql::SELECT_CHECKPOINT_FRESHNESS),
-                                    &[&volume_id],
-                                ).await.map_err(|e| Self::classify_pg_error("lock retained publication", e))?;
+                                // After locking, a fresh statement snapshot must see any
+                                // receipt committed by the previous lock holder.
+                                let row = first_row.take().ok_or_else(|| {
+                                    MetaError::Storage("lock retained publication: metadata state missing".into())
+                                })?;
                                 crate::check_pg_volume_format(row.get::<_, Option<i16>>(6))?;
                                 if let Some(receipt) = tx.query_opt(
                                     "SELECT version FROM trash_publication_receipts WHERE vol=$1 AND digest=$2",
@@ -942,8 +955,11 @@ impl PgMetaEngine {
                                     return Ok(Ok((version, observation)));
                                 }
                             }
-                            for batch in &current_batches {
-                                let batch_version_row = tx
+                            for (index, batch) in current_batches.iter().enumerate() {
+                                let batch_version_row = if index == 0 && current_retained_digest.is_none() {
+                                    first_row.take()
+                                } else {
+                                    tx
                                     .query_opt(
                                         sql::BUMP_METADATA_VERSION,
                                         &[
@@ -959,7 +975,8 @@ impl PgMetaEngine {
                                             "postgres metadata_state bump failed",
                                             e,
                                         )
-                                    })?;
+                                    })?
+                                };
                                 let Some(batch_version_row) = batch_version_row else {
                                     let error =
                                         super::volume_protocol::refused_publication(&tx, volume_id).await;

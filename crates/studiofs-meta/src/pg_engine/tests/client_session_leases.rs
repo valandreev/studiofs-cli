@@ -2,7 +2,7 @@ use super::*;
 use crate::engine::UpgradeRequiredReason;
 use crate::pg_engine::client_sessions::{
     HeartbeatError, INACTIVE_SESSION_RETENTION_SECONDS, REFRESH_IO_HOOK, SessionOwner, SessionRole,
-    prune_expired_client_sessions,
+    StampError, prune_expired_client_sessions,
 };
 use crate::pg_engine::{
     PublicationSession, insert_initial_volume_protocol, read_client_sessions,
@@ -53,7 +53,35 @@ fn client_session_leases_fence_expired_generations_on_live_postgres() {
         assert!(!read_client_sessions(&client, vol).await?[0].active);
         let tx = client.transaction().await.expect("begin stale publication");
         assert!(original_lease.stamp(&tx, vol).await.is_err());
+        assert!(matches!(
+            original_lease.stamp_and_bump(&tx, vol, 7, 0).await,
+            Err(StampError::SessionInactive)
+        ));
         tx.rollback().await.expect("rollback stale publication");
+
+        client.batch_execute(
+            "CREATE FUNCTION cancel_session_renewal() RETURNS trigger LANGUAGE plpgsql AS $$
+             BEGIN
+                 RAISE EXCEPTION USING ERRCODE = '57014', MESSAGE = 'cancel session renewal';
+             END $$;
+             CREATE TRIGGER cancel_session_renewal AFTER UPDATE ON client_sessions
+             FOR EACH ROW EXECUTE FUNCTION cancel_session_renewal();",
+        ).await.expect("install renewal cancellation");
+        let error = owner
+            .heartbeat(&client, vol, Some(initial.fencing_token), SessionRole::Mount)
+            .await
+            .err()
+            .expect("renewal was cancelled");
+        assert!(error.into_meta_error().to_string().contains("57014"));
+        let cancelled = read_client_sessions(&client, vol).await?.pop().unwrap();
+        assert!(!cancelled.active);
+        assert_eq!(cancelled.fencing_token, initial.fencing_token);
+        assert_eq!(cancelled.policy_epoch, initial.policy_epoch);
+        assert_eq!(cancelled.heartbeat_at, initial.heartbeat_at);
+        client.batch_execute(
+            "DROP TRIGGER cancel_session_renewal ON client_sessions;
+             DROP FUNCTION cancel_session_renewal();",
+        ).await.expect("remove renewal cancellation");
 
         let (renewed_lease, _) = owner
             .heartbeat(
@@ -216,15 +244,32 @@ fn client_session_leases_validate_policy_epoch_and_role_capabilities() {
         // Stamping before revalidating epoch 2 is rejected as stale.
         let tx = client.transaction().await.expect("begin stale epoch tx");
         assert!(mount_lease.stamp(&tx, vol).await.is_err());
+        assert!(matches!(
+            mount_lease.stamp_and_bump(&tx, vol, 7, 0).await,
+            Err(StampError::PolicyStale { expected: 1, found: 2 })
+        ));
         tx.rollback().await.expect("rollback stale epoch tx");
 
+        let stale_lease = mount_lease.clone();
         let (mount_lease, mount_err) = mount
             .heartbeat(&client, vol, Some(mount_lease.token()), SessionRole::Mount)
             .await
             .map_err(HeartbeatError::into_meta_error)?;
         assert!(mount_err.is_none());
         assert_eq!(mount_lease.policy_epoch(), 2);
+        assert_eq!(stale_lease.token(), mount_lease.token());
         let tx = client.transaction().await.expect("begin epoch 2 tx");
+        // Renewal updated the row in place. The old epoch still cannot bump.
+        assert!(matches!(
+            stale_lease.stamp_and_bump(&tx, vol, 7, 0).await,
+            Err(StampError::PolicyStale { expected: 1, found: 2 })
+        ));
+        let head: i64 = tx
+            .query_one(sql::SELECT_METADATA_VERSION, &[&vol])
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(head, 0);
         mount_lease.stamp(&tx, vol).await?;
         let stamped_epoch: String = tx
             .query_one("SELECT current_setting('studiofs.policy_epoch')", &[])
@@ -976,17 +1021,42 @@ fn event_publication_fence_requires_current_stamp_per_volume() {
             .get(0);
         assert_eq!(head, 0);
 
+        let (lease, policy_error) = SessionOwner::new()
+            .heartbeat(&client, vol, None, SessionRole::Mount)
+            .await
+            .map_err(HeartbeatError::into_meta_error)?;
+        assert!(policy_error.is_none());
         let tx = client.transaction().await.unwrap();
-        let session = PublicationSession::begin(&tx, vol).await?;
+        tx.execute(
+            "UPDATE metadata_state SET write_requirement = 2 WHERE vol = $1",
+            &[&vol],
+        )
+        .await
+        .unwrap();
         assert!(
-            tx.query_opt(sql::BUMP_METADATA_VERSION, &[&vol, &7_i16, &0_i64, &1_i16])
+            lease
+                .stamp_and_bump(&tx, vol, 7, 0)
                 .await
                 .unwrap()
-                .is_some()
+                .is_none()
         );
+        assert!(matches!(
+            crate::pg_engine::volume_protocol::refused_publication(&tx, vol).await,
+            MetaError::UpgradeRequired {
+                reason: UpgradeRequiredReason::WriteRequirementNewer {
+                    found: 2,
+                    supported: 1
+                }
+            }
+        ));
+        tx.rollback().await.unwrap();
+
+        let tx = client.transaction().await.unwrap();
+        let bumped = lease.stamp_and_bump(&tx, vol, 7, 0).await.unwrap().unwrap();
+        assert_eq!(bumped.get::<_, i64>(0), 1);
         assert_eq!(tx.execute(insert, &[&vol]).await.unwrap(), 1);
-        session.finish(&tx, vol).await?;
         tx.commit().await.unwrap();
+        lease.release(&client, vol).await?;
         assert!(
             client.execute(insert, &[&vol]).await.is_err(),
             "stamp leaked across transactions"
@@ -1089,8 +1159,12 @@ fn event_publication_fence_rechecks_epoch_after_waiting_for_activation() {
             .await
             .unwrap()
             .get(0);
+        let (lease, policy_error) = SessionOwner::new()
+            .heartbeat(&writer, vol, None, SessionRole::Mount)
+            .await
+            .map_err(HeartbeatError::into_meta_error)?;
+        assert!(policy_error.is_none());
         let publication = writer.transaction().await.unwrap();
-        let _session = PublicationSession::begin(&publication, vol).await?;
 
         let activation = activator.transaction().await.unwrap();
         let mut next = read_volume_protocol(&activation, vol).await?;
@@ -1102,7 +1176,6 @@ fn event_publication_fence_rechecks_epoch_after_waiting_for_activation() {
 
         // The unchanged write requirement and metadata format still admit the
         // old UPDATE. Force its statement snapshot to precede activation COMMIT.
-        let args: &[&(dyn tokio_postgres::types::ToSql + Sync)] = &[&vol, &7_i16, &10_i64, &1_i16];
         let wait_then_activate = async {
             loop {
                 let waiting: bool = activation
@@ -1122,7 +1195,7 @@ fn event_publication_fence_rechecks_epoch_after_waiting_for_activation() {
         };
         let (bumped, ()) = tokio::time::timeout(std::time::Duration::from_secs(10), async {
             tokio::join!(
-                publication.query_opt(sql::BUMP_METADATA_VERSION, args),
+                lease.stamp_and_bump(&publication, vol, 7, 10),
                 wait_then_activate
             )
         })
