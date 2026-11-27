@@ -1027,7 +1027,24 @@ pub(super) const MAINTENANCE_FENCE_SQL: &str = r#"
         required JSONB;
         declared JSONB;
     BEGIN
-        IF TG_OP = 'UPDATE' THEN
+        IF TG_OP = 'DELETE' THEN
+            -- Exclude cascades initiated by deletion of a volume.
+            SELECT array_agg(DISTINCT p.vol ORDER BY p.vol) INTO volumes
+            FROM prior_claims p JOIN volumes USING (vol);
+        ELSIF TG_TABLE_NAME = 'metadata_state' THEN
+            volumes := ARRAY[NEW.vol];
+        ELSIF TG_TABLE_NAME = 'snapshot_cleanup_leases' THEN
+            IF TG_OP = 'UPDATE' THEN
+                SELECT array_agg(DISTINCT n.vol ORDER BY n.vol) INTO volumes
+                FROM maintenance_claims n JOIN prior_claims o USING (vol, snapshot_id)
+                WHERE n.owner <> ''
+                    AND ((n.owner, n.fencing_token) IS DISTINCT FROM (o.owner, o.fencing_token)
+                        OR n.lease_expires_at > o.lease_expires_at);
+            ELSE
+                SELECT array_agg(DISTINCT vol ORDER BY vol) INTO volumes FROM maintenance_claims
+                WHERE owner <> '';
+            END IF;
+        ELSIF TG_OP = 'UPDATE' THEN
             SELECT array_agg(DISTINCT n.vol ORDER BY n.vol) INTO volumes
             FROM maintenance_claims n JOIN prior_claims o USING (vol, object_id)
             WHERE n.state = 'delete_pending' AND n.reconcile_owner IS NOT NULL
@@ -1042,16 +1059,29 @@ pub(super) const MAINTENANCE_FENCE_SQL: &str = r#"
         FOREACH volume_id IN ARRAY COALESCE(volumes, ARRAY[]::BIGINT[]) LOOP
             SELECT publication_epoch INTO epoch
             FROM metadata_state WHERE vol = volume_id FOR SHARE;
+            -- Checkpoint rows also cascade when their metadata parent is removed.
+            IF TG_OP = 'DELETE' AND TG_TABLE_NAME = 'serving_checkpoint_encodings'
+                AND epoch IS NULL THEN
+                CONTINUE;
+            END IF;
             SELECT requirements->'maintain' INTO required
             FROM volume_protocol WHERE vol = volume_id AND policy_epoch = epoch;
             declared := NULLIF(current_setting('studiofs.maintenance_capabilities', true), '')::jsonb;
+            -- Pre-fence clients may still run the newly guarded operations
+            -- under the baseline policy. Take the row lock even for that
+            -- path so a concurrent activation sees the committed lease.
+            IF TG_TABLE_NAME <> 'snapshot_payload_upload_objects' AND declared IS NULL
+                AND required = '["maintenance.payload_gc.v2"]'::jsonb
+            THEN
+                CONTINUE;
+            END IF;
             IF epoch IS NULL OR epoch::text IS DISTINCT FROM current_setting('studiofs.maintenance_epoch', true)
                 OR required IS NULL OR declared IS NULL
                 OR NOT (declared @> required AND declared ? 'maintenance.payload_gc.v2')
                 OR (SELECT version FROM studiofs_schema_components WHERE component = 'payload_gc')
                     IS DISTINCT FROM 2
             THEN
-                RAISE EXCEPTION 'maintenance_forbidden: deletion claim requires current maintenance epoch and capabilities'
+                RAISE EXCEPTION 'maintenance_forbidden: operation requires current maintenance epoch and capabilities'
                     USING ERRCODE = 'restrict_violation';
             END IF;
         END LOOP;
@@ -1068,6 +1098,31 @@ pub(super) const MAINTENANCE_FENCE_SQL: &str = r#"
         AFTER UPDATE ON snapshot_payload_upload_objects
         REFERENCING OLD TABLE AS prior_claims NEW TABLE AS maintenance_claims
         FOR EACH STATEMENT EXECUTE FUNCTION studiofs_fence_maintenance_claim();
+
+    DROP TRIGGER IF EXISTS studiofs_maintenance_cleanup_insert_fence ON snapshot_cleanup_leases;
+    CREATE TRIGGER studiofs_maintenance_cleanup_insert_fence
+        AFTER INSERT ON snapshot_cleanup_leases
+        REFERENCING NEW TABLE AS maintenance_claims
+        FOR EACH STATEMENT EXECUTE FUNCTION studiofs_fence_maintenance_claim();
+    DROP TRIGGER IF EXISTS studiofs_maintenance_cleanup_update_fence ON snapshot_cleanup_leases;
+    CREATE TRIGGER studiofs_maintenance_cleanup_update_fence
+        AFTER UPDATE ON snapshot_cleanup_leases
+        REFERENCING OLD TABLE AS prior_claims NEW TABLE AS maintenance_claims
+        FOR EACH STATEMENT EXECUTE FUNCTION studiofs_fence_maintenance_claim();
+
+    DROP TRIGGER IF EXISTS studiofs_maintenance_event_prune_fence ON event_log;
+    CREATE TRIGGER studiofs_maintenance_event_prune_fence
+        AFTER DELETE ON event_log REFERENCING OLD TABLE AS prior_claims
+        FOR EACH STATEMENT EXECUTE FUNCTION studiofs_fence_maintenance_claim();
+    DROP TRIGGER IF EXISTS studiofs_maintenance_checkpoint_prune_fence ON serving_checkpoint_encodings;
+    CREATE TRIGGER studiofs_maintenance_checkpoint_prune_fence
+        AFTER DELETE ON serving_checkpoint_encodings REFERENCING OLD TABLE AS prior_claims
+        FOR EACH STATEMENT EXECUTE FUNCTION studiofs_fence_maintenance_claim();
+    DROP TRIGGER IF EXISTS studiofs_maintenance_prune_floor_fence ON metadata_state;
+    CREATE TRIGGER studiofs_maintenance_prune_floor_fence
+        AFTER UPDATE OF event_log_prune_floor ON metadata_state
+        FOR EACH ROW WHEN (NEW.event_log_prune_floor > OLD.event_log_prune_floor)
+        EXECUTE FUNCTION studiofs_fence_maintenance_claim();
 "#;
 
 /// Version of the payload GC queue, sweep-checkpoint and upload-fence schema

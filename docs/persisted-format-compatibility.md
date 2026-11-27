@@ -529,23 +529,28 @@ serving checkpoint used for live mounts.
   `payload_gc` component (SFS-980).
 - Existing fences: `fence_maintenance` locks `metadata_state`, checks the
   volume policy and sets the transaction-local maintenance epoch and capability
-  GUCs before destructive SQL. The deletion-claim trigger checks them against
-  the current policy and the `payload_gc` version alongside the volume-format
-  trigger. CLI and mounted Janitors require the recorded component version and
-  enabled deletion guards before starting.
+  GUCs before destructive SQL. PostgreSQL checks them on payload deletion
+  claims, snapshot cleanup lease acquisition and renewal, replay and serving
+  checkpoint deletes, and replay floor advances. The newly guarded operations
+  accept pre-fence workers under the baseline maintenance policy. An expanded
+  maintenance requirement fences those workers for that volume. The guards
+  leave foreground mount, read, write and delete behavior for in-window
+  clients governed by their existing policies. CLI and mounted Janitors require
+  the recorded `payload_gc` component version and enabled deletion guards.
 - A change to required maintenance capabilities returns a retryable policy
-  refusal while a Janitor holds the per-volume lock or a snapshot or payload
-  deletion claim remains unsettled. A compatible worker can recover an
-  expired claim before retrying activation. This protects S3 work admitted
-  before the new policy takes effect.
-  Snapshot cleanup rechecks policy on claim, renewal and finalization. Event
-  pruning checks it under the lock that protects the replay floor. Compatible
+  refusal while a Janitor holds the per-volume lock or a snapshot cleanup or
+  payload deletion lease remains live. Expired leases and owners without a
+  live lease permit activation. The epoch fence applies when work is claimed
+  or renewed. A cancelled or timed-out S3 DELETE sent before activation can
+  still reach the object store afterward because the request can outlive its
+  lease. Its target was proven unreachable under the old policy. Compatible
   checkpoint publication can retain superseded encodings until an authorized
   worker can prune them.
 - Successor may change: raise `payload_gc`, which fences 0.2.5 Janitors through
   the exact-version probe. That is fail-closed but blocks GC on every volume in
   the database until all Janitors are upgraded.
-- Fail-closed outcome: `MaintenanceForbidden` before any S3 DELETE. Owner:
+- Fail-closed outcome: `MaintenanceForbidden` on a new claim or renewal
+  under incompatible policy. Owner:
   [SFS-1016](https://linear.app/valandreev/issue/SFS-1016).
 
 ## Existing mechanisms to extend, not duplicate

@@ -12,20 +12,26 @@ Clients lacking a newly required maintenance capability must stop deleting share
 - [x] (2026-11-27) Reproduced a stale payload claim on PostgreSQL after activating a successor-only maintenance capability.
 - [x] (2026-11-27) Added transaction-bound checks for payload, snapshot and replay maintenance.
 - [x] (2026-11-27) Verified PostgreSQL policy fencing, replay retention and schema migration repair, plus CLI refusal and recovery on RustFS.
+- [x] (2026-11-27) Extended the PostgreSQL fence to cleanup leases, replay pruning, serving checkpoint pruning and replay floor advances. Added live regressions for pre-fence SQL and expired owners.
+- [x] (2026-11-27) Passed eight focused PostgreSQL tests, the maintenance compatibility unit test, the RustFS-backed CLI refusal test, and the metadata Clippy and formatting checks on the review fixes.
 
 ## Surprises & Discoveries
 
 The format-only deletion trigger accepted a stale client's claim after the policy epoch advanced. The RED test failed with `stale maintenance claim succeeded`. The configured RustFS proxy refused the first connection. A process-local proxy exception for the configured host reached the test service.
 
+The review regression failed with `MaintenanceInProgress` when an expired lease still had an owner. The same test now activates the policy with that owner recorded and verifies that unstamped maintenance SQL leaves the lease, replay floor and retained rows intact.
+
 ## Decision Log
 
 Reuse the metadata state row and transaction-local settings to order maintenance against activation, following publication. On a lock wait the epoch on the current metadata row can be newer than the joined policy snapshot. The worker rereads the policy after acquiring the row lock in that case. The server checks each volume in a batch against the epoch, declared maintenance capabilities and payload GC component version.
 
-Changing the required maintenance set requires the existing Janitor lock and settled snapshot or payload deletion claims. An expired claim can be recovered by a compatible worker. Expiry alone cannot prove that an admitted S3 request drained.
+Changing the required maintenance set requires the existing Janitor lock and the absence of live snapshot or payload deletion leases. Expired and abandoned owners permit activation. The epoch fence applies on claim and renewal. A cancelled or timed-out S3 DELETE sent before activation may still reach the object store afterward. Its target was proven unreachable under the old policy.
+
+The existing database fence also checks cleanup lease acquisition and renewal, event log and serving checkpoint deletion, and replay floor advances. Pre-fence workers keep baseline maintenance behavior on these paths until the volume requires additional maintenance capabilities. Foreground operations continue to use their existing compatibility rules.
 
 ## Outcomes & Retrospective
 
-The PostgreSQL regression refuses a worker that waited behind policy activation and a claim stamped with an older epoch. The snapshot and replay regression verifies preserved snapshot sources and replay rows. The CLI refused maintenance without changing its sweep cursor or the RustFS object. Compatible CLI scenarios verified dry-run and budget handling, protected-object retention, deletion and restart recovery. Mounted filesystem acceptance and throughput measurements were outside this validation.
+The PostgreSQL regression refuses a worker that waited behind policy activation and a claim stamped with an older epoch. The review regression verifies refusals for pre-fence lease acquisition and renewal, replay and checkpoint deletes, and replay floor advances. It also exercises local foreground create, lookup and unlink under the active policy. The CLI refused maintenance without changing its sweep cursor or the RustFS object. Initial compatible CLI scenarios verified dry-run and budget handling, protected-object retention, deletion and restart recovery. Mounted filesystem acceptance and throughput measurements were outside this validation.
 
 ## Context and Orientation
 
@@ -41,7 +47,7 @@ From the repository root run `cargo test -p studiofs-meta --lib pg_maintenance_ 
 
 ## Validation and Acceptance
 
-The stale claim fails without creating a deletion record. An unsettled cleanup claim prevents activation and leaves the current epoch unchanged. Once the claim drains and the policy activates, current workers without the new capability report `maintenance_capability_missing`. Compatible sessions continue safe cleanup.
+The stale claim fails without creating a deletion record. A live cleanup lease prevents activation and leaves the current epoch unchanged. An expired lease with its owner still recorded permits activation. After activation, pre-fence SQL cannot acquire or renew a lease, delete replay or checkpoint rows, or advance the replay floor. Current workers without the new capability report `maintenance_capability_missing`. Compatible sessions continue safe cleanup.
 
 ## Idempotence and Recovery
 
@@ -55,4 +61,4 @@ PostgreSQL tests use separately created schemas. CLI tests place their fixtures 
 
 Reuse ClientCapabilities, VolumeProtocol and payload_gc schema version 2. PostgreSQL orders activation and destructive transactions.
 
-The plan records the RED result, activation ordering and the focused validation commands.
+The review revision records the additional PostgreSQL guards and the live-lease activation rule so operators can distinguish an epoch refusal from an S3 request that outlives its lease.

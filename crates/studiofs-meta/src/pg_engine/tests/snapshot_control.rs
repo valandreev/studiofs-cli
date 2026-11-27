@@ -77,7 +77,7 @@ fn pg_maintenance_policy_preserves_snapshot_and_replay_history() {
         policy.requirements.features.insert(capability.to_owned(), FeatureState::Required);
         policy.requirements.maintain.insert(capability.to_owned());
 
-        // An already-admitted delete must drain before new semantics take effect.
+        // A live lease blocks activation. Its expired owner can remain recorded.
         client.execute("INSERT INTO snapshot_cleanup_leases
                         (vol, snapshot_id, owner, fencing_token, lease_expires_at)
                         VALUES ($1, $2, 'admitted', 1, clock_timestamp() + interval '1 hour')",
@@ -89,10 +89,65 @@ fn pg_maintenance_policy_preserves_snapshot_and_replay_history() {
         ));
         tx.rollback().await.unwrap();
         assert_eq!(read_volume_protocol(&client, vol).await?.epoch, policy.epoch);
-        client.execute("UPDATE snapshot_cleanup_leases SET owner = '' WHERE vol = $1 AND snapshot_id = $2", &[&vol, &id]).await.unwrap();
+        client.execute("UPDATE snapshot_cleanup_leases SET lease_expires_at = clock_timestamp() - interval '1 second' WHERE vol = $1 AND snapshot_id = $2", &[&vol, &id]).await.unwrap();
+        client.execute(
+            "INSERT INTO serving_checkpoint_encodings
+                (vol, checkpoint_version, checkpoint_format, checkpoint_schema, publication_generation,
+                 snapshot, checkpoint_sha256)
+             SELECT vol, checkpoint_version, 4, 1, 1, snapshot, checkpoint_sha256 FROM metadata_state WHERE vol = $1",
+            &[&vol],
+        ).await.unwrap();
         let tx = client.transaction().await.unwrap();
         update_volume_protocol(&tx, vol, policy.epoch, &policy, &actor, "test").await?;
         tx.commit().await.unwrap();
+
+        // Emulate a worker that already mounted before the fence was installed.
+        // Each statement runs without the maintenance GUCs used by current code.
+        let one = 1_i64;
+        let vol_param: &[&(dyn tokio_postgres::types::ToSql + Sync)] = &[&vol];
+        let lease_params: &[&(dyn tokio_postgres::types::ToSql + Sync)] = &[&vol, &id];
+        let prune_params: &[&(dyn tokio_postgres::types::ToSql + Sync)] = &[&vol, &one, &one];
+        for (sql, params) in [
+            (
+                "INSERT INTO snapshot_cleanup_leases
+                    (vol, snapshot_id, owner, lease_expires_at)
+                 VALUES ($1, $2, 'legacy', clock_timestamp() + interval '1 hour')
+                 ON CONFLICT (vol, snapshot_id) DO UPDATE SET owner = EXCLUDED.owner,
+                     lease_expires_at = EXCLUDED.lease_expires_at",
+                lease_params,
+            ),
+            (
+                "UPDATE snapshot_cleanup_leases SET lease_expires_at = clock_timestamp() + interval '1 hour'
+                 WHERE vol = $1 AND snapshot_id = $2",
+                lease_params,
+            ),
+            (sql::DELETE_EVENT_LOG_PRUNE_BATCH, prune_params),
+            (sql::UPDATE_EVENT_LOG_PRUNE_STATE, prune_params),
+            ("DELETE FROM serving_checkpoint_encodings WHERE vol = $1", vol_param),
+        ] {
+            let error = client.query(sql, params).await
+                .expect_err("pre-fence maintenance must be refused");
+            assert_eq!(error.code(), Some(&tokio_postgres::error::SqlState::RESTRICT_VIOLATION));
+        }
+        let lease = client.query_one(
+            "SELECT owner, lease_expires_at <= clock_timestamp() FROM snapshot_cleanup_leases WHERE vol = $1 AND snapshot_id = $2",
+            lease_params,
+        ).await.unwrap();
+        assert_eq!(lease.get::<_, String>(0), "admitted");
+        assert!(lease.get::<_, bool>(1));
+        client.execute(
+            "DELETE FROM snapshot_cleanup_leases WHERE vol = $1 AND snapshot_id = $2", lease_params,
+        ).await.unwrap();
+        let error = client.execute(
+            "INSERT INTO snapshot_cleanup_leases (vol, snapshot_id, owner, lease_expires_at)
+             VALUES ($1, $2, 'legacy', clock_timestamp() + interval '1 hour')",
+            lease_params,
+        ).await.expect_err("pre-fence worker must not acquire a new lease");
+        assert_eq!(error.code(), Some(&tokio_postgres::error::SqlState::RESTRICT_VIOLATION));
+        assert_eq!(client.query_one(
+            "SELECT count(*) FROM snapshot_cleanup_leases WHERE vol = $1 AND snapshot_id = $2",
+            lease_params,
+        ).await.unwrap().get::<_, i64>(0), 0);
 
         let worker = SnapshotWorkerId::new("stale-worker").unwrap();
         for error in [
@@ -115,7 +170,8 @@ fn pg_maintenance_policy_preserves_snapshot_and_replay_history() {
         let unchanged = client.query_one(
             "SELECT lifecycle, event_log_prune_floor,
                     (SELECT count(*) FROM event_log WHERE vol = $1),
-                    (SELECT count(*) FROM snapshot_source_checkpoints WHERE vol = $1 AND snapshot_id = $2)
+                    (SELECT count(*) FROM snapshot_source_checkpoints WHERE vol = $1 AND snapshot_id = $2),
+                    (SELECT count(*) FROM serving_checkpoint_encodings WHERE vol = $1)
              FROM snapshot_catalog JOIN metadata_state USING (vol) WHERE vol = $1 AND id = $2",
             &[&vol, &id],
         ).await.unwrap();
@@ -123,6 +179,19 @@ fn pg_maintenance_policy_preserves_snapshot_and_replay_history() {
         assert_eq!(unchanged.get::<_, i64>(1), 0);
         assert_eq!(unchanged.get::<_, i64>(2), 1);
         assert_eq!(unchanged.get::<_, i64>(3), 1);
+        assert_eq!(unchanged.get::<_, i64>(4), 1);
+
+        tokio::task::spawn_blocking(move || {
+            let name = b"foreground-file";
+            let file = engine.create_file(ROOT_INO, name, 0, 0, 0o644).unwrap();
+            assert_eq!(engine.lookup(ROOT_INO, name).unwrap().ino, file.ino);
+            assert_eq!(engine.unlink(ROOT_INO, name).unwrap().ino, file.ino);
+        }).await.unwrap();
+        client.execute(
+            "DELETE FROM snapshot_source_checkpoints WHERE vol = $1 AND snapshot_id = $2",
+            lease_params,
+        ).await.unwrap();
+        assert_eq!(client.execute("DELETE FROM volumes WHERE vol = $1", vol_param).await.unwrap(), 1);
         Ok(())
     }).unwrap();
 }

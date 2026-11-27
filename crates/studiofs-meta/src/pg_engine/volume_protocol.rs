@@ -264,17 +264,18 @@ pub async fn update_volume_protocol(
         if !idle {
             return Err(ProtocolRejection::MaintenanceInProgress.into());
         }
-        // Artifact cleanup uses a separate lease. Claims and renewals take
-        // the metadata share lock, so no lease can start or extend past this check.
-        // Lease expiry permits retry but does not prove that a remote DELETE drained.
+        // Claims and renewals are fenced by the policy epoch under the metadata
+        // row lock. A cancelled or timed-out S3 DELETE sent before activation may
+        // still land afterward. Its target was proven unreachable under the old policy.
         let leased: bool = tx
             .query_one(
                 "SELECT EXISTS (
                     SELECT 1 FROM snapshot_cleanup_leases
-                    WHERE vol = $1 AND owner <> ''
+                    WHERE vol = $1 AND owner <> '' AND lease_expires_at > clock_timestamp()
                  ) OR EXISTS (
                     SELECT 1 FROM snapshot_payload_upload_objects
                     WHERE vol = $1 AND state = 'delete_pending' AND reconcile_owner IS NOT NULL
+                        AND reconcile_lease_expires_at > clock_timestamp()
                  )",
                 &[&volume],
             )
