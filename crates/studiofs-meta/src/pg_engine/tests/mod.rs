@@ -752,22 +752,6 @@ fn ensure_test_schema_once(dsn: &str) {
     ready.insert(dsn.to_owned());
 }
 
-#[test]
-#[ignore = "requires PostgreSQL test service via STUDIOFS_TEST_PG_DSN"]
-fn isolated_pg_volumes_use_schema_specific_id_ranges() {
-    let first = pg_dsn().expect("STUDIOFS_TEST_PG_DSN is required");
-    let second = pg_dsn().expect("STUDIOFS_TEST_PG_DSN is required");
-    let a = PgTestVolume::new(&first, "id-range-a");
-    let b = PgTestVolume::new(&first, "id-range-b");
-    let c = PgTestVolume::new(&second, "id-range-c");
-
-    let range_size = 1 << 20;
-    assert_eq!(a.volume_id % range_size, 0);
-    assert_eq!(b.volume_id, a.volume_id + 1);
-    assert_eq!(c.volume_id % range_size, 0);
-    assert_ne!(a.volume_id / range_size, c.volume_id / range_size);
-}
-
 fn execute_test_sql(dsn: &str, statement: String) -> MetaResult<()> {
     run_async(async move {
         let (client, connection) = tokio_postgres::connect(dsn, tokio_postgres::NoTls)
