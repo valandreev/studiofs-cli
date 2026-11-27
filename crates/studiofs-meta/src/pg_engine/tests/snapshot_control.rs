@@ -38,6 +38,19 @@ fn pg_maintenance_policy_preserves_snapshot_and_replay_history() {
         Some(Utc::now()),
         None,
     );
+    let compatible_snapshot = capture_entry_once(
+        dsn,
+        snapshot_request(volume.volume_id, SnapshotOrigin::Automatic),
+    );
+    set_snapshot_state(
+        dsn,
+        volume.volume_id,
+        compatible_snapshot.snapshot_id.as_str(),
+        "ready",
+        "completed",
+        Some(Utc::now()),
+        None,
+    );
     let dir = studiofs_test_support::workspace_target_tempdir("maintenance-history-");
     let db = dir.path().join("meta.redb");
     seed_local(&db, &volume.format_info());
@@ -56,6 +69,14 @@ fn pg_maintenance_policy_preserves_snapshot_and_replay_history() {
         let _connection = tokio::spawn(connection);
         let vol = volume.volume_id;
         let id = snapshot.snapshot_id.as_str();
+        let worker = SnapshotWorkerId::new("maintenance-worker").unwrap();
+        engine.request_delete(&compatible_snapshot.snapshot_id).await.unwrap();
+        let claim = engine.claim_next(&worker, Duration::from_secs(60)).await.unwrap().unwrap();
+        assert_eq!(claim.catalog.snapshot_id, compatible_snapshot.snapshot_id);
+        let finalized = engine.finalize_deleted(&claim).await.unwrap();
+        assert_eq!(finalized.lifecycle, SnapshotLifecycle::Deleted);
+        engine.request_delete(&snapshot.snapshot_id).await.unwrap();
+
         let tx = client.transaction().await.unwrap();
         let publisher = PublicationSession::begin(&tx, vol).await?;
         tx.execute("INSERT INTO event_log (vol, batch_version, event_type, event_payload, client_id)
@@ -98,7 +119,7 @@ fn pg_maintenance_policy_preserves_snapshot_and_replay_history() {
             &[&vol],
         ).await.unwrap();
         let tx = client.transaction().await.unwrap();
-        update_volume_protocol(&tx, vol, policy.epoch, &policy, &actor, "test").await?;
+        let active = update_volume_protocol(&tx, vol, policy.epoch, &policy, &actor, "test").await?;
         tx.commit().await.unwrap();
 
         // Emulate a worker that already mounted before the fence was installed.
@@ -107,6 +128,18 @@ fn pg_maintenance_policy_preserves_snapshot_and_replay_history() {
         let vol_param: &[&(dyn tokio_postgres::types::ToSql + Sync)] = &[&vol];
         let lease_params: &[&(dyn tokio_postgres::types::ToSql + Sync)] = &[&vol, &id];
         let prune_params: &[&(dyn tokio_postgres::types::ToSql + Sync)] = &[&vol, &one, &one];
+        let legacy_finalization = client.transaction().await.unwrap();
+        assert_eq!(legacy_finalization.execute(
+            "DELETE FROM snapshot_source_checkpoints WHERE vol = $1 AND snapshot_id = $2",
+            lease_params,
+        ).await.unwrap(), 1);
+        let error = legacy_finalization.execute(
+            "UPDATE snapshot_catalog SET lifecycle = 'deleted', updated_at = clock_timestamp()
+             WHERE vol = $1 AND id = $2 AND lifecycle = 'deleting'",
+            lease_params,
+        ).await.expect_err("pre-fence finalization must be refused");
+        assert_eq!(error.code(), Some(&tokio_postgres::error::SqlState::RESTRICT_VIOLATION));
+        legacy_finalization.rollback().await.unwrap();
         for (sql, params) in [
             (
                 "INSERT INTO snapshot_cleanup_leases
@@ -175,7 +208,7 @@ fn pg_maintenance_policy_preserves_snapshot_and_replay_history() {
              FROM snapshot_catalog JOIN metadata_state USING (vol) WHERE vol = $1 AND id = $2",
             &[&vol, &id],
         ).await.unwrap();
-        assert_eq!(unchanged.get::<_, String>(0), "ready");
+        assert_eq!(unchanged.get::<_, String>(0), "deleting");
         assert_eq!(unchanged.get::<_, i64>(1), 0);
         assert_eq!(unchanged.get::<_, i64>(2), 1);
         assert_eq!(unchanged.get::<_, i64>(3), 1);
@@ -187,10 +220,22 @@ fn pg_maintenance_policy_preserves_snapshot_and_replay_history() {
             assert_eq!(engine.lookup(ROOT_INO, name).unwrap().ino, file.ino);
             assert_eq!(engine.unlink(ROOT_INO, name).unwrap().ino, file.ino);
         }).await.unwrap();
-        client.execute(
+        let successor = client.transaction().await.unwrap();
+        let capabilities: Vec<_> = actor.maintain.into_iter().collect();
+        successor.query_one(
+            "SELECT set_config('studiofs.maintenance_epoch', $1, true),
+                    set_config('studiofs.maintenance_capabilities', to_jsonb($2::text[])::text, true)",
+            &[&active.epoch.to_string(), &capabilities],
+        ).await.unwrap();
+        successor.execute(
             "DELETE FROM snapshot_source_checkpoints WHERE vol = $1 AND snapshot_id = $2",
             lease_params,
         ).await.unwrap();
+        assert_eq!(successor.execute(
+            "UPDATE snapshot_catalog SET lifecycle = 'deleted' WHERE vol = $1 AND id = $2",
+            lease_params,
+        ).await.unwrap(), 1);
+        successor.commit().await.unwrap();
         assert_eq!(client.execute("DELETE FROM volumes WHERE vol = $1", vol_param).await.unwrap(), 1);
         Ok(())
     }).unwrap();

@@ -1031,7 +1031,7 @@ pub(super) const MAINTENANCE_FENCE_SQL: &str = r#"
             -- Exclude cascades initiated by deletion of a volume.
             SELECT array_agg(DISTINCT p.vol ORDER BY p.vol) INTO volumes
             FROM prior_claims p JOIN volumes USING (vol);
-        ELSIF TG_TABLE_NAME = 'metadata_state' THEN
+        ELSIF TG_TABLE_NAME IN ('metadata_state', 'snapshot_catalog') THEN
             volumes := ARRAY[NEW.vol];
         ELSIF TG_TABLE_NAME = 'snapshot_cleanup_leases' THEN
             IF TG_OP = 'UPDATE' THEN
@@ -1109,6 +1109,12 @@ pub(super) const MAINTENANCE_FENCE_SQL: &str = r#"
         AFTER UPDATE ON snapshot_cleanup_leases
         REFERENCING OLD TABLE AS prior_claims NEW TABLE AS maintenance_claims
         FOR EACH STATEMENT EXECUTE FUNCTION studiofs_fence_maintenance_claim();
+
+    DROP TRIGGER IF EXISTS studiofs_maintenance_snapshot_finalize_fence ON snapshot_catalog;
+    CREATE TRIGGER studiofs_maintenance_snapshot_finalize_fence
+        AFTER UPDATE OF lifecycle ON snapshot_catalog
+        FOR EACH ROW WHEN (OLD.lifecycle = 'deleting' AND NEW.lifecycle = 'deleted')
+        EXECUTE FUNCTION studiofs_fence_maintenance_claim();
 
     DROP TRIGGER IF EXISTS studiofs_maintenance_event_prune_fence ON event_log;
     CREATE TRIGGER studiofs_maintenance_event_prune_fence

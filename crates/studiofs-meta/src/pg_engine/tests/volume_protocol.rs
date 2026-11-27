@@ -101,7 +101,7 @@ fn pg_maintenance_stale_claim_is_rejected() {
                         if blocked {
                             break;
                         }
-                        tokio::task::yield_now().await;
+                        tokio::time::sleep(Duration::from_millis(20)).await;
                     }
                     activation.commit().await.unwrap();
                 },

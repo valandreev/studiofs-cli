@@ -1218,6 +1218,7 @@ fn pg_janitor_sweep_checkpoint_restart_scope_dry_run_and_version() {
 #[test]
 #[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
 fn janitor_refuses_missing_interrupted_drifted_or_unsupported_gc_schema() {
+    use crate::pg_engine::migrations::{CHECKPOINT_ENCODINGS_COMPONENT, MIGRATIONS};
     use crate::pg_engine::schema::{
         EVENT_PUBLICATION_FENCE_SQL, MAINTENANCE_FENCE_SQL, PAYLOAD_GC_SCHEMA_VERSION,
         studiofs_pg_schema_sql,
@@ -1312,13 +1313,18 @@ fn janitor_refuses_missing_interrupted_drifted_or_unsupported_gc_schema() {
 
         // Retry and repeatable application on empty and populated databases.
         sql(studiofs_pg_schema_sql().to_owned()).expect("first application");
+        let checkpoint_encodings = MIGRATIONS
+            .iter()
+            .find(|step| step.component == CHECKPOINT_ENCODINGS_COMPONENT && step.version == 1)
+            .expect("registered checkpoint encodings prerequisite");
         sql(format!(
-            "{} {EVENT_PUBLICATION_FENCE_SQL} {MAINTENANCE_FENCE_SQL}
+            "{} {} {EVENT_PUBLICATION_FENCE_SQL} {MAINTENANCE_FENCE_SQL}
              INSERT INTO volumes (vol, name, uuid, block_size) VALUES ({volume_id}, 'sfs980', 'sfs980', 8192);
              INSERT INTO metadata_state (vol, metadata_format_version, version, snapshot,
                  checkpoint_sha256, checkpoint_publication_state, checkpoint_generation)
              VALUES ({volume_id}, 7, 0, ''::bytea, decode(repeat('00', 32), 'hex'), 'pending', 0);",
-            crate::pg_engine::client_sessions::SCHEMA
+            crate::pg_engine::client_sessions::SCHEMA,
+            checkpoint_encodings.sql,
         ))
         .expect("deploy session registry, maintenance guards and volume");
         run_async(async {

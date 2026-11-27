@@ -50,13 +50,17 @@ fn evaluate_maintenance(policy: &VolumeProtocol) -> MetaResult<()> {
     Ok(())
 }
 
-/// The caller owns the transaction. The locked metadata row supplies the
+/// Authorizes and stamps maintenance on the volume in the caller's transaction.
+///
+/// The locked metadata row supplies the
 /// epoch. If we waited behind activation, the joined policy can come from an
 /// older statement snapshot, so re-read it under the acquired lock.
-pub(super) async fn fence_maintenance<C: GenericClient + Sync>(
-    tx: &C,
-    volume: i64,
-) -> MetaResult<()> {
+///
+/// # Errors
+///
+/// Returns the policy refusal if this binary lacks a required capability, or a
+/// classified error if the policy cannot be locked, read, or stamped.
+pub async fn fence_maintenance<C: GenericClient + Sync>(tx: &C, volume: i64) -> MetaResult<()> {
     let classify = |error| PgMetaEngine::classify_pg_error("fence maintenance", error);
     let capabilities: Vec<&str> = ClientCapabilities::current().maintain.into_iter().collect();
     let row = tx
