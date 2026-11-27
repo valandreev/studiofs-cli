@@ -159,6 +159,9 @@ pub enum ProtocolRejection {
         /// Read capability its oldest faithful encoding needs.
         capability: &'static str,
     },
+    /// An explicit feature cutover (SFS-1017) or Contract DDL step was refused.
+    #[error("feature cutover refused: {0}")]
+    CutoverRefused(String),
 }
 
 impl VolumeProtocol {
@@ -438,6 +441,566 @@ pub fn check_update(
     Ok(found != current.write_requirement || new != old)
 }
 
+/// Phase of an explicit Expand–Migrate–Activate–Contract feature cutover (SFS-1017).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CutoverPhase {
+    /// Register the feature as `available`; all 0.2.5+ clients stay writable.
+    Expand,
+    /// Mark the feature `compatible` (in use, optional); all 0.2.5+ clients stay writable.
+    Migrate,
+    /// Require the feature for the selected roles (`required`), fencing clients that lack it.
+    Activate,
+    /// Pre-Contract rollback: move `required` back to `compatible`, or `compatible` back to `available`.
+    Deactivate,
+    /// Terminal retirement (`retired`) on this volume; allowed only from `available`
+    /// (after `deactivate`). Runs no DDL; the database-wide check gates the Contract DDL step.
+    Contract,
+}
+
+impl CutoverPhase {
+    /// Stable lowercase name for diagnostics and CLI output.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Expand => "expand",
+            Self::Migrate => "migrate",
+            Self::Activate => "activate",
+            Self::Deactivate => "deactivate",
+            Self::Contract => "contract",
+        }
+    }
+}
+
+/// Operation set a feature gates when activated as `required`.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum CapabilityRole {
+    /// Required to mount, bootstrap, and replay.
+    Read,
+    /// Required to publish events or volume settings.
+    Write,
+    /// Required to run GC, janitor, or pruning.
+    Maintain,
+}
+
+/// How expired sessions with unknown offline local work are handled before a breaking activation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OfflineClientPolicy {
+    /// Expired sessions lacking the feature block cutover because they may hold unpublished local work.
+    #[default]
+    BlockUnknownWork,
+    /// Operator explicitly accepts that offline clients lacking the feature will be fenced on reconnect.
+    AcceptFence,
+}
+
+/// Operator request for a per-volume feature cutover step.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CutoverRequest {
+    /// Target capability name.
+    pub feature: String,
+    /// Target lifecycle phase.
+    pub phase: CutoverPhase,
+    /// Capability roles required when activating. `Deactivate` removes every role
+    /// and rejects a non-empty set; other phases ignore it.
+    pub roles: BTreeSet<CapabilityRole>,
+    /// Optional explicit `write_requirement` override.
+    pub write_requirement: Option<u16>,
+    /// Policy for expired sessions that may hold unknown offline local work.
+    pub offline_client_policy: OfflineClientPolicy,
+}
+
+/// Local cache observations fed into cutover readiness checks when available.
+///
+/// Event publication to PostgreSQL happens only after the corresponding payload
+/// uploads have completed, so `unpublished_events` covers dirty/unpublished
+/// payload work as well.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CutoverLocalState {
+    /// Unpublished local metadata events in the inspected local cache.
+    pub unpublished_events: u64,
+    /// Local applied metadata version, if a local cache was inspected.
+    pub local_version: Option<i64>,
+}
+
+/// Shared backend observations fed into cutover readiness checks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CutoverSharedState {
+    /// Current remote metadata head version.
+    pub remote_head_version: i64,
+    /// Latest published baseline checkpoint version.
+    pub checkpoint_version: i64,
+    /// Whether the serving checkpoint is ready.
+    pub checkpoint_ready: bool,
+    /// Published checkpoint encodings available for bootstrap.
+    pub available_checkpoints: Vec<CheckpointDescriptor>,
+    /// Whether snapshot creation or GC/cleanup maintenance is currently active.
+    pub snapshot_or_gc_active: bool,
+    /// Description of active snapshot/GC work, if any.
+    pub active_maintenance_detail: Option<String>,
+}
+
+/// A specific readiness blocker preventing a cutover transition.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CutoverBlocker {
+    /// The requested feature state transition violates `check_update` or `FeatureState::may_become`.
+    InvalidTransition(String),
+    /// The acting binary does not declare a capability required by the proposed policy.
+    UnsupportedByActor(String),
+    /// An active client session lacks a required capability or write requirement.
+    ActiveUnsupportedSession {
+        /// Session identifier.
+        session_id: uuid::Uuid,
+        /// Client build string.
+        build: String,
+        /// Capabilities or requirements missing from the session.
+        missing: Vec<String>,
+    },
+    /// An expired session lacks the capability and may still hold unpublished offline local work.
+    ExpiredUnsupportedSession {
+        /// Session identifier.
+        session_id: uuid::Uuid,
+        /// Client build string.
+        build: String,
+        /// Capabilities or requirements missing from the session.
+        missing: Vec<String>,
+    },
+    /// Local cache has unpublished metadata events (or payloads awaiting publication).
+    DirtyUnpublishedLocalWork {
+        /// Unpublished local metadata event count.
+        unpublished_events: u64,
+    },
+    /// Local cache has not caught up to the remote metadata head.
+    ReplicationLag {
+        /// Local applied metadata version.
+        local_version: i64,
+        /// Remote metadata head version.
+        remote_head_version: i64,
+    },
+    /// The volume has metadata but no published serving checkpoint with the
+    /// policy's checkpoint descriptor (cutover never changes that descriptor).
+    MissingCompatibleCheckpoint {
+        /// Required checkpoint descriptor.
+        required: CheckpointDescriptor,
+    },
+    /// Snapshot creation or GC/cleanup maintenance is in progress.
+    SnapshotOrGcInProgress {
+        /// Detail of the active maintenance or snapshot job.
+        detail: String,
+    },
+}
+
+impl std::fmt::Display for CutoverBlocker {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidTransition(msg) => write!(f, "invalid transition: {msg}"),
+            Self::UnsupportedByActor(msg) => write!(f, "unsupported by acting binary: {msg}"),
+            Self::ActiveUnsupportedSession {
+                session_id,
+                build,
+                missing,
+            } => write!(
+                f,
+                "active session {session_id} (build {build}) lacks: {}",
+                missing.join(", ")
+            ),
+            Self::ExpiredUnsupportedSession {
+                session_id,
+                build,
+                missing,
+            } => write!(
+                f,
+                "expired session {session_id} (build {build}) lacks [{}] and may hold unknown offline local work (pass --accept-offline-clients to fence on reconnect)",
+                missing.join(", ")
+            ),
+            Self::DirtyUnpublishedLocalWork { unpublished_events } => write!(
+                f,
+                "local cache has dirty unpublished work ({unpublished_events} unpublished events)"
+            ),
+            Self::ReplicationLag {
+                local_version,
+                remote_head_version,
+            } => write!(
+                f,
+                "local replication lag: local version {local_version} < remote head {remote_head_version}"
+            ),
+            Self::MissingCompatibleCheckpoint { required } => write!(
+                f,
+                "no published serving checkpoint for format {} schema {}",
+                required.format, required.schema
+            ),
+            Self::SnapshotOrGcInProgress { detail } => {
+                write!(f, "snapshot or GC maintenance in progress: {detail}")
+            }
+        }
+    }
+}
+
+/// Partitioned client sessions inspected for cutover readiness.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SessionInspection {
+    /// Active sessions that support the proposed policy.
+    pub eligible_active: Vec<crate::client_sessions::ClientSession>,
+    /// Active sessions that lack required capabilities or write requirement.
+    pub blocking_active: Vec<crate::client_sessions::ClientSession>,
+    /// Expired sessions that lack required capabilities or write requirement.
+    pub expired_unsupported: Vec<crate::client_sessions::ClientSession>,
+    /// Active sessions running on an older policy epoch.
+    pub stale_epoch_active: Vec<crate::client_sessions::ClientSession>,
+}
+
+/// Full dry-run or pre-execution report for an explicit feature cutover.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CutoverDryRunReport {
+    /// Target feature capability name.
+    pub feature: String,
+    /// Requested cutover phase.
+    pub phase: CutoverPhase,
+    /// Current policy epoch.
+    pub current_epoch: u64,
+    /// Next policy epoch if applied (`current_epoch` when no-op).
+    pub next_epoch: u64,
+    /// Current stored policy.
+    pub current: VolumeProtocol,
+    /// Proposed policy if transition construction succeeded.
+    pub proposed: Option<VolumeProtocol>,
+    /// Whether this transition can be rolled back later.
+    pub reversible: bool,
+    /// Human-readable description of the rollback boundary.
+    pub rollback_boundary: String,
+    /// Inspected client sessions.
+    pub sessions: SessionInspection,
+    /// Blockers preventing execution.
+    pub blockers: Vec<CutoverBlocker>,
+}
+
+impl CutoverDryRunReport {
+    /// Returns `true` when there are no blockers.
+    #[must_use]
+    pub fn is_ready(&self) -> bool {
+        self.blockers.is_empty()
+    }
+}
+
+/// Computes the missing capabilities/requirements for a `ClientSession` against `proposed`.
+#[must_use]
+pub(crate) fn missing_capabilities_for_session(
+    session: &crate::client_sessions::ClientSession,
+    proposed: &VolumeProtocol,
+) -> Vec<String> {
+    let mut missing = Vec::new();
+    if session.capabilities.volume_format_max < crate::compat::BASELINE_VOLUME_FORMAT {
+        missing.push(format!(
+            "volume_format>={}",
+            crate::compat::BASELINE_VOLUME_FORMAT
+        ));
+    }
+    if session.capabilities.write_requirement_max < proposed.write_requirement {
+        missing.push(format!("write_requirement>={}", proposed.write_requirement));
+    }
+    for cap in &proposed.requirements.read {
+        if !session.capabilities.read.iter().any(|c| c == cap) {
+            missing.push(format!("read:{cap}"));
+        }
+    }
+    for cap in &proposed.requirements.write {
+        if !session.capabilities.write.iter().any(|c| c == cap) {
+            missing.push(format!("write:{cap}"));
+        }
+    }
+    for cap in &proposed.requirements.maintain {
+        if !session.capabilities.maintain.iter().any(|c| c == cap) {
+            missing.push(format!("maintain:{cap}"));
+        }
+    }
+    missing
+}
+
+/// Constructs the proposed [`VolumeProtocol`] for a cutover phase transition.
+///
+/// # Errors
+///
+/// Returns [`ProtocolRejection`] if the requested transition is invalid for the
+/// current feature state or roles.
+pub(crate) fn build_proposed_protocol(
+    current: &VolumeProtocol,
+    request: &CutoverRequest,
+) -> Result<VolumeProtocol, ProtocolRejection> {
+    let mut proposed = current.clone();
+    let current_state = current.requirements.features.get(&request.feature).copied();
+    match request.phase {
+        CutoverPhase::Expand => {
+            if let Some(state) = current_state
+                && state != FeatureState::Available
+            {
+                return Err(ProtocolRejection::InvalidTransition {
+                    name: request.feature.clone(),
+                    from: Some(state),
+                    to: Some(FeatureState::Available),
+                });
+            }
+            proposed
+                .requirements
+                .features
+                .insert(request.feature.clone(), FeatureState::Available);
+        }
+        CutoverPhase::Migrate => {
+            if current_state == Some(FeatureState::Required) {
+                return Err(ProtocolRejection::InvalidTransition {
+                    name: request.feature.clone(),
+                    from: Some(FeatureState::Required),
+                    to: Some(FeatureState::Compatible),
+                });
+            }
+            proposed
+                .requirements
+                .features
+                .insert(request.feature.clone(), FeatureState::Compatible);
+        }
+        CutoverPhase::Activate => {
+            if request.roles.is_empty() && current_state != Some(FeatureState::Required) {
+                return Err(ProtocolRejection::Inconsistent(request.feature.clone()));
+            }
+            proposed
+                .requirements
+                .features
+                .insert(request.feature.clone(), FeatureState::Required);
+            for role in &request.roles {
+                match role {
+                    CapabilityRole::Read => {
+                        proposed.requirements.read.insert(request.feature.clone());
+                    }
+                    CapabilityRole::Write => {
+                        if proposed.requirements.write.insert(request.feature.clone()) {
+                            proposed.write_requirement =
+                                current.write_requirement.saturating_add(1);
+                        }
+                    }
+                    CapabilityRole::Maintain => {
+                        proposed
+                            .requirements
+                            .maintain
+                            .insert(request.feature.clone());
+                    }
+                }
+            }
+            // An explicit value always wins; `check_update` validates it.
+            if let Some(wr) = request.write_requirement {
+                proposed.write_requirement = wr;
+            }
+        }
+        CutoverPhase::Deactivate if !request.roles.is_empty() => {
+            return Err(ProtocolRejection::CutoverRefused(format!(
+                "deactivate removes every role of `{}`; do not pass roles",
+                request.feature
+            )));
+        }
+        CutoverPhase::Deactivate => match current_state {
+            Some(FeatureState::Required) => {
+                proposed
+                    .requirements
+                    .features
+                    .insert(request.feature.clone(), FeatureState::Compatible);
+                proposed.requirements.read.remove(&request.feature);
+                let removed_write = proposed.requirements.write.remove(&request.feature);
+                proposed.requirements.maintain.remove(&request.feature);
+                if removed_write {
+                    proposed.write_requirement = request
+                        .write_requirement
+                        .unwrap_or(SHARED_WRITE_REQUIREMENT.min_supported);
+                }
+            }
+            Some(FeatureState::Compatible) => {
+                proposed
+                    .requirements
+                    .features
+                    .insert(request.feature.clone(), FeatureState::Available);
+            }
+            Some(FeatureState::Available) => {}
+            other => {
+                return Err(ProtocolRejection::InvalidTransition {
+                    name: request.feature.clone(),
+                    from: other,
+                    to: Some(FeatureState::Compatible),
+                });
+            }
+        },
+        CutoverPhase::Contract => {
+            if current_state != Some(FeatureState::Available) {
+                return Err(ProtocolRejection::CutoverRefused(format!(
+                    "feature `{}` is {current_state:?}; deactivate it to available before contract",
+                    request.feature
+                )));
+            }
+            proposed
+                .requirements
+                .features
+                .insert(request.feature.clone(), FeatureState::Retired);
+        }
+    }
+    Ok(proposed)
+}
+
+/// Evaluates whether `request` can safely transition `current` given `actor`,
+/// `sessions`, `local`, and `shared` observations.
+#[must_use]
+pub fn evaluate_cutover_readiness(
+    current: &VolumeProtocol,
+    request: &CutoverRequest,
+    actor: &ClientCapabilities,
+    sessions: &[crate::client_sessions::ClientSession],
+    local: &CutoverLocalState,
+    shared: &CutoverSharedState,
+) -> CutoverDryRunReport {
+    let mut blockers = Vec::new();
+    let mut inspection = SessionInspection::default();
+    let (reversible, rollback_boundary) = match request.phase {
+        CutoverPhase::Expand => (
+            true,
+            "Reversible: feature is only marked available; 0.2.5+ clients remain writable."
+                .to_owned(),
+        ),
+        CutoverPhase::Migrate => (
+            true,
+            "Reversible before Activate: deactivate returns feature to available.".to_owned(),
+        ),
+        CutoverPhase::Activate => (
+            true,
+            "Reversible before Contract via `deactivate` (unless an irreversible format was written)."
+                .to_owned(),
+        ),
+        CutoverPhase::Deactivate => (
+            true,
+            "Rollback step: returns feature to pre-activation compatibility.".to_owned(),
+        ),
+        CutoverPhase::Contract => (
+            false,
+            "Irreversible: `retired` is terminal and cannot be deactivated.".to_owned(),
+        ),
+    };
+
+    let proposed = match build_proposed_protocol(current, request) {
+        Ok(proposed) => match check_update(current, &proposed, actor) {
+            Ok(_) => Some(proposed),
+            Err(err @ ProtocolRejection::UnknownCapability(_))
+            | Err(err @ ProtocolRejection::UnsupportedCheckpoint { .. }) => {
+                blockers.push(CutoverBlocker::UnsupportedByActor(err.to_string()));
+                None
+            }
+            Err(err) => {
+                blockers.push(CutoverBlocker::InvalidTransition(err.to_string()));
+                None
+            }
+        },
+        Err(err) => {
+            blockers.push(CutoverBlocker::InvalidTransition(err.to_string()));
+            None
+        }
+    };
+
+    let target_protocol = proposed.as_ref().unwrap_or(current);
+    let mut changed = false;
+    if let Some(prop) = &proposed {
+        changed = prop.write_requirement != current.write_requirement
+            || prop.requirements != current.requirements;
+    }
+
+    for session in sessions {
+        let missing = missing_capabilities_for_session(session, target_protocol);
+        if session.active {
+            if u64::try_from(session.policy_epoch).map_or(true, |epoch| epoch < current.epoch) {
+                inspection.stale_epoch_active.push(session.clone());
+            }
+            if missing.is_empty() {
+                inspection.eligible_active.push(session.clone());
+            } else {
+                inspection.blocking_active.push(session.clone());
+                if matches!(
+                    request.phase,
+                    CutoverPhase::Activate | CutoverPhase::Contract
+                ) {
+                    blockers.push(CutoverBlocker::ActiveUnsupportedSession {
+                        session_id: session.session_id,
+                        build: session.build.clone(),
+                        missing,
+                    });
+                }
+            }
+        } else if !missing.is_empty() {
+            inspection.expired_unsupported.push(session.clone());
+            if request.phase == CutoverPhase::Activate
+                && request.offline_client_policy == OfflineClientPolicy::BlockUnknownWork
+            {
+                blockers.push(CutoverBlocker::ExpiredUnsupportedSession {
+                    session_id: session.session_id,
+                    build: session.build.clone(),
+                    missing,
+                });
+            }
+        }
+    }
+
+    if matches!(
+        request.phase,
+        CutoverPhase::Activate | CutoverPhase::Contract
+    ) {
+        if local.unpublished_events > 0 {
+            blockers.push(CutoverBlocker::DirtyUnpublishedLocalWork {
+                unpublished_events: local.unpublished_events,
+            });
+        }
+        if let Some(local_version) = local.local_version
+            && local_version < shared.remote_head_version
+        {
+            blockers.push(CutoverBlocker::ReplicationLag {
+                local_version,
+                remote_head_version: shared.remote_head_version,
+            });
+        }
+        if shared.snapshot_or_gc_active {
+            blockers.push(CutoverBlocker::SnapshotOrGcInProgress {
+                detail: shared
+                    .active_maintenance_detail
+                    .clone()
+                    .unwrap_or_else(|| "active snapshot or GC operation".to_owned()),
+            });
+        }
+    }
+
+    if request.phase == CutoverPhase::Activate {
+        let required_chk = target_protocol.requirements.checkpoint;
+        let has_chk =
+            shared.checkpoint_ready && shared.available_checkpoints.contains(&required_chk);
+        if shared.remote_head_version > 0 && !has_chk {
+            blockers.push(CutoverBlocker::MissingCompatibleCheckpoint {
+                required: required_chk,
+            });
+        }
+    }
+
+    let next_epoch = if changed {
+        current.epoch.saturating_add(1)
+    } else {
+        current.epoch
+    };
+
+    CutoverDryRunReport {
+        feature: request.feature.clone(),
+        phase: request.phase,
+        current_epoch: current.epoch,
+        next_epoch,
+        current: current.clone(),
+        proposed,
+        reversible,
+        rollback_boundary,
+        sessions: inspection,
+        blockers,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -693,5 +1256,306 @@ mod tests {
         let decision = evaluate(&ClientCapabilities::current(), &volume, &local);
         assert!(!decision.allows(Operation::Publication));
         assert!(decision.allows(Operation::Bootstrap));
+    }
+
+    fn make_session(
+        active: bool,
+        has_future: bool,
+        write_requirement_max: u16,
+    ) -> crate::client_sessions::ClientSession {
+        use crate::client_sessions::{ClientSession, SessionCapabilities};
+        let now = chrono::Utc::now();
+        let mut read = vec![
+            CAP_EVENT_CODEC_V1.to_owned(),
+            CAP_PAYLOAD_STFS_V2.to_owned(),
+            CAP_PAYLOAD_STFS_V3.to_owned(),
+            CAP_PAYLOAD_SFEC_V1.to_owned(),
+        ];
+        if has_future {
+            read.push(FUTURE.to_owned());
+        }
+        ClientSession {
+            session_id: uuid::Uuid::new_v4(),
+            build: "0.2.5".to_owned(),
+            capabilities: SessionCapabilities {
+                volume_format_min: 7,
+                volume_format_max: 7,
+                write_requirement_max,
+                read,
+                write: BASELINE_WRITE_CAPABILITIES
+                    .iter()
+                    .map(|s| (*s).to_owned())
+                    .collect(),
+                maintain: vec![CAP_MAINTENANCE_PAYLOAD_GC_V2.to_owned()],
+            },
+            policy_epoch: 1,
+            fencing_token: 1,
+            heartbeat_at: now,
+            lease_expires_at: if active {
+                now + chrono::Duration::seconds(60)
+            } else {
+                now - chrono::Duration::seconds(60)
+            },
+            active,
+        }
+    }
+
+    fn ready_shared_state() -> CutoverSharedState {
+        CutoverSharedState {
+            remote_head_version: 10,
+            checkpoint_version: 10,
+            checkpoint_ready: true,
+            available_checkpoints: vec![CheckpointDescriptor::BASELINE],
+            snapshot_or_gc_active: false,
+            active_maintenance_detail: None,
+        }
+    }
+
+    #[test]
+    fn dry_run_reports_active_and_expired_session_and_local_blockers() {
+        let actor = successor_actor();
+        let mut compatible = VolumeProtocol::baseline();
+        compatible
+            .requirements
+            .features
+            .insert(FUTURE.to_owned(), FeatureState::Compatible);
+
+        let active_unsupported = make_session(true, false, 1);
+        let active_supported = make_session(true, true, 2);
+        let expired_unsupported = make_session(false, false, 1);
+
+        let req = CutoverRequest {
+            feature: FUTURE.to_owned(),
+            phase: CutoverPhase::Activate,
+            roles: BTreeSet::from([CapabilityRole::Read]),
+            write_requirement: None,
+            offline_client_policy: OfflineClientPolicy::BlockUnknownWork,
+        };
+        let local = CutoverLocalState {
+            unpublished_events: 2,
+            local_version: Some(8),
+        };
+        let mut shared = ready_shared_state();
+        shared.snapshot_or_gc_active = true;
+        shared.checkpoint_ready = false;
+
+        let report = evaluate_cutover_readiness(
+            &compatible,
+            &req,
+            &actor,
+            &[
+                active_unsupported.clone(),
+                active_supported.clone(),
+                expired_unsupported.clone(),
+            ],
+            &local,
+            &shared,
+        );
+        assert!(!report.is_ready());
+        assert_eq!(report.current_epoch, 1);
+        assert_eq!(report.next_epoch, 2);
+        assert_eq!(report.sessions.eligible_active.len(), 1);
+        assert_eq!(report.sessions.blocking_active.len(), 1);
+        assert_eq!(report.sessions.expired_unsupported.len(), 1);
+        assert!(report.blockers.iter().any(|b| matches!(
+            b,
+            CutoverBlocker::ActiveUnsupportedSession { session_id, .. }
+                if *session_id == active_unsupported.session_id
+        )));
+        assert!(report.blockers.iter().any(|b| matches!(
+            b,
+            CutoverBlocker::ExpiredUnsupportedSession { session_id, .. }
+                if *session_id == expired_unsupported.session_id
+        )));
+        assert!(report.blockers.iter().any(|b| matches!(
+            b,
+            CutoverBlocker::DirtyUnpublishedLocalWork {
+                unpublished_events: 2,
+            }
+        )));
+        assert!(report.blockers.iter().any(|b| matches!(
+            b,
+            CutoverBlocker::ReplicationLag {
+                local_version: 8,
+                remote_head_version: 10
+            }
+        )));
+        assert!(
+            report
+                .blockers
+                .iter()
+                .any(|b| matches!(b, CutoverBlocker::MissingCompatibleCheckpoint { .. }))
+        );
+        assert!(
+            report
+                .blockers
+                .iter()
+                .any(|b| matches!(b, CutoverBlocker::SnapshotOrGcInProgress { .. }))
+        );
+
+        // Accepting offline client fence clears only the expired-session blocker, not active ones.
+        let mut accept_req = req;
+        accept_req.offline_client_policy = OfflineClientPolicy::AcceptFence;
+        let report_accepted = evaluate_cutover_readiness(
+            &compatible,
+            &accept_req,
+            &actor,
+            &[active_supported, expired_unsupported],
+            &CutoverLocalState::default(),
+            &ready_shared_state(),
+        );
+        assert!(report_accepted.is_ready(), "{:?}", report_accepted.blockers);
+    }
+
+    #[test]
+    fn expand_and_migrate_keep_baseline_writable_and_deactivate_refused_after_retired() {
+        let actor = successor_actor();
+        let baseline = VolumeProtocol::baseline();
+        let expand_req = CutoverRequest {
+            feature: FUTURE.to_owned(),
+            phase: CutoverPhase::Expand,
+            roles: BTreeSet::new(),
+            write_requirement: None,
+            offline_client_policy: OfflineClientPolicy::BlockUnknownWork,
+        };
+        let expanded = build_proposed_protocol(&baseline, &expand_req).unwrap();
+        assert_eq!(expanded.write_requirement, 1);
+        assert!(check_update(&baseline, &expanded, &actor).unwrap());
+
+        let migrate_req = CutoverRequest {
+            phase: CutoverPhase::Migrate,
+            ..expand_req.clone()
+        };
+        let migrated = build_proposed_protocol(&expanded, &migrate_req).unwrap();
+        assert_eq!(migrated.write_requirement, 1);
+        assert!(check_update(&expanded, &migrated, &actor).unwrap());
+
+        // Baseline 0.2.5 client can still publish during Expand and Migrate.
+        migrated
+            .check_operations(
+                VolumeRequirements::baseline(),
+                Some(CheckpointDescriptor::BASELINE),
+                &BTreeMap::new(),
+                &[
+                    Operation::Bootstrap,
+                    Operation::Replay,
+                    Operation::Publication,
+                ],
+            )
+            .unwrap();
+
+        let deactivate_req = CutoverRequest {
+            phase: CutoverPhase::Deactivate,
+            ..expand_req.clone()
+        };
+        let available = build_proposed_protocol(&migrated, &deactivate_req).unwrap();
+        let contract_req = CutoverRequest {
+            phase: CutoverPhase::Contract,
+            ..expand_req
+        };
+        let retired = build_proposed_protocol(&available, &contract_req).unwrap();
+        assert!(check_update(&available, &retired, &actor).unwrap());
+
+        // Deactivation after Retired is refused.
+        let report = evaluate_cutover_readiness(
+            &retired,
+            &deactivate_req,
+            &actor,
+            &[],
+            &CutoverLocalState::default(),
+            &ready_shared_state(),
+        );
+        assert!(!report.is_ready());
+        assert!(
+            report
+                .blockers
+                .iter()
+                .any(|b| matches!(b, CutoverBlocker::InvalidTransition(_)))
+        );
+    }
+
+    fn request(phase: CutoverPhase, roles: &[CapabilityRole]) -> CutoverRequest {
+        CutoverRequest {
+            feature: FUTURE.to_owned(),
+            phase,
+            roles: roles.iter().copied().collect(),
+            write_requirement: None,
+            offline_client_policy: OfflineClientPolicy::BlockUnknownWork,
+        }
+    }
+
+    #[test]
+    fn contract_requires_explicit_deactivation_to_available() {
+        let contract = request(CutoverPhase::Contract, &[]);
+        for state in [FeatureState::Compatible, FeatureState::Required] {
+            let current = with(&VolumeProtocol::baseline(), set_state(state));
+            let err = build_proposed_protocol(&current, &contract).unwrap_err();
+            assert!(
+                matches!(&err, ProtocolRejection::CutoverRefused(msg) if msg.contains("deactivate it to available")),
+                "{err}"
+            );
+        }
+        let available = with(
+            &VolumeProtocol::baseline(),
+            set_state(FeatureState::Available),
+        );
+        let retired = build_proposed_protocol(&available, &contract).unwrap();
+        assert_eq!(
+            retired.requirements.features.get(FUTURE),
+            Some(&FeatureState::Retired)
+        );
+    }
+
+    #[test]
+    fn deactivate_rejects_roles() {
+        let current = with(
+            &VolumeProtocol::baseline(),
+            set_state(FeatureState::Required),
+        );
+        let err = build_proposed_protocol(
+            &current,
+            &request(CutoverPhase::Deactivate, &[CapabilityRole::Read]),
+        )
+        .unwrap_err();
+        assert!(matches!(err, ProtocolRejection::CutoverRefused(_)), "{err}");
+    }
+
+    #[test]
+    fn activate_applies_explicit_write_requirement_when_write_already_required() {
+        let actor = successor_actor();
+        let mut req = request(CutoverPhase::Activate, &[CapabilityRole::Write]);
+        let compatible = with(
+            &VolumeProtocol::baseline(),
+            set_state(FeatureState::Compatible),
+        );
+        let active = build_proposed_protocol(&compatible, &req).unwrap();
+        assert_eq!(active.write_requirement, 2);
+        req.write_requirement = Some(5);
+        assert_eq!(
+            build_proposed_protocol(&active, &req)
+                .unwrap()
+                .write_requirement,
+            5
+        );
+        // A refused proposal yields no proposal, no epoch bump and no session
+        // blockers measured against the refused policy.
+        let report = evaluate_cutover_readiness(
+            &compatible,
+            &req,
+            &actor,
+            &[make_session(true, false, 1)],
+            &CutoverLocalState::default(),
+            &ready_shared_state(),
+        );
+        assert!(report.proposed.is_none());
+        assert_eq!(report.next_epoch, report.current_epoch);
+        assert!(
+            report
+                .blockers
+                .iter()
+                .all(|b| matches!(b, CutoverBlocker::InvalidTransition(_))),
+            "{:?}",
+            report.blockers
+        );
     }
 }

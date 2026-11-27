@@ -24,6 +24,7 @@ use tokio_postgres::GenericClient;
 use super::schema::studiofs_pg_schema_sql;
 use crate::engine::{MetaError, MetaResult, UpgradeRequiredReason};
 use crate::version::POSTGRES_PAYLOAD_GC_SCHEMA;
+use crate::volume_protocol::ProtocolRejection;
 
 /// Transaction-scoped advisory lock key that serializes every schema change
 /// and volume provisioning (`init`, `load`, `upgrade`).
@@ -76,6 +77,8 @@ pub struct Migration {
     pub name: &'static str,
     /// Kind of change.
     pub phase: MigrationPhase,
+    /// Feature capability that a `Contract` migration retires; `None` for non-Contract steps.
+    pub contract_feature: Option<&'static str>,
     /// SQL run in the step's transaction.
     pub sql: &'static str,
 }
@@ -101,6 +104,7 @@ const BASELINE: Migration = Migration {
     version: 1,
     name: "0.2.5 baseline",
     phase: MigrationPhase::Additive,
+    contract_feature: None,
     sql: studiofs_pg_schema_sql(),
 };
 
@@ -109,6 +113,7 @@ const CLIENT_SESSIONS: Migration = Migration {
     version: 1,
     name: "per-volume client session leases",
     phase: MigrationPhase::Additive,
+    contract_feature: None,
     sql: super::client_sessions::SCHEMA,
 };
 
@@ -117,6 +122,7 @@ const CHECKPOINT_ENCODINGS: Migration = Migration {
     version: 1,
     name: "independent serving checkpoint encodings",
     phase: MigrationPhase::Additive,
+    contract_feature: None,
     sql: "CREATE TABLE IF NOT EXISTS serving_checkpoint_encodings (
               vol BIGINT NOT NULL REFERENCES metadata_state(vol) ON DELETE CASCADE,
               checkpoint_version BIGINT NOT NULL CHECK (checkpoint_version >= 0),
@@ -137,6 +143,7 @@ const FORMAT_FENCES: Migration = Migration {
     version: 1,
     name: "fence 0.2.x writers on adopted volumes",
     phase: MigrationPhase::Additive,
+    contract_feature: None,
     sql: "CREATE OR REPLACE FUNCTION studiofs_fence_deletion_claim_volume_format()
           RETURNS TRIGGER LANGUAGE plpgsql AS $$
           BEGIN
@@ -181,6 +188,7 @@ const EVENT_PUBLICATION_FENCE: Migration = Migration {
     version: crate::version::POSTGRES_EVENT_PUBLICATION_FENCE_SCHEMA.current as i32,
     name: "fence metadata event publication",
     phase: MigrationPhase::Additive,
+    contract_feature: None,
     sql: super::schema::EVENT_PUBLICATION_FENCE_SQL,
 };
 
@@ -189,6 +197,7 @@ const MAINTENANCE_FENCE: Migration = Migration {
     version: 1,
     name: "fence destructive maintenance claims",
     phase: MigrationPhase::Additive,
+    contract_feature: None,
     sql: super::schema::MAINTENANCE_FENCE_SQL,
 };
 
@@ -199,6 +208,7 @@ const SUCCESSOR_PROBE: Migration = Migration {
     version: 2,
     name: "test successor probe table",
     phase: MigrationPhase::Additive,
+    contract_feature: None,
     sql: "CREATE TABLE IF NOT EXISTS studiofs_successor_probe (
               vol BIGINT PRIMARY KEY REFERENCES volumes(vol) ON DELETE CASCADE,
               note TEXT
@@ -342,7 +352,7 @@ fn plan(
     Ok(pending)
 }
 
-fn pg_failure(context: &str, error: &tokio_postgres::Error) -> MetaError {
+pub(super) fn pg_failure(context: &str, error: &tokio_postgres::Error) -> MetaError {
     // Backend text may echo connection data, so only the SQLSTATE is kept.
     // A statement PostgreSQL rejected is a storage error, not lost connectivity.
     match error.code() {
@@ -551,12 +561,106 @@ pub(crate) async fn migrate_with(
                 .map_err(|error| pg_failure("finish schema migration", &error))?;
             return Ok(applied);
         };
+        if step.phase == MigrationPhase::Contract {
+            let feature = step.contract_feature.ok_or_else(|| {
+                ProtocolRejection::CutoverRefused(format!(
+                    "contract migration {step} does not name the feature it retires"
+                ))
+            })?;
+            let blockers = contract_database_volume_blockers(&tx, feature).await?;
+            if let Some((vol, detail)) = blockers.first() {
+                return Err(ProtocolRejection::CutoverRefused(format!(
+                    "cannot apply contract migration {step}: volume '{vol}' {detail}"
+                ))
+                .into());
+            }
+        }
         apply(&tx, &step, registry).await?;
         tx.commit()
             .await
             .map_err(|error| pg_failure("commit schema migration", &error))?;
         applied.push(step);
     }
+}
+
+/// Checks every volume in the database before a `Contract` DDL step.
+///
+/// Returns `(volume_name, reason)` for every volume that lacks a `volume_protocol`
+/// policy or still has `feature` in a required set or in `compatible` or
+/// `required` state.
+async fn contract_database_volume_blockers<C>(
+    client: &C,
+    feature: &str,
+) -> MetaResult<Vec<(String, String)>>
+where
+    C: GenericClient + Sync,
+{
+    let has_volumes: bool = client
+        .query_one(
+            "SELECT to_regclass('volumes') IS NOT NULL
+                AND to_regclass('volume_protocol') IS NOT NULL
+                AND to_regclass('metadata_state') IS NOT NULL",
+            &[],
+        )
+        .await
+        .map_err(|error| pg_failure("check database volumes for contract", &error))?
+        .try_get(0)
+        .map_err(|error| pg_failure("decode database volumes for contract", &error))?;
+    if !has_volumes {
+        return Ok(Vec::new());
+    }
+    let rows = client
+        .query(
+            "SELECT v.name, p.policy_epoch, m.write_requirement, p.requirements::TEXT
+             FROM volumes v
+             LEFT JOIN metadata_state m ON m.vol = v.vol
+             LEFT JOIN volume_protocol p ON p.vol = v.vol
+             ORDER BY v.vol",
+            &[],
+        )
+        .await
+        .map_err(|error| pg_failure("inspect database volumes for contract", &error))?;
+    let mut blockers = Vec::new();
+    for row in rows {
+        let decode = |error| pg_failure("decode database volumes for contract", &error);
+        let name: String = row.try_get(0).map_err(decode)?;
+        let epoch: Option<i64> = row.try_get(1).map_err(decode)?;
+        let write_requirement: Option<i16> = row.try_get(2).map_err(decode)?;
+        let requirements: Option<String> = row.try_get(3).map_err(decode)?;
+        let (Some(epoch), Some(write_requirement), Some(requirements)) =
+            (epoch, write_requirement, requirements)
+        else {
+            blockers.push((
+                name,
+                "has no volume_protocol policy; run `studiofs upgrade` on it first".to_owned(),
+            ));
+            continue;
+        };
+        let protocol = crate::volume_protocol::VolumeProtocol::decode(
+            epoch,
+            write_requirement,
+            &requirements,
+        )?;
+        let state = protocol.requirements.features.get(feature).copied();
+        let in_required_set = protocol.requirements.read.contains(feature)
+            || protocol.requirements.write.contains(feature)
+            || protocol.requirements.maintain.contains(feature);
+        if in_required_set
+            || matches!(
+                state,
+                Some(
+                    crate::volume_protocol::FeatureState::Compatible
+                        | crate::volume_protocol::FeatureState::Required
+                )
+            )
+        {
+            blockers.push((
+                name,
+                format!("still needs feature `{feature}` (state: {state:?})"),
+            ));
+        }
+    }
+    Ok(blockers)
 }
 
 /// Read-only preflight for `studiofs upgrade --dry-run`: the recorded
@@ -634,6 +738,10 @@ mod tests {
             version,
             name: "test",
             phase,
+            contract_feature: match phase {
+                MigrationPhase::Contract => Some("sfs1005.test.v1"),
+                MigrationPhase::Additive | MigrationPhase::Backfill => None,
+            },
             sql,
         }
     }
@@ -699,6 +807,19 @@ mod tests {
             i32::from(crate::version::POSTGRES_CHECKPOINT_ENCODINGS_SCHEMA.current)
         );
         assert_eq!(MIGRATIONS[0], BASELINE);
+        for step in MIGRATIONS {
+            if step.phase == MigrationPhase::Contract {
+                assert!(
+                    step.contract_feature.is_some_and(|f| !f.is_empty()),
+                    "contract migration {step} must name the feature it retires"
+                );
+            } else {
+                assert!(
+                    step.contract_feature.is_none(),
+                    "non-contract migration {step} must not set contract_feature"
+                );
+            }
+        }
     }
 
     /// The baseline is frozen: a schema change is a new migration, not an edit.

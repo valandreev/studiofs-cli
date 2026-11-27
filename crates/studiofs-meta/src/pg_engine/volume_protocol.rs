@@ -9,11 +9,15 @@
 
 use tokio_postgres::GenericClient;
 
+use super::migrations::pg_failure;
 use super::{PgMetaEngine, sql};
-use crate::compat::{ClientCapabilities, Operation, VolumeRequirements};
+use crate::compat::{CheckpointDescriptor, ClientCapabilities, Operation, VolumeRequirements};
 use crate::engine::{MetaError, MetaResult, UpgradeRequiredReason};
 use crate::version::SHARED_WRITE_REQUIREMENT;
-use crate::volume_protocol::{ProtocolRejection, VolumeProtocol, check_update};
+use crate::volume_protocol::{
+    CutoverDryRunReport, CutoverLocalState, CutoverRequest, CutoverSharedState, ProtocolRejection,
+    VolumeProtocol, check_update, evaluate_cutover_readiness,
+};
 
 const SELECT_PROTOCOL: &str = "
     SELECT p.policy_epoch, m.write_requirement, p.requirements::TEXT,
@@ -193,27 +197,12 @@ pub(super) fn decode_volume_policy(
     VolumeProtocol::decode(epoch, write_requirement, requirements)
 }
 
-/// Replaces the policy with `proposed` (its `epoch` is ignored) when the
-/// stored epoch is `expected_epoch` and [`check_update`] accepts the change
-/// for a binary declaring `actor`. The epoch rises by one, the write
-/// requirement and an audit row are written in the same transaction. A retry
-/// whose change already committed returns the stored policy; a change that
-/// alters nothing keeps the epoch.
-///
-/// # Errors
-///
-/// `VolumeProtocolRejected` (`EpochConflict`, `Missing` or a violated rule),
-/// `UpgradeRequired` for a policy written by a newer binary, or a classified
-/// PostgreSQL error.
-pub async fn update_volume_protocol(
+async fn lock_volume_for_protocol_update(
     tx: &tokio_postgres::Transaction<'_>,
     volume: i64,
-    expected_epoch: u64,
-    proposed: &VolumeProtocol,
-    actor: &ClientCapabilities,
-    actor_id: &str,
-) -> MetaResult<VolumeProtocol> {
-    let failed = |error| PgMetaEngine::classify_pg_error("update volume protocol", error);
+    context: &str,
+) -> MetaResult<()> {
+    let failed = |error| PgMetaEngine::classify_pg_error(context, error);
     // Use the same lock order as load: its volume lock conflicts with the
     // foreign-key lock needed by the history insert.
     let volume_row = tx
@@ -236,24 +225,18 @@ pub async fn update_volume_protocol(
     if state_row.is_none() {
         return Err(ProtocolRejection::Missing.into());
     }
-    // Under READ COMMITTED a statement that waited for a row lock can still
-    // have a stale snapshot of other tables. Read the policy in a new statement.
-    let current = read_volume_protocol(tx, volume).await?;
-    let same = current.write_requirement == proposed.write_requirement
-        && current.requirements == proposed.requirements;
-    if current.epoch != expected_epoch {
-        if same {
-            return Ok(current);
-        }
-        return Err(ProtocolRejection::EpochConflict {
-            expected: expected_epoch,
-            found: current.epoch,
-        }
-        .into());
-    }
-    if !check_update(&current, proposed, actor)? {
-        return Ok(current);
-    }
+    Ok(())
+}
+
+async fn apply_locked_volume_protocol_update(
+    tx: &tokio_postgres::Transaction<'_>,
+    volume: i64,
+    current: &VolumeProtocol,
+    proposed: &VolumeProtocol,
+    actor_id: &str,
+    context: &str,
+) -> MetaResult<VolumeProtocol> {
+    let failed = |error| PgMetaEngine::classify_pg_error(context, error);
     if current.requirements.maintain != proposed.requirements.maintain {
         // Janitors hold this lock across S3 requests. Try it without waiting
         // because Janitors acquire it before taking the metadata row lock.
@@ -326,6 +309,56 @@ pub async fn update_volume_protocol(
     .await
     .map_err(failed)?;
     Ok(next)
+}
+
+/// Replaces the policy with `proposed` (its `epoch` is ignored) when the
+/// stored epoch is `expected_epoch` and [`check_update`] accepts the change
+/// for a binary declaring `actor`. The epoch rises by one, the write
+/// requirement and an audit row are written in the same transaction. A retry
+/// whose change already committed returns the stored policy; a change that
+/// alters nothing keeps the epoch.
+///
+/// # Errors
+///
+/// `VolumeProtocolRejected` (`EpochConflict`, `Missing` or a violated rule),
+/// `UpgradeRequired` for a policy written by a newer binary, or a classified
+/// PostgreSQL error.
+pub async fn update_volume_protocol(
+    tx: &tokio_postgres::Transaction<'_>,
+    volume: i64,
+    expected_epoch: u64,
+    proposed: &VolumeProtocol,
+    actor: &ClientCapabilities,
+    actor_id: &str,
+) -> MetaResult<VolumeProtocol> {
+    lock_volume_for_protocol_update(tx, volume, "update volume protocol").await?;
+    // Under READ COMMITTED a statement that waited for a row lock can still
+    // have a stale snapshot of other tables. Read the policy in a new statement.
+    let current = read_volume_protocol(tx, volume).await?;
+    let same = current.write_requirement == proposed.write_requirement
+        && current.requirements == proposed.requirements;
+    if current.epoch != expected_epoch {
+        if same {
+            return Ok(current);
+        }
+        return Err(ProtocolRejection::EpochConflict {
+            expected: expected_epoch,
+            found: current.epoch,
+        }
+        .into());
+    }
+    if !check_update(&current, proposed, actor)? {
+        return Ok(current);
+    }
+    apply_locked_volume_protocol_update(
+        tx,
+        volume,
+        &current,
+        proposed,
+        actor_id,
+        "update volume protocol",
+    )
+    .await
 }
 
 /// `SHARED_WRITE_REQUIREMENT` as the `$4` parameter of `BUMP_METADATA_VERSION`.
@@ -417,4 +450,196 @@ pub(super) fn check_read_operations(
         &Default::default(),
         &[Operation::Bootstrap, Operation::Replay],
     )
+}
+
+async fn collect_cutover_shared_state<C: GenericClient + Sync>(
+    client: &C,
+    volume: i64,
+) -> MetaResult<(VolumeProtocol, CutoverSharedState)> {
+    let failed = |error| PgMetaEngine::classify_pg_error("collect cutover state", error);
+    let decode = |error| pg_failure("decode cutover state", &error);
+    let current = read_volume_protocol(client, volume).await?;
+    let state_row = client
+        .query_opt(
+            "SELECT version, checkpoint_version, octet_length(snapshot) > 0
+             FROM metadata_state WHERE vol = $1",
+            &[&volume],
+        )
+        .await
+        .map_err(failed)?
+        .ok_or(ProtocolRejection::Missing)?;
+    let remote_head_version: i64 = state_row.try_get(0).map_err(decode)?;
+    let checkpoint_version: i64 = state_row.try_get(1).map_err(decode)?;
+    let has_baseline_snapshot: Option<bool> = state_row.try_get(2).map_err(decode)?;
+    let checkpoint_ready = checkpoint_version > 0 && has_baseline_snapshot.unwrap_or(false);
+    let mut available_checkpoints = Vec::new();
+    if checkpoint_ready {
+        available_checkpoints.push(CheckpointDescriptor::BASELINE);
+    }
+    let has_encodings_table: bool = client
+        .query_one(
+            "SELECT to_regclass('serving_checkpoint_encodings') IS NOT NULL",
+            &[],
+        )
+        .await
+        .map_err(failed)?
+        .try_get(0)
+        .map_err(decode)?;
+    if has_encodings_table {
+        let rows = client
+            .query(
+                "SELECT DISTINCT checkpoint_format, checkpoint_schema
+                 FROM serving_checkpoint_encodings WHERE vol = $1",
+                &[&volume],
+            )
+            .await
+            .map_err(failed)?;
+        for row in rows {
+            let format: i16 = row.try_get(0).map_err(decode)?;
+            let schema: i16 = row.try_get(1).map_err(decode)?;
+            let (Ok(format), Ok(schema)) = (u16::try_from(format), u16::try_from(schema)) else {
+                return Err(MetaError::Storage(format!(
+                    "serving checkpoint encoding has invalid format {format} or schema {schema}"
+                )));
+            };
+            let desc = CheckpointDescriptor { format, schema };
+            if !available_checkpoints.contains(&desc) {
+                available_checkpoints.push(desc);
+            }
+        }
+    }
+
+    let maint_row = client
+        .query_one(
+            "SELECT
+                EXISTS (
+                    SELECT 1 FROM snapshot_cleanup_leases
+                    WHERE vol = $1 AND owner <> '' AND lease_expires_at > clock_timestamp()
+                ),
+                EXISTS (
+                    SELECT 1 FROM snapshot_payload_upload_objects
+                    WHERE vol = $1 AND state = 'delete_pending' AND reconcile_owner IS NOT NULL
+                      AND reconcile_lease_expires_at > clock_timestamp()
+                ),
+                EXISTS (
+                    SELECT 1 FROM snapshot_creation_jobs
+                    WHERE vol = $1 AND state IN ('queued', 'running', 'retry_wait')
+                )",
+            &[&volume],
+        )
+        .await
+        .map_err(failed)?;
+    let cleanup_active: bool = maint_row.try_get(0).map_err(decode)?;
+    let gc_active: bool = maint_row.try_get(1).map_err(decode)?;
+    let snapshot_active: bool = maint_row.try_get(2).map_err(decode)?;
+    let snapshot_or_gc_active = cleanup_active || gc_active || snapshot_active;
+    let active_maintenance_detail = if snapshot_active {
+        Some("snapshot creation job is queued, running or waiting to retry".to_owned())
+    } else if cleanup_active {
+        Some("snapshot cleanup lease is active".to_owned())
+    } else if gc_active {
+        Some("payload GC delete_pending lease is active".to_owned())
+    } else {
+        None
+    };
+
+    Ok((
+        current,
+        CutoverSharedState {
+            remote_head_version,
+            checkpoint_version,
+            checkpoint_ready,
+            available_checkpoints,
+            snapshot_or_gc_active,
+            active_maintenance_detail,
+        },
+    ))
+}
+
+/// Inspects cutover readiness for `volume` without modifying any state.
+///
+/// # Errors
+///
+/// Returns `VolumeProtocolRejected(Missing)` if the volume has no policy, or a
+/// classified PostgreSQL error.
+pub async fn inspect_cutover_dry_run<C: GenericClient + Sync>(
+    client: &C,
+    volume: i64,
+    request: &CutoverRequest,
+    actor: &ClientCapabilities,
+    local: &CutoverLocalState,
+) -> MetaResult<CutoverDryRunReport> {
+    let (current, shared) = collect_cutover_shared_state(client, volume).await?;
+    let sessions = super::client_sessions::read_client_sessions(client, volume).await?;
+    Ok(evaluate_cutover_readiness(
+        &current, request, actor, &sessions, local, &shared,
+    ))
+}
+
+/// Atomically validates readiness and applies an explicit feature cutover
+/// under the same `volumes` / `metadata_state` row locks used by publication.
+///
+/// # Errors
+///
+/// Returns `EpochConflict` if `expected_epoch` does not match,
+/// `CutoverRefused` with the blocker list if readiness fails, or a classified
+/// PostgreSQL error.
+pub async fn execute_feature_cutover(
+    client: &mut tokio_postgres::Client,
+    volume: i64,
+    expected_epoch: Option<u64>,
+    request: &CutoverRequest,
+    actor: &ClientCapabilities,
+    actor_id: &str,
+    local: &CutoverLocalState,
+) -> MetaResult<CutoverDryRunReport> {
+    let failed = |error| PgMetaEngine::classify_pg_error("execute feature cutover", error);
+    let tx = client
+        .build_transaction()
+        .isolation_level(tokio_postgres::IsolationLevel::ReadCommitted)
+        .start()
+        .await
+        .map_err(failed)?;
+    lock_volume_for_protocol_update(&tx, volume, "execute feature cutover").await?;
+    let (current, shared) = collect_cutover_shared_state(&tx, volume).await?;
+    if let Some(expected) = expected_epoch
+        && current.epoch != expected
+    {
+        return Err(ProtocolRejection::EpochConflict {
+            expected,
+            found: current.epoch,
+        }
+        .into());
+    }
+    let sessions = super::client_sessions::read_client_sessions(&tx, volume).await?;
+    let report = evaluate_cutover_readiness(&current, request, actor, &sessions, local, &shared);
+    if !report.is_ready() {
+        let summary = report
+            .blockers
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(ProtocolRejection::CutoverRefused(format!(
+            "`{}` ({}) blocked: {summary}",
+            request.feature,
+            request.phase.as_str()
+        ))
+        .into());
+    }
+    if let Some(proposed) = &report.proposed
+        && report.next_epoch != report.current_epoch
+    {
+        apply_locked_volume_protocol_update(
+            &tx,
+            volume,
+            &current,
+            proposed,
+            actor_id,
+            "execute feature cutover",
+        )
+        .await?;
+    }
+    tx.commit().await.map_err(failed)?;
+    Ok(report)
 }

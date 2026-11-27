@@ -108,7 +108,8 @@ fn resolve_pg_pool_size(configured: usize) -> MetaResult<usize> {
     Ok(configured)
 }
 
-pub(crate) const LOCAL_PG_VERSION_COUNTER: &str = "pgLastAppliedBatchVersion";
+/// Local redb counter holding the last applied PostgreSQL metadata version.
+pub const LOCAL_PG_VERSION_COUNTER: &str = "pgLastAppliedBatchVersion";
 pub(crate) const LOCAL_PG_NAMESPACE_VERSION_COUNTER: &str = "pgLastAppliedNamespaceBatchVersion";
 const LOCAL_PG_CLIENT_SLOT_COUNTER: &str = "pgClientSlotPlusOne";
 /// Per-volume restore-stage owner tag; a replace that wiped it would orphan old stages.
@@ -591,8 +592,9 @@ use remote_apply::{
 };
 pub use retained::{RetainedLifecycleSweep, seed_retained_authority};
 pub use volume_protocol::{
-    check_volume_read_policy, fence_maintenance, insert_initial_volume_protocol,
-    insert_restored_volume_protocol, read_volume_protocol, update_volume_protocol,
+    check_volume_read_policy, execute_feature_cutover, fence_maintenance,
+    insert_initial_volume_protocol, insert_restored_volume_protocol, inspect_cutover_dry_run,
+    read_volume_protocol, update_volume_protocol,
 };
 pub use volume_settings::{
     S3VolumeSettingsUpdate, set_shared_compression, set_shared_initial_volume_settings,
