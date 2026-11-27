@@ -203,11 +203,24 @@ pub(super) const BUMP_METADATA_VERSION: &str = bump_metadata_version!(
     "::TEXT = current_setting('studiofs.policy_epoch', true)"
 );
 
+/// Leading comment of every publication stamp statement. PostgreSQL keeps it in
+/// `pg_stat_activity.query`, so tests can find a waiting publisher without
+/// depending on the CTE layout.
+macro_rules! publication_stamp_marker {
+    () => {
+        "/* studiofs:publication-stamp */"
+    };
+}
+
+#[cfg(test)]
+pub(super) const PUBLICATION_STAMP_MARKER: &str = publication_stamp_marker!();
+
 // Materialize once so the volatile GUC writes run before the dependent bump
 // or receipt lock. FOR SHARE pins the exact lease generation until tx ends.
 macro_rules! with_publication_stamp {
     ($($tail:expr),+ $(,)?) => {
         concat!(
+            publication_stamp_marker!(),
             r#"
             WITH locked AS MATERIALIZED (
                 SELECT policy_epoch, lease_expires_at FROM client_sessions
