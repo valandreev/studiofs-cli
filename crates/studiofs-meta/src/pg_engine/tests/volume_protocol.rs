@@ -850,3 +850,380 @@ fn pending_events_stay_unpublished_while_the_policy_cannot_represent_them() {
     assert!(sql_i64(schema.dsn(), events, vol, None).unwrap() > 0);
     pg.prepare_for_close().expect("close writer");
 }
+
+#[test]
+#[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
+fn cutover_dry_run_blocks_active_and_expired_unsupported_sessions_on_live_postgres() {
+    use crate::compat::ClientCapabilities;
+    use crate::pg_engine::{execute_feature_cutover, inspect_cutover_dry_run};
+    use crate::volume_protocol::{
+        CapabilityRole, CutoverBlocker, CutoverLocalState, CutoverPhase, CutoverRequest,
+        OfflineClientPolicy,
+    };
+    use std::collections::BTreeSet;
+
+    let dsn = pg_dsn().expect("STUDIOFS_TEST_PG_DSN is required");
+    let schema = IsolatedPgSchema::new(&dsn);
+    let volume = PgTestVolume::new(schema.dsn(), "sfs1017-dry-run");
+    run_async(async {
+        let (mut client, connection) =
+            tokio_postgres::connect(schema.dsn(), tokio_postgres::NoTls)
+                .await
+                .map_err(|error| MetaError::Storage(pg_err(error)))?;
+        let _connection = tokio::spawn(connection);
+        let vol = volume.volume_id;
+        let feature = "metadata.cutover.v1";
+        let mut actor = ClientCapabilities::current();
+        actor.read.insert(feature);
+
+        // Expand + Migrate first.
+        let expand_req = CutoverRequest {
+            feature: feature.to_owned(),
+            phase: CutoverPhase::Expand,
+            roles: BTreeSet::new(),
+            write_requirement: None,
+            checkpoint: None,
+            offline_client_policy: OfflineClientPolicy::BlockUnknownWork,
+        };
+        execute_feature_cutover(
+            &mut client,
+            vol,
+            Some(1),
+            &expand_req,
+            &actor,
+            "sfs1017-test",
+            &CutoverLocalState::default(),
+        )
+        .await?;
+        let migrate_req = CutoverRequest {
+            phase: CutoverPhase::Migrate,
+            ..expand_req.clone()
+        };
+        execute_feature_cutover(
+            &mut client,
+            vol,
+            Some(2),
+            &migrate_req,
+            &actor,
+            "sfs1017-test",
+            &CutoverLocalState::default(),
+        )
+        .await?;
+
+        // Insert one active unsupported session and one expired unsupported session.
+        let active_id = uuid::Uuid::new_v4();
+        let expired_id = uuid::Uuid::new_v4();
+        let baseline_caps = serde_json::json!({
+            "volume_format_min": 7,
+            "volume_format_max": 7,
+            "write_requirement_max": 1,
+            "read": ["event.codec.v1", "payload.stfs.v2", "payload.stfs.v3", "payload.sfec.v1"],
+            "write": ["event.codec.v1", "payload.stfs.v2", "payload.stfs.v3", "payload.sfec.v1"],
+            "maintain": ["maintenance.payload_gc.v2"]
+        })
+        .to_string();
+        client
+            .execute(
+                "INSERT INTO client_sessions
+                 (vol, session_id, owner, build, capabilities, policy_epoch, fencing_token, heartbeat_at, lease_expires_at)
+                 VALUES
+                 ($1, $2, 'o1', '0.2.5', $4::TEXT::JSONB, 3, 1, clock_timestamp(), clock_timestamp() + interval '60 seconds'),
+                 ($1, $3, 'o2', '0.2.5', $4::TEXT::JSONB, 3, 1, clock_timestamp() - interval '120 seconds', clock_timestamp() - interval '60 seconds')",
+                &[&vol, &active_id.to_string(), &expired_id.to_string(), &baseline_caps],
+            )
+            .await
+            .map_err(|e| MetaError::Storage(pg_err(e)))?;
+
+        let activate_req = CutoverRequest {
+            phase: CutoverPhase::Activate,
+            roles: BTreeSet::from([CapabilityRole::Read]),
+            ..expand_req
+        };
+        let report = inspect_cutover_dry_run(
+            &client,
+            vol,
+            &activate_req,
+            &actor,
+            &CutoverLocalState::default(),
+        )
+        .await?;
+        assert!(!report.is_ready());
+        assert!(report.blockers.iter().any(|b| matches!(
+            b,
+            CutoverBlocker::ActiveUnsupportedSession { session_id, .. } if *session_id == active_id
+        )));
+        assert!(report.blockers.iter().any(|b| matches!(
+            b,
+            CutoverBlocker::ExpiredUnsupportedSession { session_id, .. } if *session_id == expired_id
+        )));
+
+        // Remove the active unsupported session; expired session STILL blocks unless accepted.
+        client
+            .execute(
+                "DELETE FROM client_sessions WHERE vol = $1 AND session_id = $2",
+                &[&vol, &active_id.to_string()],
+            )
+            .await
+            .map_err(|e| MetaError::Storage(pg_err(e)))?;
+        let still_blocked = inspect_cutover_dry_run(
+            &client,
+            vol,
+            &activate_req,
+            &actor,
+            &CutoverLocalState::default(),
+        )
+        .await?;
+        assert!(!still_blocked.is_ready());
+        assert!(still_blocked.blockers.iter().any(|b| matches!(
+            b,
+            CutoverBlocker::ExpiredUnsupportedSession { session_id, .. } if *session_id == expired_id
+        )));
+
+        let accepted_req = CutoverRequest {
+            offline_client_policy: OfflineClientPolicy::AcceptFence,
+            ..activate_req
+        };
+        let ready = execute_feature_cutover(
+            &mut client,
+            vol,
+            Some(3),
+            &accepted_req,
+            &actor,
+            "sfs1017-test",
+            &CutoverLocalState::default(),
+        )
+        .await?;
+        assert!(ready.is_ready());
+        assert_eq!(ready.next_epoch, 4);
+        Ok(())
+    })
+    .unwrap();
+}
+
+#[test]
+#[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
+fn cutover_activate_and_publication_race_fences_stale_writer() {
+    use crate::compat::ClientCapabilities;
+    use crate::pg_engine::execute_feature_cutover;
+    use crate::volume_protocol::{
+        CapabilityRole, CutoverLocalState, CutoverPhase, CutoverRequest, OfflineClientPolicy,
+    };
+    use std::collections::BTreeSet;
+
+    let dsn = pg_dsn().expect("STUDIOFS_TEST_PG_DSN is required");
+    let schema = IsolatedPgSchema::new(&dsn);
+    let volume = PgTestVolume::new(schema.dsn(), "sfs1017-race");
+    run_async(async {
+        let (mut activator, activator_conn) =
+            tokio_postgres::connect(schema.dsn(), tokio_postgres::NoTls)
+                .await
+                .map_err(|error| MetaError::Storage(pg_err(error)))?;
+        let (mut writer, writer_conn) =
+            tokio_postgres::connect(schema.dsn(), tokio_postgres::NoTls)
+                .await
+                .map_err(|error| MetaError::Storage(pg_err(error)))?;
+        let _activator_conn = tokio::spawn(activator_conn);
+        let _writer_conn = tokio::spawn(writer_conn);
+        let vol = volume.volume_id;
+        let feature = "metadata.read_cutover.v1";
+        let mut actor = ClientCapabilities::current();
+        actor.read.insert(feature);
+
+        let base_req = CutoverRequest {
+            feature: feature.to_owned(),
+            phase: CutoverPhase::Expand,
+            roles: BTreeSet::new(),
+            write_requirement: None,
+            checkpoint: None,
+            offline_client_policy: OfflineClientPolicy::AcceptFence,
+        };
+        execute_feature_cutover(
+            &mut activator,
+            vol,
+            Some(1),
+            &base_req,
+            &actor,
+            "sfs1017-race",
+            &CutoverLocalState::default(),
+        )
+        .await?;
+        execute_feature_cutover(
+            &mut activator,
+            vol,
+            Some(2),
+            &CutoverRequest {
+                phase: CutoverPhase::Migrate,
+                ..base_req.clone()
+            },
+            &actor,
+            "sfs1017-race",
+            &CutoverLocalState::default(),
+        )
+        .await?;
+
+        // Writer begins a publication session at epoch 3 before Activate.
+        let pub_tx = writer.transaction().await.unwrap();
+        let _session = PublicationSession::begin(&pub_tx, vol).await?;
+        pub_tx
+            .execute("SELECT set_config('studiofs.policy_epoch', '3', true)", &[])
+            .await
+            .unwrap();
+
+        // Activate in a separate connection, bumping policy_epoch from 3 to 4.
+        let activate_req = CutoverRequest {
+            phase: CutoverPhase::Activate,
+            roles: BTreeSet::from([CapabilityRole::Read]),
+            write_requirement: None,
+            ..base_req
+        };
+        execute_feature_cutover(
+            &mut activator,
+            vol,
+            Some(3),
+            &activate_req,
+            &actor,
+            "sfs1017-race",
+            &CutoverLocalState::default(),
+        )
+        .await?;
+
+        // The stale writer's BUMP_METADATA_VERSION (write_requirement <= 1, epoch 3) is fenced.
+        let bumped = pub_tx
+            .query_opt(sql::BUMP_METADATA_VERSION, &[&vol, &7_i16, &10_i64, &1_i16])
+            .await
+            .unwrap();
+        assert!(
+            bumped.is_none(),
+            "stale writer should be fenced after Activate"
+        );
+        Ok(())
+    })
+    .unwrap();
+}
+
+#[test]
+#[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
+fn contract_refused_when_another_volume_still_needs_feature_and_deactivate_refused_after_retired() {
+    use crate::compat::ClientCapabilities;
+    use crate::pg_engine::execute_feature_cutover;
+    use crate::volume_protocol::{
+        CutoverLocalState, CutoverPhase, CutoverRequest, OfflineClientPolicy, ProtocolRejection,
+    };
+    use std::collections::BTreeSet;
+
+    let dsn = pg_dsn().expect("STUDIOFS_TEST_PG_DSN is required");
+    let schema = IsolatedPgSchema::new(&dsn);
+    let vol_a = PgTestVolume::new(schema.dsn(), "sfs1017-vol-a");
+    let vol_b = PgTestVolume::new(schema.dsn(), "sfs1017-vol-b");
+    run_async(async {
+        let (mut client, connection) = tokio_postgres::connect(schema.dsn(), tokio_postgres::NoTls)
+            .await
+            .map_err(|error| MetaError::Storage(pg_err(error)))?;
+        let _connection = tokio::spawn(connection);
+        let feature = "metadata.contract.v1";
+        let mut actor = ClientCapabilities::current();
+        actor.read.insert(feature);
+
+        let expand = CutoverRequest {
+            feature: feature.to_owned(),
+            phase: CutoverPhase::Expand,
+            roles: BTreeSet::new(),
+            write_requirement: None,
+            checkpoint: None,
+            offline_client_policy: OfflineClientPolicy::BlockUnknownWork,
+        };
+        let migrate = CutoverRequest {
+            phase: CutoverPhase::Migrate,
+            ..expand.clone()
+        };
+        for vol in [vol_a.volume_id, vol_b.volume_id] {
+            execute_feature_cutover(
+                &mut client,
+                vol,
+                Some(1),
+                &expand,
+                &actor,
+                "sfs1017-test",
+                &CutoverLocalState::default(),
+            )
+            .await?;
+            execute_feature_cutover(
+                &mut client,
+                vol,
+                Some(2),
+                &migrate,
+                &actor,
+                "sfs1017-test",
+                &CutoverLocalState::default(),
+            )
+            .await?;
+        }
+
+        // Contracting vol_a while vol_b still has the feature in Compatible must be refused.
+        let contract = CutoverRequest {
+            phase: CutoverPhase::Contract,
+            ..expand.clone()
+        };
+        let err = execute_feature_cutover(
+            &mut client,
+            vol_a.volume_id,
+            Some(3),
+            &contract,
+            &actor,
+            "sfs1017-test",
+            &CutoverLocalState::default(),
+        )
+        .await
+        .expect_err("contract must fail while vol_b still needs the feature");
+        assert!(err.to_string().contains("sfs1017-vol-b"), "{err}");
+
+        // Move vol_b back to Available, then Contract vol_a succeeds.
+        let deactivate = CutoverRequest {
+            phase: CutoverPhase::Deactivate,
+            ..expand.clone()
+        };
+        execute_feature_cutover(
+            &mut client,
+            vol_b.volume_id,
+            Some(3),
+            &deactivate,
+            &actor,
+            "sfs1017-test",
+            &CutoverLocalState::default(),
+        )
+        .await?;
+        execute_feature_cutover(
+            &mut client,
+            vol_a.volume_id,
+            Some(3),
+            &contract,
+            &actor,
+            "sfs1017-test",
+            &CutoverLocalState::default(),
+        )
+        .await?;
+
+        // Deactivate after Retired on vol_a must be refused.
+        let retired_err = execute_feature_cutover(
+            &mut client,
+            vol_a.volume_id,
+            Some(4),
+            &deactivate,
+            &actor,
+            "sfs1017-test",
+            &CutoverLocalState::default(),
+        )
+        .await
+        .expect_err("deactivate after retired must fail");
+        assert!(
+            retired_err.to_string().contains("invalid transition")
+                || matches!(
+                    retired_err,
+                    MetaError::VolumeProtocolRejected(ProtocolRejection::InvalidTransition { .. })
+                ),
+            "{retired_err}"
+        );
+        Ok(())
+    })
+    .unwrap();
+}

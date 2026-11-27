@@ -10,10 +10,13 @@
 use tokio_postgres::GenericClient;
 
 use super::{PgMetaEngine, sql};
-use crate::compat::{ClientCapabilities, Operation, VolumeRequirements};
+use crate::compat::{CheckpointDescriptor, ClientCapabilities, Operation, VolumeRequirements};
 use crate::engine::{MetaError, MetaResult, UpgradeRequiredReason};
 use crate::version::SHARED_WRITE_REQUIREMENT;
-use crate::volume_protocol::{ProtocolRejection, VolumeProtocol, check_update};
+use crate::volume_protocol::{
+    CutoverDryRunReport, CutoverLocalState, CutoverPhase, CutoverRequest, CutoverSharedState,
+    ProtocolRejection, VolumeProtocol, check_update, evaluate_cutover_readiness,
+};
 
 const SELECT_PROTOCOL: &str = "
     SELECT p.policy_epoch, m.write_requirement, p.requirements::TEXT,
@@ -417,4 +420,229 @@ pub(super) fn check_read_operations(
         &Default::default(),
         &[Operation::Bootstrap, Operation::Replay],
     )
+}
+
+async fn collect_cutover_shared_state<C: GenericClient + Sync>(
+    client: &C,
+    volume: i64,
+    phase: CutoverPhase,
+    feature: &str,
+) -> MetaResult<(VolumeProtocol, CutoverSharedState)> {
+    let failed = |error| PgMetaEngine::classify_pg_error("collect cutover state", error);
+    let current = read_volume_protocol(client, volume).await?;
+    let state_row = client
+        .query_opt(
+            "SELECT version, checkpoint_version, octet_length(snapshot) > 0
+             FROM metadata_state WHERE vol = $1",
+            &[&volume],
+        )
+        .await
+        .map_err(failed)?
+        .ok_or(ProtocolRejection::Missing)?;
+    let remote_head_version: i64 = state_row.get(0);
+    let checkpoint_version: i64 = state_row.get(1);
+    let has_baseline_snapshot: Option<bool> = state_row.get(2);
+    let checkpoint_ready = checkpoint_version > 0 && has_baseline_snapshot.unwrap_or(false);
+    let mut available_checkpoints = Vec::new();
+    if checkpoint_ready {
+        available_checkpoints.push(CheckpointDescriptor::BASELINE);
+    }
+    let has_encodings_table: bool = client
+        .query_one(
+            "SELECT to_regclass('serving_checkpoint_encodings') IS NOT NULL",
+            &[],
+        )
+        .await
+        .map_err(failed)?
+        .get(0);
+    if has_encodings_table {
+        let rows = client
+            .query(
+                "SELECT DISTINCT checkpoint_format, checkpoint_schema
+                 FROM serving_checkpoint_encodings WHERE vol = $1",
+                &[&volume],
+            )
+            .await
+            .map_err(failed)?;
+        for row in rows {
+            let format: i16 = row.get(0);
+            let schema: i16 = row.get(1);
+            if let (Ok(format), Ok(schema)) = (u16::try_from(format), u16::try_from(schema)) {
+                let desc = CheckpointDescriptor { format, schema };
+                if !available_checkpoints.contains(&desc) {
+                    available_checkpoints.push(desc);
+                }
+            }
+        }
+    }
+
+    let maint_row = client
+        .query_one(
+            "SELECT
+                EXISTS (
+                    SELECT 1 FROM snapshot_cleanup_leases
+                    WHERE vol = $1 AND owner <> '' AND lease_expires_at > clock_timestamp()
+                ),
+                EXISTS (
+                    SELECT 1 FROM snapshot_payload_upload_objects
+                    WHERE vol = $1 AND state = 'delete_pending' AND reconcile_owner IS NOT NULL
+                      AND reconcile_lease_expires_at > clock_timestamp()
+                ),
+                EXISTS (
+                    SELECT 1 FROM snapshot_creation_jobs
+                    WHERE vol = $1 AND state IN ('pending', 'running')
+                )",
+            &[&volume],
+        )
+        .await
+        .map_err(failed)?;
+    let cleanup_active: bool = maint_row.get(0);
+    let gc_active: bool = maint_row.get(1);
+    let snapshot_active: bool = maint_row.get(2);
+    let snapshot_or_gc_active = cleanup_active || gc_active || snapshot_active;
+    let active_maintenance_detail = if snapshot_active {
+        Some("snapshot creation job is pending or running".to_owned())
+    } else if cleanup_active {
+        Some("snapshot cleanup lease is active".to_owned())
+    } else if gc_active {
+        Some("payload GC delete_pending lease is active".to_owned())
+    } else {
+        None
+    };
+
+    let (database_volume_blockers, pending_contract_migrations) = if phase == CutoverPhase::Contract
+    {
+        let target_name: Option<String> = client
+            .query_opt("SELECT name FROM volumes WHERE vol = $1", &[&volume])
+            .await
+            .map_err(failed)?
+            .map(|r| r.get(0));
+        let mut db_blockers =
+            super::migrations::contract_database_volume_blockers(client, Some(feature)).await?;
+        // Exclude the target volume itself from other-volume blockers; its own
+        // state transition is validated by `build_proposed_protocol` + `check_update`.
+        if let Some(ref name) = target_name {
+            db_blockers.retain(|(vol_name, _)| vol_name != name);
+        }
+        let (_, pending) = super::migrations::registered_schema_status(client, false).await?;
+        let contract_steps = pending
+            .into_iter()
+            .filter(|step| step.phase == super::migrations::MigrationPhase::Contract)
+            .map(|step| step.to_string())
+            .collect();
+        (db_blockers, contract_steps)
+    } else {
+        (Vec::new(), Vec::new())
+    };
+
+    Ok((
+        current,
+        CutoverSharedState {
+            remote_head_version,
+            checkpoint_version,
+            checkpoint_ready,
+            available_checkpoints,
+            snapshot_or_gc_active,
+            active_maintenance_detail,
+            database_volume_blockers,
+            pending_contract_migrations,
+        },
+    ))
+}
+
+/// Inspects cutover readiness for `volume` without modifying any state.
+///
+/// # Errors
+///
+/// Returns `VolumeProtocolRejected(Missing)` if the volume has no policy, or a
+/// classified PostgreSQL error.
+pub async fn inspect_cutover_dry_run<C: GenericClient + Sync>(
+    client: &C,
+    volume: i64,
+    request: &CutoverRequest,
+    actor: &ClientCapabilities,
+    local: &CutoverLocalState,
+) -> MetaResult<CutoverDryRunReport> {
+    let (current, shared) =
+        collect_cutover_shared_state(client, volume, request.phase, &request.feature).await?;
+    let sessions = super::client_sessions::read_client_sessions(client, volume).await?;
+    Ok(evaluate_cutover_readiness(
+        &current, request, actor, &sessions, local, &shared,
+    ))
+}
+
+/// Atomically validates readiness and applies an explicit feature cutover
+/// under the same `volumes` / `metadata_state` row locks used by publication.
+///
+/// # Errors
+///
+/// Returns `EpochConflict` if `expected_epoch` does not match, `Storage` with
+/// the blocker list if readiness fails, or a classified PostgreSQL error.
+pub async fn execute_feature_cutover(
+    client: &mut tokio_postgres::Client,
+    volume: i64,
+    expected_epoch: Option<u64>,
+    request: &CutoverRequest,
+    actor: &ClientCapabilities,
+    actor_id: &str,
+    local: &CutoverLocalState,
+) -> MetaResult<CutoverDryRunReport> {
+    let failed = |error| PgMetaEngine::classify_pg_error("execute feature cutover", error);
+    let tx = client
+        .build_transaction()
+        .isolation_level(tokio_postgres::IsolationLevel::ReadCommitted)
+        .start()
+        .await
+        .map_err(failed)?;
+    let volume_row = tx
+        .query_opt(
+            "SELECT vol FROM volumes WHERE vol = $1 FOR KEY SHARE",
+            &[&volume],
+        )
+        .await
+        .map_err(failed)?;
+    if volume_row.is_none() {
+        return Err(ProtocolRejection::Missing.into());
+    }
+    let state_row = tx
+        .query_opt(
+            "SELECT vol FROM metadata_state WHERE vol = $1 FOR UPDATE",
+            &[&volume],
+        )
+        .await
+        .map_err(failed)?;
+    if state_row.is_none() {
+        return Err(ProtocolRejection::Missing.into());
+    }
+    let (current, shared) =
+        collect_cutover_shared_state(&tx, volume, request.phase, &request.feature).await?;
+    if let Some(expected) = expected_epoch
+        && current.epoch != expected
+    {
+        return Err(ProtocolRejection::EpochConflict {
+            expected,
+            found: current.epoch,
+        }
+        .into());
+    }
+    let sessions = super::client_sessions::read_client_sessions(&tx, volume).await?;
+    let report = evaluate_cutover_readiness(&current, request, actor, &sessions, local, &shared);
+    if !report.is_ready() {
+        let summary = report
+            .blockers
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(MetaError::Storage(format!(
+            "feature cutover `{}` ({}) blocked: {summary}",
+            request.feature,
+            request.phase.as_str()
+        )));
+    }
+    if let Some(proposed) = &report.proposed {
+        update_volume_protocol(&tx, volume, current.epoch, proposed, actor, actor_id).await?;
+    }
+    tx.commit().await.map_err(failed)?;
+    Ok(report)
 }

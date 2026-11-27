@@ -2,19 +2,64 @@
 //! volume cache.
 
 use anyhow::{Context, bail};
-use clap::Args;
+use clap::{Args, ValueEnum};
+use std::collections::BTreeSet;
 use std::time::Duration;
 use studiofs_meta::RedbMetaEngine;
+use studiofs_meta::compat::ClientCapabilities;
 use studiofs_meta::pg_engine::migrations::{migrate_registered_schema, registered_schema_status};
+use studiofs_meta::pg_engine::{execute_feature_cutover, inspect_cutover_dry_run};
 use studiofs_meta::schema::{FormatInfo, PostgresConfig};
+use studiofs_meta::volume_protocol::{
+    CapabilityRole, CutoverDryRunReport, CutoverLocalState, CutoverPhase, CutoverRequest,
+    OfflineClientPolicy,
+};
 
 const BACKUP_GUIDANCE: &str = "Before upgrading: stop every mount and janitor of every volume in this PostgreSQL database, back up the database (for example with pg_dump), and run `studiofs dump` with the version that last opened each volume. Schema migrations are database-wide and never move back.";
 
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CliCutoverPhase {
+    Expand,
+    Migrate,
+    Activate,
+    Deactivate,
+    Contract,
+}
+
+impl From<CliCutoverPhase> for CutoverPhase {
+    fn from(value: CliCutoverPhase) -> Self {
+        match value {
+            CliCutoverPhase::Expand => Self::Expand,
+            CliCutoverPhase::Migrate => Self::Migrate,
+            CliCutoverPhase::Activate => Self::Activate,
+            CliCutoverPhase::Deactivate => Self::Deactivate,
+            CliCutoverPhase::Contract => Self::Contract,
+        }
+    }
+}
+
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CliCapabilityRole {
+    Read,
+    Write,
+    Maintain,
+}
+
+impl From<CliCapabilityRole> for CapabilityRole {
+    fn from(value: CliCapabilityRole) -> Self {
+        match value {
+            CliCapabilityRole::Read => Self::Read,
+            CliCapabilityRole::Write => Self::Write,
+            CliCapabilityRole::Maintain => Self::Maintain,
+        }
+    }
+}
+
 #[derive(Args, Debug)]
 pub struct UpgradeArgs {
-    /// Locally discovered volume; stop all its mounts and janitors first.
+    /// Locally discovered volume; stop all its mounts and janitors first (except for `--feature` cutover inspection).
     pub name: String,
-    /// Report the schema migrations and format upgrade that would run, without changing anything.
+    /// Report the schema migrations, format upgrade, or feature cutover readiness without changing anything.
     #[arg(long)]
     pub dry_run: bool,
     /// Re-apply the 0.2.5 baseline schema to restore dropped objects; allowed only while no later schema migration is recorded.
@@ -23,23 +68,49 @@ pub struct UpgradeArgs {
     /// Cache directory used by mount, when set with its --cache-dir option.
     #[arg(long)]
     pub cache_dir: Option<std::path::PathBuf>,
+    /// Feature capability name for an explicit Expand-Migrate-Activate-Contract cutover.
+    #[arg(long, requires = "phase", conflicts_with = "repair_schema")]
+    pub feature: Option<String>,
+    /// Cutover phase (`expand`, `migrate`, `activate`, `deactivate`, `contract`).
+    #[arg(
+        long,
+        value_enum,
+        requires = "feature",
+        conflicts_with = "repair_schema"
+    )]
+    pub phase: Option<CliCutoverPhase>,
+    /// Capability role(s) (`read`, `write`, `maintain`) when activating a feature.
+    #[arg(long = "role", value_enum, requires = "feature")]
+    pub roles: Vec<CliCapabilityRole>,
+    /// Explicit write_requirement override for feature activation or deactivation.
+    #[arg(long, requires = "feature")]
+    pub write_requirement: Option<u16>,
+    /// Explicitly accept fencing offline clients that may hold unknown unpublished local work.
+    #[arg(long, requires = "feature")]
+    pub accept_offline_clients: bool,
+    /// Expected policy epoch for optimistic concurrency when applying a feature cutover.
+    #[arg(long, requires = "feature")]
+    pub expected_epoch: Option<u64>,
     /// Upgrade only the stopped local metadata database.
     #[cfg(feature = "test-successor")]
-    #[arg(long, conflicts_with_all = ["repair_schema", "dry_run"])]
+    #[arg(long, conflicts_with_all = ["repair_schema", "dry_run", "feature"])]
     pub local_only: bool,
 }
 
 impl UpgradeArgs {
     pub fn dispatch(self) -> anyhow::Result<()> {
-        if super::utils::active_mount_record_for_volume(&self.name)?.is_some() {
-            bail!("Unmount this volume before running upgrade.");
-        }
         let path =
             super::utils::get_default_meta_dir(&self.name)?.join(format!("{}.db", self.name));
         if !path.is_file() {
             bail!(
                 "Local volume metadata is missing; run upgrade where this volume already has a stopped cache."
             );
+        }
+        if let (Some(feature), Some(phase)) = (self.feature.clone(), self.phase) {
+            return self.dispatch_feature_cutover(&path, feature, phase.into());
+        }
+        if super::utils::active_mount_record_for_volume(&self.name)?.is_some() {
+            bail!("Unmount this volume before running upgrade.");
         }
         #[cfg(feature = "test-successor")]
         if self.local_only {
@@ -106,6 +177,113 @@ impl UpgradeArgs {
         );
         Ok(())
     }
+
+    fn dispatch_feature_cutover(
+        self,
+        path: &std::path::Path,
+        feature: String,
+        phase: CutoverPhase,
+    ) -> anyhow::Result<()> {
+        let format = RedbMetaEngine::read_format_info_for_upgrade_readonly(path)
+            .context("Cannot read local metadata; nothing was changed")?;
+        let pg = postgres_binding(&format, &self.name)?;
+        let roles: BTreeSet<CapabilityRole> = self.roles.into_iter().map(Into::into).collect();
+        let request = CutoverRequest {
+            feature,
+            phase,
+            roles,
+            write_requirement: self.write_requirement,
+            checkpoint: None,
+            offline_client_policy: if self.accept_offline_clients {
+                OfflineClientPolicy::AcceptFence
+            } else {
+                OfflineClientPolicy::BlockUnknownWork
+            },
+        };
+        let local_state = CutoverLocalState::default();
+        let actor = ClientCapabilities::current();
+        let runtime = tokio::runtime::Runtime::new()?;
+        if self.dry_run {
+            let report = runtime
+                .block_on(async {
+                    tokio::time::timeout(
+                        Duration::from_secs(45),
+                        super::init::with_postgres_client(&pg.url, |client| async move {
+                            Ok(inspect_cutover_dry_run(
+                                &client,
+                                pg.volume_id,
+                                &request,
+                                &actor,
+                                &local_state,
+                            )
+                            .await?)
+                        }),
+                    )
+                    .await
+                })
+                .context("Feature cutover dry-run timed out; nothing was changed")?
+                .context("Feature cutover dry-run failed; nothing was changed")?;
+            print!("{}", format_cutover_report(&report, true));
+            return Ok(());
+        }
+        let expected_epoch = self.expected_epoch;
+        let report = runtime
+            .block_on(async {
+                tokio::time::timeout(
+                    Duration::from_secs(45),
+                    super::init::with_postgres_client(&pg.url, |mut client| async move {
+                        Ok(execute_feature_cutover(
+                            &mut client,
+                            pg.volume_id,
+                            expected_epoch,
+                            &request,
+                            &actor,
+                            "studiofs upgrade",
+                            &local_state,
+                        )
+                        .await?)
+                    }),
+                )
+                .await
+            })
+            .context("Feature cutover timed out")?
+            .context("Feature cutover was not applied")?;
+        print!("{}", format_cutover_report(&report, false));
+        Ok(())
+    }
+}
+
+fn format_cutover_report(report: &CutoverDryRunReport, dry_run: bool) -> String {
+    let mut out = String::new();
+    if dry_run {
+        out.push_str("Dry run: nothing was changed.\n");
+    } else {
+        out.push_str("Feature cutover applied.\n");
+    }
+    out.push_str(&format!(
+        "Feature: {} (phase: {})\nEpoch: {} -> {}\nRollback boundary: {}\n",
+        report.feature,
+        report.phase.as_str(),
+        report.current_epoch,
+        report.next_epoch,
+        report.rollback_boundary
+    ));
+    out.push_str(&format!(
+        "Sessions: {} eligible active, {} blocking active, {} expired unsupported, {} stale-epoch active\n",
+        report.sessions.eligible_active.len(),
+        report.sessions.blocking_active.len(),
+        report.sessions.expired_unsupported.len(),
+        report.sessions.stale_epoch_active.len()
+    ));
+    if report.blockers.is_empty() {
+        out.push_str("Blockers: none\n");
+    } else {
+        out.push_str("Blockers:\n");
+        for blocker in &report.blockers {
+            out.push_str(&format!("  - {blocker}\n"));
+        }
+    }
+    out
 }
 
 fn finish_local_upgrade(
@@ -231,5 +409,48 @@ mod tests {
             super::super::parse_for_test(&["upgrade", "volume", "--local-only", "--repair-schema"])
                 .is_err()
         );
+    }
+
+    #[test]
+    fn feature_cutover_flags_parse_and_require_each_other() {
+        assert!(
+            super::super::parse_for_test(&["upgrade", "volume", "--feature", "metadata.v1"])
+                .is_err()
+        );
+        assert!(
+            super::super::parse_for_test(&["upgrade", "volume", "--phase", "activate"]).is_err()
+        );
+        let parsed = parse(&[
+            "upgrade",
+            "volume",
+            "--feature",
+            "metadata.v1",
+            "--phase",
+            "activate",
+            "--role",
+            "read",
+            "--role",
+            "write",
+            "--write-requirement",
+            "2",
+            "--accept-offline-clients",
+            "--expected-epoch",
+            "3",
+            "--dry-run",
+        ])
+        .unwrap();
+        assert_eq!(parsed.feature.as_deref(), Some("metadata.v1"));
+        assert_eq!(parsed.phase, Some(super::CliCutoverPhase::Activate));
+        assert_eq!(
+            parsed.roles,
+            vec![
+                super::CliCapabilityRole::Read,
+                super::CliCapabilityRole::Write
+            ]
+        );
+        assert_eq!(parsed.write_requirement, Some(2));
+        assert!(parsed.accept_offline_clients);
+        assert_eq!(parsed.expected_epoch, Some(3));
+        assert!(parsed.dry_run);
     }
 }

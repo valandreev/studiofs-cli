@@ -551,12 +551,100 @@ pub(crate) async fn migrate_with(
                 .map_err(|error| pg_failure("finish schema migration", &error))?;
             return Ok(applied);
         };
+        if step.phase == MigrationPhase::Contract {
+            let blockers = contract_database_volume_blockers(&tx, None).await?;
+            if let Some((vol, detail)) = blockers.first() {
+                return Err(MetaError::Storage(format!(
+                    "cannot apply contract migration {step}: volume '{vol}' {detail}"
+                )));
+            }
+        }
         apply(&tx, &step, registry).await?;
         tx.commit()
             .await
             .map_err(|error| pg_failure("commit schema migration", &error))?;
         applied.push(step);
     }
+}
+
+/// Checks every volume in the database before a `Contract` transition or DDL step.
+///
+/// Returns `(volume_name, reason)` for every volume that lacks a `volume_protocol`
+/// policy or (when `feature` is `Some`) still has `feature` in `compatible` or
+/// `required` state.
+pub async fn contract_database_volume_blockers<C>(
+    client: &C,
+    feature: Option<&str>,
+) -> MetaResult<Vec<(String, String)>>
+where
+    C: GenericClient + Sync,
+{
+    let has_volumes: bool = client
+        .query_one(
+            "SELECT to_regclass('volumes') IS NOT NULL
+                AND to_regclass('volume_protocol') IS NOT NULL
+                AND to_regclass('metadata_state') IS NOT NULL",
+            &[],
+        )
+        .await
+        .map_err(|error| pg_failure("check database volumes for contract", &error))?
+        .get(0);
+    if !has_volumes {
+        return Ok(Vec::new());
+    }
+    let rows = client
+        .query(
+            "SELECT v.name, p.policy_epoch, m.write_requirement, p.requirements::TEXT
+             FROM volumes v
+             LEFT JOIN metadata_state m ON m.vol = v.vol
+             LEFT JOIN volume_protocol p ON p.vol = v.vol
+             ORDER BY v.vol",
+            &[],
+        )
+        .await
+        .map_err(|error| pg_failure("inspect database volumes for contract", &error))?;
+    let mut blockers = Vec::new();
+    for row in rows {
+        let name: String = row.get(0);
+        let epoch: Option<i64> = row.get(1);
+        let write_requirement: Option<i16> = row.get(2);
+        let requirements: Option<String> = row.get(3);
+        let (Some(epoch), Some(write_requirement), Some(requirements)) =
+            (epoch, write_requirement, requirements)
+        else {
+            blockers.push((
+                name,
+                "has no volume_protocol policy; run `studiofs upgrade` on it first".to_owned(),
+            ));
+            continue;
+        };
+        let protocol = crate::volume_protocol::VolumeProtocol::decode(
+            epoch,
+            write_requirement,
+            &requirements,
+        )?;
+        if let Some(cap) = feature {
+            let state = protocol.requirements.features.get(cap).copied();
+            let in_required_set = protocol.requirements.read.contains(cap)
+                || protocol.requirements.write.contains(cap)
+                || protocol.requirements.maintain.contains(cap);
+            if in_required_set
+                || matches!(
+                    state,
+                    Some(
+                        crate::volume_protocol::FeatureState::Compatible
+                            | crate::volume_protocol::FeatureState::Required
+                    )
+                )
+            {
+                blockers.push((
+                    name,
+                    format!("still needs feature `{cap}` (state: {state:?})"),
+                ));
+            }
+        }
+    }
+    Ok(blockers)
 }
 
 /// Read-only preflight for `studiofs upgrade --dry-run`: the recorded

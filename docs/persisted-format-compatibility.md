@@ -741,6 +741,30 @@ revalidates the policy epoch before its first publication and its first replay
 batch. A client offline across Activate keeps its local work and fails closed
 at publication or replay with a typed reason.
 
+Because an expired session lease in `client_sessions` does not prove that an
+offline client has no unpublished local work, `studiofs upgrade NAME --feature CAP --phase activate`
+treats expired unsupported sessions as blockers by default unless the operator
+explicitly passes `--accept-offline-clients`.
+
+### Explicit feature cutover (`studiofs upgrade --feature`)
+
+Operators drive per-volume Expand–Migrate–Activate–Contract transitions through
+`studiofs upgrade <name> --feature <cap> --phase <expand|migrate|activate|deactivate|contract>`:
+
+- `--dry-run` inspects the volume policy, transition epochs, rollback boundary,
+  eligible and blocking active sessions, expired unsupported sessions,
+  compatible checkpoints, snapshot/GC state, and (for `contract`) every volume
+  in the database without mutating anything.
+- `expand` (`available`) and `migrate` (`compatible`) keep 0.2.5+ clients writable.
+- `activate` (`required`) atomically checks readiness under the `volumes` and
+  `metadata_state` row locks used by publication, raises `write_requirement`
+  when gating a write capability, and fences stale writers.
+- `deactivate` rolls back `required -> compatible` or `compatible -> available`
+  before `contract`.
+- `contract` (`retired`, terminal) and `MigrationPhase::Contract` schema steps
+  verify every volume in the PostgreSQL database before retiring a feature or
+  dropping shared objects; `deactivate` is refused after `retired`.
+
 ### Rollback limits
 
 Rollback is supported only before Activate, or after Activate only until
