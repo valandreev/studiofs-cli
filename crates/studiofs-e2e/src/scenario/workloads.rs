@@ -292,10 +292,9 @@ pub(super) use snapshot_v2::*;
 pub(super) use sync_safety::*;
 #[cfg(test)]
 pub(crate) use test_fixtures::{
-    TEST_FAILING_VALIDATE, TEST_FAILING_VALIDATE_AND_CLEANUP, TEST_PASSING,
+    TEST_FAILING_VALIDATE, TEST_FAILING_VALIDATE_AND_CLEANUP, TEST_PASSING, TestFailingScenario,
+    TestPassingScenario,
 };
-#[cfg(test)]
-pub(super) use test_fixtures::{TestFailingScenario, TestPassingScenario};
 pub(super) use worker_concurrency::WorkerConcurrency;
 #[cfg(test)]
 mod tests;

@@ -10,7 +10,7 @@ pub(crate) const TEST_FAILING_VALIDATE_AND_CLEANUP: &str = "__test-failing-valid
 pub(crate) const TEST_PASSING: &str = "__test-passing";
 
 #[derive(Debug, Clone, Copy)]
-pub(in crate::scenario) struct TestFailingScenario {
+pub(crate) struct TestFailingScenario {
     pub(in crate::scenario) cleanup_fails: bool,
 }
 
@@ -54,7 +54,7 @@ impl Scenario for TestFailingScenario {
 
 #[cfg(test)]
 #[derive(Debug, Clone, Copy)]
-pub(in crate::scenario) struct TestPassingScenario;
+pub(crate) struct TestPassingScenario;
 
 #[cfg(test)]
 impl Scenario for TestPassingScenario {
