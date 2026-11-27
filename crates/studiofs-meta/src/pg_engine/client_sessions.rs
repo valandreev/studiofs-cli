@@ -652,6 +652,33 @@ impl PublicationSession {
         Ok(Self(lease))
     }
 
+    /// Renews and restamps the lease before the next write in a long transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the session lost ownership, its policy epoch is
+    /// stale, or PostgreSQL rejects the renewal or stamp.
+    pub async fn renew(&mut self, tx: &Transaction<'_>, volume: i64) -> MetaResult<()> {
+        let lease = &mut self.0;
+        let row = tx
+            .query_opt(
+                RENEW,
+                &[
+                    &volume,
+                    &lease.owner.id,
+                    &lease.owner.owner,
+                    &lease.token,
+                    &lease.validated_epoch,
+                    &LEASE_SECONDS,
+                ],
+            )
+            .await
+            .map_err(|error| classify_session_pg_error("renew publication session", error))?
+            .ok_or_else(|| HeartbeatError::Fenced.into_meta_error())?;
+        lease.token = row.get(0);
+        lease.stamp(tx, volume).await
+    }
+
     /// Removes the short-lived transactional session row after its last write
     /// and before committing, avoiding unbounded session-table growth.
     ///

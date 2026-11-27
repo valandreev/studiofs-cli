@@ -174,6 +174,10 @@ that declares support for 0.2.5 (the compiled test successor of
     `metadata_state` checkpoint, prune and `write_requirement` columns.
   - `payload_gc`: the payload upload and reachability ledger that publication
     writes.
+  - `event_publication_fence`: the mirrored `metadata_state.publication_epoch`
+    and the three triggers that initialize the epoch, synchronize policy changes,
+    and fence inserts into `event_log`. A missing trigger or one disabled for
+    ordinary writes requires schema repair before the mount can start.
 
   Each component's `studiofs_schema_components` row must exist and be at least
   its `min_supported`. A newer version or an unknown component is additive for

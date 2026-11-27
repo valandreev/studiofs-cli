@@ -177,7 +177,7 @@ const FORMAT_FENCES: Migration = Migration {
 /// would still see its original statement snapshot.
 const EVENT_PUBLICATION_FENCE: Migration = Migration {
     component: EVENT_PUBLICATION_FENCE_COMPONENT,
-    version: 1,
+    version: crate::version::POSTGRES_EVENT_PUBLICATION_FENCE_SCHEMA.current as i32,
     name: "fence metadata event publication",
     phase: MigrationPhase::Additive,
     sql: super::schema::EVENT_PUBLICATION_FENCE_SQL,
