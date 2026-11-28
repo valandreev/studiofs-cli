@@ -1996,6 +1996,7 @@ fn run_baseline_successor_pair(
                 wait_for_active_sessions(config, 2, Duration::from_secs(30))?;
 
                 // Unmount successor temporarily to drive feature cutover (cutover requires local cache unmounted).
+                wait_for_sync_safe(&controller, CLIENT_SUCCESSOR)?;
                 controller.unmount(CLIENT_SUCCESSOR)?;
 
                 // 1. Expand (`available`)
@@ -2172,6 +2173,7 @@ fn run_baseline_successor_pair(
                     &base_mount,
                     "cell05-after-deactivate",
                 )?;
+                wait_for_sync_safe(&controller, CLIENT_SUCCESSOR)?;
                 controller.unmount(CLIENT_BASELINE)?;
                 controller.unmount(CLIENT_SUCCESSOR)?;
                 record_op(
@@ -3004,10 +3006,11 @@ fn offline_sentinel(
 }
 
 fn write_sync(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    let mut file = OpenOptions::new()
+    // WinFSP FlushFileBuffers is volatile writeback; write-through is the
+    // local durability barrier the cell 4 force-kill must not cross.
+    let mut file = mounted_write_barrier_open_options()
         .create(true)
         .truncate(true)
-        .write(true)
         .open(path)?;
     file.write_all(bytes)?;
     file.sync_all()
@@ -3373,6 +3376,22 @@ fn wait_for_published_write(
                 && runtime["upload"]["active_uploads"] == 0
                 && observe_metadata_version(config, remaining_observation_time(deadline))?
                     > version)
+        },
+    )
+}
+
+/// Cutover refuses a stopped cache whose local events are not remotely acknowledged.
+fn wait_for_sync_safe(
+    controller: &MultiClientController<SystemClientProcessExecutor>,
+    client: &str,
+) -> Result<(), ScenarioError> {
+    wait_for_matrix_state(
+        "mounted client sync_safety reports all local work acknowledged",
+        CONVERGENCE_TIMEOUT,
+        |deadline| {
+            let runtime = controller
+                .runtime_snapshot_with_timeout(client, remaining_observation_time(deadline))?;
+            Ok(runtime["sync_safety"]["state"] == "safe")
         },
     )
 }

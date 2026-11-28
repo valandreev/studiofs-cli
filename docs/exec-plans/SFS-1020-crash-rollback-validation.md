@@ -26,6 +26,8 @@ Operators need to be able to repeat an interrupted `studiofs upgrade` or restart
 - [x] (2026-11-27 22:32Z) Rebuilt both binaries from `1a950c27` and passed the macOS crash matrix (9/9) with the new operations.
 - [x] (2026-11-27 22:44Z) Passed the rebuilt macOS forward matrix (8/8) with statement logging. `check_publication_statements.py` exited 0 with 14 statements per measured batch for both releases. Verified that no run containers or mounts remained.
 - [x] (2026-11-28 10:15Z) SFS-1136: built both binaries from clean `bbac7a4f` on Linux and passed the crash matrix (9/9), forward matrix (8/8), maintenance run (2/2), bridge smoke and every focused test listed below. Statement parity held. See [Linux pass](#linux-pass-sfs-1136).
+- [x] (2026-11-28 10:11Z) SFS-1135: on Windows the first two WinFSP crash runs, `sfs1135-windows-crash` and `sfs1135-windows-crash-r2`, failed in cells 4 and 5 on runner defects (see Surprises). Fixed the runner in `774db772`.
+- [x] (2026-11-28 10:25Z) SFS-1135: with binaries built from clean `bbac7a4f` on Windows, passed the crash matrix (9/9 on `-r3`), forward matrix (8/8), maintenance run (2/2) and every focused test listed below. Statement parity held. See [Windows pass](#windows-pass-sfs-1135).
 
 ## Surprises & Discoveries
 
@@ -38,6 +40,10 @@ After the baseline was force-killed with PostgreSQL stopped, its old lease and t
 Compose's default ports are exclusive. Parallel runs with the defaults failed preflight before mounting anything. Independent runs below use disjoint port ranges.
 
 PostgreSQL truncates long statements in `pg_stat_activity`. The SFS-1015 test now identifies the fused statement by its leading CTE and still waits for the activation transaction to block the publisher before committing.
+
+Windows (SFS-1135), first attempt. `sfs1135-windows-crash` passed cells 1–3, 8 and 9, then failed in cell 4 with `os error 2`. After the force-kill and restart, the baseline log showed `startup recovery removed lost unpublished upload inode without durable payload graph`, so the offline write was gone. The matrix wrote it with `sync_all`, which on WinFSP is `FlushFileBuffers`. The [platform bridge contract](../platform-bridges.md) defines that call as volatile writeback, and only write-through handles are a local durability barrier. Other mounted scenarios already use `mounted_write_barrier_open_options`. The matrix `write_sync` now uses it too. On Unix the helper only sets `write(true)`, so the Linux and macOS behavior is unchanged.
+
+Windows, second attempt. `sfs1135-windows-crash-r2` passed cell 4, including the replay kill, then failed in cell 5. The cancelled activation was refused with `local cache has dirty unpublished work (3 unpublished events)` instead of SQLSTATE 57014. The successor still had events from the cell 4 replay-kill writes that were published but not yet acknowledged locally when the runner stopped it. Checksum convergence does not prove the outbound acknowledgement. Cell 5 now waits for the successor's `sync_safety` state to read `safe` before each stop that precedes a cutover. Both failed runs are retained under `target/e2e-runs/`.
 
 ## Decision Log
 
@@ -55,7 +61,7 @@ Mounted renewal fault: a trigger cancels every `client_sessions` update that ext
 
 ## Outcomes & Retrospective
 
-The rebuilt macOS crash matrix passed nine of nine cells with no skips. It records recovery of both legacy adoption chains, schema and local revision cancellation, checkpoint and prune retry, snapshot checksum, a force-killed baseline with an unpublished write, supported deactivate, and irreversible downgrade refusal. The rebuilt ordinary forward matrix passed eight of eight cells and the maintenance run passed both scenarios. PostgreSQL statement counts match v0.2.4 for the measured file-payload batch. The format-7 header and v5 dump fixture seals pass the drift gate. The build and fixture provenance uses `7fe972358f9e48655249739ae7c8415bcac5504d` with uncommitted changes. The review rerun built from `1a950c27` with uncommitted runner changes. It passed `sfs1020-macos-crash-review` (9/9) and `sfs1020-macos-forward-review` (8/8), and statement parity held. One gap remains for the mounted gate: a kill between applying a replay page and committing its cursor. Unit hooks cover that point. Windows remains pending SFS-1135, and final release evidence comes from the clean candidate. The Linux pass (SFS-1136) passed every gate on its first attempt from clean `bbac7a4f`, with no runner or product changes.
+The rebuilt macOS crash matrix passed nine of nine cells with no skips. It records recovery of both legacy adoption chains, schema and local revision cancellation, checkpoint and prune retry, snapshot checksum, a force-killed baseline with an unpublished write, supported deactivate, and irreversible downgrade refusal. The rebuilt ordinary forward matrix passed eight of eight cells and the maintenance run passed both scenarios. PostgreSQL statement counts match v0.2.4 for the measured file-payload batch. The format-7 header and v5 dump fixture seals pass the drift gate. The build and fixture provenance uses `7fe972358f9e48655249739ae7c8415bcac5504d` with uncommitted changes. The review rerun built from `1a950c27` with uncommitted runner changes. It passed `sfs1020-macos-crash-review` (9/9) and `sfs1020-macos-forward-review` (8/8), and statement parity held. One gap remains for the mounted gate: a kill between applying a replay page and committing its cursor. Unit hooks cover that point. Final release evidence comes from the clean candidate. The Linux pass (SFS-1136) passed every gate on its first attempt from clean `bbac7a4f`, with no runner or product changes. The Windows pass (SFS-1135) passed every gate from clean `bbac7a4f` binaries after two runner fixes in `774db772`. One fix replaced a volatile `FlushFileBuffers` that the runner used as the durability barrier before a force-kill. The other made the runner wait for local events to be acknowledged before stopping the successor. Windows needed no product changes.
 
 ## Context and Orientation
 
@@ -135,6 +141,30 @@ User content was checksum-verified and pending local operations were preserved. 
 
 The Compose stacks were torn down afterwards. `mount` showed no FUSE mount except `fusectl`, and no `sfs1136` containers or volumes remained. The replay-commit gap recorded above still applies on Linux.
 
+## Windows pass (SFS-1135)
+
+On 2026-11-28 the suite ran on native Windows 11 x86_64 with WinFSP and Docker Desktop. The baseline and test successor were built from clean `bbac7a4f`. The successor manifest `target/test-successor/manifest.json` (SHA-256 `2b3b8475433a75f851b84f188458e7a3c41be0c4c4cdc1969b28f180b26b8bc7`) records five verified changes, `source_dirty=false`, baseline `target/debug/studiofs.exe` `a8857c5da4babcaef963bbb52d6afe1c17731f768b7856462a56a323382b69e0` and successor `target/test-successor/debug/studiofs.exe` `b14085a735c0140ca254831286d943229b38f214046a1ba940d9c26ac75fce5e`.
+
+The counted runs used `studiofs-e2e.exe` built with the runner fixes now in `774db772`, SHA-256 `7b4ab1e7c5a4906bba2e7294acc329cf0a02099a6add20a5c5ccc8810738d6ae`. That commit changes only the test runner, so the product binaries were not rebuilt.
+
+`gh release download` fetched the published archives into `target/sfs1135-v024/` and `target/sfs1135-v022/`. `studiofs-0.2.4-x86_64-pc-windows.zip` (`cbd877327d86adc2e77395578298f9cc5f9a3d4a517559f9d8904698b805c3a6`) matched its release `.sha256` and the runner's pinned value. `studiofs-0.2.2-x86_64-pc-windows-msvc.zip` (`10748f832568b8f918b1b316e48d819139ff9aaaccb190a77abf5aca5cbebff0`) matched its release `.sha256`.
+
+Each archive was hash-checked before `Expand-Archive` unpacked it into a new `extract/` directory. The v0.2.4 `studiofs.exe` SHA-256 is `a63ac1c4214dcd3a8777f8bf1d4c7051d2fe4649f94179258b8b228bc4d182be`. The v0.2.2 `studiofs.exe` SHA-256 is `44f53fce1f0bfebe2ec78e033c1ade4f928a5e1e0433b474034ccf5dc66d2d58`.
+
+Docker was shared with the Linux run. The runs therefore used disjoint port ranges: 37100-37119 for crash, 37200-37219 for forward and 37300-37319 for maintenance. The live PostgreSQL tests used Compose project `studiofs-sfs1135-pg` on port 37432.
+
+| Gate | Command | Result | Artifacts |
+| --- | --- | --- | --- |
+| Forward matrix with statement logging | Concrete Steps forward command with run ID `sfs1135-windows-forward`, `--port-range 37200-37219`, the Windows v0.2.4 binary and `$env:STUDIOFS_E2E_COMPOSE_FILE = "$PWD\target\sfs1135-stmt-compose.e2e.yml"` (the same statement-logging copy) | Pass, 8/8 cells. The `mounted_xattr_two_way` operation in cell 1 is platform-gated, as recorded in SFS-1019 | `target/e2e-runs/sfs1135-windows-forward/` |
+| Statement parity | `python -B tools/test_successor/check_publication_statements.py target/e2e-runs/sfs1135-windows-forward/artifacts/docker/compose.log` | Pass, exit 0. v0.2.4 ran 14 statements per batch (1 measured) and 0.2.5 ran 14 (1 measured) | `target/sfs1135-publication-statements.txt` |
+| Crash matrix | Concrete Steps crash command with run ID `sfs1135-windows-crash-r3`, `--port-range 37100-37119` and the Windows v0.2.4 and v0.2.2 binaries | Pass, 9/9 cells, 0 skipped cells, with the same platform-gated xattr operation. The replay kill happened at cursor 27 with head 31. The restart reached 31 and verified 8 SHA-256 digests. Epochs stayed at 1 in cells 1, 2 and 4 and advanced from 5 to 6 at activation. At adoption both epochs advanced to 1. Format 6 started with both absent, and format 5 started with an absent policy epoch and publication epoch 0 | `target/e2e-runs/sfs1135-windows-crash-r3/`; failed attempts in `sfs1135-windows-crash/` and `sfs1135-windows-crash-r2/` |
+| Maintenance | Concrete Steps maintenance command with run ID `sfs1135-windows-maintenance`, the `.exe` paths and `--port-range 37300-37319` | Pass, 2/2 scenarios | `target/e2e-runs/sfs1135-windows-maintenance/` |
+| Live PostgreSQL | Every PG filter in the table above and in the paragraph after it, plus the three split-batch PG tests | Pass, one test each, and 3 for `event_publication_fence` | `target/sfs1135-pg/pg-<name>.log`, `target/sfs1135-pg/summary.txt` |
+| redb and CLI | `split_publication_`, `published_format6_upgrade_resumes_after_each_local_stage`, `--features test-successor baseline_dirty_cache_local_revision_resumes_at_every_boundary`, `checkpoint_freshness_sql_uses_persisted_scalar_bookkeeping`, `dump_load_roundtrip_restores_the_published_baseline` with `-- --ignored`, and `load_refuses_v4_dump_with_upgrade_instruction` | Pass (2, 1, 1, 1, 1 and 1) | `target/sfs1135-pg/` |
+| Runner checks | `cargo test -p studiofs-e2e --lib --locked scenario::workloads::forward_compat_matrix -- --nocapture`, `cargo clippy -p studiofs-e2e --all-targets --locked -- -D warnings` | Pass (7), clean | — |
+
+The cell 4 force-killed baseline remounted its cache, recovered the checksum of its unpublished write, and published that write to the successor. This required the write-through fix described in Surprises. The Compose stacks were torn down afterwards. No `sfs1135` containers, volumes, networks, `studiofs` processes or WinFSP mounts remained, and no test log contains a DSN. The replay-commit gap recorded above still applies on Windows.
+
 ## Idempotence and Recovery
 
 Each matrix starts with a fresh Compose database, bucket, and client roots. The runner removes its own containers and mounts and retains reports. A cancelled transaction leaves the previous committed registry, checkpoint, prune floor, or policy available. A normal retry reuses the stopped local database and removes its upgrade marker when local completion commits. Remove the dedicated test stacks with `docker compose -f docker/compose.e2e.yml -p studiofs-sfs1020-fused down -v` and the same command with `-p studiofs-sfs1020-dump-restore`.
@@ -150,6 +180,8 @@ The verified successor build manifest is `target/test-successor/manifest.json`, 
 ## Interfaces and Dependencies
 
 The wrapper adds `--crash-rollback` and selects the existing scenario. The only product code used exclusively by the test successor is the local revision interruption in `crates/studiofs-meta/src/redb_engine/format.rs`. It exits after the stage-3 transaction commits. The ordinary and crash suites require real Docker PostgreSQL and RustFS, the baseline executable, the compiled test successor executable, and the published legacy executables for cells 8 and 9.
+
+Revision note, 2026-11-28 (SFS-1135). Added the Windows pass evidence and the two runner fixes.
 
 Revision note, 2026-11-28 (SFS-1136). Added the Linux pass evidence.
 
