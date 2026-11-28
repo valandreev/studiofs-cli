@@ -62,6 +62,13 @@ class RepeatTests(unittest.TestCase):
         self.assertEqual(summary["iterations_run"], 2)
         self.assertEqual([r["passed"] for r in summary["steps"]], [True, True, False, True])
 
+    def test_scenarios_only_rejects_explicit_steps(self) -> None:
+        with mock.patch.object(sys, "argv", ["e2e_gate.py", "--scenarios-only", "--step", "crash"]), mock.patch.object(
+            sys, "stderr"
+        ), self.assertRaises(SystemExit) as raised:
+            e2e_gate.main()
+        self.assertEqual(raised.exception.code, 2)
+
     def test_repeat_must_be_positive(self) -> None:
         self.assertEqual(e2e_gate.positive_int("10"), 10)
         with self.assertRaises(argparse.ArgumentTypeError):

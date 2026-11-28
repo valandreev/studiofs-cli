@@ -145,6 +145,8 @@ def main() -> int:
         help="run the selected steps N times in a row; stop after the first failed iteration",
     )
     args = parser.parse_args()
+    if args.scenarios_only and args.step:
+        parser.error("--scenarios-only selects its own steps; drop --step or --scenarios-only")
     if args.scenarios_only:
         args.allow_dirty = True
 
