@@ -93,6 +93,29 @@ pub fn available_scenarios() -> &'static [ScenarioDefinition] {
     })
 }
 
+/// Selector that expands to every registered scenario of the release E2E gate.
+pub const RELEASE_GATE_SELECTOR: &str = "release-gate";
+
+/// Registered scenarios the `release-gate` selector leaves out. The fixture
+/// capture and the Janitor benchmark are opt-in tools. The forward-compat matrix
+/// migrates the shared PostgreSQL irreversibly, so `tools/release/e2e_gate.py`
+/// runs it in its own sandbox.
+const RELEASE_GATE_EXCLUDED: [&str; 3] = [
+    "published-volume-fixture-capture",
+    "janitor-live-benchmark",
+    MOUNTED_FORWARD_COMPAT_MATRIX,
+];
+
+/// Returns the registered scenario names the `release-gate` selector runs, in
+/// registry order.
+pub fn release_gate_scenarios() -> Vec<&'static str> {
+    available_scenarios()
+        .iter()
+        .map(|scenario| scenario.name)
+        .filter(|name| !RELEASE_GATE_EXCLUDED.contains(name))
+        .collect()
+}
+
 /// Resolves a scenario name to a concrete scenario implementation.
 pub(crate) fn resolve_scenario(name: &str) -> Option<Box<dyn Scenario>> {
     match name {
@@ -290,5 +313,22 @@ mod tests {
         );
         assert!(resolve_scenario(super::MOUNTED_FORWARD_COMPAT_MATRIX).is_some());
         assert!(resolve_scenario(super::FORWARD_COMPAT_MATRIX_ALIAS).is_some());
+    }
+
+    #[test]
+    fn release_gate_runs_every_registered_scenario_except_excluded_ones() {
+        let gate = super::release_gate_scenarios();
+        for excluded in super::RELEASE_GATE_EXCLUDED {
+            assert!(
+                available_scenarios().iter().any(|s| s.name == excluded),
+                "excluded scenario is not registered: {excluded}"
+            );
+            assert!(!gate.contains(&excluded), "gate must skip {excluded}");
+        }
+        assert_eq!(
+            gate.len() + super::RELEASE_GATE_EXCLUDED.len(),
+            available_scenarios().len()
+        );
+        assert!(gate.iter().all(|name| resolve_scenario(name).is_some()));
     }
 }

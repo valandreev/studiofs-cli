@@ -96,7 +96,8 @@ pub struct RunArgs {
     #[arg(long)]
     pub port_range: Option<String>,
 
-    /// Optional whole-run timeout string reserved for future hook enforcement.
+    /// Optional timeout for each supervised scenario child, such as `30m`;
+    /// defaults to five minutes.
     #[arg(long)]
     pub timeout: Option<String>,
 
@@ -384,6 +385,12 @@ fn expand_scenario_selector_part(
 ) -> Vec<String> {
     if part.is_empty() {
         return Vec::new();
+    }
+    if part == scenario::RELEASE_GATE_SELECTOR {
+        return scenario::release_gate_scenarios()
+            .into_iter()
+            .map(str::to_string)
+            .collect();
     }
     if let Some((start, end)) = parse_scenario_range(part) {
         return (start..=end)
