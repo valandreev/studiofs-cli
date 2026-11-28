@@ -335,10 +335,11 @@ cargo test --workspace --all-targets -- --ignored --nocapture --test-threads=1
 Run every real mounted E2E scenario. The command builds the release binary,
 the E2E runner and the compiled test successor, downloads the verified
 published `v0.2.4` binary, and runs all scenarios, including the
-forward-compatibility matrix:
+forward-compatibility matrix. `--repeat 10` builds once and runs the scenarios
+10 times in a row. It stops after the first run that fails:
 
 ```bash
-python tools/release/e2e_gate.py --scenarios-only
+python tools/release/e2e_gate.py --scenarios-only --repeat 10
 ```
 
 Every StudioFS release starting with 0.2.5 passes the release E2E gate on
