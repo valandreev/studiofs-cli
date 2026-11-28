@@ -385,6 +385,12 @@ fn expand_scenario_selector_part(
     if part.is_empty() {
         return Vec::new();
     }
+    if part == scenario::RELEASE_GATE_SELECTOR {
+        return scenario::release_gate_scenarios()
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+    }
     if let Some((start, end)) = parse_scenario_range(part) {
         return (start..=end)
             .map(|index| scenario_name_by_one_based_index(index, scenarios))

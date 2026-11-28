@@ -314,6 +314,48 @@ v0.2.2 and v0.2.4, runs the scenario, and copies the artifacts into
 cargo run -p studiofs-e2e -- run published-volume-fixture-capture --studiofs-bin <published studiofs> --infra compose --run-id sfs-1002-capture-v0-2-4 --retain always
 ```
 
+### Release E2E Gate
+
+Before a release, run `tools/release/e2e_gate.py` once on each release platform:
+Windows/WinFSP, Linux/FUSE and macOS/macFUSE. Run it from a clean commit,
+because the summary records the source commit. The script refuses uncommitted
+changes unless `--allow-dirty` is passed, and such a run is not release evidence.
+It needs Cargo, Python 3, Docker Compose, the native mount driver and an
+authenticated `gh` CLI.
+
+```sh
+python tools/release/e2e_gate.py
+```
+
+The gate first builds `target/release/studiofs`, `studiofs-e2e` and the verified
+compiled test successor (`tools/test_successor/build.py --require-complete`).
+Then it runs three steps, each with its own run id `<prefix>-<step>`:
+
+| Step | What runs | Notes |
+|---|---|---|
+| `scenarios` | `studiofs-e2e run --scenario release-gate` with the release binary | Every registered scenario except the opt-in `published-volume-fixture-capture` and `janitor-live-benchmark` and the forward-compat matrix. Scenarios for another OS, such as `mounted-macos-mmap-exec` off macOS, are reported as `skipped`. |
+| `forward` | `tools/test_successor/run_compat_matrix.py` | The SFS-1019 matrix gets its own sandbox because the successor migrates the shared PostgreSQL irreversibly. The published `v0.2.4` binary for the host is downloaded and SHA-256-verified, so its fenced-client cell must run. |
+| `crash` | the same matrix with `--crash-rollback` | The SFS-1020 fault-injection matrix, including the `v0.2.2` format-5 adoption pair. |
+
+Every step runs even when an earlier one fails. The gate prints a summary,
+writes `target/e2e-runs/<prefix>-summary.json` with each step's status,
+failed and skipped scenarios and matrix cell counts, and exits 1 when any step
+failed. Retained sandboxes follow `--retain` (default `on-failure`).
+
+To rerun one failed step against the binaries from the previous build, pass
+`--skip-build` and `--step` (repeatable):
+
+```sh
+python tools/release/e2e_gate.py --skip-build --step forward --run-id-prefix release-gate-retry
+```
+
+`v0.2.4` and `v0.2.2` publish no Intel macOS binary. On that host the
+published-client cells are reported as `skipped`.
+
+Running the numbered range (`--scenario 1-53`) instead of the gate fails the
+forward-compat matrix immediately when the compiled test successor has not been
+built.
+
 ### SFS-1019 Supported-Release Forward-Compatibility Matrix
 
 `mounted-forward-compat-matrix` (alias `forward-compat-matrix`) is the opt-in
@@ -332,11 +374,16 @@ SFS-1053) append to the `pairs` array in that report.
 python tools/test_successor/run_compat_matrix.py --run-id sfs-1019-matrix --retain always
 ```
 
+The wrapper downloads and SHA-256-verifies the host's published `v0.2.4`
+binary on Windows, Linux and Apple-silicon macOS, and the `v0.2.2` binary
+when `--crash-rollback` is passed. `--v024-bin`/`--v022-bin` use a local binary
+instead, and `--skip-v024`/`--skip-v022` leave those cells out.
+
 On Windows/WinFSP, native POSIX `setxattr`/`getxattr` syscalls are reported as
 platform-gated (`skipped`), while the xattr capability cutover and refusal
-(`event.set_user_xattr.v1`) run on every platform. On Linux/macOS, pass
-`--v024-bin <path>` to include the fenced `v0.2.4` cell alongside the baseline
-and compiled successor pair.
+(`event.set_user_xattr.v1`) run on every platform. The fenced `v0.2.4` cell
+runs alongside the baseline and compiled successor pair wherever the wrapper
+has a published binary for the host.
 
 For SFS-1020, run the same registered scenario with the crash and rollback
 checks enabled. Verify the native v0.2.2 and v0.2.4 binaries against their

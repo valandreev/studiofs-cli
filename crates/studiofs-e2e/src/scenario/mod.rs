@@ -4,8 +4,8 @@ mod registry;
 mod types;
 mod workloads;
 
-pub use registry::available_scenarios;
 pub(crate) use registry::resolve_scenario;
+pub use registry::{RELEASE_GATE_SELECTOR, available_scenarios, release_gate_scenarios};
 pub use types::{Scenario, ScenarioContext, ScenarioDefinition, ScenarioError};
 pub use workloads::{
     BASIC_MULTI_CLIENT_SMOKE, COLLISION_MKDIR_RMDIR_VS_CREATE, COLLISION_OVERWRITE_VS_READ,

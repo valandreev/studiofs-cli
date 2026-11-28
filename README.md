@@ -344,6 +344,21 @@ cargo run -p studiofs-e2e -- clean
 
 On Windows, use `target/debug/studiofs.exe` for `--studiofs-bin`.
 
+Before a release, run the whole mounted E2E gate once on each platform
+(Windows/WinFSP, Linux/FUSE, macOS/macFUSE) from a clean commit. One command
+builds the release binary, the E2E runner and the compiled test successor,
+downloads the verified published `v0.2.4`/`v0.2.2` binaries, and runs every
+scenario plus the forward-compatibility and crash/rollback matrices:
+
+```bash
+python tools/release/e2e_gate.py
+```
+
+It needs Cargo, Python 3, Docker Compose, the native mount driver and an
+authenticated `gh` CLI. The summary lands in
+`target/e2e-runs/<prefix>-summary.json`. See
+[Release E2E Gate](docs/tests.md#release-e2e-gate) for steps and reruns.
+
 The E2E runner starts `docker/compose.e2e.yml` by default. The compose stack
 contains PostgreSQL 18, RustFS, and a Toxiproxy placeholder, waits for healthy
 required services, writes Docker logs under `artifacts/docker/`, and tears down

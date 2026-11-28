@@ -123,6 +123,19 @@ fn run_scenario_selection_expands_comma_separated_numbers() {
     assert_eq!(args.scenario_names(), scenario_names_by_index(&[2, 5, 10]));
 }
 
+#[test]
+fn run_scenario_selection_expands_release_gate() {
+    let cli = Cli::try_parse_from(["studiofs-e2e", "run", "--scenario", "release-gate"]).unwrap();
+    let Commands::Run(args) = cli.command else {
+        panic!("expected run command");
+    };
+
+    let names = args.scenario_names();
+    assert_eq!(names, studiofs_e2e::scenario::release_gate_scenarios());
+    assert!(names.contains(&"basic-multi-client-smoke".to_string()));
+    assert!(!names.contains(&"mounted-forward-compat-matrix".to_string()));
+}
+
 /// Registered scenarios deliberately left out of the full mounted gate.
 /// The gate runs on Linux, while `mounted-macos-mmap-exec` covers macFUSE page-ins;
 /// `published-volume-fixture-capture` needs a published release binary (SFS-1002).
