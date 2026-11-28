@@ -686,7 +686,7 @@ impl PgMetaEngine {
     }
 
     /// Read epoch bounds at one validated checkpoint/head cut without changing local serving state.
-    fn shared_retained_content_epochs(
+    pub(super) fn shared_retained_content_epochs(
         &self,
         events: &[MetaEvent],
     ) -> MetaResult<HashMap<Ino, u64>> {

@@ -7916,6 +7916,226 @@ fn unsupported_checkpoint_format_does_not_discard_healthy_pool_connection() {
 
 #[test]
 #[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
+fn retained_content_epochs_replay_gap_does_not_discard_healthy_pool_connection() {
+    let dsn = pg_dsn().expect("STUDIOFS_TEST_PG_DSN is required");
+    let volume = PgTestVolume::new(&dsn, "pg-retained-epochs-replay-gap");
+    let dir = studiofs_test_support::workspace_target_tempdir("test-");
+    let db = dir.path().join("meta.redb");
+    seed_local(&db, &volume.format_info());
+    let engine = PgMetaEngine::open_with_options(
+        &db,
+        PgOpenOptions {
+            background_poll: false,
+            ..Default::default()
+        },
+    )
+    .expect("open pg engine");
+
+    let (first_version, target_version) = {
+        let _guard = engine.replication_lock.lock().unwrap();
+        let first = engine
+            .push_event_log_batch_locked(&[MetaEvent::RemoveAttr { ino: 42 }])
+            .expect("publish first replay batch");
+        let second = engine
+            .push_event_log_batch_locked(&[MetaEvent::RemoveAttr { ino: 43 }])
+            .expect("publish second replay batch");
+        (first, second)
+    };
+    assert!(target_version > first_version);
+
+    let volume_id = volume.volume_id;
+    run_async(with_pg_test_client(&dsn, move |client| async move {
+        assert_eq!(
+            client
+                .execute(
+                    "DELETE FROM event_log WHERE vol = $1 AND batch_version = $2",
+                    &[&volume_id, &first_version],
+                )
+                .await
+                .unwrap(),
+            1
+        );
+        Ok(())
+    }))
+    .unwrap();
+
+    let discarded = engine.command_pool_stats().discarded;
+    assert!(matches!(
+        engine.shared_retained_content_epochs(&[]),
+        Err(MetaError::ReplayGap {
+            local_version: 0,
+            first_available_version,
+            target_version: target,
+        }) if first_available_version == target_version && target == target_version
+    ));
+    assert_eq!(engine.command_pool_stats().discarded, discarded);
+}
+
+#[test]
+#[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
+fn file_lock_acquire_vanished_lease_does_not_discard_healthy_pool_connection() {
+    let dsn = pg_dsn().expect("STUDIOFS_TEST_PG_DSN is required");
+    let volume = PgTestVolume::new(&dsn, "pg-file-lock-vanished-lease");
+    let dir = studiofs_test_support::workspace_target_tempdir("test-");
+    let db = dir.path().join("meta.redb");
+    seed_local(&db, &volume.format_info());
+    let engine = PgMetaEngine::open_with_options(
+        &db,
+        PgOpenOptions {
+            background_poll: false,
+            ..Default::default()
+        },
+    )
+    .expect("open pg engine");
+    engine.ensure_remote_format_validated().unwrap();
+    engine.ensure_lock_workers_started().unwrap();
+
+    let ino: Ino = 42;
+    let volume_id = volume.volume_id;
+    let now_ms = PgMetaEngine::now_millis();
+    let expires_at_ms = now_ms + 60_000;
+    run_async(with_pg_test_client(&dsn, move |client| async move {
+        assert_eq!(
+            client
+                .execute(
+                    r#"
+                    INSERT INTO file_lock_leases (
+                        vol,
+                        ino,
+                        kind,
+                        exclusive_owner,
+                        shared_owners,
+                        lease_expires_at_unix_ms,
+                        generation,
+                        updated_at
+                    )
+                    VALUES ($1, $2, $3, $4, '{}', $5, 1, now())
+                    "#,
+                    &[
+                        &volume_id,
+                        &(ino as i64),
+                        &(HardLockKind::Exclusive as i16),
+                        &"peer-owner",
+                        &expires_at_ms,
+                    ],
+                )
+                .await
+                .unwrap(),
+            1
+        );
+        Ok(())
+    }))
+    .unwrap();
+
+    let discarded = engine.command_pool_stats().discarded;
+    let acquire_result = run_async({
+        let dsn = dsn.clone();
+        let engine = Arc::clone(&engine);
+        async move {
+            let (mut side_client, side_conn) =
+                tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
+                    .await
+                    .map_err(|e| MetaError::Storage(pg_err(e)))?;
+            let side_task = tokio::spawn(async move {
+                let _ = side_conn.await;
+            });
+            let (observer_client, observer_conn) =
+                tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
+                    .await
+                    .map_err(|e| MetaError::Storage(pg_err(e)))?;
+            let observer_task = tokio::spawn(async move {
+                let _ = observer_conn.await;
+            });
+
+            let side_pid: i32 = side_client
+                .query_one("SELECT pg_backend_pid()", &[])
+                .await
+                .map_err(|e| MetaError::Storage(pg_err(e)))?
+                .get(0);
+            let tx = side_client
+                .transaction()
+                .await
+                .map_err(|e| MetaError::Storage(pg_err(e)))?;
+            let locked_ino: i64 = tx
+                .query_one(
+                    "SELECT ino FROM file_lock_leases WHERE vol = $1 AND ino = $2 FOR UPDATE",
+                    &[&volume_id, &(ino as i64)],
+                )
+                .await
+                .map_err(|e| MetaError::Storage(pg_err(e)))?
+                .get(0);
+            assert_eq!(locked_ino, ino as i64);
+
+            let acquire_handle = std::thread::spawn(move || {
+                engine.acquire_file_lock_lease(
+                    ino,
+                    HardLockKind::Exclusive,
+                    Duration::from_secs(30),
+                )
+            });
+
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                let blocked: i64 = observer_client
+                    .query_one(
+                        r#"
+                        SELECT COUNT(*)
+                        FROM pg_stat_activity
+                        WHERE pid <> $1
+                          AND wait_event_type = 'Lock'
+                          AND $1 = ANY(pg_blocking_pids(pid))
+                        "#,
+                        &[&side_pid],
+                    )
+                    .await
+                    .map_err(|e| MetaError::Storage(pg_err(e)))?
+                    .get(0);
+                if blocked > 0 {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "timed out waiting for acquire SELECT ... FOR UPDATE to block on side transaction"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+
+            let deleted = tx
+                .execute(
+                    "DELETE FROM file_lock_leases WHERE vol = $1 AND ino = $2",
+                    &[&volume_id, &(ino as i64)],
+                )
+                .await
+                .map_err(|e| MetaError::Storage(pg_err(e)))?;
+            assert_eq!(deleted, 1);
+            tx.commit()
+                .await
+                .map_err(|e| MetaError::Storage(pg_err(e)))?;
+
+            drop(observer_client);
+            drop(side_client);
+            observer_task.abort();
+            side_task.abort();
+            let _ = observer_task.await;
+            let _ = side_task.await;
+
+            Ok(acquire_handle
+                .join()
+                .expect("file lock acquire thread panicked"))
+        }
+    })
+    .expect("drive vanished-lease race");
+
+    assert!(matches!(
+        acquire_result,
+        Err(MetaError::Storage(message))
+            if message == "postgres file lock acquire select failed: query returned an unexpected number of rows"
+    ));
+    assert_eq!(engine.command_pool_stats().discarded, discarded);
+}
+
+#[test]
+#[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
 fn invalid_bootstrap_descriptor_does_not_discard_healthy_pool_connection() {
     let Some(dsn) = pg_dsn() else {
         return;
