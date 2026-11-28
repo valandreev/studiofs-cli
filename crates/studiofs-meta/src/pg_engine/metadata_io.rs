@@ -602,13 +602,21 @@ async fn read_checkpoint_freshness_with_pool(
                             e,
                         )
                     })?;
-                row.as_ref()
+                match row
+                    .as_ref()
                     .map(checkpoint_freshness_observation_from_row)
                     .transpose()
+                {
+                    Err(
+                        error @ (MetaError::NeedsMigration { .. }
+                        | MetaError::UnsupportedFormatVersion { .. }),
+                    ) => Ok(Err(error)),
+                    result => Ok(Ok(result?)),
+                }
             })
         },
     )
-    .await?;
+    .await??;
     observation.ok_or_else(|| {
         MetaError::Storage(
             "postgres metadata_state row missing during checkpoint freshness observation"

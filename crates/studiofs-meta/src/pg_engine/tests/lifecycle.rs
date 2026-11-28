@@ -7818,6 +7818,8 @@ fn pg_checkpoint_encodings_keep_baseline_and_successor_replayable() {
 #[test]
 #[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
 fn missing_replay_state_does_not_discard_healthy_pool_connection() {
+    use crate::trash::MetaVolumeSettings;
+
     let dsn = pg_dsn().expect("STUDIOFS_TEST_PG_DSN is required");
     let volume = PgTestVolume::new(&dsn, "pg-missing-replay-state");
     let dir = studiofs_test_support::workspace_target_tempdir("test-");
@@ -7837,6 +7839,8 @@ fn missing_replay_state_does_not_discard_healthy_pool_connection() {
         .push_event_log_batch_locked(&[MetaEvent::RemoveAttr { ino: 42 }])
         .expect("publish a replay target");
     assert!(target > engine.local_version.load(Ordering::SeqCst));
+    engine.ensure_remote_format_validated().unwrap();
+    engine.acquire_publication_session().unwrap();
     let volume_id = volume.volume_id;
     run_async(with_pg_test_client(&dsn, |client| async move {
         assert_eq!(
@@ -7851,6 +7855,11 @@ fn missing_replay_state_does_not_discard_healthy_pool_connection() {
     .unwrap();
     let discarded = engine.command_pool_stats().discarded;
     assert!(matches!(
+        engine.compare_and_set_trash_days(0, 7),
+        Err(MetaError::Storage(message)) if message == "lock volume settings: query returned an unexpected number of rows"
+    ));
+    assert_eq!(engine.command_pool_stats().discarded, discarded);
+    assert!(matches!(
         engine.pull_foreign_events_locked_to_target(None, target, None),
         Err(MetaError::Storage(message)) if message == "postgres metadata replay state row missing"
     ));
@@ -7858,6 +7867,49 @@ fn missing_replay_state_does_not_discard_healthy_pool_connection() {
     assert!(matches!(
         engine.read_remote_checkpoint_freshness(),
         Err(MetaError::Storage(message)) if message == "postgres metadata_state row missing during checkpoint freshness observation"
+    ));
+    assert_eq!(engine.command_pool_stats().discarded, discarded);
+}
+
+#[test]
+#[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
+fn unsupported_checkpoint_format_does_not_discard_healthy_pool_connection() {
+    let dsn = pg_dsn().expect("STUDIOFS_TEST_PG_DSN is required");
+    let volume = PgTestVolume::new(&dsn, "pg-checkpoint-format-pool");
+    let dir = studiofs_test_support::workspace_target_tempdir("test-");
+    let db = dir.path().join("meta.redb");
+    seed_local(&db, &volume.format_info());
+    let engine = PgMetaEngine::open_with_options(
+        &db,
+        PgOpenOptions {
+            background_poll: false,
+            ..Default::default()
+        },
+    )
+    .expect("open pg engine");
+
+    let expected = crate::version::SHARED_VOLUME_FORMAT.current;
+    let newer = i16::try_from(expected + 1).unwrap();
+    run_async(with_pg_test_client(&dsn, |client| async move {
+        assert_eq!(
+            client
+                .execute(
+                    "UPDATE metadata_state SET metadata_format_version = $2 WHERE vol = $1",
+                    &[&volume.volume_id, &newer],
+                )
+                .await
+                .unwrap(),
+            1
+        );
+        Ok(())
+    }))
+    .unwrap();
+
+    let discarded = engine.command_pool_stats().discarded;
+    assert!(matches!(
+        engine.read_remote_checkpoint_freshness(),
+        Err(MetaError::UnsupportedFormatVersion { found, expected: supported })
+            if found == expected + 1 && supported == expected
     ));
     assert_eq!(engine.command_pool_stats().discarded, discarded);
 }

@@ -727,7 +727,7 @@ impl PgMetaEngine {
                     "read retained winner content epochs",
                     move |client| {
                         Box::pin(async move {
-                            Self::query_foreign_event_page(
+                            match Self::query_foreign_event_page(
                                 client,
                                 volume_id,
                                 cursor,
@@ -736,10 +736,14 @@ impl PgMetaEngine {
                                 max_bytes,
                             )
                             .await
+                            {
+                                Err(error @ MetaError::ReplayGap { .. }) => Ok(Err(error)),
+                                result => Ok(Ok(result?)),
+                            }
                         })
                     },
                 )
-                .await?;
+                .await??;
                 let batches = super::RemoteApplyCoordinator::decode_event_rows(page.rows, "")?;
                 if batches.is_empty() {
                     return Err(MetaError::ReplayGap {
@@ -779,20 +783,31 @@ impl PgMetaEngine {
                 "read shared retention period",
                 move |client| {
                     Box::pin(async move {
-                        client
-                            .query_one(
+                        let row = client
+                            .query_opt(
                                 "SELECT volume_settings FROM metadata_state WHERE vol=$1",
                                 &[&volume_id],
                             )
                             .await
-                            .map(|row| row.get::<_, Option<Vec<u8>>>(0))
                             .map_err(|error| {
                                 Self::classify_pg_error("read shared retention period", error)
+                            })?;
+                        row.map(|row| {
+                            row.try_get::<_, Option<Vec<u8>>>(0).map_err(|error| {
+                                Self::classify_pg_error("read shared retention period", error)
                             })
+                        })
+                        .transpose()
                     })
                 },
             )
             .await
+        })?;
+        let bytes = bytes.ok_or_else(|| {
+            MetaError::Storage(
+                "read shared retention period: query returned an unexpected number of rows"
+                    .to_string(),
+            )
         })?;
         Ok(shared_settings(bytes.as_deref())?.revision)
     }

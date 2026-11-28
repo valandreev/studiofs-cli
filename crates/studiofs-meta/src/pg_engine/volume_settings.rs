@@ -177,7 +177,10 @@ impl PgMetaEngine {
                             super::runtime::finish_pooled_transaction(
                                 tx,
                                 outcome,
-                                super::volume_protocol::is_volume_read_policy_rejection,
+                                |error| {
+                                    super::volume_protocol::is_volume_read_policy_rejection(error)
+                                        || matches!(error, MetaError::Storage(message) if message == MISSING_VOLUME_SETTINGS_ROW)
+                                },
                                 |error| Self::classify_pg_error("finish volume settings", error),
                             )
                             .await
@@ -323,6 +326,9 @@ async fn update_volume_settings(
     Ok(accepted)
 }
 
+const MISSING_VOLUME_SETTINGS_ROW: &str =
+    "lock volume settings: query returned an unexpected number of rows";
+
 async fn update_volume_settings_in_tx(
     tx: &tokio_postgres::Transaction<'_>,
     protocol: &crate::volume_protocol::VolumeProtocol,
@@ -333,14 +339,20 @@ async fn update_volume_settings_in_tx(
     update: impl FnOnce(&mut VolumeSettings),
 ) -> MetaResult<Option<VolumeSettings>> {
     let row = tx
-        .query_one(
+        .query_opt(
             "SELECT metadata_format_version, volume_settings FROM metadata_state WHERE vol=$1 FOR UPDATE",
             &[&volume],
         )
         .await
+        .map_err(|error| PgMetaEngine::classify_pg_error("lock volume settings", error))?
+        .ok_or_else(|| MetaError::Storage(MISSING_VOLUME_SETTINGS_ROW.to_string()))?;
+    crate::check_pg_volume_format(
+        row.try_get(0)
+            .map_err(|error| PgMetaEngine::classify_pg_error("lock volume settings", error))?,
+    )?;
+    let bytes: Option<Vec<u8>> = row
+        .try_get(1)
         .map_err(|error| PgMetaEngine::classify_pg_error("lock volume settings", error))?;
-    crate::check_pg_volume_format(row.get(0))?;
-    let bytes: Option<Vec<u8>> = row.get(1);
     let mut settings = bytes
         .as_deref()
         .map(VolumeSettings::decode_json)
