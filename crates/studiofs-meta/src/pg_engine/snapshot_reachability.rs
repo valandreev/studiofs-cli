@@ -34,6 +34,9 @@ pub const SNAPSHOT_UPLOADED_FRAGMENT_LEASE_SECS: i64 = 60;
 /// upload registration never revives and publication rejects.
 pub(super) const FINISH_UPLOADED_OBJECT_DELETION_SQL: &str = "UPDATE snapshot_payload_upload_objects SET closed_at = COALESCE(closed_at, clock_timestamp()), next_retry_at = NULL, last_error = $5, reconcile_owner = NULL, reconcile_lease_expires_at = NULL WHERE vol = $1 AND object_id = $2 AND reconcile_owner = $3 AND reconcile_fence = $4 AND state = 'delete_pending'";
 
+pub(super) const PAYLOAD_PUBLICATION_FENCED: &str =
+    "snapshot payload publication requires a new object id after deletion has started";
+
 /// SQL predicate (parameter `$1` = vol): the object-ID column `id`'s counter is
 /// below the acknowledged watermark of its payload namespace
 /// (`namespace << 39 | counter`). The owning client never registers or publishes
@@ -294,10 +297,7 @@ where
                 "delete_pending" | "deleted"
             )
         }) {
-            return Err(MetaError::Storage(
-                "snapshot payload publication requires a new object id after deletion has started"
-                    .to_owned(),
-            ));
+            return Err(MetaError::Storage(PAYLOAD_PUBLICATION_FENCED.to_owned()));
         }
         let tracked = states
             .iter()
@@ -329,8 +329,7 @@ where
                 .get::<_, bool>(0)
         {
             return Err(MetaError::Storage(
-                "snapshot payload publication requires a new object id after deletion has started"
-                    .to_owned(),
+                PAYLOAD_PUBLICATION_FENCED.to_owned(),
             ));
         }
     }
@@ -572,30 +571,43 @@ impl PgMetaEngine {
                                     error,
                                 )
                             })?;
-                            super::volume_protocol::fence_maintenance(&tx, volume_id).await?;
-                            tx.execute(
-                                RETIRE_ABANDONED_UPLOADS_SQL.as_str(),
-                                &[&volume_id, &object_ids, &vec!["uploaded"], &deleted_at],
+                            let outcome = async {
+                                super::volume_protocol::fence_maintenance(&tx, volume_id).await?;
+                                tx.execute(
+                                    RETIRE_ABANDONED_UPLOADS_SQL.as_str(),
+                                    &[&volume_id, &object_ids, &vec!["uploaded"], &deleted_at],
+                                )
+                                .await
+                                .map_err(|error| {
+                                    Self::classify_pg_error(
+                                        "postgres abandoned upload retirement failed",
+                                        error,
+                                    )
+                                })?;
+                                Ok(())
+                            }
+                            .await;
+                            if let Err(error) = super::runtime::finish_pooled_transaction(
+                                tx,
+                                outcome,
+                                super::volume_protocol::is_volume_read_policy_rejection,
+                                |error| {
+                                    Self::classify_pg_error(
+                                        "postgres abandoned upload commit failed",
+                                        error,
+                                    )
+                                },
                             )
-                            .await
-                            .map_err(|error| {
-                                Self::classify_pg_error(
-                                    "postgres abandoned upload retirement failed",
-                                    error,
-                                )
-                            })?;
-                            tx.commit().await.map_err(|error| {
-                                Self::classify_pg_error(
-                                    "postgres abandoned upload commit failed",
-                                    error,
-                                )
-                            })?;
+                            .await?
+                            {
+                                return Ok(Err(error));
+                            }
                         }
-                        Ok(())
+                        Ok(Ok(()))
                     })
                 },
             )
-            .await
+            .await?
         })
     }
 
@@ -776,14 +788,14 @@ impl PgMetaEngine {
                                 )
                             })?;
                         let Some(fast_path) = fast_path else {
-                            return Err(MetaError::Storage(
+                            return Ok(Err(MetaError::Storage(
                                 "postgres snapshot reachability bootstrap metadata state row missing"
                                     .to_owned(),
-                            ));
+                            )));
                         };
                         let remote_version: i64 = fast_path.get(0);
                         if fast_path.get::<_, bool>(1) {
-                            return Ok(ReachabilityBootstrapOutcome::AlreadyInitialized);
+                            return Ok(Ok(ReachabilityBootstrapOutcome::AlreadyInitialized));
                         }
 
                         let local_version_before_scan = checked_i64(
@@ -793,7 +805,7 @@ impl PgMetaEngine {
                         // This non-locking version read is only an early cutoff;
                         // the transaction below rechecks the authoritative row.
                         if local_version_before_scan != remote_version {
-                            return Ok(ReachabilityBootstrapOutcome::VersionMismatch);
+                            return Ok(Ok(ReachabilityBootstrapOutcome::VersionMismatch));
                         }
 
                         let references = local.list_published_object_references()?;
@@ -803,7 +815,7 @@ impl PgMetaEngine {
                         )?;
                         // The references must belong to one stable local version.
                         if local_version_before_scan != local_version_after_scan {
-                            return Ok(ReachabilityBootstrapOutcome::VersionMismatch);
+                            return Ok(Ok(ReachabilityBootstrapOutcome::VersionMismatch));
                         }
 
                         let mut reference_inodes = Vec::with_capacity(references.len());
@@ -825,8 +837,8 @@ impl PgMetaEngine {
                                 error,
                             )
                         })?;
-                        let version: i64 = tx
-                            .query_one(
+                        let Some(state) = tx
+                            .query_opt(
                                 "SELECT version FROM metadata_state WHERE vol = $1 FOR UPDATE",
                                 &[&volume_id],
                             )
@@ -837,7 +849,24 @@ impl PgMetaEngine {
                                     error,
                                 )
                             })?
-                            .get(0);
+                        else {
+                            return super::runtime::finish_pooled_transaction(
+                                tx,
+                                Err(MetaError::Storage(
+                                    "postgres snapshot reachability bootstrap version query failed: query returned an unexpected number of rows"
+                                        .to_owned(),
+                                )),
+                                |_| true,
+                                |error| {
+                                    Self::classify_pg_error(
+                                        "postgres snapshot reachability bootstrap missing state rollback failed",
+                                        error,
+                                    )
+                                },
+                            )
+                            .await;
+                        };
+                        let version: i64 = state.get(0);
                         let initialized = tx
                             .query_opt(
                                 "SELECT initialized_version FROM snapshot_reachability_bootstrap WHERE vol = $1",
@@ -857,7 +886,7 @@ impl PgMetaEngine {
                                     error,
                                 )
                             })?;
-                            return Ok(ReachabilityBootstrapOutcome::AlreadyInitialized);
+                            return Ok(Ok(ReachabilityBootstrapOutcome::AlreadyInitialized));
                         }
 
                         let creating_snapshot = tx
@@ -879,7 +908,7 @@ impl PgMetaEngine {
                                     error,
                                 )
                             })?;
-                            return Ok(ReachabilityBootstrapOutcome::SnapshotCreationInProgress);
+                            return Ok(Ok(ReachabilityBootstrapOutcome::SnapshotCreationInProgress));
                         }
 
                         // Only this row-locked version can authorize the
@@ -897,7 +926,7 @@ impl PgMetaEngine {
                                     error,
                                 )
                             })?;
-                            return Ok(ReachabilityBootstrapOutcome::VersionMismatch);
+                            return Ok(Ok(ReachabilityBootstrapOutcome::VersionMismatch));
                         }
 
                         let inserted = tx
@@ -919,10 +948,10 @@ impl PgMetaEngine {
                                     error,
                                 )
                             })?;
-                            return Err(MetaError::Storage(
+                            return Ok(Err(MetaError::Storage(
                                 "postgres snapshot reachability bootstrap marker was not inserted"
                                     .to_owned(),
-                            ));
+                            )));
                         }
 
                         for (inode_chunk, object_id_chunk) in reference_inodes
@@ -982,11 +1011,11 @@ impl PgMetaEngine {
                                 error,
                             )
                         })?;
-                        Ok(ReachabilityBootstrapOutcome::Completed)
+                        Ok(Ok(ReachabilityBootstrapOutcome::Completed))
                     })
                 },
             )
-            .await
+            .await?
         })
     }
 
@@ -1443,7 +1472,7 @@ impl PgMetaEngine {
         })
     }
 
-    fn confirm_fragment_uploads_sync(
+    pub(super) fn confirm_fragment_uploads_sync(
         &self,
         entries: &[UploadedFragmentLedgerEntry],
     ) -> MetaResult<()> {
@@ -1471,51 +1500,53 @@ impl PgMetaEngine {
                                 error,
                             )
                         })?;
-                        let updated = tx
-                            .execute(
-                                "WITH entries AS (SELECT * FROM unnest($2::BIGINT[], $3::INT[], $4::BIGINT[], $5::BYTEA[]) AS fragment_values(object_id, fragment_index, expected_byte_length, expected_sha256)) UPDATE snapshot_payload_upload_fragments AS fragment SET expected_byte_length = entries.expected_byte_length, expected_sha256 = entries.expected_sha256, confirmed_at = now(), confirmation_state = 'confirmed', last_error = NULL FROM entries WHERE fragment.vol = $1 AND fragment.object_id = entries.object_id AND fragment.fragment_index = entries.fragment_index",
-                                &[
-                                    &volume_id,
-                                    &object_ids,
-                                    &fragment_indices,
-                                    &expected_byte_lengths,
-                                    &expected_sha256,
-                                ],
+                        let outcome = async {
+                            let updated = tx
+                                .execute(
+                                    "WITH entries AS (SELECT * FROM unnest($2::BIGINT[], $3::INT[], $4::BIGINT[], $5::BYTEA[]) AS fragment_values(object_id, fragment_index, expected_byte_length, expected_sha256)) UPDATE snapshot_payload_upload_fragments AS fragment SET expected_byte_length = entries.expected_byte_length, expected_sha256 = entries.expected_sha256, confirmed_at = now(), confirmation_state = 'confirmed', last_error = NULL FROM entries WHERE fragment.vol = $1 AND fragment.object_id = entries.object_id AND fragment.fragment_index = entries.fragment_index",
+                                    &[
+                                        &volume_id,
+                                        &object_ids,
+                                        &fragment_indices,
+                                        &expected_byte_lengths,
+                                        &expected_sha256,
+                                    ],
+                                )
+                                .await
+                                .map_err(|error| {
+                                    Self::classify_pg_error(
+                                        "postgres snapshot upload fragment confirmation failed",
+                                        error,
+                                    )
+                                })?;
+                            if updated != expected_row_count {
+                                return Err(MetaError::Storage(
+                                    "snapshot upload fragment confirmation row is missing".to_owned(),
+                                ));
+                            }
+                            tx.execute(
+                                "UPDATE snapshot_payload_upload_objects AS upload_object SET state = 'uploaded' WHERE upload_object.vol = $1 AND upload_object.object_id = ANY($2::BIGINT[]) AND upload_object.state = 'uploading' AND NOT EXISTS (SELECT 1 FROM snapshot_payload_upload_fragments AS fragment WHERE fragment.vol = upload_object.vol AND fragment.object_id = upload_object.object_id AND fragment.confirmation_state <> 'confirmed')",
+                                &[&volume_id, &object_ids],
                             )
                             .await
                             .map_err(|error| {
                                 Self::classify_pg_error(
-                                    "postgres snapshot upload fragment confirmation failed",
+                                    "postgres snapshot upload object confirmation failed",
                                     error,
                                 )
                             })?;
-                        if updated != expected_row_count {
-                            return Err(MetaError::Storage(
-                                "snapshot upload fragment confirmation row is missing".to_owned(),
-                            ));
-                        }
-                        tx.execute(
-                            "UPDATE snapshot_payload_upload_objects AS upload_object SET state = 'uploaded' WHERE upload_object.vol = $1 AND upload_object.object_id = ANY($2::BIGINT[]) AND upload_object.state = 'uploading' AND NOT EXISTS (SELECT 1 FROM snapshot_payload_upload_fragments AS fragment WHERE fragment.vol = upload_object.vol AND fragment.object_id = upload_object.object_id AND fragment.confirmation_state <> 'confirmed')",
-                            &[&volume_id, &object_ids],
-                        )
-                        .await
-                        .map_err(|error| {
-                            Self::classify_pg_error(
-                                "postgres snapshot upload object confirmation failed",
-                                error,
-                            )
-                        })?;
-                        tx.commit().await.map_err(|error| {
+                            Ok(())
+                        }.await;
+                        super::runtime::finish_pooled_transaction(tx, outcome, |error| matches!(error, MetaError::Storage(message) if message == "snapshot upload fragment confirmation row is missing"), |error| {
                             Self::classify_pg_error(
                                 "postgres snapshot upload confirmation commit failed",
                                 error,
                             )
-                        })?;
-                        Ok(())
+                        }).await
                     })
                 },
             )
-            .await
+            .await?
         })
     }
 
@@ -1544,18 +1575,29 @@ impl PgMetaEngine {
                         })?;
                         // Same fenced claim as the CLI Janitor: an untracked object
                         // gets a delete_pending row, so it is never deleted unfenced.
-                        let fencing_token = super::janitor::claim_object_deletion_in(
-                            tx, volume_id, object_id, &owner,
+                        let outcome = super::janitor::claim_object_deletion_in(
+                            &tx, volume_id, object_id, &owner,
                         )
-                        .await?;
-                        Ok(fencing_token
-                            .map_or(UploadedObjectDeletionClaim::Protected, |fencing_token| {
-                                UploadedObjectDeletionClaim::Claimed { fencing_token }
-                            }))
+                        .await
+                        .map(|fencing_token| {
+                            fencing_token.map_or(
+                                UploadedObjectDeletionClaim::Protected,
+                                |fencing_token| UploadedObjectDeletionClaim::Claimed {
+                                    fencing_token,
+                                },
+                            )
+                        });
+                        super::runtime::finish_pooled_transaction(
+                            tx,
+                            outcome,
+                            super::volume_protocol::is_volume_read_policy_rejection,
+                            |error| Self::classify_pg_error("finish janitor deletion claim", error),
+                        )
+                        .await
                     })
                 },
             )
-            .await
+            .await?
         })
     }
 

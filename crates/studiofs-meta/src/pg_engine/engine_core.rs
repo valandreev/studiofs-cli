@@ -316,7 +316,7 @@ impl MetaEngineCore for PgMetaEngine {
                         Self::classify_pg_error("postgres file lock acquire ensure row failed", e)
                     })?;
                     let row = tx
-                        .query_one(
+                        .query_opt(
                             r#"
                             SELECT ino, kind, exclusive_owner, shared_owners, lease_expires_at_unix_ms, generation
                             FROM file_lock_leases
@@ -329,6 +329,18 @@ impl MetaEngineCore for PgMetaEngine {
                         .map_err(|e| {
                             Self::classify_pg_error("postgres file lock acquire select failed", e)
                         })?;
+                    let Some(row) = row else {
+                        // The owner can release the conflicting lease between the two statements.
+                        return super::runtime::finish_pooled_transaction(
+                            tx,
+                            Err(MetaError::Storage(
+                                "postgres file lock acquire select failed: query returned an unexpected number of rows".to_string(),
+                            )),
+                            |_| true,
+                            |e| Self::classify_pg_error("postgres file lock acquire rollback failed", e),
+                        )
+                        .await;
+                    };
                     let current = Self::current_file_lock_lease_from_row(row, now_ms)?;
 
                     let maybe_next = match current.as_ref() {
@@ -434,11 +446,11 @@ impl MetaEngineCore for PgMetaEngine {
                             )
                         })?)
                     };
-                    Ok(outcome)
+                    Ok(Ok(outcome))
                 }),
             )
             .await
-        })?;
+        })??;
         match &outcome {
             FileLockLeaseAcquireOutcome::Acquired(snapshot) => {
                 self.remember_held_file_lock(snapshot.ino, lease_ttl);

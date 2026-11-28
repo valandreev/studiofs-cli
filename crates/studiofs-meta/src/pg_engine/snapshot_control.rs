@@ -20,6 +20,9 @@ use crate::snapshot_ports::{
 use std::path::Path;
 use std::time::Duration;
 
+pub(super) const MISSING_SNAPSHOT_CHECKPOINT: &str =
+    "snapshot control plane operation failed: snapshot checkpoint is missing";
+
 /// Inputs captured by one PostgreSQL Snapshot v2 registration transaction.
 #[derive(Debug, Clone)]
 pub(crate) struct SnapshotCaptureRequest {
@@ -173,54 +176,56 @@ impl PgSnapshotBackend {
                                 error,
                             )
                         })?;
-                        let rows = tx
-                            .query(
-                                "SELECT vol, name, uuid FROM volumes WHERE vol = $1 OR uuid = $2 FOR UPDATE",
-                                &[&hint.volume_id, &hint.volume_uuid],
-                            )
-                            .await
-                            .map_err(|error| {
-                                classify_postgres_error(
-                                    "snapshot volume identity query unavailable",
-                                    error,
+                        let outcome = async {
+                            let rows = tx
+                                .query(
+                                    "SELECT vol, name, uuid FROM volumes WHERE vol = $1 OR uuid = $2 FOR UPDATE",
+                                    &[&hint.volume_id, &hint.volume_uuid],
                                 )
+                                .await
+                                .map_err(|error| {
+                                    classify_postgres_error(
+                                        "snapshot volume identity query unavailable",
+                                        error,
+                                    )
+                                })?;
+                            if rows.len() != 1 {
+                                return Err(MetaError::Storage(
+                                    "snapshot volume identity is missing or ambiguous".into(),
+                                ));
+                            }
+                            let row = &rows[0];
+                            let volume_id = row.get::<_, VolumeId>(0);
+                            let volume_name = row.get::<_, String>(1);
+                            let volume_uuid = row.get::<_, String>(2);
+                            if volume_id != hint.volume_id
+                                || volume_name != hint.volume_name
+                                || volume_uuid != hint.volume_uuid
+                            {
+                                return Err(MetaError::Storage(
+                                    "snapshot volume identity does not match PostgreSQL".into(),
+                                ));
+                            }
+                            let context = SnapshotVolumeContext::new(
+                                volume_id,
+                                volume_name,
+                                volume_uuid,
+                            )
+                            .map_err(|_| {
+                                MetaError::Storage("PostgreSQL snapshot volume identity is invalid".into())
                             })?;
-                        if rows.len() != 1 {
-                            return Err(MetaError::Storage(
-                                "snapshot volume identity is missing or ambiguous".into(),
-                            ));
-                        }
-                        let row = &rows[0];
-                        let volume_id = row.get::<_, VolumeId>(0);
-                        let volume_name = row.get::<_, String>(1);
-                        let volume_uuid = row.get::<_, String>(2);
-                        if volume_id != hint.volume_id
-                            || volume_name != hint.volume_name
-                            || volume_uuid != hint.volume_uuid
-                        {
-                            return Err(MetaError::Storage(
-                                "snapshot volume identity does not match PostgreSQL".into(),
-                            ));
-                        }
-                        let context = SnapshotVolumeContext::new(
-                            volume_id,
-                            volume_name,
-                            volume_uuid,
-                        )
-                        .map_err(|_| {
-                            MetaError::Storage("PostgreSQL snapshot volume identity is invalid".into())
-                        })?;
-                        tx.commit().await.map_err(|error| {
+                            Ok(context)
+                        }.await;
+                        super::runtime::finish_pooled_transaction(tx, outcome, |error| matches!(error, MetaError::Storage(message) if matches!(message.as_str(), "snapshot volume identity is missing or ambiguous" | "snapshot volume identity does not match PostgreSQL" | "PostgreSQL snapshot volume identity is invalid")), |error| {
                             classify_postgres_error(
                                 "snapshot volume validation commit unavailable",
                                 error,
                             )
-                        })?;
-                        Ok(context)
+                        }).await
                     })
                 },
             )
-            .await
+            .await?
         })
     }
 
@@ -999,12 +1004,16 @@ fn escape_like(value: &str) -> String {
 }
 
 fn snapshot_control_error(operation: &'static str) -> MetaError {
-    let message = format!("snapshot control plane operation failed: {operation}");
     match operation {
-        "published checkpoint is missing"
-        | "snapshot volume is missing"
-        | "snapshot checkpoint is missing" => MetaError::Storage(message),
-        _ => MetaError::RemoteUnavailable(message),
+        "snapshot checkpoint is missing" => {
+            MetaError::Storage(MISSING_SNAPSHOT_CHECKPOINT.to_owned())
+        }
+        "published checkpoint is missing" | "snapshot volume is missing" => MetaError::Storage(
+            format!("snapshot control plane operation failed: {operation}"),
+        ),
+        _ => MetaError::RemoteUnavailable(format!(
+            "snapshot control plane operation failed: {operation}"
+        )),
     }
 }
 

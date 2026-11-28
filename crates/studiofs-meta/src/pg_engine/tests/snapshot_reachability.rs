@@ -728,6 +728,7 @@ fn bootstrap_defers_while_a_snapshot_is_creating() {
     engine
         .sync_metadata()
         .expect("metadata sync must remain available while reachability bootstrap is deferred");
+    let discarded = engine.command_pool_stats().discarded;
     let error = engine
         .get_global_snapshot_pins()
         .expect_err("janitor pins must stay unavailable until bootstrap completes");
@@ -736,6 +737,7 @@ fn bootstrap_defers_while_a_snapshot_is_creating() {
             .to_string()
             .contains("snapshot reachability bootstrap incomplete")
     );
+    assert_eq!(engine.command_pool_stats().discarded, discarded);
     drop(engine);
 }
 
@@ -1149,6 +1151,15 @@ fn uploaded_fragment_ledger_batches_preserve_recovery_rows() {
     })
     .expect("verify upload fragment batch rows");
 
+    let mut missing = entries[1].clone();
+    missing.fragment_index = 99;
+    let discarded = engine.command_pool_stats().discarded;
+    assert!(matches!(
+        engine.confirm_fragment_uploads_sync(&[entries[0].clone(), missing]),
+        Err(MetaError::Storage(message)) if message.contains("confirmation row is missing")
+    ));
+    assert_eq!(engine.command_pool_stats().discarded, discarded);
+
     engine
         .confirm_fragment_uploads(&entries)
         .expect("confirm upload fragment batch");
@@ -1188,7 +1199,10 @@ fn uploaded_fragment_ledger_batches_preserve_recovery_rows() {
 #[test]
 #[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
 fn abandoned_uploaded_objects_retire_only_after_local_publication_is_settled() {
+    use crate::compat::ClientCapabilities;
+    use crate::pg_engine::{read_volume_protocol, update_volume_protocol};
     use crate::snapshot_ports::UploadedObjectDeletionClaim::{Claimed, Protected};
+    use crate::volume_protocol::{FeatureState, ProtocolRejection};
 
     let dsn = pg_dsn().expect("STUDIOFS_TEST_PG_DSN is required for this ignored test");
     let volume = PgTestVolume::new(&dsn, "snapshot-reachability-abandoned-upload");
@@ -1342,6 +1356,81 @@ fn abandoned_uploaded_objects_retire_only_after_local_publication_is_settled() {
         .flush_metadata()
         .expect("preserve locally referenced upload");
     assert_eq!(state(73).as_deref(), Some("uploaded"));
+
+    upload(76);
+    engine
+        .add_pending_deletion(76, 5)
+        .expect("record deletion for the abandoned upload");
+    create_published_small_file(&engine, ROOT_INO, b"retirement-policy-barrier", 77);
+    let _replication = engine.replication_lock.lock().expect("lock replication");
+    let batch = engine
+        .claim_pending_batch(true)
+        .expect("claim outbound metadata");
+    let recent_flush = engine
+        .flush_pending_claimed_batch_with_restore(batch)
+        .expect("publish outbound metadata");
+    engine
+        .pull_and_reconcile_foreign_events_locked(recent_flush.as_ref())
+        .expect("reconcile outbound metadata before retirement");
+    assert_eq!(state(76).as_deref(), Some("uploaded"));
+    run_async(async {
+        let (mut client, connection) = tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
+            .await
+            .expect("connect to activate a maintenance capability");
+        let connection_task = tokio::spawn(connection);
+        client
+            .execute(
+                "UPDATE snapshot_payload_upload_objects SET reconcile_lease_expires_at = clock_timestamp() - interval '1 second' WHERE vol = $1 AND object_id = 71",
+                &[&volume.volume_id],
+            )
+            .await
+            .expect("expire the earlier cleanup claim before activating the policy");
+        let capability = "maintenance.payload_gc.v3";
+        let mut actor = ClientCapabilities::current();
+        actor.maintain.insert(capability);
+        let mut policy = read_volume_protocol(&client, volume.volume_id).await?;
+        for state in [
+            FeatureState::Available,
+            FeatureState::Compatible,
+            FeatureState::Required,
+        ] {
+            policy
+                .requirements
+                .features
+                .insert(capability.to_owned(), state);
+            if state == FeatureState::Required {
+                policy.requirements.maintain.insert(capability.to_owned());
+            }
+            let tx = client.transaction().await.unwrap();
+            policy = update_volume_protocol(
+                &tx,
+                volume.volume_id,
+                policy.epoch,
+                &policy,
+                &actor,
+                "test",
+            )
+            .await?;
+            tx.commit().await.unwrap();
+        }
+        connection_task.abort();
+        Ok(())
+    })
+    .expect("activate required maintenance capability");
+
+    let discarded = engine.command_pool_stats().discarded;
+    let error = engine
+        .retire_abandoned_uploads()
+        .expect_err("reject retirement under the new maintenance policy");
+    assert!(
+        matches!(
+            error,
+            MetaError::VolumeProtocolRejected(ProtocolRejection::MaintenanceForbidden { .. })
+        ),
+        "{error}"
+    );
+    assert_eq!(engine.command_pool_stats().discarded, discarded);
+    assert_eq!(state(76).as_deref(), Some("uploaded"));
 }
 
 fn activate_payload_allocator(engine: &PgMetaEngine, namespace: u32, reserved_through: u64) {

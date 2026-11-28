@@ -28,6 +28,11 @@ fn lease_millis(lease_for: Duration) -> Result<i64, SnapshotPortError> {
     Ok(millis)
 }
 
+fn is_rejection(error: &MetaError) -> bool {
+    super::volume_protocol::is_volume_read_policy_rejection(error)
+        || matches!(error, MetaError::Storage(message) if matches!(message.as_str(), STALE_LEASE | SNAPSHOT_NOT_FOUND | SNAPSHOT_NOT_DELETING | ACTIVE_MOUNT_LEASE | ACTIVE_CREATION_LEASE))
+}
+
 fn map_error(operation: &'static str, error: MetaError) -> SnapshotPortError {
     match &error {
         MetaError::VolumeProtocolRejected(
@@ -78,21 +83,27 @@ impl SnapshotCleanupStore for PgMetaEngine {
                             .transaction()
                             .await
                             .map_err(|_| pg_failure("begin snapshot deletion"))?;
-                        let entry = snapshot_control::request_snapshot_delete_in_transaction(
-                            &tx,
-                            volume_id,
-                            &snapshot_id,
-                        )
-                        .await?;
-                        tx.commit()
-                            .await
-                            .map_err(|_| pg_failure("commit snapshot deletion"))?;
-                        Ok(entry)
+                        let outcome = async {
+                            let entry = snapshot_control::request_snapshot_delete_in_transaction(
+                                &tx,
+                                volume_id,
+                                &snapshot_id,
+                            )
+                            .await?;
+                            Ok(entry)
+                        }
+                        .await;
+                        super::runtime::finish_pooled_transaction(tx, outcome, is_rejection, |_| {
+                            pg_failure("commit snapshot deletion")
+                        })
+                        .await
                     })
                 },
             )
             .await;
-            result.map_err(|error| map_error("request snapshot deletion", error))
+            result
+                .and_then(std::convert::identity)
+                .map_err(|error| map_error("request snapshot deletion", error))
         })
     }
 
@@ -117,102 +128,101 @@ impl SnapshotCleanupStore for PgMetaEngine {
                             .transaction()
                             .await
                             .map_err(|_| pg_failure("begin snapshot cleanup claim"))?;
-                        super::volume_protocol::fence_maintenance(&tx, volume_id).await?;
-                        let expired_row = tx
-                            .query_opt(
-                                "SELECT c.id
-                                 FROM snapshot_catalog AS c
-                                 WHERE c.vol = $1
-                                   AND c.lifecycle = 'ready'
-                                   AND c.ready_at IS NOT NULL
-                                   AND c.expires_at IS NOT NULL
-                                   AND c.expires_at <= clock_timestamp()
-                                 ORDER BY c.updated_at, c.id
-                                 LIMIT 1
-                                 FOR UPDATE OF c SKIP LOCKED",
-                                &[&volume_id],
-                            )
-                            .await
-                            .map_err(|_| pg_failure("find expired snapshot cleanup"))?;
-                        if let Some(row) = expired_row {
-                            let snapshot_id_text: String = row.get(0);
-                            let snapshot_id = SnapshotId::parse(&snapshot_id_text).map_err(|_| {
-                                MetaError::Storage("invalid snapshot ID in PostgreSQL".to_string())
-                            })?;
-                            snapshot_control::request_snapshot_delete_in_transaction(
-                                &tx,
-                                volume_id,
-                                &snapshot_id,
-                            )
-                            .await?;
-                        }
-                        let row = tx
-                            .query_opt(
-                                "SELECT c.id
-                                 FROM snapshot_catalog AS c
-                                 LEFT JOIN snapshot_cleanup_leases AS l
-                                   ON l.vol = c.vol
-                                  AND l.snapshot_id = c.id
-                                 WHERE c.vol = $1
-                                   AND c.lifecycle = 'deleting'
-                                   AND NOT EXISTS (
-                                       SELECT 1
-                                       FROM snapshot_mount_leases AS mount_lease
-                                       WHERE mount_lease.vol = c.vol
-                                         AND mount_lease.snapshot_id = c.id
-                                         AND mount_lease.released_at IS NULL
-                                         AND mount_lease.lease_expires_at > clock_timestamp()
-                                   )
-                                   AND NOT EXISTS (
-                                       SELECT 1
-                                       FROM snapshot_creation_leases AS creation_lease
-                                       WHERE creation_lease.vol = c.vol
-                                         AND creation_lease.snapshot_id = c.id
-                                         AND creation_lease.owner <> ''
-                                         AND creation_lease.lease_expires_at > clock_timestamp()
-                                   )
-                                   AND (l.snapshot_id IS NULL
-                                        OR l.lease_expires_at <= clock_timestamp())
-                                 ORDER BY c.updated_at, c.id
-                                 LIMIT 1
-                                 FOR UPDATE OF c SKIP LOCKED",
-                                &[&volume_id],
-                            )
-                            .await
-                            .map_err(|_| pg_failure("find snapshot cleanup"))?;
-                        let Some(row) = row else {
-                            tx.commit()
+                        let outcome = async {
+                            super::volume_protocol::fence_maintenance(&tx, volume_id).await?;
+                            let expired_row = tx
+                                .query_opt(
+                                    "SELECT c.id
+                                     FROM snapshot_catalog AS c
+                                     WHERE c.vol = $1
+                                       AND c.lifecycle = 'ready'
+                                       AND c.ready_at IS NOT NULL
+                                       AND c.expires_at IS NOT NULL
+                                       AND c.expires_at <= clock_timestamp()
+                                     ORDER BY c.updated_at, c.id
+                                     LIMIT 1
+                                     FOR UPDATE OF c SKIP LOCKED",
+                                    &[&volume_id],
+                                )
                                 .await
-                                .map_err(|_| pg_failure("commit empty snapshot cleanup claim"))?;
-                            return Ok(None);
-                        };
-                        let snapshot_id: String = row.get(0);
-                        let worker_text = worker.as_str();
-                        let lease = tx
-                            .query_one(
-                                "INSERT INTO snapshot_cleanup_leases (vol, snapshot_id, owner, lease_expires_at, fencing_token, acquired_at, renewed_at) VALUES ($1, $2, $3, clock_timestamp() + ($4::bigint * interval '1 millisecond'), 1, clock_timestamp(), clock_timestamp()) ON CONFLICT (vol, snapshot_id) DO UPDATE SET owner = EXCLUDED.owner, lease_expires_at = EXCLUDED.lease_expires_at, fencing_token = snapshot_cleanup_leases.fencing_token + 1, acquired_at = clock_timestamp(), renewed_at = clock_timestamp() RETURNING lease_expires_at, fencing_token",
-                                &[&volume_id, &snapshot_id, &worker_text, &lease_ms],
-                            )
-                            .await
-                            .map_err(|_| pg_failure("claim snapshot cleanup lease"))?;
-                        let catalog = snapshot_jobs::load_catalog(&tx, volume_id, &snapshot_id).await?;
-                        let claim = SnapshotCleanupClaim {
-                            catalog,
-                            lease: SnapshotCleanupLease {
-                                owner: worker.as_str().to_string(),
-                                expires_at: lease.get(0),
-                                fencing_token: lease.get(1),
-                            },
-                        };
-                        tx.commit()
-                            .await
-                            .map_err(|_| pg_failure("commit snapshot cleanup claim"))?;
-                        Ok(Some(claim))
+                                .map_err(|_| pg_failure("find expired snapshot cleanup"))?;
+                            if let Some(row) = expired_row {
+                                let snapshot_id_text: String = row.get(0);
+                                let snapshot_id = SnapshotId::parse(&snapshot_id_text).map_err(|_| {
+                                    MetaError::Storage("invalid snapshot ID in PostgreSQL".to_string())
+                                })?;
+                                snapshot_control::request_snapshot_delete_in_transaction(
+                                    &tx,
+                                    volume_id,
+                                    &snapshot_id,
+                                )
+                                .await?;
+                            }
+                            let row = tx
+                                .query_opt(
+                                    "SELECT c.id
+                                     FROM snapshot_catalog AS c
+                                     LEFT JOIN snapshot_cleanup_leases AS l
+                                       ON l.vol = c.vol
+                                      AND l.snapshot_id = c.id
+                                     WHERE c.vol = $1
+                                       AND c.lifecycle = 'deleting'
+                                       AND NOT EXISTS (
+                                           SELECT 1
+                                           FROM snapshot_mount_leases AS mount_lease
+                                           WHERE mount_lease.vol = c.vol
+                                             AND mount_lease.snapshot_id = c.id
+                                             AND mount_lease.released_at IS NULL
+                                             AND mount_lease.lease_expires_at > clock_timestamp()
+                                       )
+                                       AND NOT EXISTS (
+                                           SELECT 1
+                                           FROM snapshot_creation_leases AS creation_lease
+                                           WHERE creation_lease.vol = c.vol
+                                             AND creation_lease.snapshot_id = c.id
+                                             AND creation_lease.owner <> ''
+                                             AND creation_lease.lease_expires_at > clock_timestamp()
+                                       )
+                                       AND (l.snapshot_id IS NULL
+                                            OR l.lease_expires_at <= clock_timestamp())
+                                     ORDER BY c.updated_at, c.id
+                                     LIMIT 1
+                                     FOR UPDATE OF c SKIP LOCKED",
+                                    &[&volume_id],
+                                )
+                                .await
+                                .map_err(|_| pg_failure("find snapshot cleanup"))?;
+                            let Some(row) = row else {
+                                return Ok(None);
+                            };
+                            let snapshot_id: String = row.get(0);
+                            let worker_text = worker.as_str();
+                            let lease = tx
+                                .query_one(
+                                    "INSERT INTO snapshot_cleanup_leases (vol, snapshot_id, owner, lease_expires_at, fencing_token, acquired_at, renewed_at) VALUES ($1, $2, $3, clock_timestamp() + ($4::bigint * interval '1 millisecond'), 1, clock_timestamp(), clock_timestamp()) ON CONFLICT (vol, snapshot_id) DO UPDATE SET owner = EXCLUDED.owner, lease_expires_at = EXCLUDED.lease_expires_at, fencing_token = snapshot_cleanup_leases.fencing_token + 1, acquired_at = clock_timestamp(), renewed_at = clock_timestamp() RETURNING lease_expires_at, fencing_token",
+                                    &[&volume_id, &snapshot_id, &worker_text, &lease_ms],
+                                )
+                                .await
+                                .map_err(|_| pg_failure("claim snapshot cleanup lease"))?;
+                            let catalog = snapshot_jobs::load_catalog(&tx, volume_id, &snapshot_id).await?;
+                            let claim = SnapshotCleanupClaim {
+                                catalog,
+                                lease: SnapshotCleanupLease {
+                                    owner: worker.as_str().to_string(),
+                                    expires_at: lease.get(0),
+                                    fencing_token: lease.get(1),
+                                },
+                            };
+                            Ok(Some(claim))
+                        }.await;
+                        super::runtime::finish_pooled_transaction(tx, outcome, is_rejection, |_| pg_failure("commit snapshot cleanup claim")).await
                     })
                 },
             )
             .await;
-            result.map_err(|error| map_error("claim snapshot cleanup", error))
+            result
+                .and_then(std::convert::identity)
+                .map_err(|error| map_error("claim snapshot cleanup", error))
         })
     }
 
@@ -236,32 +246,35 @@ impl SnapshotCleanupStore for PgMetaEngine {
                     Box::pin(async move {
                         let tx = client.transaction().await
                             .map_err(|_| pg_failure("begin snapshot cleanup renewal"))?;
-                        super::volume_protocol::fence_maintenance(&tx, volume_id).await?;
-                        let row = tx
-                            .query_opt(
-                                "UPDATE snapshot_cleanup_leases SET lease_expires_at = clock_timestamp() + ($5::bigint * interval '1 millisecond'), renewed_at = clock_timestamp() WHERE vol = $1 AND snapshot_id = $2 AND owner = $3 AND fencing_token = $4 AND lease_expires_at > clock_timestamp() RETURNING lease_expires_at, fencing_token",
-                                &[
-                                    &volume_id,
-                                    &snapshot_id,
-                                    &claim.lease.owner,
-                                    &claim.lease.fencing_token,
-                                    &lease_ms,
-                                ],
-                            )
-                            .await
-                            .map_err(|_| pg_failure("renew snapshot cleanup lease"))?
-                            .ok_or_else(|| MetaError::Storage(STALE_LEASE.to_string()))?;
-                        tx.commit().await
-                            .map_err(|_| pg_failure("commit snapshot cleanup renewal"))?;
-                        let mut renewed = claim;
-                        renewed.lease.expires_at = row.get(0);
-                        renewed.lease.fencing_token = row.get(1);
-                        Ok(renewed)
+                        let outcome = async {
+                            super::volume_protocol::fence_maintenance(&tx, volume_id).await?;
+                            let row = tx
+                                .query_opt(
+                                    "UPDATE snapshot_cleanup_leases SET lease_expires_at = clock_timestamp() + ($5::bigint * interval '1 millisecond'), renewed_at = clock_timestamp() WHERE vol = $1 AND snapshot_id = $2 AND owner = $3 AND fencing_token = $4 AND lease_expires_at > clock_timestamp() RETURNING lease_expires_at, fencing_token",
+                                    &[
+                                        &volume_id,
+                                        &snapshot_id,
+                                        &claim.lease.owner,
+                                        &claim.lease.fencing_token,
+                                        &lease_ms,
+                                    ],
+                                )
+                                .await
+                                .map_err(|_| pg_failure("renew snapshot cleanup lease"))?
+                                .ok_or_else(|| MetaError::Storage(STALE_LEASE.to_string()))?;
+                            let mut renewed = claim;
+                            renewed.lease.expires_at = row.get(0);
+                            renewed.lease.fencing_token = row.get(1);
+                            Ok(renewed)
+                        }.await;
+                        super::runtime::finish_pooled_transaction(tx, outcome, is_rejection, |_| pg_failure("commit snapshot cleanup renewal")).await
                     })
                 },
             )
             .await;
-            result.map_err(|error| map_error("renew snapshot cleanup lease", error))
+            result
+                .and_then(std::convert::identity)
+                .map_err(|error| map_error("renew snapshot cleanup lease", error))
         })
     }
 
@@ -290,15 +303,20 @@ impl SnapshotCleanupStore for PgMetaEngine {
                             )
                             .await
                             .map_err(|_| pg_failure("release snapshot cleanup lease"))?;
-                        if released != 1 {
-                            return Err(MetaError::Storage(STALE_LEASE.to_string()));
-                        }
-                        Ok(())
+                        Ok(released)
                     })
                 },
             )
             .await;
-            result.map_err(|error| map_error("release snapshot cleanup lease", error))
+            result
+                .and_then(|rows| {
+                    if rows == 1 {
+                        Ok(())
+                    } else {
+                        Err(MetaError::Storage(STALE_LEASE.to_string()))
+                    }
+                })
+                .map_err(|error| map_error("release snapshot cleanup lease", error))
         })
     }
 
@@ -322,105 +340,104 @@ impl SnapshotCleanupStore for PgMetaEngine {
                             .transaction()
                             .await
                             .map_err(|_| pg_failure("begin snapshot finalization"))?;
-                        super::volume_protocol::fence_maintenance(&tx, volume_id).await?;
-                        let lifecycle = tx
-                            .query_opt(
-                                "SELECT lifecycle FROM snapshot_catalog WHERE vol = $1 AND id = $2 FOR UPDATE",
-                                &[&volume_id, &snapshot_id],
-                            )
-                            .await
-                            .map_err(|_| pg_failure("load snapshot for finalization"))?
-                            .ok_or_else(|| MetaError::Storage(SNAPSHOT_NOT_FOUND.to_string()))?;
-                        let lifecycle: String = lifecycle.get(0);
-                        if lifecycle == "deleted" {
-                            tx.execute(
-                                "UPDATE snapshot_cleanup_leases SET owner = '', lease_expires_at = clock_timestamp(), renewed_at = clock_timestamp() WHERE vol = $1 AND snapshot_id = $2 AND owner = $3 AND fencing_token = $4",
-                                &[
-                                    &volume_id,
-                                    &snapshot_id,
-                                    &claim.lease.owner,
-                                    &claim.lease.fencing_token,
-                                ],
-                            )
-                            .await
-                            .map_err(|_| pg_failure("release completed cleanup lease"))?;
-                            let catalog = snapshot_jobs::load_catalog(&tx, volume_id, &snapshot_id).await?;
-                            tx.commit()
+                        let outcome = async {
+                            super::volume_protocol::fence_maintenance(&tx, volume_id).await?;
+                            let lifecycle = tx
+                                .query_opt(
+                                    "SELECT lifecycle FROM snapshot_catalog WHERE vol = $1 AND id = $2 FOR UPDATE",
+                                    &[&volume_id, &snapshot_id],
+                                )
                                 .await
-                                .map_err(|_| pg_failure("commit completed snapshot cleanup"))?;
-                            return Ok(catalog);
-                        }
-                        if lifecycle != "deleting" {
-                            return Err(MetaError::Storage(SNAPSHOT_NOT_DELETING.to_string()));
-                        }
-                        let active_mount: bool = tx
-                            .query_one(
-                                "SELECT EXISTS (SELECT 1 FROM snapshot_mount_leases WHERE vol = $1 AND snapshot_id = $2 AND released_at IS NULL AND lease_expires_at > clock_timestamp())",
-                                &[&volume_id, &snapshot_id],
-                            )
-                            .await
-                            .map_err(|_| pg_failure("check snapshot mount leases"))?
-                            .get(0);
-                        if active_mount {
-                            return Err(MetaError::Storage(ACTIVE_MOUNT_LEASE.to_string()));
-                        }
-                        let active_creation: bool = tx
-                            .query_one(
-                                "SELECT EXISTS (SELECT 1 FROM snapshot_creation_leases WHERE vol = $1 AND snapshot_id = $2 AND owner <> '' AND lease_expires_at > clock_timestamp())",
-                                &[&volume_id, &snapshot_id],
-                            )
-                            .await
-                            .map_err(|_| pg_failure("check snapshot creation leases"))?
-                            .get(0);
-                        if active_creation {
-                            return Err(MetaError::Storage(ACTIVE_CREATION_LEASE.to_string()));
-                        }
+                                .map_err(|_| pg_failure("load snapshot for finalization"))?
+                                .ok_or_else(|| MetaError::Storage(SNAPSHOT_NOT_FOUND.to_string()))?;
+                            let lifecycle: String = lifecycle.get(0);
+                            if lifecycle == "deleted" {
+                                tx.execute(
+                                    "UPDATE snapshot_cleanup_leases SET owner = '', lease_expires_at = clock_timestamp(), renewed_at = clock_timestamp() WHERE vol = $1 AND snapshot_id = $2 AND owner = $3 AND fencing_token = $4",
+                                    &[
+                                        &volume_id,
+                                        &snapshot_id,
+                                        &claim.lease.owner,
+                                        &claim.lease.fencing_token,
+                                    ],
+                                )
+                                .await
+                                .map_err(|_| pg_failure("release completed cleanup lease"))?;
+                                let catalog = snapshot_jobs::load_catalog(&tx, volume_id, &snapshot_id).await?;
+                                return Ok(catalog);
+                            }
+                            if lifecycle != "deleting" {
+                                return Err(MetaError::Storage(SNAPSHOT_NOT_DELETING.to_string()));
+                            }
+                            let active_mount: bool = tx
+                                .query_one(
+                                    "SELECT EXISTS (SELECT 1 FROM snapshot_mount_leases WHERE vol = $1 AND snapshot_id = $2 AND released_at IS NULL AND lease_expires_at > clock_timestamp())",
+                                    &[&volume_id, &snapshot_id],
+                                )
+                                .await
+                                .map_err(|_| pg_failure("check snapshot mount leases"))?
+                                .get(0);
+                            if active_mount {
+                                return Err(MetaError::Storage(ACTIVE_MOUNT_LEASE.to_string()));
+                            }
+                            let active_creation: bool = tx
+                                .query_one(
+                                    "SELECT EXISTS (SELECT 1 FROM snapshot_creation_leases WHERE vol = $1 AND snapshot_id = $2 AND owner <> '' AND lease_expires_at > clock_timestamp())",
+                                    &[&volume_id, &snapshot_id],
+                                )
+                                .await
+                                .map_err(|_| pg_failure("check snapshot creation leases"))?
+                                .get(0);
+                            if active_creation {
+                                return Err(MetaError::Storage(ACTIVE_CREATION_LEASE.to_string()));
+                            }
 
-                        for statement in [
-                            "DELETE FROM snapshot_artifact_payload_proofs WHERE vol = $1 AND snapshot_id = $2",
-                            "DELETE FROM snapshot_artifacts WHERE vol = $1 AND snapshot_id = $2",
-                            "DELETE FROM snapshot_artifact_attempts WHERE vol = $1 AND snapshot_id = $2",
-                            "DELETE FROM snapshot_source_checkpoints WHERE vol = $1 AND snapshot_id = $2",
-                        ] {
-                            tx.execute(statement, &[&volume_id, &snapshot_id])
+                            for statement in [
+                                "DELETE FROM snapshot_artifact_payload_proofs WHERE vol = $1 AND snapshot_id = $2",
+                                "DELETE FROM snapshot_artifacts WHERE vol = $1 AND snapshot_id = $2",
+                                "DELETE FROM snapshot_artifact_attempts WHERE vol = $1 AND snapshot_id = $2",
+                                "DELETE FROM snapshot_source_checkpoints WHERE vol = $1 AND snapshot_id = $2",
+                            ] {
+                                tx.execute(statement, &[&volume_id, &snapshot_id])
+                                    .await
+                                    .map_err(|_| pg_failure("delete snapshot cleanup metadata"))?;
+                            }
+                            let updated = tx
+                                .execute(
+                                    "UPDATE snapshot_catalog SET lifecycle = 'deleted', updated_at = clock_timestamp() WHERE vol = $1 AND id = $2 AND lifecycle = 'deleting'",
+                                    &[&volume_id, &snapshot_id],
+                                )
                                 .await
-                                .map_err(|_| pg_failure("delete snapshot cleanup metadata"))?;
-                        }
-                        let updated = tx
-                            .execute(
-                                "UPDATE snapshot_catalog SET lifecycle = 'deleted', updated_at = clock_timestamp() WHERE vol = $1 AND id = $2 AND lifecycle = 'deleting'",
-                                &[&volume_id, &snapshot_id],
-                            )
-                            .await
-                            .map_err(|_| pg_failure("finalize deleted snapshot"))?;
-                        if updated != 1 {
-                            return Err(MetaError::Storage(STALE_LEASE.to_string()));
-                        }
-                        let released = tx
-                            .execute(
-                                "UPDATE snapshot_cleanup_leases SET owner = '', lease_expires_at = clock_timestamp(), renewed_at = clock_timestamp() WHERE vol = $1 AND snapshot_id = $2 AND owner = $3 AND fencing_token = $4",
-                                &[
-                                    &volume_id,
-                                    &snapshot_id,
-                                    &claim.lease.owner,
-                                    &claim.lease.fencing_token,
-                                ],
-                            )
-                            .await
-                            .map_err(|_| pg_failure("release finalized cleanup lease"))?;
-                        if released != 1 {
-                            return Err(MetaError::Storage(STALE_LEASE.to_string()));
-                        }
-                        let catalog = snapshot_jobs::load_catalog(&tx, volume_id, &snapshot_id).await?;
-                        tx.commit()
-                            .await
-                            .map_err(|_| pg_failure("commit snapshot finalization"))?;
-                        Ok(catalog)
+                                .map_err(|_| pg_failure("finalize deleted snapshot"))?;
+                            if updated != 1 {
+                                return Err(MetaError::Storage(STALE_LEASE.to_string()));
+                            }
+                            let released = tx
+                                .execute(
+                                    "UPDATE snapshot_cleanup_leases SET owner = '', lease_expires_at = clock_timestamp(), renewed_at = clock_timestamp() WHERE vol = $1 AND snapshot_id = $2 AND owner = $3 AND fencing_token = $4",
+                                    &[
+                                        &volume_id,
+                                        &snapshot_id,
+                                        &claim.lease.owner,
+                                        &claim.lease.fencing_token,
+                                    ],
+                                )
+                                .await
+                                .map_err(|_| pg_failure("release finalized cleanup lease"))?;
+                            if released != 1 {
+                                return Err(MetaError::Storage(STALE_LEASE.to_string()));
+                            }
+                            let catalog = snapshot_jobs::load_catalog(&tx, volume_id, &snapshot_id).await?;
+                            Ok(catalog)
+                        }.await;
+                        super::runtime::finish_pooled_transaction(tx, outcome, is_rejection, |_| pg_failure("commit snapshot finalization")).await
                     })
                 },
             )
             .await;
-            result.map_err(|error| map_error("finalize snapshot deletion", error))
+            result
+                .and_then(std::convert::identity)
+                .map_err(|error| map_error("finalize snapshot deletion", error))
         })
     }
 }

@@ -13,6 +13,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 use tracing::warn;
 
+const MISSING_REPLAY_STATE: &str = "postgres metadata replay state row missing";
+
 pub(super) fn replay_cancelled(
     worker_shutdown: &AtomicBool,
     caller_shutdown: Option<&AtomicBool>,
@@ -257,161 +259,165 @@ impl PgMetaEngine {
                         let tx = client.transaction().await.map_err(|e| {
                             Self::classify_pg_error("postgres begin pull transaction failed", e)
                         })?;
-                        let lock_key = pg_event_log_prune_lock_key(volume_id);
-                        tx.query_one(sql::ACQUIRE_METADATA_REPLAY_ADVISORY_LOCK, &[&lock_key])
-                            .await
-                            .map_err(|e| {
-                                Self::classify_pg_error(
-                                    "postgres metadata replay advisory lock failed",
-                                    e,
-                                )
-                            })?;
-                        let replay_state = tx
-                            .query_opt(sql::SELECT_METADATA_REPLAY_STATE, &[&volume_id])
-                            .await
-                            .map_err(|e| {
-                                Self::classify_pg_error(
-                                    "postgres metadata replay state revalidation failed",
-                                    e,
-                                )
-                            })?;
-                        let replay_state = replay_state.ok_or_else(|| {
-                            MetaError::Storage(
-                                "postgres metadata replay state row missing".to_string(),
-                            )
-                        })?;
-                        let format_version = replay_state
-                            .try_get::<_, Option<i16>>("metadata_format_version")
-                            .map_err(|e| {
-                                Self::classify_pg_error(
-                                    "postgres metadata format version read failed",
-                                    e,
-                                )
-                            })?;
-                        let policy = super::volume_protocol::decode_volume_policy(
-                            format_version,
-                            replay_state.get("policy_epoch"),
-                            replay_state.get("write_requirement"),
-                            replay_state.get("policy_requirements"),
-                        )?;
-                        super::volume_protocol::check_read_operations(&policy, None)?;
-                        let baseline_checkpoint_version = replay_state
-                            .try_get::<_, i64>("checkpoint_version")
-                            .map_err(|e| {
-                                Self::classify_pg_error(
-                                    "postgres checkpoint version read failed",
-                                    e,
-                                )
-                            })?;
-                        let retained_floor = replay_state
-                            .try_get::<_, i64>("event_log_prune_floor")
-                            .map_err(|e| {
-                                Self::classify_pg_error(
-                                    "postgres event-log retention floor read failed",
-                                    e,
-                                )
-                            })?;
-                        let publication_state = replay_state
-                            .try_get::<_, String>("checkpoint_publication_state")
-                            .map_err(|e| {
-                                Self::classify_pg_error(
-                                    "postgres checkpoint publication state read failed",
-                                    e,
-                                )
-                            })?;
-                        let mut effective_checkpoint = if publication_state == "published" {
-                            baseline_checkpoint_version
-                        } else {
-                            -1
-                        };
-                        if effective_checkpoint < retained_floor {
-                            let has_encodings = tx
-                                .query_one(sql::CHECKPOINT_ENCODINGS_AVAILABLE, &[])
+                        let outcome = async {
+                            let lock_key = pg_event_log_prune_lock_key(volume_id);
+                            tx.query_one(sql::ACQUIRE_METADATA_REPLAY_ADVISORY_LOCK, &[&lock_key])
                                 .await
                                 .map_err(|e| {
                                     Self::classify_pg_error(
-                                        "postgres checkpoint encodings probe failed",
-                                        e,
-                                    )
-                                })?
-                                .try_get::<_, bool>(0)
-                                .map_err(|e| {
-                                    Self::classify_pg_error(
-                                        "postgres checkpoint encodings probe parse failed",
+                                        "postgres metadata replay advisory lock failed",
                                         e,
                                     )
                                 })?;
-                            if has_encodings {
-                                let alt_version = tx
-                                    .query_one(
-                                        sql::SELECT_COMPATIBLE_CHECKPOINT_MAX_VERSION,
-                                        &[
-                                            &volume_id,
-                                            &retained_floor,
-                                            &(SERVING_CHECKPOINT_FORMAT.min_supported as i16),
-                                            &ServingCheckpoint::FORMAT_VERSION,
-                                            &(SERVING_CHECKPOINT_SCHEMA.min_supported as i16),
-                                            &ServingCheckpoint::SCHEMA_VERSION,
-                                        ],
+                            let replay_state = tx
+                                .query_opt(sql::SELECT_METADATA_REPLAY_STATE, &[&volume_id])
+                                .await
+                                .map_err(|e| {
+                                    Self::classify_pg_error(
+                                        "postgres metadata replay state revalidation failed",
+                                        e,
                                     )
+                                })?;
+                            let replay_state = replay_state.ok_or_else(|| {
+                                MetaError::Storage(MISSING_REPLAY_STATE.to_owned())
+                            })?;
+                            let format_version = replay_state
+                                .try_get::<_, Option<i16>>("metadata_format_version")
+                                .map_err(|e| {
+                                    Self::classify_pg_error(
+                                        "postgres metadata format version read failed",
+                                        e,
+                                    )
+                                })?;
+                            let policy = super::volume_protocol::decode_volume_policy(
+                                format_version,
+                                replay_state.get("policy_epoch"),
+                                replay_state.get("write_requirement"),
+                                replay_state.get("policy_requirements"),
+                            )?;
+                            super::volume_protocol::check_read_operations(&policy, None)?;
+                            let baseline_checkpoint_version = replay_state
+                                .try_get::<_, i64>("checkpoint_version")
+                                .map_err(|e| {
+                                    Self::classify_pg_error(
+                                        "postgres checkpoint version read failed",
+                                        e,
+                                    )
+                                })?;
+                            let retained_floor = replay_state
+                                .try_get::<_, i64>("event_log_prune_floor")
+                                .map_err(|e| {
+                                    Self::classify_pg_error(
+                                        "postgres event-log retention floor read failed",
+                                        e,
+                                    )
+                                })?;
+                            let publication_state = replay_state
+                                .try_get::<_, String>("checkpoint_publication_state")
+                                .map_err(|e| {
+                                    Self::classify_pg_error(
+                                        "postgres checkpoint publication state read failed",
+                                        e,
+                                    )
+                                })?;
+                            let mut effective_checkpoint = if publication_state == "published" {
+                                baseline_checkpoint_version
+                            } else {
+                                -1
+                            };
+                            if effective_checkpoint < retained_floor {
+                                let has_encodings = tx
+                                    .query_one(sql::CHECKPOINT_ENCODINGS_AVAILABLE, &[])
                                     .await
                                     .map_err(|e| {
                                         Self::classify_pg_error(
-                                            "postgres compatible checkpoint version read failed",
+                                            "postgres checkpoint encodings probe failed",
                                             e,
                                         )
                                     })?
-                                    .try_get::<_, Option<i64>>(0)
+                                    .try_get::<_, bool>(0)
                                     .map_err(|e| {
                                         Self::classify_pg_error(
-                                            "postgres compatible checkpoint version parse failed",
+                                            "postgres checkpoint encodings probe parse failed",
                                             e,
                                         )
                                     })?;
-                                if let Some(alt_version) = alt_version {
-                                    effective_checkpoint = effective_checkpoint.max(alt_version);
+                                if has_encodings {
+                                    let alt_version = tx
+                                        .query_one(
+                                            sql::SELECT_COMPATIBLE_CHECKPOINT_MAX_VERSION,
+                                            &[
+                                                &volume_id,
+                                                &retained_floor,
+                                                &(SERVING_CHECKPOINT_FORMAT.min_supported as i16),
+                                                &ServingCheckpoint::FORMAT_VERSION,
+                                                &(SERVING_CHECKPOINT_SCHEMA.min_supported as i16),
+                                                &ServingCheckpoint::SCHEMA_VERSION,
+                                            ],
+                                        )
+                                        .await
+                                        .map_err(|e| {
+                                            Self::classify_pg_error(
+                                                "postgres compatible checkpoint version read failed",
+                                                e,
+                                            )
+                                        })?
+                                        .try_get::<_, Option<i64>>(0)
+                                        .map_err(|e| {
+                                            Self::classify_pg_error(
+                                                "postgres compatible checkpoint version parse failed",
+                                                e,
+                                            )
+                                        })?;
+                                    if let Some(alt_version) = alt_version {
+                                        effective_checkpoint = effective_checkpoint.max(alt_version);
+                                    }
+                                }
+                                if effective_checkpoint < retained_floor
+                                    && last_batch_version >= 0
+                                    && retained_floor >= 0
+                                    && target_version >= 0
+                                    && last_batch_version < retained_floor
+                                {
+                                    return Err(MetaError::NeedCompatibleCheckpoint {
+                                        replay_floor: retained_floor,
+                                    });
                                 }
                             }
-                            if effective_checkpoint < retained_floor
-                                && last_batch_version >= 0
-                                && retained_floor >= 0
-                                && target_version >= 0
-                                && last_batch_version < retained_floor
-                            {
-                                return Err(MetaError::NeedCompatibleCheckpoint {
-                                    replay_floor: retained_floor,
-                                });
-                            }
-                        }
-                        let checkpoint_version = if effective_checkpoint >= 0 {
-                            effective_checkpoint
-                        } else {
-                            baseline_checkpoint_version
-                        };
-                        Self::validate_replay_cursor_against_floor(
-                            last_batch_version,
-                            retained_floor,
-                            checkpoint_version,
-                            target_version,
-                        )?;
+                            let checkpoint_version = if effective_checkpoint >= 0 {
+                                effective_checkpoint
+                            } else {
+                                baseline_checkpoint_version
+                            };
+                            Self::validate_replay_cursor_against_floor(
+                                last_batch_version,
+                                retained_floor,
+                                checkpoint_version,
+                                target_version,
+                            )?;
 
-                        let page = Self::query_foreign_event_page(
-                            &tx,
-                            volume_id,
-                            last_batch_version,
-                            target_version,
-                            sync_max_batches_per_page,
-                            sync_max_response_bytes_per_page,
-                        )
-                        .await?;
-                        tx.commit().await.map_err(|e| {
+                            let page = Self::query_foreign_event_page(
+                                &tx,
+                                volume_id,
+                                last_batch_version,
+                                target_version,
+                                sync_max_batches_per_page,
+                                sync_max_response_bytes_per_page,
+                            )
+                            .await?;
+                            Ok(page)
+                        }.await;
+                        super::runtime::finish_pooled_transaction(tx, outcome, |error| {
+                            super::volume_protocol::is_volume_read_policy_rejection(error)
+                                || matches!(error, MetaError::NeedCompatibleCheckpoint { .. } | MetaError::RebootstrapRequired { .. } | MetaError::ReplayGap { .. })
+                                || matches!(error, MetaError::Storage(message) if message == MISSING_REPLAY_STATE)
+                        }, |e| {
                             Self::classify_pg_error("postgres pull transaction commit failed", e)
-                        })?;
-                        Ok(page)
+                        }).await
                     })
                 },
             )
-            .await
+            .await?
         })?;
         let query_duration_us = elapsed_micros(page_started);
 

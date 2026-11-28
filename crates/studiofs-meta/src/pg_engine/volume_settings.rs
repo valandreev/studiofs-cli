@@ -125,51 +125,73 @@ impl PgMetaEngine {
             let now_ms = Self::now_millis();
             let current_session = session.clone();
             let current_update = update;
-            let outcome =
-                self.run_async(async move {
-                    Self::with_postgres_client_timeout(
-                        pool,
-                        timeout,
-                        "update volume settings",
-                        move |client| {
-                            Box::pin(async move {
-                                let tx = client.transaction().await.map_err(|error| {
-                                    Self::classify_pg_error("begin volume settings", error)
-                                })?;
-                                match current_session.stamp_checked(&tx, volume).await {
+            let outcome = self.run_async(async move {
+                Self::with_postgres_client_timeout(
+                    pool,
+                    timeout,
+                    "update volume settings",
+                    move |client| {
+                        Box::pin(async move {
+                            let tx = client.transaction().await.map_err(|error| {
+                                Self::classify_pg_error("begin volume settings", error)
+                            })?;
+                            match current_session.stamp_checked(&tx, volume).await {
                                 Ok(()) => {}
-                                Err(error @ (super::client_sessions::StampError::SessionInactive
-                                    | super::client_sessions::StampError::PolicyStale { .. })) => {
-                                    drop(tx);
+                                Err(
+                                    error @ (super::client_sessions::StampError::SessionInactive
+                                    | super::client_sessions::StampError::PolicyStale {
+                                        ..
+                                    }),
+                                ) => {
+                                    tx.rollback().await.map_err(|error| {
+                                        Self::classify_pg_error(
+                                            "rollback stale volume settings publication",
+                                            error,
+                                        )
+                                    })?;
                                     return Ok(Err((error, current_update)));
                                 }
                                 Err(super::client_sessions::StampError::Other(error)) => {
                                     return Err(error);
                                 }
                             }
-                                let accepted = update_volume_settings_in_tx(
-                                    &tx,
-                                    current_session.protocol(),
-                                    volume,
-                                    Some(expected_revision),
-                                    &current_client_id,
-                                    now_ms,
-                                    current_update,
-                                )
-                                .await?;
-                                if accepted.is_some() {
-                                    tx.commit().await.map_err(|error| {
-                                        Self::classify_pg_error("commit volume settings", error)
-                                    })?;
-                                }
-                                Ok(Ok(accepted))
-                            })
-                        },
-                    )
-                    .await
-                });
+                            let outcome = update_volume_settings_in_tx(
+                                &tx,
+                                current_session.protocol(),
+                                volume,
+                                Some(expected_revision),
+                                &current_client_id,
+                                now_ms,
+                                current_update,
+                            )
+                            .await;
+                            if matches!(outcome, Ok(None)) {
+                                tx.rollback().await.map_err(|error| {
+                                    Self::classify_pg_error(
+                                        "rollback stale volume settings revision",
+                                        error,
+                                    )
+                                })?;
+                                return Ok(Ok(Ok(None)));
+                            }
+                            super::runtime::finish_pooled_transaction(
+                                tx,
+                                outcome,
+                                |error| {
+                                    super::volume_protocol::is_volume_read_policy_rejection(error)
+                                        || matches!(error, MetaError::Storage(message) if message == MISSING_VOLUME_SETTINGS_ROW)
+                                },
+                                |error| Self::classify_pg_error("finish volume settings", error),
+                            )
+                            .await
+                            .map(Ok)
+                        })
+                    },
+                )
+                .await
+            });
             match outcome {
-                Ok(Ok(accepted)) => break accepted,
+                Ok(Ok(accepted)) => break accepted?,
                 Ok(Err((stamp_error, returned_update))) => {
                     if attempt == 0 {
                         attempt += 1;
@@ -304,6 +326,9 @@ async fn update_volume_settings(
     Ok(accepted)
 }
 
+const MISSING_VOLUME_SETTINGS_ROW: &str =
+    "lock volume settings: query returned an unexpected number of rows";
+
 async fn update_volume_settings_in_tx(
     tx: &tokio_postgres::Transaction<'_>,
     protocol: &crate::volume_protocol::VolumeProtocol,
@@ -314,14 +339,20 @@ async fn update_volume_settings_in_tx(
     update: impl FnOnce(&mut VolumeSettings),
 ) -> MetaResult<Option<VolumeSettings>> {
     let row = tx
-        .query_one(
+        .query_opt(
             "SELECT metadata_format_version, volume_settings FROM metadata_state WHERE vol=$1 FOR UPDATE",
             &[&volume],
         )
         .await
+        .map_err(|error| PgMetaEngine::classify_pg_error("lock volume settings", error))?
+        .ok_or_else(|| MetaError::Storage(MISSING_VOLUME_SETTINGS_ROW.to_string()))?;
+    crate::check_pg_volume_format(
+        row.try_get(0)
+            .map_err(|error| PgMetaEngine::classify_pg_error("lock volume settings", error))?,
+    )?;
+    let bytes: Option<Vec<u8>> = row
+        .try_get(1)
         .map_err(|error| PgMetaEngine::classify_pg_error("lock volume settings", error))?;
-    crate::check_pg_volume_format(row.get(0))?;
-    let bytes: Option<Vec<u8>> = row.get(1);
     let mut settings = bytes
         .as_deref()
         .map(VolumeSettings::decode_json)

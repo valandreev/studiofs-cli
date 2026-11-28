@@ -113,7 +113,7 @@ impl PgMetaEngine {
                             None
                         };
                         if should_skip_event_log_prune(progress) {
-                            return Ok(None);
+                            return Ok(Ok(None));
                         }
 
                         let tx = client.transaction().await.map_err(|error| {
@@ -139,7 +139,7 @@ impl PgMetaEngine {
                                 )
                             })?;
                         if !lock_acquired {
-                            return Ok(None);
+                            return Ok(Ok(None));
                         }
 
                         let Some(state) = tx
@@ -152,10 +152,25 @@ impl PgMetaEngine {
                                 )
                             })?
                         else {
-                            return Ok(None);
+                            return Ok(Ok(None));
                         };
 
-                        super::volume_protocol::fence_maintenance(&tx, volume_id).await?;
+                        if let Err(error) =
+                            super::volume_protocol::fence_maintenance(&tx, volume_id).await
+                        {
+                            return super::runtime::finish_pooled_transaction(
+                                tx,
+                                Err(error),
+                                super::volume_protocol::is_volume_read_policy_rejection,
+                                |error| {
+                                    Self::classify_pg_error(
+                                        "postgres event-log prune rollback failed",
+                                        error,
+                                    )
+                                },
+                            )
+                            .await;
+                        }
                         let checkpoint_version = nonnegative(
                             state.try_get(0).map_err(|error| {
                                 Self::classify_pg_error(
@@ -203,7 +218,7 @@ impl PgMetaEngine {
                         )?;
 
                         if current_floor >= safe_floor {
-                            return Ok(None);
+                            return Ok(Ok(None));
                         }
 
                         let deleted = tx
@@ -292,16 +307,16 @@ impl PgMetaEngine {
                         tx.commit().await.map_err(|error| {
                             Self::classify_pg_error("postgres event-log prune commit failed", error)
                         })?;
-                        Ok(Some(EventLogPruneResult {
+                        Ok(Ok(Some(EventLogPruneResult {
                             safe_floor,
                             durable_floor,
                             pruned_rows,
                             total_pruned_rows,
-                        }))
+                        })))
                     })
                 },
             )
-            .await
+            .await?
         });
         if let Ok(Some(prune)) = &result {
             debug!(

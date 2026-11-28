@@ -789,6 +789,7 @@ fn pending_events_stay_unpublished_while_the_policy_cannot_represent_them() {
     assert!(pending > 0);
 
     let batch = pg.claim_pending_batch(true).expect("pending batch");
+    let discarded = pg.command_pool_stats().discarded;
     let refused = pg.flush_pending_claimed_batch_with_restore(batch).err();
     assert!(
         matches!(
@@ -812,6 +813,20 @@ fn pending_events_stay_unpublished_while_the_policy_cannot_represent_them() {
     pg.sync_metadata_with_source(crate::pg_engine::MetadataSyncSource::FallbackPoll)
         .expect("poll while publication is blocked");
     assert_eq!(pg.pg_sync_progress_snapshot().last_sync_error, blocked);
+
+    assert_eq!(pg.command_pool_stats().discarded, discarded);
+
+    use crate::trash::MetaVolumeSettings;
+    assert!(matches!(
+        pg.compare_and_set_trash_days(0, 3),
+        Err(MetaError::VolumeProtocolRejected(
+            ProtocolRejection::EventNotRepresentable {
+                kind: "set_volume_settings",
+                ..
+            }
+        ))
+    ));
+    assert_eq!(pg.command_pool_stats().discarded, discarded);
 
     // Online settings changes negotiate against the same policy.
     let settings = run_async({

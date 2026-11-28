@@ -183,18 +183,28 @@ fn pg_maintenance_policy_preserves_snapshot_and_replay_history() {
         ).await.unwrap().get::<_, i64>(0), 0);
 
         let worker = SnapshotWorkerId::new("stale-worker").unwrap();
+        let discarded = engine.command_pool_stats().discarded;
         for error in [
             SnapshotCleanupStore::claim_next(engine.as_ref(), &worker, Duration::from_secs(60)).await.unwrap_err(),
             SnapshotCleanupStore::request_delete(engine.as_ref(), &snapshot.snapshot_id).await.unwrap_err(),
         ] {
             assert!(matches!(error, SnapshotPortError::Permanent { code, .. } if code.as_str() == "maintenance_capability_missing"));
         }
+        assert_eq!(engine.command_pool_stats().discarded, discarded);
         let worker_engine = engine.clone();
         tokio::task::spawn_blocking(move || {
+            assert!(matches!(
+                crate::snapshot_ports::UploadedFragmentLedger::claim_uploaded_object_deletion(
+                    worker_engine.as_ref(), 100, "stale-worker"
+                ),
+                Err(MetaError::VolumeProtocolRejected(ProtocolRejection::MaintenanceForbidden { .. }))
+            ));
+            assert_eq!(worker_engine.command_pool_stats().discarded, discarded);
             assert!(matches!(
                 worker_engine.run_event_log_prune_once(),
                 Err(MetaError::VolumeProtocolRejected(ProtocolRejection::MaintenanceForbidden { .. }))
             ));
+            assert_eq!(worker_engine.command_pool_stats().discarded, discarded);
             assert!(matches!(
                 worker_engine.try_acquire_pg_janitor_lock(),
                 Err(MetaError::VolumeProtocolRejected(ProtocolRejection::MaintenanceForbidden { .. }))
@@ -282,7 +292,30 @@ fn missing_snapshot_does_not_discard_healthy_pool_connection() {
         error,
         SnapshotPortError::permanent("snapshot_not_found", "snapshot does not exist")
     );
-    assert_eq!(engine.command_pool_stats().discarded - before.discarded, 0);
+    assert_eq!(engine.command_pool_stats().discarded, before.discarded);
+
+    let hint = crate::snapshot::SnapshotVolumeIdentityHint::new(
+        volume.volume_id,
+        "wrong-volume-name",
+        &volume.uuid,
+    )
+    .expect("valid local volume hint");
+    assert!(matches!(
+        engine.validate_snapshot_volume_context(&hint),
+        Err(MetaError::Storage(message)) if message.contains("does not match PostgreSQL")
+    ));
+    assert_eq!(engine.command_pool_stats().discarded, before.discarded);
+
+    run_async(async {
+        let error = SnapshotCleanupStore::request_delete(engine.as_ref(), &snapshot_id)
+            .await
+            .expect_err("missing snapshot deletion must be rejected");
+        assert!(matches!(error, SnapshotPortError::Permanent { code, .. }
+            if code.as_str() == "snapshot_not_found"));
+        assert_eq!(engine.command_pool_stats().discarded, before.discarded);
+        Ok(())
+    })
+    .unwrap();
 }
 
 #[test]
@@ -731,6 +764,41 @@ fn mount_renewal_is_fenced_by_active_cleanup_claim() {
         SnapshotPortError::Permanent { code, .. } if code.as_str() == "stale_lease"
     ));
     assert_eq!(engine.command_pool_stats().discarded, before.discarded);
+
+    run_async(async {
+        let mut claim = crate::snapshot::SnapshotCleanupClaim {
+            catalog: snapshot,
+            lease: crate::snapshot::SnapshotCleanupLease {
+                owner: "cleanup-owner".to_owned(),
+                expires_at: Utc::now(),
+                fencing_token: 1,
+            },
+        };
+        let error = SnapshotCleanupStore::finalize_deleted(engine.as_ref(), &claim)
+            .await
+            .expect_err("active mount must prevent finalization");
+        assert!(
+            error.to_string().contains("waiting for an active lease"),
+            "{error}"
+        );
+        assert_eq!(engine.command_pool_stats().discarded, before.discarded);
+
+        claim.lease.fencing_token = -1;
+        let renewal =
+            SnapshotCleanupStore::renew_lease(engine.as_ref(), &claim, Duration::from_secs(60))
+                .await
+                .expect_err("stale cleanup fence must reject renewal");
+        let release = SnapshotCleanupStore::release_lease(engine.as_ref(), &claim)
+            .await
+            .expect_err("stale cleanup fence must reject release");
+        for error in [renewal, release] {
+            assert!(matches!(error, SnapshotPortError::Permanent { code, .. }
+                if code.as_str() == "stale_lease"));
+        }
+        assert_eq!(engine.command_pool_stats().discarded, before.discarded);
+        Ok(())
+    })
+    .unwrap();
 
     let fenced_lease = crate::snapshot::SnapshotMountLease {
         fencing_token: -1,

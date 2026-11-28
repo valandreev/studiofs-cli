@@ -1237,13 +1237,13 @@ const SETTLE_OBJECT_DELETIONS_SQL: &str = "WITH settled AS (SELECT * FROM unnest
 /// the mounted Janitor. Returns the fencing token, or `None` when the object is
 /// protected.
 pub(super) async fn claim_object_deletion_in(
-    tx: tokio_postgres::Transaction<'_>,
+    tx: &tokio_postgres::Transaction<'_>,
     volume_id: i64,
     object_id: i64,
     owner: &str,
 ) -> MetaResult<Option<i64>> {
     let lease_secs = super::snapshot_reachability::SNAPSHOT_UPLOADED_FRAGMENT_LEASE_SECS as f64;
-    fence_maintenance(&tx, volume_id).await?;
+    fence_maintenance(tx, volume_id).await?;
     let claimed = tx
         .query_opt(
             CLAIM_OBJECT_DELETIONS_SQL.as_str(),
@@ -1251,9 +1251,6 @@ pub(super) async fn claim_object_deletion_in(
         )
         .await
         .map_err(|error| PgMetaEngine::classify_pg_error("janitor claim lease failed", error))?;
-    tx.commit()
-        .await
-        .map_err(|error| PgMetaEngine::classify_pg_error("janitor claim commit failed", error))?;
     Ok(claimed.map(|row| row.get::<_, i64>(1)))
 }
 
@@ -1414,9 +1411,7 @@ impl PgMetaEngine {
                                 )
                             })?;
                         if bootstrap_ready.is_none() {
-                            return Err(MetaError::Storage(
-                                "snapshot reachability bootstrap incomplete".to_owned(),
-                            ));
+                            return Ok(None);
                         }
                         client
                             .query(
@@ -1429,12 +1424,12 @@ impl PgMetaEngine {
                                     "postgres janitor snapshot pin query failed",
                                     e,
                                 )
-                            })
+                            }).map(Some)
                     })
                 },
             )
             .await
-        })?;
+        })?.ok_or_else(|| MetaError::Storage("snapshot reachability bootstrap incomplete".to_owned()))?;
 
         let mut pins = HashSet::new();
         for row in rows {
