@@ -337,8 +337,9 @@ Then it runs three steps, each with its own run id `<prefix>-<step>`:
 | `forward` | `tools/test_successor/run_compat_matrix.py` | The SFS-1019 matrix gets its own sandbox because the successor migrates the shared PostgreSQL irreversibly. The published `v0.2.4` binary for the host is downloaded and SHA-256-verified, so its fenced-client cell must run. |
 | `crash` | the same matrix with `--crash-rollback` | The SFS-1020 fault-injection matrix, including the `v0.2.2` format-5 adoption pair. |
 
-The gate checks that `cargo`, `docker` and `gh` are on `PATH` before it
-builds. Every step runs even when an earlier one fails. The gate prints a summary,
+Before it builds, the gate checks that `cargo`, `docker` and `gh` are on `PATH`
+and that `docker info` reaches a running engine. On macOS that engine is
+OrbStack through its Docker context, so start OrbStack first. Every step runs even when an earlier one fails. The gate prints a summary,
 writes `target/e2e-runs/<prefix>-summary.json` with each step's status,
 failed and skipped scenarios and matrix cell counts, and exits 1 when any step
 failed. Retained sandboxes follow `--retain` (default `on-failure`).

@@ -132,6 +132,10 @@ def main() -> int:
     if missing:
         print(f"missing required tools on PATH: {', '.join(missing)}", file=sys.stderr)
         return 2
+    # The CLI can exist while its engine is down (macOS OrbStack not started, Docker Desktop stopped).
+    if subprocess.run(["docker", "info"], capture_output=True).returncode != 0:
+        print("docker engine is not reachable; start OrbStack (macOS) or Docker Desktop, then retry", file=sys.stderr)
+        return 2
     commit = git("rev-parse", "HEAD")
     dirty = git("status", "--porcelain", "--untracked-files=no")
     if dirty and not args.allow_dirty:
