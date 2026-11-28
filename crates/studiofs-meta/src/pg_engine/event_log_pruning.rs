@@ -161,14 +161,7 @@ impl PgMetaEngine {
                             return super::runtime::finish_pooled_transaction(
                                 tx,
                                 Err(error),
-                                |error| {
-                                    matches!(
-                                        error,
-                                        MetaError::VolumeProtocolRejected(
-                                            crate::volume_protocol::ProtocolRejection::MaintenanceForbidden { .. }
-                                        )
-                                    )
-                                },
+                                super::volume_protocol::is_volume_read_policy_rejection,
                                 |error| {
                                     Self::classify_pg_error(
                                         "postgres event-log prune rollback failed",

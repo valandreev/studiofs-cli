@@ -837,8 +837,8 @@ impl PgMetaEngine {
                                 error,
                             )
                         })?;
-                        let version: i64 = tx
-                            .query_one(
+                        let Some(state) = tx
+                            .query_opt(
                                 "SELECT version FROM metadata_state WHERE vol = $1 FOR UPDATE",
                                 &[&volume_id],
                             )
@@ -849,7 +849,24 @@ impl PgMetaEngine {
                                     error,
                                 )
                             })?
-                            .get(0);
+                        else {
+                            return super::runtime::finish_pooled_transaction(
+                                tx,
+                                Err(MetaError::Storage(
+                                    "postgres snapshot reachability bootstrap version query failed: query returned an unexpected number of rows"
+                                        .to_owned(),
+                                )),
+                                |_| true,
+                                |error| {
+                                    Self::classify_pg_error(
+                                        "postgres snapshot reachability bootstrap missing state rollback failed",
+                                        error,
+                                    )
+                                },
+                            )
+                            .await;
+                        };
+                        let version: i64 = state.get(0);
                         let initialized = tx
                             .query_opt(
                                 "SELECT initialized_version FROM snapshot_reachability_bootstrap WHERE vol = $1",

@@ -1,6 +1,7 @@
+use super::lifecycle::with_pg_test_client;
 use super::{
     DEFAULT_PG_EVENT_LOG_PRUNE_BATCHES, IsolatedPgSchema, PG_EVENT_LOG_PRUNE_BATCHES_ENV_VAR,
-    PgOpenOptions, PgTestVolume, pg_dsn, run_async, seed_local, set_test_env,
+    PgOpenOptions, PgTestVolume, drop_volume_protocol, pg_dsn, run_async, seed_local, set_test_env,
 };
 use crate::pg_engine::PgMetaEngine;
 use crate::pg_engine::event_log_pruning::{
@@ -76,6 +77,55 @@ fn event_log_prune_batch_limit_falls_back_for_invalid_environment_values() {
     assert!(PgMetaEngine::validate_event_log_prune_batch_limit(0).is_err());
     assert!(PgMetaEngine::validate_event_log_prune_batch_limit(-1).is_err());
     assert!(PgMetaEngine::validate_event_log_prune_batch_limit(1).is_ok());
+}
+
+#[test]
+#[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
+fn pg_event_log_prune_missing_policy_does_not_discard_connection() {
+    let dsn = pg_dsn().expect("STUDIOFS_TEST_PG_DSN is required");
+    let volume = PgTestVolume::new(&dsn, "pg-event-log-prune-missing-policy");
+    let dir = studiofs_test_support::workspace_target_tempdir("test-");
+    let db = dir.path().join("meta.redb");
+    seed_local(&db, &volume.format_info());
+    let engine = PgMetaEngine::open_with_options(
+        &db,
+        PgOpenOptions {
+            background_poll: false,
+            ..Default::default()
+        },
+    )
+    .expect("open pg engine");
+
+    let volume_id = volume.volume_id;
+    run_async(with_pg_test_client(&dsn, move |mut client| async move {
+        let tx = client
+            .transaction()
+            .await
+            .expect("begin checkpoint fixture");
+        let session = crate::pg_engine::PublicationSession::begin(&tx, volume_id).await?;
+        assert_eq!(
+            tx.execute(
+                "UPDATE metadata_state SET version = 1, checkpoint_version = 1 WHERE vol = $1",
+                &[&volume_id],
+            )
+            .await
+            .expect("seed a checkpoint eligible for pruning"),
+            1
+        );
+        session.finish(&tx, volume_id).await?;
+        tx.commit().await.expect("commit checkpoint fixture");
+        drop_volume_protocol(&client, volume_id).await
+    }))
+    .expect("remove the isolated volume policy");
+
+    let discarded = engine.command_pool_stats().discarded;
+    assert!(matches!(
+        engine.run_event_log_prune_once(),
+        Err(crate::engine::MetaError::VolumeProtocolRejected(
+            crate::volume_protocol::ProtocolRejection::Missing
+        ))
+    ));
+    assert_eq!(engine.command_pool_stats().discarded, discarded);
 }
 
 #[test]

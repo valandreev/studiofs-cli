@@ -2076,7 +2076,7 @@ fn checkpoint_coordination_miss_fails_closed_when_freshness_observation_fails() 
     );
 }
 
-async fn with_pg_test_client<T, F, Fut>(dsn: &str, f: F) -> Result<T, MetaError>
+pub(super) async fn with_pg_test_client<T, F, Fut>(dsn: &str, f: F) -> Result<T, MetaError>
 where
     F: FnOnce(tokio_postgres::Client) -> Fut,
     Fut: std::future::Future<Output = Result<T, MetaError>>,
@@ -7853,6 +7853,11 @@ fn missing_replay_state_does_not_discard_healthy_pool_connection() {
     assert!(matches!(
         engine.pull_foreign_events_locked_to_target(None, target, None),
         Err(MetaError::Storage(message)) if message == "postgres metadata replay state row missing"
+    ));
+    assert_eq!(engine.command_pool_stats().discarded, discarded);
+    assert!(matches!(
+        engine.read_remote_checkpoint_freshness(),
+        Err(MetaError::Storage(message)) if message == "postgres metadata_state row missing during checkpoint freshness observation"
     ));
     assert_eq!(engine.command_pool_stats().discarded, discarded);
 }

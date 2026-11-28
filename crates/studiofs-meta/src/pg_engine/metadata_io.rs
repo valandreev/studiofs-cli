@@ -587,7 +587,7 @@ async fn read_checkpoint_freshness_with_pool(
     volume_id: i64,
     command_timeout: std::time::Duration,
 ) -> MetaResult<CheckpointFreshnessObservation> {
-    PgMetaEngine::with_postgres_client_timeout(
+    let observation = PgMetaEngine::with_postgres_client_timeout(
         command_pool,
         command_timeout,
         "checkpoint freshness observation",
@@ -601,18 +601,20 @@ async fn read_checkpoint_freshness_with_pool(
                             "postgres checkpoint freshness select failed",
                             e,
                         )
-                    })?
-                    .ok_or_else(|| {
-                        MetaError::Storage(
-                            "postgres metadata_state row missing during checkpoint freshness observation"
-                                .to_string(),
-                        )
                     })?;
-                checkpoint_freshness_observation_from_row(&row)
+                row.as_ref()
+                    .map(checkpoint_freshness_observation_from_row)
+                    .transpose()
             })
         },
     )
-    .await
+    .await?;
+    observation.ok_or_else(|| {
+        MetaError::Storage(
+            "postgres metadata_state row missing during checkpoint freshness observation"
+                .to_string(),
+        )
+    })
 }
 
 // Match the page query's sizing expression: two BIGINT columns plus a
