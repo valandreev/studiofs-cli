@@ -54,6 +54,8 @@ jobs:
         run: |
           mkdir -p target
           python3 tools/test_successor/test_build.py
+          python3 tools/test_successor/test_run_compat_matrix.py
+          python3 tools/release/test_e2e_gate.py
           python3 tools/release/test_package.py
           cargo test -p studiofs-meta --features test-successor --lib -- version:: test_successor
           if cargo check -p studiofs --release --features test-successor > target/test-successor-release-check.log 2>&1; then

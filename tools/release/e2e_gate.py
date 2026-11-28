@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import shutil
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -96,7 +97,13 @@ def summarize(step: str, run_dir: Path, exit_code: int) -> dict:
     matrix_path = run_dir / MATRIX_ARTIFACT
     if matrix_path.is_file():
         result["matrix"] = json.loads(matrix_path.read_text(encoding="utf-8")).get("summary")
+        # A skipped cell (no published binary for this host) passes but is incomplete evidence.
+        result["complete"] = result["matrix"].get("skipped", 0) == 0
     return result
+
+
+def git(*args: str) -> str:
+    return subprocess.run(["git", *args], cwd=REPO, capture_output=True, text=True, check=True).stdout.strip()
 
 
 def main() -> int:
@@ -107,21 +114,30 @@ def main() -> int:
     parser.add_argument("--platform", default="auto")
     parser.add_argument("--retain", default="on-failure", choices=("always", "on-failure", "never"))
     parser.add_argument("--port-range", default=None)
-    parser.add_argument("--timeout", default=None, help="whole-run timeout for each step, passed to studiofs-e2e")
+    parser.add_argument("--timeout", default=None, help="per-scenario timeout passed to studiofs-e2e (its default is 5m), e.g. 30m")
     parser.add_argument("--step", action="append", choices=STEPS, help="run only these steps (repeatable)")
     parser.add_argument("--skip-build", action="store_true", help="reuse binaries from an earlier gate build")
     parser.add_argument("--allow-dirty", action="store_true", help="allow uncommitted changes (not release evidence)")
     args = parser.parse_args()
 
-    dirty = subprocess.run(
-        ["git", "status", "--porcelain", "--untracked-files=no"], cwd=REPO, capture_output=True, text=True, check=True
-    ).stdout.strip()
+    missing = [tool for tool in ("cargo", "docker", "gh") if shutil.which(tool) is None]
+    if missing:
+        print(f"missing required tools on PATH: {', '.join(missing)}", file=sys.stderr)
+        return 2
+    commit = git("rev-parse", "HEAD")
+    dirty = git("status", "--porcelain", "--untracked-files=no")
     if dirty and not args.allow_dirty:
         print("worktree has uncommitted changes; commit them or pass --allow-dirty:\n" + dirty, file=sys.stderr)
         return 2
 
     if not args.skip_build:
         build()
+    elif not args.allow_dirty:
+        manifest = REPO / "target" / "test-successor" / "manifest.json"
+        built = json.loads(manifest.read_text(encoding="utf-8")).get("source_commit") if manifest.is_file() else None
+        if built != commit:
+            print(f"--skip-build: binaries were built from {built}, not HEAD {commit}; rebuild", file=sys.stderr)
+            return 2
 
     results = []
     for step in args.step or STEPS:
@@ -130,13 +146,13 @@ def main() -> int:
         exit_code = run(step_command(step, args, run_id))
         results.append(summarize(step, REPO / args.root / run_id, exit_code))
 
-    commit = subprocess.run(["git", "rev-parse", "HEAD"], cwd=REPO, capture_output=True, text=True).stdout.strip()
     summary = {
         "run_id_prefix": args.run_id_prefix,
         "source_commit": commit,
         "source_dirty": bool(dirty),
         "platform": sys.platform,
         "passed": all(r["passed"] for r in results),
+        "complete": all(r.get("complete", True) for r in results),
         "steps": results,
     }
     summary_path = REPO / args.root / f"{args.run_id_prefix}-summary.json"
@@ -150,6 +166,8 @@ def main() -> int:
             line += f"  scenarios={r['scenarios']} failed={len(r['failed'])} skipped={len(r['skipped'])}"
         if r.get("matrix"):
             line += f"  cells={r['matrix']}"
+            if not r["complete"]:
+                line += "  INCOMPLETE (skipped cells)"
         print(line)
         for failed in r.get("failed", []):
             print(f"    failed: {failed['name']}: {failed['error']}")

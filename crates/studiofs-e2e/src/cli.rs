@@ -96,7 +96,8 @@ pub struct RunArgs {
     #[arg(long)]
     pub port_range: Option<String>,
 
-    /// Optional whole-run timeout string reserved for future hook enforcement.
+    /// Optional timeout for each supervised scenario child, such as `30m`;
+    /// defaults to five minutes.
     #[arg(long)]
     pub timeout: Option<String>,
 

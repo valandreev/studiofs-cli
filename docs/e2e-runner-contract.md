@@ -69,7 +69,7 @@ Required initial run flags and environment:
 | `--port-range <start-end>` | Optional deterministic host port pool for Docker services. The compose runner allocates PostgreSQL, RustFS S3, RustFS console, and Toxiproxy API ports in that order. |
 | `STUDIOFS_E2E_COMPOSE_FILE` | Optional environment override for the compose file path. Defaults to `docker/compose.e2e.yml` discovered from the current directory or executable location. |
 | `STUDIOFS_E2E_MOUNT_ROOT` | macOS mounted runs only. Canonical host setting from the repository `.env`; each client mount is created below `<root>/<client>/<volume>`. The value must be an absolute path on an internal volume. A process environment value overrides `.env` for one run. |
-| `--timeout <duration>` | Whole-run timeout; per-hook timeouts are derived from it unless overridden later. |
+| `--timeout <duration>` | Timeout for each supervised scenario child process, such as `30m`. Defaults to five minutes. |
 
 The initial runner implements `list`, `run`, and `clean`. Future subcommands
 may add dedicated `preflight` or artifact commands, but those must reuse the

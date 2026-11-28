@@ -337,24 +337,33 @@ Then it runs three steps, each with its own run id `<prefix>-<step>`:
 | `forward` | `tools/test_successor/run_compat_matrix.py` | The SFS-1019 matrix gets its own sandbox because the successor migrates the shared PostgreSQL irreversibly. The published `v0.2.4` binary for the host is downloaded and SHA-256-verified, so its fenced-client cell must run. |
 | `crash` | the same matrix with `--crash-rollback` | The SFS-1020 fault-injection matrix, including the `v0.2.2` format-5 adoption pair. |
 
-Every step runs even when an earlier one fails. The gate prints a summary,
+The gate checks that `cargo`, `docker` and `gh` are on `PATH` before it
+builds. Every step runs even when an earlier one fails. The gate prints a summary,
 writes `target/e2e-runs/<prefix>-summary.json` with each step's status,
 failed and skipped scenarios and matrix cell counts, and exits 1 when any step
 failed. Retained sandboxes follow `--retain` (default `on-failure`).
 
 To rerun one failed step against the binaries from the previous build, pass
-`--skip-build` and `--step` (repeatable):
+`--skip-build` and `--step` (repeatable). Without `--allow-dirty`, the gate
+refuses `--skip-build` when the test-successor manifest was built from a commit
+other than `HEAD`:
 
 ```sh
 python tools/release/e2e_gate.py --skip-build --step forward --run-id-prefix release-gate-retry
 ```
 
 `v0.2.4` and `v0.2.2` publish no Intel macOS binary. On that host the
-published-client cells are reported as `skipped`.
+published-client cells are reported as `skipped`, and the summary marks the
+step and the gate `"complete": false` (`INCOMPLETE` in the printed summary)
+while `passed` stays true.
 
-Running the numbered range (`--scenario 1-53`) instead of the gate fails the
-forward-compat matrix immediately when the compiled test successor has not been
-built.
+Selecting the forward-compat matrix outside the gate, for example through a
+numbered range that covers every registered scenario, fails it immediately when
+the compiled test successor has not been built.
+
+On macOS, set `STUDIOFS_E2E_MOUNT_ROOT` in the repository `.env` first; the
+runner reads it for every mounted client. `--timeout` is the per-scenario child
+timeout (default five minutes) and is passed to every step.
 
 ### SFS-1019 Supported-Release Forward-Compatibility Matrix
 

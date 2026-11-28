@@ -158,9 +158,11 @@ def main() -> int:
     parser.add_argument(
         "--v022-bin",
         default=None,
-        help="verified native v0.2.2 binary for format-5 adoption (downloaded with --crash-rollback when omitted)",
+        help="verified native v0.2.2 binary for format-5 adoption; used only with --crash-rollback, downloaded when omitted",
     )
-    parser.add_argument("--skip-v022", action="store_true")
+    parser.add_argument(
+        "--skip-v022", action="store_true", help="with --crash-rollback, leave the v0.2.2 cell out"
+    )
     parser.add_argument("--skip-v024", action="store_true")
     parser.add_argument("--skip-build", action="store_true")
     parser.add_argument(
@@ -223,7 +225,6 @@ def main() -> int:
     env["STUDIOFS_E2E_SUCCESSOR_BIN"] = str(successor_bin)
     if args.crash_rollback:
         env["STUDIOFS_E2E_CRASH_ROLLBACK"] = "1"
-    if args.crash_rollback:
         v022_bin = ensure_published_binary(repo, V022_TAG, args.v022_bin, args.skip_v022)
         if v022_bin is not None:
             env["STUDIOFS_E2E_V022_BIN"] = str(v022_bin.resolve(strict=True))
