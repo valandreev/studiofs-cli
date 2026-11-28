@@ -25,6 +25,7 @@ Operators need to be able to repeat an interrupted `studiofs upgrade` or restart
 - [x] (2026-11-27 22:25Z) Passed the split-batch publication tests after the stamp fusion: three live PostgreSQL tests and two redb tests.
 - [x] (2026-11-27 22:32Z) Rebuilt both binaries from `1a950c27` and passed the macOS crash matrix (9/9) with the new operations.
 - [x] (2026-11-27 22:44Z) Passed the rebuilt macOS forward matrix (8/8) with statement logging. `check_publication_statements.py` exited 0 with 14 statements per measured batch for both releases. Verified that no run containers or mounts remained.
+- [x] (2026-11-28 10:15Z) SFS-1136: built both binaries from clean `bbac7a4f` on Linux and passed the crash matrix (9/9), forward matrix (8/8), maintenance run (2/2), bridge smoke and every focused test listed below. Statement parity held. See [Linux pass](#linux-pass-sfs-1136).
 
 ## Surprises & Discoveries
 
@@ -54,7 +55,7 @@ Mounted renewal fault: a trigger cancels every `client_sessions` update that ext
 
 ## Outcomes & Retrospective
 
-The rebuilt macOS crash matrix passed nine of nine cells with no skips. It records recovery of both legacy adoption chains, schema and local revision cancellation, checkpoint and prune retry, snapshot checksum, a force-killed baseline with an unpublished write, supported deactivate, and irreversible downgrade refusal. The rebuilt ordinary forward matrix passed eight of eight cells and the maintenance run passed both scenarios. PostgreSQL statement counts match v0.2.4 for the measured file-payload batch. The format-7 header and v5 dump fixture seals pass the drift gate. The build and fixture provenance uses `7fe972358f9e48655249739ae7c8415bcac5504d` with uncommitted changes. The review rerun built from `1a950c27` with uncommitted runner changes. It passed `sfs1020-macos-crash-review` (9/9) and `sfs1020-macos-forward-review` (8/8), and statement parity held. One gap remains for the mounted gate: a kill between applying a replay page and committing its cursor. Unit hooks cover that point. Windows remains pending SFS-1135, Linux remains pending SFS-1136, and final release evidence comes from the clean candidate.
+The rebuilt macOS crash matrix passed nine of nine cells with no skips. It records recovery of both legacy adoption chains, schema and local revision cancellation, checkpoint and prune retry, snapshot checksum, a force-killed baseline with an unpublished write, supported deactivate, and irreversible downgrade refusal. The rebuilt ordinary forward matrix passed eight of eight cells and the maintenance run passed both scenarios. PostgreSQL statement counts match v0.2.4 for the measured file-payload batch. The format-7 header and v5 dump fixture seals pass the drift gate. The build and fixture provenance uses `7fe972358f9e48655249739ae7c8415bcac5504d` with uncommitted changes. The review rerun built from `1a950c27` with uncommitted runner changes. It passed `sfs1020-macos-crash-review` (9/9) and `sfs1020-macos-forward-review` (8/8), and statement parity held. One gap remains for the mounted gate: a kill between applying a replay page and committing its cursor. Unit hooks cover that point. Windows remains pending SFS-1135, and final release evidence comes from the clean candidate. The Linux pass (SFS-1136) passed every gate on its first attempt from clean `bbac7a4f`, with no runner or product changes.
 
 ## Context and Orientation
 
@@ -114,6 +115,26 @@ In the table, the command prefix `PG` is `cargo test --locked -p studiofs-meta -
 
 The other passing live PostgreSQL filters were `client_session_leases_register_renew_and_close_pg_engines`, `client_session_leases_failed_heartbeat_preserves_local_reads_and_recovers`, `mount_policy_change_freezes_local_writer`, `cutover_activate_and_publication_race_fences_stale_writer`, `published_format_adoption_retries_and_fences_legacy_publication`, `test_pg_retained_publication_response_loss_retry`, and `volume_protocol_policy_and_write_requirement_on_live_postgres` (one each). The CLI filters `dump_load_roundtrip_restores_the_published_baseline` with `-- --ignored --nocapture` and `load_refuses_v4_dump_with_upgrade_instruction` each passed with `cargo test --locked -p studiofs --bin studiofs`. The static SQL check `checkpoint_freshness_sql_uses_persisted_scalar_bookkeeping` passed (1). `cargo clippy --locked -p studiofs-meta --all-targets -- -D warnings`, `cargo fmt --all -- --check`, and `git diff --check` passed.
 
+## Linux pass (SFS-1136)
+
+On 2026-11-28 the suite ran on WSL2 Ubuntu (kernel 6.6, libfuse3 3.14) from the repository's native ext4 checkout. The baseline, test successor and `studiofs-e2e` were built from clean `bbac7a4f`. The successor manifest `target/test-successor/manifest.json` (SHA-256 `b60d02412be2ddb491665cb231865ee7ff0b6e90bfab631d4c8e03815e5cb537`) records five verified changes, `source_dirty=false`, baseline `033661c6de635005d4ada8d4a342e8c6f5cc51c25b32c82366c535074e91e578` and successor `3632053359f58c8062e20e5d93b2fd6206929ff14f197f905d9747ef6ff88ae9`. The published archives `studiofs-0.2.4-x86_64-linux-gnu.tar.gz` and `studiofs-0.2.2-x86_64-unknown-linux-gnu.tar.gz` passed `sha256sum -c` before extraction into `target/sfs1136-v024/` and `target/sfs1136-v022/`. The maintenance run added `--port-range 36300-36319` because a Windows run shared the Docker daemon. The live PostgreSQL tests used the Compose project `studiofs-sfs1136-pg` on port 35432.
+
+| Gate | Command | Result | Artifacts |
+| --- | --- | --- | --- |
+| Bridge smoke | `cargo test -p studiofs-linux-fuse mounted_regular_file_io_is_visible_across_reopen -- --ignored --test-threads=1` | Pass (2, including the kernel-cache variant) | `target/sfs1136-logs/bridge-smoke.log` |
+| Forward matrix with statement logging | Concrete Steps forward command with run ID `sfs1136-linux-forward`, the Linux v0.2.4 binary and `STUDIOFS_E2E_COMPOSE_FILE="$PWD/target/sfs1136-stmt-compose.e2e.yml"` (the same statement-logging copy) | Pass, 8/8 cells, 35 operations, 0 skipped | `target/e2e-runs/sfs1136-linux-forward/` |
+| Statement parity | `python3 -B tools/test_successor/check_publication_statements.py target/e2e-runs/sfs1136-linux-forward/artifacts/docker/compose.log` | Pass, exit 0. v0.2.4 ran 14 statements per batch (2 measured) and 0.2.5 ran 14 (1 measured) | `target/sfs1136-logs/sfs1136-linux-forward-checker.log` |
+| Crash matrix | Concrete Steps crash command with run ID `sfs1136-linux-crash` and the Linux v0.2.4 and v0.2.2 binaries | Pass, 9/9 cells, 55 operations, 0 skipped. The replay kill happened at cursor 22 with head 26. The restart reached 26 and verified 8 SHA-256 digests. Epochs stayed at 1 in cells 1, 2 and 4 and advanced from 5 to 6 at activation. At adoption both epochs advanced to 1. Format 6 started with both absent, and format 5 started with an absent policy epoch and publication epoch 0 | `target/e2e-runs/sfs1136-linux-crash/` |
+| Maintenance | Concrete Steps maintenance command with run ID `sfs1136-linux-maintenance` and `--port-range 36300-36319` | Pass, 2/2 scenarios | `target/e2e-runs/sfs1136-linux-maintenance/` |
+| Live PostgreSQL | Every PG filter in the table above and in the paragraph after it | Pass, one test each for 22 filters, and 3 for `event_publication_fence` | `target/sfs1136-pg/<name>.log` |
+| redb and fixtures | The two redb resume commands, `split_publication_`, `baseline_fixture_manifest`, `checkpoint_freshness_sql_uses_persisted_scalar_bookkeeping`, and `baseline_fixtures` with and without `test-successor` | Pass (1, 1, 2, 2, 1, 11 and 13; the ignored regeneration generator was not run) | `target/sfs1136-redb/`; the last three in `target/sfs1136-pg/` |
+| CLI dump and load | `dump_load_roundtrip_restores_the_published_baseline` with `-- --ignored`, and `load_refuses_v4_dump_with_upgrade_instruction` | Pass (1 each) | `target/sfs1136-pg/dump_load_roundtrip.log`, `target/sfs1136-pg/load_refuses_v4.log` |
+| Runner unit tests | `cargo test -p studiofs-e2e --lib --locked scenario::workloads::forward_compat_matrix -- --nocapture` | Pass (7) | `target/sfs1136-redb/e2e_forward_compat_matrix.log` |
+
+User content was checksum-verified and pending local operations were preserved. Cell 1 checked the pre-migration payload checksum. In cell 4 the force-killed baseline remounted its cache, recovered the locally synced checksum of its unpublished write, and then published it to the successor. The replay kill verified 8 SHA-256 digests. Cell 2 converged after cold bootstrap from the checkpoint and pruned history, and cell 9 recovered the original format-5 payload.
+
+The Compose stacks were torn down afterwards. `mount` showed no FUSE mount except `fusectl`, and no `sfs1136` containers or volumes remained. The replay-commit gap recorded above still applies on Linux.
+
 ## Idempotence and Recovery
 
 Each matrix starts with a fresh Compose database, bucket, and client roots. The runner removes its own containers and mounts and retains reports. A cancelled transaction leaves the previous committed registry, checkpoint, prune floor, or policy available. A normal retry reuses the stopped local database and removes its upgrade marker when local completion commits. Remove the dedicated test stacks with `docker compose -f docker/compose.e2e.yml -p studiofs-sfs1020-fused down -v` and the same command with `-p studiofs-sfs1020-dump-restore`.
@@ -129,6 +150,8 @@ The verified successor build manifest is `target/test-successor/manifest.json`, 
 ## Interfaces and Dependencies
 
 The wrapper adds `--crash-rollback` and selects the existing scenario. The only product code used exclusively by the test successor is the local revision interruption in `crates/studiofs-meta/src/redb_engine/format.rs`. It exits after the stage-3 transaction commits. The ordinary and crash suites require real Docker PostgreSQL and RustFS, the baseline executable, the compiled test successor executable, and the published legacy executables for cells 8 and 9.
+
+Revision note, 2026-11-28 (SFS-1136). Added the Linux pass evidence.
 
 Revision note, 2026-11-27 (review). Added the fault guard, named the redb exit-hook contract, added renewal-fault and replay-kill operations and epoch monotonicity checks, re-ran the split-batch publication tests, and recorded the remaining replay-commit gap.
 
