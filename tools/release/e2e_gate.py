@@ -20,6 +20,9 @@ Steps:
 Each step gets its own run id `<prefix>-<step>`. Every step runs even when an
 earlier one fails; the gate writes `<root>/<prefix>-summary.json` and exits 1
 when any step failed.
+
+`--repeat N` builds once and runs the selected steps N times in a row, with run
+ids `<prefix>-r<i>-<step>`. It stops after the first iteration with a failed step.
 """
 
 from __future__ import annotations
@@ -107,6 +110,17 @@ def git(*args: str) -> str:
     return subprocess.run(["git", *args], cwd=REPO, capture_output=True, text=True, check=True).stdout.strip()
 
 
+def positive_int(value: str) -> int:
+    number = int(value)
+    if number < 1:
+        raise argparse.ArgumentTypeError("must be at least 1")
+    return number
+
+
+def run_id_for(prefix: str, step: str, iteration: int, repeat: int) -> str:
+    return f"{prefix}-{step}" if repeat == 1 else f"{prefix}-r{iteration}-{step}"
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -123,6 +137,12 @@ def main() -> int:
         "--scenarios-only",
         action="store_true",
         help="run every E2E scenario (the scenarios and forward steps) on any worktree; skips the crash matrix",
+    )
+    parser.add_argument(
+        "--repeat",
+        type=positive_int,
+        default=1,
+        help="run the selected steps N times in a row; stop after the first failed iteration",
     )
     args = parser.parse_args()
     if args.scenarios_only:
@@ -151,18 +171,26 @@ def main() -> int:
             print(f"--skip-build: binaries were built from {built}, not HEAD {commit}; rebuild", file=sys.stderr)
             return 2
 
+    steps = args.step or (SCENARIO_STEPS if args.scenarios_only else STEPS)
     results = []
-    for step in args.step or (SCENARIO_STEPS if args.scenarios_only else STEPS):
-        run_id = f"{args.run_id_prefix}-{step}"
-        print(f"=== release gate step {step} (run id {run_id}) ===", flush=True)
-        exit_code = run(step_command(step, args, run_id))
-        results.append(summarize(step, REPO / args.root / run_id, exit_code))
+    for iteration in range(1, args.repeat + 1):
+        for step in steps:
+            run_id = run_id_for(args.run_id_prefix, step, iteration, args.repeat)
+            print(f"=== iteration {iteration}/{args.repeat} step {step} (run id {run_id}) ===", flush=True)
+            exit_code = run(step_command(step, args, run_id))
+            results.append({"iteration": iteration, **summarize(step, REPO / args.root / run_id, exit_code)})
+        if not all(r["passed"] for r in results):
+            if iteration < args.repeat:
+                print(f"iteration {iteration} failed; skipping the remaining {args.repeat - iteration}", flush=True)
+            break
 
     summary = {
         "run_id_prefix": args.run_id_prefix,
         "source_commit": commit,
         "source_dirty": bool(dirty),
         "platform": sys.platform,
+        "repeat": args.repeat,
+        "iterations_run": results[-1]["iteration"],
         "passed": all(r["passed"] for r in results),
         "complete": all(r.get("complete", True) for r in results),
         "steps": results,
@@ -173,7 +201,7 @@ def main() -> int:
 
     print("=== release gate summary ===")
     for r in results:
-        line = f"{r['step']:<10} {'PASS' if r['passed'] else 'FAIL'}  run_id={r['run_id']}"
+        line = f"#{r['iteration']} {r['step']:<10} {'PASS' if r['passed'] else 'FAIL'}  run_id={r['run_id']}"
         if "scenarios" in r:
             line += f"  scenarios={r['scenarios']} failed={len(r['failed'])} skipped={len(r['skipped'])}"
         if r.get("matrix"):

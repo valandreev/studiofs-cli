@@ -8,6 +8,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import e2e_gate  # noqa: E402
@@ -34,6 +35,37 @@ class StepCommandTests(unittest.TestCase):
         self.assertNotIn("--crash-rollback", forward)
         self.assertIn("--crash-rollback", crash)
         self.assertNotIn("--timeout", forward)
+
+
+class RepeatTests(unittest.TestCase):
+    def test_single_run_keeps_plain_run_ids_and_repeats_are_numbered(self) -> None:
+        self.assertEqual(e2e_gate.run_id_for("p", "forward", 1, 1), "p-forward")
+        self.assertEqual(e2e_gate.run_id_for("p", "forward", 3, 10), "p-r3-forward")
+
+    def test_failed_iteration_stops_the_loop(self) -> None:
+        outcomes = iter([0, 0, 1, 0])  # iteration 2's scenarios step fails
+        calls = []
+
+        def fake_run(cmd: list[str]) -> int:
+            calls.append(cmd)
+            return next(outcomes)
+
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(
+            sys, "argv", ["e2e_gate.py", "--scenarios-only", "--skip-build", "--repeat", "10", "--root", tmp]
+        ), mock.patch.object(e2e_gate.shutil, "which", return_value="x"), mock.patch.object(
+            e2e_gate.subprocess, "run", return_value=mock.Mock(returncode=0)
+        ), mock.patch.object(e2e_gate, "git", return_value=""), mock.patch.object(e2e_gate, "run", fake_run):
+            self.assertEqual(e2e_gate.main(), 1)
+            summary = json.loads(next(Path(tmp).glob("*-summary.json")).read_text(encoding="utf-8"))
+
+        self.assertEqual(len(calls), 4)  # both steps of iterations 1 and 2, nothing after
+        self.assertEqual(summary["iterations_run"], 2)
+        self.assertEqual([r["passed"] for r in summary["steps"]], [True, True, False, True])
+
+    def test_repeat_must_be_positive(self) -> None:
+        self.assertEqual(e2e_gate.positive_int("10"), 10)
+        with self.assertRaises(argparse.ArgumentTypeError):
+            e2e_gate.positive_int("0")
 
 
 class SummarizeTests(unittest.TestCase):
