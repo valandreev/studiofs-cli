@@ -2,7 +2,7 @@
   "manifest_version": 1,
   "issue": "SFS-1002",
   "baseline": "0.2.5",
-  "status": "candidate fixture seal complete at 7fe972358f9e48655249739ae7c8415bcac5504d with SFS-1020 working-tree changes",
+  "status": "candidate fixture seal complete at clean commit 81298aea9726a8c3b2d1e752c72de00ce5fa75be",
   "paths_relative_to": "workspace root",
   "regenerate": {
     "baseline": "Run the focused baseline generators listed below, refresh all changed SHA-256 values and append the reason to regenerations. Existing generators require both the environment flag and --ignored.",
@@ -26,7 +26,7 @@
     {
       "path": "crates/studiofs-meta/tests/fixtures/baseline-0.2.5/format-info.json",
       "sha256": "b3d9932a4de0ecf8a32e28f50e01eb55352b2d78ebc3d323c9ecfc0685fe8e13",
-      "source": "commit 7fe972358f9e48655249739ae7c8415bcac5504d with SFS-1020 working-tree changes",
+      "source": "clean commit 81298aea9726a8c3b2d1e752c72de00ce5fa75be",
       "generator": "STUDIOFS_REGENERATE_BASELINE_FIXTURES=1 cargo test --locked -p studiofs-meta --lib regenerate_baseline_0_2_5_fixtures -- --ignored",
       "identity": "FormatInfo format_version 7, postgres backend, encryption format 1",
       "expected": "decodes at the shared format baseline without normalizing its version",
@@ -286,8 +286,8 @@
     },
     {
       "path": "crates/studiofs/tests/fixtures/dump-v5-0.2.5.json",
-      "sha256": "67a04ea86c7c6544e67db5a6b2e9afa8dd0af8fdf59063067e668226765f6711",
-      "source": "commit 7fe972358f9e48655249739ae7c8415bcac5504d with SFS-1020 working-tree changes",
+      "sha256": "71765e6399768dac5d7a5c85f0cb59d26ffeac819719a410c81e4d36f2d89be1",
+      "source": "clean commit 81298aea9726a8c3b2d1e752c72de00ce5fa75be",
       "generator": "Run candidate studiofs init sfs1020-dump-baseline against disposable local PostgreSQL and RustFS, then studiofs dump sfs1020-dump-baseline --path-to-dump dump-v5-0.2.5.json",
       "identity": "MetadataDump dump_version 5, shared format 7, checkpoint format 4/schema 1, local redb revision 6",
       "expected": "studiofs load restores the published serving checkpoint and baseline volume policy into fresh PostgreSQL",
@@ -404,16 +404,21 @@
       "date": "2026-11-27",
       "issue": "SFS-1020",
       "reason": "Pinned the generated format-7 FormatInfo from 7fe972358f9e48655249739ae7c8415bcac5504d with SFS-1020 working-tree changes. Preserved the already re-pinned metadata bytes and the published format-5/6 adoption inputs. Captured the dump v5 fixture with the candidate studiofs dump command and verified it with studiofs load on a separate disposable PostgreSQL."
+    },
+    {
+      "date": "2026-11-28",
+      "issue": "SFS-1160",
+      "reason": "Re-sealed the format-7 FormatInfo and v5 dump from the clean release candidate. The regenerated header matched the pinned bytes, and the captured dump restored a published format-7 volume into fresh PostgreSQL."
     }
   ],
   "test_successor": {
-    "source_commit": "7fe972358f9e48655249739ae7c8415bcac5504d",
-    "source_dirty": true,
+    "source_commit": "81298aea9726a8c3b2d1e752c72de00ce5fa75be",
+    "source_dirty": false,
     "generator": "python3 tools/test_successor/build.py --require-complete",
     "generated_manifest": "target/test-successor/manifest.json",
-    "generated_manifest_sha256": "635e469c18d1b97e4e1fb514d2320e8ac5fb49532f02a8db51a300b58da66142",
-    "baseline_binary_sha256": "2ea6df2ebc77c49b9650cca1c74e17dcc6a3809e68e6101f0bf82d3f281d89da",
-    "binary_sha256": "c4bf4031b6095b4e2e66e7c301e0f525483e87b3c5873d01563c97a214ed8bc7",
+    "generated_manifest_sha256": "21e5af441174c79590a447ecf85b66fc72744b04c0c409a65f2325326c5c2f81",
+    "baseline_binary_sha256": "df9ae5ceeb3d74b369a81391aed10bfb28b4397c9f3bbbf97168da2b2a9be8da",
+    "binary_sha256": "3f1b5f430f02c03128e9c3a0b025510ec40f3b14fd42378ee1d967972c835373",
     "verified_identity_changes": [
       "postgres-core-schema-2",
       "event-set-user-xattr-v1",
@@ -434,6 +439,6 @@
       }
     ]
   },
-  "seal_source_commit": "7fe972358f9e48655249739ae7c8415bcac5504d",
-  "seal_source_dirty": true
+  "seal_source_commit": "81298aea9726a8c3b2d1e752c72de00ce5fa75be",
+  "seal_source_dirty": false
 }
