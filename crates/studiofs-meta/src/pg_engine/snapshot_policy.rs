@@ -482,7 +482,10 @@ impl<T: SnapshotBackendAccess + Send + Sync> SnapshotPolicyStore for T {
                                 }
                             }
                         }.await;
-                        super::runtime::finish_pooled_transaction(tx, outcome, is_rejection, |_| pg_failure("commit created snapshot policy slot")).await
+                        super::runtime::finish_pooled_transaction(tx, outcome, |error| {
+                            is_rejection(error)
+                                || matches!(error, MetaError::Storage(message) if message == snapshot_control::MISSING_SNAPSHOT_CHECKPOINT)
+                        }, |_| pg_failure("commit created snapshot policy slot")).await
                     })
                 },
             )

@@ -13,6 +13,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 use tracing::warn;
 
+const MISSING_REPLAY_STATE: &str = "postgres metadata replay state row missing";
+
 pub(super) fn replay_cancelled(
     worker_shutdown: &AtomicBool,
     caller_shutdown: Option<&AtomicBool>,
@@ -277,9 +279,7 @@ impl PgMetaEngine {
                                     )
                                 })?;
                             let replay_state = replay_state.ok_or_else(|| {
-                                MetaError::Storage(
-                                    "postgres metadata replay state row missing".to_string(),
-                                )
+                                MetaError::Storage(MISSING_REPLAY_STATE.to_owned())
                             })?;
                             let format_version = replay_state
                                 .try_get::<_, Option<i16>>("metadata_format_version")
@@ -407,7 +407,11 @@ impl PgMetaEngine {
                             .await?;
                             Ok(page)
                         }.await;
-                        super::runtime::finish_pooled_transaction(tx, outcome, |error| super::volume_protocol::is_volume_read_policy_rejection(error) || matches!(error, MetaError::NeedCompatibleCheckpoint { .. } | MetaError::RebootstrapRequired { .. } | MetaError::ReplayGap { .. }), |e| {
+                        super::runtime::finish_pooled_transaction(tx, outcome, |error| {
+                            super::volume_protocol::is_volume_read_policy_rejection(error)
+                                || matches!(error, MetaError::NeedCompatibleCheckpoint { .. } | MetaError::RebootstrapRequired { .. } | MetaError::ReplayGap { .. })
+                                || matches!(error, MetaError::Storage(message) if message == MISSING_REPLAY_STATE)
+                        }, |e| {
                             Self::classify_pg_error("postgres pull transaction commit failed", e)
                         }).await
                     })

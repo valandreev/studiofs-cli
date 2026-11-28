@@ -18,6 +18,9 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
+const MISSING_RETAINED_PUBLICATION_STATE: &str =
+    "lock retained publication: metadata state missing";
+
 fn descriptor_row_error(error: tokio_postgres::Error) -> MetaError {
     MetaError::Storage(format!(
         "postgres bootstrap checkpoint descriptor row is invalid: {error}"
@@ -944,7 +947,7 @@ impl PgMetaEngine {
                                     // After locking, a fresh statement snapshot must see any
                                     // receipt committed by the previous lock holder.
                                     let row = first_row.take().ok_or_else(|| {
-                                        MetaError::Storage("lock retained publication: metadata state missing".into())
+                                        MetaError::Storage(MISSING_RETAINED_PUBLICATION_STATE.to_owned())
                                     })?;
                                     crate::check_pg_volume_format(row.get::<_, Option<i16>>("metadata_format_version"))?;
                                     if let Some(receipt) = tx.query_opt(
@@ -1113,7 +1116,9 @@ impl PgMetaEngine {
                                         || super::volume_protocol::is_volume_read_policy_rejection(error)
                                         || super::retained::is_retained_publication_rejection(error)
                                         || matches!(error, MetaError::Storage(message)
-                                            if message == super::snapshot_reachability::PAYLOAD_PUBLICATION_FENCED)
+                                            if matches!(message.as_str(),
+                                                super::snapshot_reachability::PAYLOAD_PUBLICATION_FENCED
+                                                    | MISSING_RETAINED_PUBLICATION_STATE))
                                 },
                                 |error| Self::classify_pg_error("finish PostgreSQL publication", error),
                             ).await?;

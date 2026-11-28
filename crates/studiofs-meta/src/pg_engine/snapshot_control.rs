@@ -20,6 +20,9 @@ use crate::snapshot_ports::{
 use std::path::Path;
 use std::time::Duration;
 
+pub(super) const MISSING_SNAPSHOT_CHECKPOINT: &str =
+    "snapshot control plane operation failed: snapshot checkpoint is missing";
+
 /// Inputs captured by one PostgreSQL Snapshot v2 registration transaction.
 #[derive(Debug, Clone)]
 pub(crate) struct SnapshotCaptureRequest {
@@ -1001,12 +1004,16 @@ fn escape_like(value: &str) -> String {
 }
 
 fn snapshot_control_error(operation: &'static str) -> MetaError {
-    let message = format!("snapshot control plane operation failed: {operation}");
     match operation {
-        "published checkpoint is missing"
-        | "snapshot volume is missing"
-        | "snapshot checkpoint is missing" => MetaError::Storage(message),
-        _ => MetaError::RemoteUnavailable(message),
+        "snapshot checkpoint is missing" => {
+            MetaError::Storage(MISSING_SNAPSHOT_CHECKPOINT.to_owned())
+        }
+        "published checkpoint is missing" | "snapshot volume is missing" => MetaError::Storage(
+            format!("snapshot control plane operation failed: {operation}"),
+        ),
+        _ => MetaError::RemoteUnavailable(format!(
+            "snapshot control plane operation failed: {operation}"
+        )),
     }
 }
 

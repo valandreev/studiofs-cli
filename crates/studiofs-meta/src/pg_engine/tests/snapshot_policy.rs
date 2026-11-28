@@ -165,9 +165,7 @@ fn concurrent_initial_policy_sets_allocate_distinct_generations() {
 #[test]
 #[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
 fn policy_slot_claim_and_job_insert_are_one_transaction() {
-    let Some(dsn) = pg_dsn() else {
-        return;
-    };
+    let dsn = pg_dsn().expect("STUDIOFS_TEST_PG_DSN is required");
     let volume = PgTestVolume::new(&dsn, "snapshot-policy-slot");
     let dir = studiofs_test_support::workspace_target_tempdir("test-");
     let db_path = dir.path().join("meta.redb");
@@ -219,8 +217,6 @@ fn policy_slot_claim_and_job_insert_are_one_transaction() {
             )
             .await
             .expect("expire evaluator lease");
-        connection_task.abort();
-
         let reclaimed = SnapshotPolicyStore::claim_evaluator_lease(
             &*engine,
             &context,
@@ -255,6 +251,23 @@ fn policy_slot_claim_and_job_insert_are_one_transaction() {
         .await
         .expect("follow existing due slot");
         assert!(matches!(second, SnapshotPolicyEvaluation::Followed { .. }));
+
+        assert_eq!(client.execute("DELETE FROM metadata_state WHERE vol = $1", &[&volume.volume_id]).await.unwrap(), 1);
+        let error = SnapshotPolicyStore::evaluate_due_slot(
+            &*engine,
+            &context,
+            &reclaimed,
+            now + chrono::Duration::days(1),
+        )
+        .await
+        .expect_err("reject a due slot without a checkpoint");
+        assert_eq!(
+            error,
+            crate::snapshot_ports::SnapshotPortError::from_backend("evaluate snapshot policy slot", ""),
+        );
+        assert_eq!(engine.command_pool_stats().discarded, discarded);
+        assert_eq!(client.query_one("SELECT count(*) FROM snapshot_policy_slots WHERE vol = $1", &[&volume.volume_id]).await.unwrap().get::<_, i64>(0), 1);
+        connection_task.abort();
         Ok(())
     })
     .expect("automatic policy slot transaction");

@@ -204,6 +204,7 @@ fn pg_maintenance_policy_preserves_snapshot_and_replay_history() {
                 worker_engine.run_event_log_prune_once(),
                 Err(MetaError::VolumeProtocolRejected(ProtocolRejection::MaintenanceForbidden { .. }))
             ));
+            assert_eq!(worker_engine.command_pool_stats().discarded, discarded);
             assert!(matches!(
                 worker_engine.try_acquire_pg_janitor_lock(),
                 Err(MetaError::VolumeProtocolRejected(ProtocolRejection::MaintenanceForbidden { .. }))
