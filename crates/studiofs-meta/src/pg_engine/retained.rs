@@ -29,6 +29,29 @@ pub(super) fn publication_digest(
     Ok(Some(digest.finalize().to_vec()))
 }
 
+const CONFLICTING_TRANSITION: &str =
+    "has a conflicting shared transition; accepted local data and journal remain pending";
+const STALE_EXPIRY: &str = "expiry was judged under superseded shared settings; the stale proposal is retired and the entry stays retained";
+const RECEIPT_REMOVAL: &str = "receipt cannot be removed from shared metadata; accepted local data and journal remain pending";
+const NO_SHARED_ADMISSION: &str =
+    "retained transition has no shared admission; preserve this cache and retry publication";
+
+pub(super) fn is_retained_publication_rejection(error: &MetaError) -> bool {
+    let MetaError::Storage(message) = error else {
+        return false;
+    };
+    message == NO_SHARED_ADMISSION
+        || message
+            .strip_prefix("retained entry ")
+            .and_then(|message| message.split_once(' '))
+            .is_some_and(|(_, reason)| {
+                matches!(
+                    reason,
+                    CONFLICTING_TRANSITION | STALE_EXPIRY | RECEIPT_REMOVAL
+                )
+            })
+}
+
 /// Called after the publication's format-fenced metadata row lock. All receipt
 /// comparisons and their namespace events commit in the same PG transaction.
 /// `validate_expiry` gates a fresh expiry against the current shared settings revision;
@@ -80,7 +103,7 @@ pub(super) async fn apply_retained_authority(
                 || transitioned != incoming
             {
                 return Err(MetaError::Storage(format!(
-                    "retained entry {ino} has a conflicting shared transition; accepted local data and journal remain pending"
+                    "retained entry {ino} {CONFLICTING_TRANSITION}"
                 )));
             }
             if validate_expiry {
@@ -95,7 +118,7 @@ pub(super) async fn apply_retained_authority(
             locked.insert(receipt, incoming);
         } else {
             if incoming.state != RetainedEntryState::Retained || incoming.revision != 0 {
-                return Err(MetaError::Storage("retained transition has no shared admission; preserve this cache and retry publication".into()));
+                return Err(MetaError::Storage(NO_SHARED_ADMISSION.into()));
             }
             tx.execute(
                 "INSERT INTO trash_entry_authority(vol,receipt,record) VALUES($1,$2,$3)",
@@ -135,7 +158,7 @@ async fn check_expiry_revision(
     let bytes: Option<Vec<u8>> = row.get(0);
     if shared_settings(bytes.as_deref())?.revision != *settings_revision {
         return Err(MetaError::Storage(format!(
-            "retained entry {receipt} expiry was judged under superseded shared settings; the stale proposal is retired and the entry stays retained"
+            "retained entry {receipt} {STALE_EXPIRY}"
         )));
     }
     Ok(())
@@ -231,9 +254,7 @@ async fn reject_receipt_removal(
     events: &[MetaEvent],
 ) -> MetaResult<()> {
     let removed_receipt_error = |ino: &dyn std::fmt::Display| {
-        MetaError::Storage(format!(
-            "retained entry {ino} receipt cannot be removed from shared metadata; accepted local data and journal remain pending"
-        ))
+        MetaError::Storage(format!("retained entry {ino} {RECEIPT_REMOVAL}"))
     };
     let mut removed = Vec::new();
     for event in events {

@@ -15,6 +15,11 @@ const STALE_POLICY: &str = "snapshot policy generation fenced";
 const POLICY_VOLUME_MISSING: &str = "snapshot policy volume is missing";
 const STALE_EVALUATOR_LEASE: &str = "snapshot policy evaluator lease fenced";
 
+fn is_rejection(error: &MetaError) -> bool {
+    super::volume_protocol::is_volume_read_policy_rejection(error)
+        || matches!(error, MetaError::Storage(message) if matches!(message.as_str(), STALE_POLICY | STALE_EVALUATOR_LEASE | POLICY_VOLUME_MISSING))
+}
+
 fn map_error(operation: &'static str, error: MetaError) -> SnapshotPortError {
     match &error {
         MetaError::Storage(message) if message == STALE_POLICY => SnapshotPortError::permanent(
@@ -130,53 +135,55 @@ impl<T: SnapshotBackendAccess + Send + Sync> SnapshotPolicyStore for T {
                             .transaction()
                             .await
                             .map_err(|_| pg_failure("begin policy set"))?;
-                        tx.query_opt(
-                            "SELECT vol FROM volumes WHERE vol = $1 FOR UPDATE",
-                            &[&volume_id],
-                        )
-                        .await
-                        .map_err(|_| pg_failure("lock policy volume"))?
-                        .ok_or_else(|| MetaError::Storage(POLICY_VOLUME_MISSING.to_string()))?;
-                        let current = tx
-                            .query_opt(
-                                "SELECT generation FROM snapshot_policies WHERE vol = $1 FOR UPDATE",
+                        let outcome = async {
+                            tx.query_opt(
+                                "SELECT vol FROM volumes WHERE vol = $1 FOR UPDATE",
                                 &[&volume_id],
                             )
                             .await
-                            .map_err(|_| pg_failure("read policy generation"))?
-                            .map(|row| row.get::<_, i64>(0));
-                        if let Some(expected_generation) = expected_generation
-                            && current != Some(expected_generation)
-                        {
-                            return Err(MetaError::Storage(STALE_POLICY.to_string()));
-                        }
-                        let generation = current
-                            .unwrap_or(0)
-                            .checked_add(1)
-                            .ok_or_else(|| MetaError::Storage("policy generation overflow".to_string()))?;
-                        let daily_at = policy.daily_at();
-                        let timezone = policy.timezone().to_string();
-                        tx.execute(
-                            "INSERT INTO snapshot_policies (vol, generation, daily_at, timezone, retention_seconds, enabled) VALUES ($1, $2, $3, $4, $5, TRUE) ON CONFLICT (vol) DO UPDATE SET generation = EXCLUDED.generation, daily_at = EXCLUDED.daily_at, timezone = EXCLUDED.timezone, retention_seconds = EXCLUDED.retention_seconds, latest_completed_slot = NULL, enabled = TRUE, updated_at = clock_timestamp()",
-                            &[
-                                &volume_id,
-                                &generation,
-                                &daily_at,
-                                &timezone,
-                                &retention_seconds,
-                            ],
-                        )
-                        .await
-                        .map_err(|_| pg_failure("store snapshot policy"))?;
-                        tx.commit()
+                            .map_err(|_| pg_failure("lock policy volume"))?
+                            .ok_or_else(|| MetaError::Storage(POLICY_VOLUME_MISSING.to_string()))?;
+                            let current = tx
+                                .query_opt(
+                                    "SELECT generation FROM snapshot_policies WHERE vol = $1 FOR UPDATE",
+                                    &[&volume_id],
+                                )
+                                .await
+                                .map_err(|_| pg_failure("read policy generation"))?
+                                .map(|row| row.get::<_, i64>(0));
+                            if let Some(expected_generation) = expected_generation
+                                && current != Some(expected_generation)
+                            {
+                                return Err(MetaError::Storage(STALE_POLICY.to_string()));
+                            }
+                            let generation = current
+                                .unwrap_or(0)
+                                .checked_add(1)
+                                .ok_or_else(|| MetaError::Storage("policy generation overflow".to_string()))?;
+                            let daily_at = policy.daily_at();
+                            let timezone = policy.timezone().to_string();
+                            tx.execute(
+                                "INSERT INTO snapshot_policies (vol, generation, daily_at, timezone, retention_seconds, enabled) VALUES ($1, $2, $3, $4, $5, TRUE) ON CONFLICT (vol) DO UPDATE SET generation = EXCLUDED.generation, daily_at = EXCLUDED.daily_at, timezone = EXCLUDED.timezone, retention_seconds = EXCLUDED.retention_seconds, latest_completed_slot = NULL, enabled = TRUE, updated_at = clock_timestamp()",
+                                &[
+                                    &volume_id,
+                                    &generation,
+                                    &daily_at,
+                                    &timezone,
+                                    &retention_seconds,
+                                ],
+                            )
                             .await
-                            .map_err(|_| pg_failure("commit policy set"))?;
-                        Ok(SnapshotPolicyRecord { generation, policy })
+                            .map_err(|_| pg_failure("store snapshot policy"))?;
+                            Ok(SnapshotPolicyRecord { generation, policy })
+                        }.await;
+                        super::runtime::finish_pooled_transaction(tx, outcome, is_rejection, |_| pg_failure("commit policy set")).await
                     })
                 },
             )
             .await;
-            result.map_err(|error| map_error("set snapshot policy", error))
+            result
+                .and_then(std::convert::identity)
+                .map_err(|error| map_error("set snapshot policy", error))
         })
     }
 
@@ -233,15 +240,20 @@ impl<T: SnapshotBackendAccess + Send + Sync> SnapshotPolicyStore for T {
                             )
                             .await
                             .map_err(|_| pg_failure("cancel snapshot policy"))?;
-                        if updated != 1 {
-                            return Err(MetaError::Storage(STALE_POLICY.to_string()));
-                        }
-                        Ok(())
+                        Ok(updated)
                     })
                 },
             )
             .await;
-            result.map_err(|error| map_error("cancel snapshot policy", error))
+            result
+                .and_then(|rows| {
+                    if rows == 1 {
+                        Ok(())
+                    } else {
+                        Err(MetaError::Storage(STALE_POLICY.to_string()))
+                    }
+                })
+                .map_err(|error| map_error("cancel snapshot policy", error))
         })
     }
 
@@ -276,18 +288,21 @@ impl<T: SnapshotBackendAccess + Send + Sync> SnapshotPolicyStore for T {
                                 &[&volume_id, &owner, &lease_ms],
                             )
                             .await
-                            .map_err(|_| pg_failure("claim snapshot policy evaluator lease"))?
-                            .map(|row| SnapshotPolicyEvaluatorLease {
+                            .map_err(|_| pg_failure("claim snapshot policy evaluator lease"))
+                            .map(|row| row.map(|row| SnapshotPolicyEvaluatorLease {
                                 owner: row.get(0),
                                 expires_at: row.get(1),
                                 fencing_token: row.get(2),
-                            })
-                            .ok_or_else(|| MetaError::Storage(STALE_EVALUATOR_LEASE.to_string()))
+                            }))
                     })
                 },
             )
             .await;
-            result.map_err(|error| map_error("claim snapshot policy evaluator lease", error))
+            result
+                .and_then(|lease| {
+                    lease.ok_or_else(|| MetaError::Storage(STALE_EVALUATOR_LEASE.to_string()))
+                })
+                .map_err(|error| map_error("claim snapshot policy evaluator lease", error))
         })
     }
 
@@ -314,18 +329,21 @@ impl<T: SnapshotBackendAccess + Send + Sync> SnapshotPolicyStore for T {
                                 &[&volume_id, &lease.owner, &lease_ms, &lease.fencing_token],
                             )
                             .await
-                            .map_err(|_| pg_failure("renew snapshot policy evaluator lease"))?
-                            .map(|row| SnapshotPolicyEvaluatorLease {
+                            .map_err(|_| pg_failure("renew snapshot policy evaluator lease"))
+                            .map(|row| row.map(|row| SnapshotPolicyEvaluatorLease {
                                 owner: row.get(0),
                                 expires_at: row.get(1),
                                 fencing_token: row.get(2),
-                            })
-                            .ok_or_else(|| MetaError::Storage(STALE_EVALUATOR_LEASE.to_string()))
+                            }))
                     })
                 },
             )
             .await;
-            result.map_err(|error| map_error("renew snapshot policy evaluator lease", error))
+            result
+                .and_then(|lease| {
+                    lease.ok_or_else(|| MetaError::Storage(STALE_EVALUATOR_LEASE.to_string()))
+                })
+                .map_err(|error| map_error("renew snapshot policy evaluator lease", error))
         })
     }
 
@@ -357,134 +375,121 @@ impl<T: SnapshotBackendAccess + Send + Sync> SnapshotPolicyStore for T {
                             .transaction()
                             .await
                             .map_err(|_| pg_failure("begin snapshot policy evaluation"))?;
-                        tx.query_opt(
-                            "SELECT 1 FROM volumes WHERE vol = $1 FOR UPDATE",
-                            &[&volume_id],
-                        )
-                        .await
-                        .map_err(|_| pg_failure("lock snapshot policy volume"))?
-                        .ok_or_else(|| MetaError::Storage(POLICY_VOLUME_MISSING.to_string()))?;
-                        tx.query_opt(
-                            "SELECT 1 FROM snapshot_policy_evaluator_leases WHERE vol = $1 AND owner = $2 AND fencing_token = $3 AND lease_expires_at > clock_timestamp() FOR UPDATE",
-                            &[&volume_id, &lease.owner, &lease.fencing_token],
-                        )
-                        .await
-                        .map_err(|_| pg_failure("lock snapshot policy evaluator lease"))?
-                        .ok_or_else(|| MetaError::Storage(STALE_EVALUATOR_LEASE.to_string()))?;
-                        let Some(row) = tx
-                            .query_opt(
-                                "SELECT generation, daily_at, timezone, retention_seconds, latest_completed_slot FROM snapshot_policies WHERE vol = $1 AND enabled = TRUE FOR UPDATE",
+                        let outcome = async {
+                            tx.query_opt(
+                                "SELECT 1 FROM volumes WHERE vol = $1 FOR UPDATE",
                                 &[&volume_id],
                             )
                             .await
-                            .map_err(|_| pg_failure("load active snapshot policy"))?
-                        else {
-                            tx.commit()
-                                .await
-                                .map_err(|_| pg_failure("commit empty snapshot policy evaluation"))?;
-                            return Ok(SnapshotPolicyEvaluation::NoPolicy {
-                                next_wake_at: next_poll(now),
-                            });
-                        };
-                        let generation: i64 = row.get(0);
-                        let policy = parse_policy_row(
-                            generation,
-                            row.get(1),
-                            row.get(2),
-                            row.get(3),
-                        )?;
-                        let latest_completed: Option<DateTime<Utc>> = row.get(4);
-                        let Some(slot) = policy.policy.latest_due_slot(now, latest_completed) else {
-                            tx.commit()
-                                .await
-                                .map_err(|_| pg_failure("commit idle snapshot policy evaluation"))?;
-                            return Ok(SnapshotPolicyEvaluation::NoPolicy {
-                                next_wake_at: next_poll(now),
-                            });
-                        };
-                        match slot {
-                            SnapshotPolicySlot::SkippedDstGap { local_date } => {
-                                let next_wake_at = next_policy_wake(&policy.policy, local_date, now);
-                                let inserted = tx
-                                    .execute(
-                                        "INSERT INTO snapshot_policy_slots (vol, generation, local_date, daily_at, slot_kind) VALUES ($1, $2, $3, $4, 'skipped_dst_gap') ON CONFLICT (vol, generation, local_date, daily_at) DO NOTHING",
-                                        &[&volume_id, &generation, &local_date, &policy.policy.daily_at()],
-                                    )
-                                    .await
-                                    .map_err(|_| pg_failure("record skipped snapshot policy slot"))?;
-                                if inserted == 0 {
-                                    tx.commit()
-                                        .await
-                                        .map_err(|_| pg_failure("commit recorded snapshot policy slot"))?;
-                                    return Ok(SnapshotPolicyEvaluation::NoPolicy {
-                                        next_wake_at,
-                                    });
-                                }
-                                tx.commit()
-                                    .await
-                                    .map_err(|_| pg_failure("commit skipped snapshot policy slot"))?;
-                                Ok(SnapshotPolicyEvaluation::SkippedDstGap {
-                                    next_wake_at,
-                                })
-                            }
-                            SnapshotPolicySlot::Due { local_date, due_at } => {
-                                let inserted = tx
-                                    .execute(
-                                        "INSERT INTO snapshot_policy_slots (vol, generation, local_date, daily_at, slot_kind, due_at) VALUES ($1, $2, $3, $4, 'due', $5) ON CONFLICT (vol, generation, local_date, daily_at) DO NOTHING",
-                                        &[&volume_id, &generation, &local_date, &policy.policy.daily_at(), &due_at],
+                            .map_err(|_| pg_failure("lock snapshot policy volume"))?
+                            .ok_or_else(|| MetaError::Storage(POLICY_VOLUME_MISSING.to_string()))?;
+                            tx.query_opt(
+                                "SELECT 1 FROM snapshot_policy_evaluator_leases WHERE vol = $1 AND owner = $2 AND fencing_token = $3 AND lease_expires_at > clock_timestamp() FOR UPDATE",
+                                &[&volume_id, &lease.owner, &lease.fencing_token],
+                            )
+                            .await
+                            .map_err(|_| pg_failure("lock snapshot policy evaluator lease"))?
+                            .ok_or_else(|| MetaError::Storage(STALE_EVALUATOR_LEASE.to_string()))?;
+                            let Some(row) = tx
+                                .query_opt(
+                                    "SELECT generation, daily_at, timezone, retention_seconds, latest_completed_slot FROM snapshot_policies WHERE vol = $1 AND enabled = TRUE FOR UPDATE",
+                                    &[&volume_id],
                                 )
                                 .await
-                                .map_err(|_| pg_failure("claim snapshot policy slot"))?;
-                                if inserted == 0 {
-                                    let linked = tx
-                                        .query_one(
-                                            "SELECT snapshot_id IS NOT NULL FROM snapshot_policy_slots WHERE vol = $1 AND generation = $2 AND local_date = $3 AND daily_at = $4",
+                                .map_err(|_| pg_failure("load active snapshot policy"))?
+                            else {
+                                return Ok(SnapshotPolicyEvaluation::NoPolicy {
+                                    next_wake_at: next_poll(now),
+                                });
+                            };
+                            let generation: i64 = row.get(0);
+                            let policy = parse_policy_row(
+                                generation,
+                                row.get(1),
+                                row.get(2),
+                                row.get(3),
+                            )?;
+                            let latest_completed: Option<DateTime<Utc>> = row.get(4);
+                            let Some(slot) = policy.policy.latest_due_slot(now, latest_completed) else {
+                                return Ok(SnapshotPolicyEvaluation::NoPolicy {
+                                    next_wake_at: next_poll(now),
+                                });
+                            };
+                            match slot {
+                                SnapshotPolicySlot::SkippedDstGap { local_date } => {
+                                    let next_wake_at = next_policy_wake(&policy.policy, local_date, now);
+                                    let inserted = tx
+                                        .execute(
+                                            "INSERT INTO snapshot_policy_slots (vol, generation, local_date, daily_at, slot_kind) VALUES ($1, $2, $3, $4, 'skipped_dst_gap') ON CONFLICT (vol, generation, local_date, daily_at) DO NOTHING",
                                             &[&volume_id, &generation, &local_date, &policy.policy.daily_at()],
                                         )
                                         .await
-                                        .map_err(|_| pg_failure("load claimed snapshot policy slot"))?
-                                        .get::<_, bool>(0);
-                                    if !linked {
-                                        return Err(pg_failure(
-                                            "claimed snapshot policy slot is incomplete",
-                                        ));
+                                        .map_err(|_| pg_failure("record skipped snapshot policy slot"))?;
+                                    if inserted == 0 {
+                                        return Ok(SnapshotPolicyEvaluation::NoPolicy {
+                                            next_wake_at,
+                                        });
                                     }
-                                    tx.commit()
-                                        .await
-                                        .map_err(|_| pg_failure("commit followed snapshot policy slot"))?;
-                                    return Ok(SnapshotPolicyEvaluation::Followed {
-                                        next_wake_at: next_poll(now),
-                                    });
+                                    Ok(SnapshotPolicyEvaluation::SkippedDstGap {
+                                        next_wake_at,
+                                    })
                                 }
-                                let entry = snapshot_control::capture_snapshot_in_transaction(
-                                    &tx,
-                                    &snapshot_control::SnapshotCaptureRequest {
-                                        volume_id,
-                                        origin: SnapshotOrigin::Automatic,
-                                        retention: policy.policy.retention(),
-                                    },
-                                )
-                                .await?;
-                                let snapshot_id = entry.snapshot_id.to_string();
-                                tx.execute(
-                                    "UPDATE snapshot_policy_slots SET snapshot_id = $5, updated_at = clock_timestamp() WHERE vol = $1 AND generation = $2 AND local_date = $3 AND daily_at = $4",
-                                    &[&volume_id, &generation, &local_date, &policy.policy.daily_at(), &snapshot_id],
-                                )
-                                .await
-                                .map_err(|_| pg_failure("link snapshot policy slot"))?;
-                                tx.commit()
+                                SnapshotPolicySlot::Due { local_date, due_at } => {
+                                    let inserted = tx
+                                        .execute(
+                                            "INSERT INTO snapshot_policy_slots (vol, generation, local_date, daily_at, slot_kind, due_at) VALUES ($1, $2, $3, $4, 'due', $5) ON CONFLICT (vol, generation, local_date, daily_at) DO NOTHING",
+                                            &[&volume_id, &generation, &local_date, &policy.policy.daily_at(), &due_at],
+                                    )
                                     .await
-                                    .map_err(|_| pg_failure("commit created snapshot policy slot"))?;
-                                Ok(SnapshotPolicyEvaluation::Created {
-                                    next_wake_at: next_poll(now),
-                                })
+                                    .map_err(|_| pg_failure("claim snapshot policy slot"))?;
+                                    if inserted == 0 {
+                                        let linked = tx
+                                            .query_one(
+                                                "SELECT snapshot_id IS NOT NULL FROM snapshot_policy_slots WHERE vol = $1 AND generation = $2 AND local_date = $3 AND daily_at = $4",
+                                                &[&volume_id, &generation, &local_date, &policy.policy.daily_at()],
+                                            )
+                                            .await
+                                            .map_err(|_| pg_failure("load claimed snapshot policy slot"))?
+                                            .get::<_, bool>(0);
+                                        if !linked {
+                                            return Err(pg_failure(
+                                                "claimed snapshot policy slot is incomplete",
+                                            ));
+                                        }
+                                        return Ok(SnapshotPolicyEvaluation::Followed {
+                                            next_wake_at: next_poll(now),
+                                        });
+                                    }
+                                    let entry = snapshot_control::capture_snapshot_in_transaction(
+                                        &tx,
+                                        &snapshot_control::SnapshotCaptureRequest {
+                                            volume_id,
+                                            origin: SnapshotOrigin::Automatic,
+                                            retention: policy.policy.retention(),
+                                        },
+                                    )
+                                    .await?;
+                                    let snapshot_id = entry.snapshot_id.to_string();
+                                    tx.execute(
+                                        "UPDATE snapshot_policy_slots SET snapshot_id = $5, updated_at = clock_timestamp() WHERE vol = $1 AND generation = $2 AND local_date = $3 AND daily_at = $4",
+                                        &[&volume_id, &generation, &local_date, &policy.policy.daily_at(), &snapshot_id],
+                                    )
+                                    .await
+                                    .map_err(|_| pg_failure("link snapshot policy slot"))?;
+                                    Ok(SnapshotPolicyEvaluation::Created {
+                                        next_wake_at: next_poll(now),
+                                    })
+                                }
                             }
-                        }
+                        }.await;
+                        super::runtime::finish_pooled_transaction(tx, outcome, is_rejection, |_| pg_failure("commit created snapshot policy slot")).await
                     })
                 },
             )
             .await;
-            result.map_err(|error| map_error("evaluate snapshot policy slot", error))
+            result
+                .and_then(std::convert::identity)
+                .map_err(|error| map_error("evaluate snapshot policy slot", error))
         })
     }
 
@@ -510,15 +515,20 @@ impl<T: SnapshotBackendAccess + Send + Sync> SnapshotPolicyStore for T {
                             )
                             .await
                             .map_err(|_| pg_failure("release snapshot policy evaluator lease"))?;
-                        if released != 1 {
-                            return Err(MetaError::Storage(STALE_EVALUATOR_LEASE.to_string()));
-                        }
-                        Ok(())
+                        Ok(released)
                     })
                 },
             )
             .await;
-            result.map_err(|error| map_error("release snapshot policy evaluator lease", error))
+            result
+                .and_then(|rows| {
+                    if rows == 1 {
+                        Ok(())
+                    } else {
+                        Err(MetaError::Storage(STALE_EVALUATOR_LEASE.to_string()))
+                    }
+                })
+                .map_err(|error| map_error("release snapshot policy evaluator lease", error))
         })
     }
 }

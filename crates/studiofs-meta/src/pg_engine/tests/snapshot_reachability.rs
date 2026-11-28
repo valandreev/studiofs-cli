@@ -728,6 +728,7 @@ fn bootstrap_defers_while_a_snapshot_is_creating() {
     engine
         .sync_metadata()
         .expect("metadata sync must remain available while reachability bootstrap is deferred");
+    let discarded = engine.command_pool_stats().discarded;
     let error = engine
         .get_global_snapshot_pins()
         .expect_err("janitor pins must stay unavailable until bootstrap completes");
@@ -736,6 +737,7 @@ fn bootstrap_defers_while_a_snapshot_is_creating() {
             .to_string()
             .contains("snapshot reachability bootstrap incomplete")
     );
+    assert_eq!(engine.command_pool_stats().discarded, discarded);
     drop(engine);
 }
 
@@ -1148,6 +1150,15 @@ fn uploaded_fragment_ledger_batches_preserve_recovery_rows() {
         Ok::<(), MetaError>(())
     })
     .expect("verify upload fragment batch rows");
+
+    let mut missing = entries[1].clone();
+    missing.fragment_index = 99;
+    let discarded = engine.command_pool_stats().discarded;
+    assert!(matches!(
+        engine.confirm_fragment_uploads_sync(&[entries[0].clone(), missing]),
+        Err(MetaError::Storage(message)) if message.contains("confirmation row is missing")
+    ));
+    assert_eq!(engine.command_pool_stats().discarded, discarded);
 
     engine
         .confirm_fragment_uploads(&entries)

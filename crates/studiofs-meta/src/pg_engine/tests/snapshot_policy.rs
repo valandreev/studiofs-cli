@@ -63,11 +63,18 @@ fn policy_set_load_cancel_uses_generation_cas() {
             .expect("seed completion watermark");
         connection_task.abort();
 
+        let discarded = engine.command_pool_stats().discarded;
+        let stale = SnapshotPolicyStore::set_policy(&*engine, &policy, Some(99))
+            .await.expect_err("stale generation must reject policy replacement");
+        assert!(stale.to_string().contains("stale_policy_generation"));
+        assert_eq!(engine.command_pool_stats().discarded, discarded);
+
         let stale = SnapshotPolicyStore::cancel_policy(&*engine, 99)
             .await
             .expect_err("stale generation must be rejected");
         assert!(stale.to_string().contains("stale_policy_generation"));
 
+        assert_eq!(engine.command_pool_stats().discarded, discarded);
         SnapshotPolicyStore::cancel_policy(&*engine, first.generation)
             .await
             .expect("cancel policy");
@@ -223,6 +230,17 @@ fn policy_slot_claim_and_job_insert_are_one_transaction() {
         .await
         .expect("reclaim expired evaluator lease");
         assert!(reclaimed.fencing_token > lease.fencing_token);
+        let other = SnapshotPolicyEvaluatorId::new("policy-evaluator-b").unwrap();
+        let discarded = engine.command_pool_stats().discarded;
+        for error in [
+            SnapshotPolicyStore::claim_evaluator_lease(&*engine, &context, &other, Duration::from_secs(60)).await.unwrap_err(),
+            SnapshotPolicyStore::renew_evaluator_lease(&*engine, &lease, Duration::from_secs(60)).await.unwrap_err(),
+            SnapshotPolicyStore::evaluate_due_slot(&*engine, &context, &lease, now).await.unwrap_err(),
+            SnapshotPolicyStore::release_evaluator_lease(&*engine, &lease).await.unwrap_err(),
+        ] {
+            assert!(error.to_string().contains("stale_evaluator_lease"), "{error}");
+        }
+        assert_eq!(engine.command_pool_stats().discarded, discarded);
         let first = SnapshotPolicyStore::evaluate_due_slot(&*engine, &context, &reclaimed, now)
             .await
             .expect("evaluate due slot");
@@ -284,21 +302,45 @@ fn snapshot_job_claim_renew_release_is_fenced() {
                 .expect("second claim")
                 .is_none()
         );
-        let stale = SnapshotJobStore::renew_lease(
-            &*engine,
-            &SnapshotJobClaim {
-                job: claim.job.clone(),
-                lease: SnapshotCreationLease {
-                    owner: worker_b.as_str().to_string(),
-                    expires_at: claim.lease.expires_at,
-                    fencing_token: claim.lease.fencing_token,
-                },
+        let discarded = engine.command_pool_stats().discarded;
+        let stale_claim = SnapshotJobClaim {
+            job: claim.job.clone(),
+            lease: SnapshotCreationLease {
+                owner: worker_b.as_str().to_string(),
+                expires_at: claim.lease.expires_at,
+                fencing_token: claim.lease.fencing_token,
             },
-            Duration::from_secs(60),
-        )
-        .await
-        .expect_err("wrong owner must be fenced");
-        assert!(stale.to_string().contains("stale_lease"));
+        };
+        for error in [
+            SnapshotJobStore::renew_lease(&*engine, &stale_claim, Duration::from_secs(60)).await.unwrap_err(),
+            SnapshotJobStore::release_lease(&*engine, &stale_claim).await.unwrap_err(),
+        ] {
+            assert!(error.to_string().contains("stale_lease"), "{error}");
+        }
+        let message = crate::snapshot_ports::RedactedSnapshotMessage::new("worker fenced");
+        let retry = crate::snapshot_ports::SnapshotRetry {
+            retry_count: 1,
+            next_retry_at: Utc::now(),
+            message: message.clone(),
+        };
+        let failure = crate::snapshot_ports::SnapshotFailure {
+            code: "worker_fenced".to_owned(),
+            message,
+        };
+        for error in [
+            SnapshotJobStore::mark_retry_wait(&*engine, &stale_claim, retry).await.unwrap_err(),
+            SnapshotJobStore::mark_failed(&*engine, &stale_claim, failure).await.unwrap_err(),
+        ] {
+            assert!(error.to_string().contains("stale_lease"), "{error}");
+        }
+        let missing = crate::snapshot::SnapshotId::from_cut("missing", Utc::now()).unwrap();
+        for error in [
+            SnapshotJobStore::claim_id_or_follow(&*engine, &missing, &worker_a, Duration::from_secs(60)).await.unwrap_err(),
+            SnapshotJobStore::load_catalog(&*engine, &missing).await.unwrap_err(),
+        ] {
+            assert!(error.to_string().contains("snapshot_not_found"), "{error}");
+        }
+        assert_eq!(engine.command_pool_stats().discarded, discarded);
 
         SnapshotJobStore::release_lease(&*engine, &claim)
             .await
@@ -471,6 +513,14 @@ fn snapshot_publish_ready_stores_all_payload_proofs() {
                 sha256: SnapshotSha256::from_bytes([index as u8; 32]),
             })
             .collect();
+
+        let mut stale = claim.clone();
+        stale.lease.fencing_token = -1;
+        let discarded = engine.command_pool_stats().discarded;
+        let error = SnapshotJobStore::publish_ready(&*engine, &stale, &descriptor, &proofs)
+            .await.expect_err("stale creation fence must reject publication");
+        assert!(error.to_string().contains("stale_lease"), "{error}");
+        assert_eq!(engine.command_pool_stats().discarded, discarded);
 
         let published = SnapshotJobStore::publish_ready(&*engine, &claim, &descriptor, &proofs)
             .await

@@ -1275,11 +1275,27 @@ fn test_pg_retained_restore_purge_conflict_preserves_local_loser() {
             .unwrap();
         let winner_version = if purge_first {
             let version = second.push_event_log_batch_locked(&purge_events).unwrap();
-            assert!(first.push_event_log_batch_locked(&restore_events).is_err());
+            let discarded = first.command_pool_stats().discarded;
+            let error = first
+                .push_event_log_batch_locked(&restore_events)
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("conflicting shared transition"),
+                "{error}"
+            );
+            assert_eq!(first.command_pool_stats().discarded, discarded);
             version
         } else {
             let version = first.push_event_log_batch_locked(&restore_events).unwrap();
-            assert!(second.push_event_log_batch_locked(&purge_events).is_err());
+            let discarded = second.command_pool_stats().discarded;
+            let error = second
+                .push_event_log_batch_locked(&purge_events)
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("conflicting shared transition"),
+                "{error}"
+            );
+            assert_eq!(second.command_pool_stats().discarded, discarded);
             version
         };
         let volume_id = volume.volume_id;
@@ -7770,10 +7786,12 @@ fn pg_checkpoint_encodings_keep_baseline_and_successor_replayable() {
         Err(MetaError::NeedCompatibleCheckpoint { replay_floor }) if replay_floor > promoted_cut
     ));
     let _guard = returning.replication_lock.lock().unwrap();
+    let discarded = returning.command_pool_stats().discarded;
     assert!(matches!(
         returning.pull_foreign_events_locked(None),
         Err(MetaError::NeedCompatibleCheckpoint { replay_floor }) if replay_floor > promoted_cut
     ));
+    assert_eq!(returning.command_pool_stats().discarded, discarded);
 }
 
 #[test]

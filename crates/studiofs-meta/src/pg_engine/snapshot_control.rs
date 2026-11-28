@@ -173,54 +173,56 @@ impl PgSnapshotBackend {
                                 error,
                             )
                         })?;
-                        let rows = tx
-                            .query(
-                                "SELECT vol, name, uuid FROM volumes WHERE vol = $1 OR uuid = $2 FOR UPDATE",
-                                &[&hint.volume_id, &hint.volume_uuid],
-                            )
-                            .await
-                            .map_err(|error| {
-                                classify_postgres_error(
-                                    "snapshot volume identity query unavailable",
-                                    error,
+                        let outcome = async {
+                            let rows = tx
+                                .query(
+                                    "SELECT vol, name, uuid FROM volumes WHERE vol = $1 OR uuid = $2 FOR UPDATE",
+                                    &[&hint.volume_id, &hint.volume_uuid],
                                 )
+                                .await
+                                .map_err(|error| {
+                                    classify_postgres_error(
+                                        "snapshot volume identity query unavailable",
+                                        error,
+                                    )
+                                })?;
+                            if rows.len() != 1 {
+                                return Err(MetaError::Storage(
+                                    "snapshot volume identity is missing or ambiguous".into(),
+                                ));
+                            }
+                            let row = &rows[0];
+                            let volume_id = row.get::<_, VolumeId>(0);
+                            let volume_name = row.get::<_, String>(1);
+                            let volume_uuid = row.get::<_, String>(2);
+                            if volume_id != hint.volume_id
+                                || volume_name != hint.volume_name
+                                || volume_uuid != hint.volume_uuid
+                            {
+                                return Err(MetaError::Storage(
+                                    "snapshot volume identity does not match PostgreSQL".into(),
+                                ));
+                            }
+                            let context = SnapshotVolumeContext::new(
+                                volume_id,
+                                volume_name,
+                                volume_uuid,
+                            )
+                            .map_err(|_| {
+                                MetaError::Storage("PostgreSQL snapshot volume identity is invalid".into())
                             })?;
-                        if rows.len() != 1 {
-                            return Err(MetaError::Storage(
-                                "snapshot volume identity is missing or ambiguous".into(),
-                            ));
-                        }
-                        let row = &rows[0];
-                        let volume_id = row.get::<_, VolumeId>(0);
-                        let volume_name = row.get::<_, String>(1);
-                        let volume_uuid = row.get::<_, String>(2);
-                        if volume_id != hint.volume_id
-                            || volume_name != hint.volume_name
-                            || volume_uuid != hint.volume_uuid
-                        {
-                            return Err(MetaError::Storage(
-                                "snapshot volume identity does not match PostgreSQL".into(),
-                            ));
-                        }
-                        let context = SnapshotVolumeContext::new(
-                            volume_id,
-                            volume_name,
-                            volume_uuid,
-                        )
-                        .map_err(|_| {
-                            MetaError::Storage("PostgreSQL snapshot volume identity is invalid".into())
-                        })?;
-                        tx.commit().await.map_err(|error| {
+                            Ok(context)
+                        }.await;
+                        super::runtime::finish_pooled_transaction(tx, outcome, |error| matches!(error, MetaError::Storage(message) if matches!(message.as_str(), "snapshot volume identity is missing or ambiguous" | "snapshot volume identity does not match PostgreSQL" | "PostgreSQL snapshot volume identity is invalid")), |error| {
                             classify_postgres_error(
                                 "snapshot volume validation commit unavailable",
                                 error,
                             )
-                        })?;
-                        Ok(context)
+                        }).await
                     })
                 },
             )
-            .await
+            .await?
         })
     }
 

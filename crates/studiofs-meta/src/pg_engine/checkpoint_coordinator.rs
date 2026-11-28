@@ -557,81 +557,89 @@ impl PgMetaEngine {
             let fencing_token = lease.fencing_token;
             let current_session = session.clone();
             let current_checkpoint = checkpoint;
-            let outcome =
-                self.run_async(async move {
-                    Self::with_postgres_client_timeout(
-                        command_pool,
-                        command_timeout,
-                        "publish fenced bootstrap checkpoint",
-                        move |client| {
-                            Box::pin(async move {
-                                let tx = client.transaction().await.map_err(|error| {
-                                    Self::classify_pg_error(
-                                        "begin bootstrap checkpoint publication",
-                                        error,
-                                    )
-                                })?;
-                                match current_session.stamp_checked(&tx, volume_id).await {
+            let outcome = self.run_async(async move {
+                Self::with_postgres_client_timeout(
+                    command_pool,
+                    command_timeout,
+                    "publish fenced bootstrap checkpoint",
+                    move |client| {
+                        Box::pin(async move {
+                            let tx = client.transaction().await.map_err(|error| {
+                                Self::classify_pg_error(
+                                    "begin bootstrap checkpoint publication",
+                                    error,
+                                )
+                            })?;
+                            match current_session.stamp_checked(&tx, volume_id).await {
                                 Ok(()) => {}
-                                Err(error @ (super::client_sessions::StampError::SessionInactive
-                                    | super::client_sessions::StampError::PolicyStale { .. })) => {
-                                    drop(tx);
+                                Err(
+                                    error @ (super::client_sessions::StampError::SessionInactive
+                                    | super::client_sessions::StampError::PolicyStale {
+                                        ..
+                                    }),
+                                ) => {
+                                    tx.rollback().await.map_err(|error| {
+                                        Self::classify_pg_error(
+                                            "rollback stale checkpoint publication",
+                                            error,
+                                        )
+                                    })?;
                                     return Ok(Err((error, current_checkpoint)));
                                 }
                                 Err(super::client_sessions::StampError::Other(error)) => {
                                     return Err(error);
                                 }
                             }
-                                let sha_slice: &[u8] = &current_checkpoint.checkpoint_sha256;
-                                let row = tx
-                                    .query_opt(
-                                        sql::UPSERT_FENCED_METADATA_CHECKPOINT,
-                                        &[
-                                            &volume_id,
-                                            &current_checkpoint.metadata_format_version,
-                                            &version,
-                                            &version,
-                                            &total_event_payload_bytes,
-                                            &current_checkpoint.payload,
-                                            &sha_slice,
-                                            &current_checkpoint.format_info,
-                                            &owner,
-                                            &fencing_token,
-                                        ],
-                                    )
-                                    .await
-                                    .map_err(|error| {
-                                        Self::classify_pg_error(
-                                            "postgres fenced checkpoint upsert failed",
-                                            error,
-                                        )
-                                    })?;
-                                let observation = row
-                                .as_ref()
-                                .map(super::metadata_io::checkpoint_freshness_observation_from_row)
-                                .transpose()?;
-                                #[cfg(feature = "test-successor")]
-                                if observation.is_some() {
-                                    publish_successor_encoding(
-                                        &tx,
-                                        volume_id,
-                                        version,
-                                        &current_checkpoint,
-                                    )
-                                    .await?;
-                                }
-                                tx.commit().await.map_err(|error| {
+                            let sha_slice: &[u8] = &current_checkpoint.checkpoint_sha256;
+                            let row = tx
+                                .query_opt(
+                                    sql::UPSERT_FENCED_METADATA_CHECKPOINT,
+                                    &[
+                                        &volume_id,
+                                        &current_checkpoint.metadata_format_version,
+                                        &version,
+                                        &version,
+                                        &total_event_payload_bytes,
+                                        &current_checkpoint.payload,
+                                        &sha_slice,
+                                        &current_checkpoint.format_info,
+                                        &owner,
+                                        &fencing_token,
+                                    ],
+                                )
+                                .await
+                                .map_err(|error| {
                                     Self::classify_pg_error(
-                                        "commit bootstrap checkpoint publication",
+                                        "postgres fenced checkpoint upsert failed",
                                         error,
                                     )
                                 })?;
-                                Ok(Ok(observation))
-                            })
-                        },
-                    )
-                    .await
-                });
+                            let observation = row
+                                .as_ref()
+                                .map(super::metadata_io::checkpoint_freshness_observation_from_row)
+                                .transpose()?;
+                            #[cfg(feature = "test-successor")]
+                            if observation.is_some() {
+                                publish_successor_encoding(
+                                    &tx,
+                                    volume_id,
+                                    version,
+                                    &current_checkpoint,
+                                )
+                                .await?;
+                            }
+                            tx.commit().await.map_err(|error| {
+                                Self::classify_pg_error(
+                                    "commit bootstrap checkpoint publication",
+                                    error,
+                                )
+                            })?;
+                            Ok(Ok(observation))
+                        })
+                    },
+                )
+                .await
+            });
             match outcome {
                 Ok(Ok(observation)) => break Ok(observation),
                 Ok(Err((stamp_error, returned_checkpoint))) => {
