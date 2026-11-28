@@ -332,23 +332,19 @@ Infra-heavy ignored suite:
 cargo test --workspace --all-targets -- --ignored --nocapture --test-threads=1
 ```
 
-Real mounted E2E runner (build the product binary first and select a scenario
-from `list`):
+Run every real mounted E2E scenario. The command builds the release binary,
+the E2E runner and the compiled test successor, downloads the verified
+published `v0.2.4` binary, and runs all scenarios, including the
+forward-compatibility matrix:
 
 ```bash
-cargo build -p studiofs
-cargo run -p studiofs-e2e -- list
-cargo run -p studiofs-e2e -- run --scenario basic-multi-client-smoke --studiofs-bin target/debug/studiofs
-cargo run -p studiofs-e2e -- clean
+python tools/release/e2e_gate.py --scenarios-only
 ```
 
-On Windows, use `target/debug/studiofs.exe` for `--studiofs-bin`.
-
-Before a release, run the whole mounted E2E gate once on each platform
-(Windows/WinFSP, Linux/FUSE, macOS/macFUSE) from a clean commit. One command
-builds the release binary, the E2E runner and the compiled test successor,
-downloads the verified published `v0.2.4`/`v0.2.2` binaries, and runs every
-scenario plus the forward-compatibility and crash/rollback matrices:
+Every StudioFS release starting with 0.2.5 passes the release E2E gate on
+Windows/WinFSP, Linux/FUSE and macOS/macFUSE before it is published. The gate
+runs on each platform from a clean commit. It adds the crash/rollback matrix
+with the published `v0.2.2` binary to the scenario run above:
 
 ```bash
 python tools/release/e2e_gate.py

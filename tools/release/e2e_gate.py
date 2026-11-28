@@ -35,6 +35,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[2]
 EXE = ".exe" if sys.platform == "win32" else ""
 STEPS = ("scenarios", "forward", "crash")
+SCENARIO_STEPS = ("scenarios", "forward")
 MATRIX_ARTIFACT = Path("artifacts/scenarios/mounted-forward-compat-matrix/forward-compat-matrix.json")
 
 
@@ -118,7 +119,14 @@ def main() -> int:
     parser.add_argument("--step", action="append", choices=STEPS, help="run only these steps (repeatable)")
     parser.add_argument("--skip-build", action="store_true", help="reuse binaries from an earlier gate build")
     parser.add_argument("--allow-dirty", action="store_true", help="allow uncommitted changes (not release evidence)")
+    parser.add_argument(
+        "--scenarios-only",
+        action="store_true",
+        help="run every E2E scenario (the scenarios and forward steps) on any worktree; skips the crash matrix",
+    )
     args = parser.parse_args()
+    if args.scenarios_only:
+        args.allow_dirty = True
 
     missing = [tool for tool in ("cargo", "docker", "gh") if shutil.which(tool) is None]
     if missing:
@@ -140,7 +148,7 @@ def main() -> int:
             return 2
 
     results = []
-    for step in args.step or STEPS:
+    for step in args.step or (SCENARIO_STEPS if args.scenarios_only else STEPS):
         run_id = f"{args.run_id_prefix}-{step}"
         print(f"=== release gate step {step} (run id {run_id}) ===", flush=True)
         exit_code = run(step_command(step, args, run_id))
